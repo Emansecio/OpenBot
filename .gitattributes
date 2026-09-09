@@ -1,0 +1,3 @@
+# Preserve the local snapshot byte-for-byte, including SHA-256 verified artifacts.
+# Do not let core.autocrlf change files when cloning on Windows.
+* -text

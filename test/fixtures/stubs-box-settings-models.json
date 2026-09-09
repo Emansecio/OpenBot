@@ -1,0 +1,29 @@
+{
+  "label": "stubs.box-settings-models",
+  "source": "plano-fase1-mvp.md §3 T13 + mapa-funcoes.md §4.5 (SandForeverBoxStatus / SandHostSettings / getAvailableModels)",
+  "value": {
+    "foreverBoxStatus": {
+      "vncUrl": null,
+      "windows": []
+    },
+    "hostSettings": {
+      "timezone": "America/Sao_Paulo",
+      "pinnedAgents": [],
+      "sidebarSections": [],
+      "autoReviewEnabled": false,
+      "localToolPermission": "ask"
+    },
+    "availableModels": [
+      { "id": "grok-4.6", "provider": "xai", "displayName": "Grok 4.6", "default": true },
+      { "id": "gpt-5.6-luna", "provider": "openai", "displayName": "GPT-5.6 Luna" },
+      { "id": "gpt-5.6-sol", "provider": "openai", "displayName": "GPT-5.6 Sol" },
+      { "id": "gpt-5.6-terra", "provider": "openai", "displayName": "GPT-5.6 Terra" },
+      { "id": "openai-compatible", "provider": "openai-compat", "displayName": "OpenAI-compatible" }
+    ],
+    "flags": {
+      "isAgentNetworkEnabled": false,
+      "isGlobalSearchEnabled": true,
+      "isEgressTunnelAvailable": false
+    }
+  }
+}

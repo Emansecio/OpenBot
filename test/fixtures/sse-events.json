@@ -1,0 +1,30 @@
+{
+  "label": "sse.events",
+  "source": "mapa-funcoes.md §4.5 (evento {channel, payload}; heartbeat :ping 15s; retry:1000) + mapa-frontend.md §3.3 (snapshot/appended)",
+  "value": {
+    "event": {
+      "channel": "transcript",
+      "payload": {
+        "type": "appended",
+        "agentId": "openbot-default",
+        "entry": {
+          "kind": "send-message",
+          "message": {
+            "type": "text",
+            "text": "olá"
+          }
+        }
+      }
+    },
+    "snapshot": {
+      "channel": "transcript",
+      "payload": {
+        "type": "snapshot",
+        "entries": [],
+        "agentId": "openbot-default"
+      }
+    },
+    "heartbeat": ":ping",
+    "retry": 1000
+  }
+}

@@ -1,0 +1,72 @@
+name: Windows artifact gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-artifact-gate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Test
+        run: npm test -- --maxWorkers=1 --no-file-parallelism
+      - name: Provenance gate
+        run: npm run verify:provenance
+      - name: Renderer boundary gate
+        run: npm run verify:renderer-boundary
+      - name: Client artifact gate
+        run: npm run verify:client-artifacts
+      - name: Visual UI artifact gate
+        run: npm run verify:visual-ui -- --artifacts-only
+      - name: Package release
+        run: npm run release:package
+      - name: Verify packaged artifacts in a clean root
+        shell: pwsh
+        run: |
+          $clean = Join-Path $env:RUNNER_TEMP ('openbot-clean-' + [guid]::NewGuid().ToString('N'))
+          $sources = Join-Path $env:RUNNER_TEMP ('openbot-sources-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $clean | Out-Null
+          New-Item -ItemType Directory -Path $sources | Out-Null
+          $dir = Get-ChildItem -Directory release -Filter 'OpenBot-*-win32-x64' | Select-Object -First 1
+          $zip = Get-ChildItem -File release -Filter 'OpenBot-*-win32-x64.zip' | Select-Object -First 1
+          $sidecar = Get-ChildItem -File release -Filter 'OpenBot-*-win32-x64.manifest.json' | Select-Object -First 1
+          if ($null -eq $dir -or $null -eq $zip -or $null -eq $sidecar) { throw 'release package did not produce directory, zip, and sidecar' }
+          $dirCopy = Join-Path $sources $dir.Name
+          $zipCopy = Join-Path $sources $zip.Name
+          $sidecarCopy = Join-Path $sources $sidecar.Name
+          Copy-Item -LiteralPath $dir.FullName -Destination $dirCopy -Recurse
+          Copy-Item -LiteralPath $zip.FullName -Destination $zipCopy
+          Copy-Item -LiteralPath $sidecar.FullName -Destination $sidecarCopy
+          $evidence = Join-Path $clean 'windows-artifact-gate.json'
+          node scripts/verify-windows-artifact-gate.mjs --directory $dirCopy --zip $zipCopy --sidecar $sidecarCopy --clean-root $clean | Tee-Object -FilePath $evidence
+          if ($LASTEXITCODE -ne 0) { throw "Windows artifact gate failed with exit code $LASTEXITCODE" }
+          Copy-Item -LiteralPath $evidence -Destination (Join-Path $env:GITHUB_WORKSPACE 'windows-artifact-gate.json')
+          node scripts/launch.mjs --preflight --root $dirCopy
+      - name: Hermetic smoke
+        run: npm run smoke:local
+      - name: Upload release and gate evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openbot-windows-release
+          path: |
+            release/*.zip
+            release/*.json
+            windows-artifact-gate.json

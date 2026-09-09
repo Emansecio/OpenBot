@@ -1,0 +1,127 @@
+{
+  "schemaVersion": 1,
+  "authorship": {
+    "schemaVersion": 1,
+    "localImplementation": {
+      "scope": ["P0.1", "P0.2", "P0.3", "P0.4"],
+      "date": "2026-08-24",
+      "authorType": "ai-agent",
+      "author": "OpenAI Codex agents",
+      "directedBy": "repository owner",
+      "ownerIdentityRecorded": false
+    },
+    "historicalComponents": {
+      "status": "unknown",
+      "scope": ["pre-existing OpenBot components", "extracted Grok Bot artifacts"],
+      "notAttributedToLocalImplementation": true
+    }
+  },
+  "entries": [
+    {
+      "id": "openbot-backend-source",
+      "classification": "own-code",
+      "origin": "OpenBot project backend source",
+      "reuse": "copy",
+      "localPath": "src"
+    },
+    {
+      "id": "openbot-maintenance-scripts",
+      "classification": "own-code",
+      "origin": "OpenBot project maintenance and verification scripts",
+      "reuse": "copy",
+      "localPath": "scripts"
+    },
+    {
+      "id": "openbot-tests",
+      "classification": "own-code",
+      "origin": "OpenBot project test suite",
+      "reuse": "copy",
+      "localPath": "test"
+    },
+    {
+      "id": "openbot-dependency-manifest",
+      "classification": "licensed-dependency",
+      "origin": "Dependency declarations in package.json; each dependency remains governed by its own license",
+      "reuse": "per-license",
+      "localPath": "package.json"
+    },
+    {
+      "id": "openbot-dependency-lock",
+      "classification": "licensed-dependency",
+      "origin": "Resolved dependency inventory in package-lock.json; each dependency remains governed by its own license",
+      "reuse": "per-license",
+      "localPath": "package-lock.json"
+    },
+    {
+      "id": "grokbot-016-package-metadata",
+      "classification": "extracted-artifact",
+      "origin": "Locally extracted Grok Bot 0.16 package metadata recorded by client/client-artifacts.manifest.json",
+      "reuse": "no-copy",
+      "localPath": "client/extracted/package.json"
+    },
+    {
+      "id": "grokbot-016-electron-main",
+      "classification": "extracted-artifact",
+      "origin": "Locally extracted Grok Bot 0.16 Electron main artifact recorded by client/client-artifacts.manifest.json",
+      "reuse": "no-copy",
+      "localPath": "client/extracted/dist/electron-main/main.cjs"
+    },
+    {
+      "id": "grokbot-016-electron-preload",
+      "classification": "extracted-artifact",
+      "origin": "Locally extracted Grok Bot 0.16 Electron preload artifact recorded by client/client-artifacts.manifest.json",
+      "reuse": "no-copy",
+      "localPath": "client/extracted/dist/electron-preload/preload.cjs"
+    },
+    {
+      "id": "grokbot-016-renderer-index",
+      "classification": "extracted-artifact",
+      "origin": "Locally extracted Grok Bot 0.16 renderer index recorded by client/client-artifacts.manifest.json",
+      "reuse": "no-copy",
+      "localPath": "client/extracted/dist/renderer/index.html"
+    },
+    {
+      "id": "grokbot-016-renderer-entry",
+      "classification": "extracted-artifact",
+      "origin": "Locally extracted Grok Bot 0.16 renderer entry recorded by client/client-artifacts.manifest.json",
+      "reuse": "no-copy",
+      "localPath": "client/extracted/dist/renderer/assets/index-DVUCYGay.js"
+    },
+    {
+      "id": "grokbot-016-renderer-style",
+      "classification": "extracted-artifact",
+      "origin": "Locally extracted Grok Bot 0.16 renderer stylesheet recorded by client/client-artifacts.manifest.json",
+      "reuse": "no-copy",
+      "localPath": "client/extracted/dist/renderer/assets/index-CqsZ1Ga4.css"
+    },
+    {
+      "id": "openbot-local-settings-overlay",
+      "classification": "own-code",
+      "origin": "OpenBot local renderer settings overlay",
+      "reuse": "copy",
+      "localPath": "client/extracted/dist/renderer/assets/openbot-local-settings.js"
+    },
+    {
+      "id": "openbot-memory-ui-overlay",
+      "classification": "own-code",
+      "origin": "OpenBot local memory UI overlay",
+      "reuse": "copy",
+      "localPath": "client/extracted/dist/renderer/assets/openbot-memory-ui.js"
+    },
+    {
+      "id": "openbot-welcome-media",
+      "classification": "own-code",
+      "origin": "OpenBot-owned welcome media currently declared in client/client-artifacts.manifest.json",
+      "reuse": "copy",
+      "localPath": "client/extracted/dist/renderer/assets/openbot-welcome-renaissance.png"
+    },
+    {
+      "id": "grokbot-018-observational-snapshot",
+      "classification": "observational-reference",
+      "origin": "Read-only behavioral reference to b-nnett/grok-bot-0.18-reconstructed; no code or artifact is imported",
+      "reuse": "no-copy",
+      "repository": "https://github.com/b-nnett/grok-bot-0.18-reconstructed.git",
+      "commit": "a9f633e09d49a85829b8236331b9e21f7e612634"
+    }
+  ]
+}

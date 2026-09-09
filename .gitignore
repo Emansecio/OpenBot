@@ -1,0 +1,30 @@
+node_modules/
+/dist/
+target/
+*.log
+.DS_Store
+
+# Local credentials and runtime state (never publish).
+.env
+.env.*
+!.env.example
+!.env.template
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+/process.json
+
+# Generated packages, diagnostics, and local agent sessions.
+/release/
+/logs/
+/test-results/
+/coverage/
+/analysis_outputs/
+/backup/
+/.chatgpt-backups/
+/.pi/
+/.slim/
+/%SystemDrive%/
+/windows-artifact-gate.json

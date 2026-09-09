@@ -1,0 +1,1 @@
+import{c as n,u as i,j as r,f as d}from"./index-DVUCYGay.js";function l(o){const s=n.c(4),{entry:e}=o,a=i()??void 0;let t;return s[0]!==e.id||s[1]!==e.message.ask||s[2]!==a?(t=r.jsx(d,{agentId:a,ask:e.message.ask,entryId:e.id}),s[0]=e.id,s[1]=e.message.ask,s[2]=a,s[3]=t):t=s[3],t}export{l as default};

@@ -1,0 +1,14 @@
+{
+  "label": "rpc.envelopes",
+  "source": "mapa-frontend.md §3.2 (envelopes {ok,value} / {ok:false,failure})",
+  "value": {
+    "ok": {
+      "ok": true,
+      "value": { "accepted": true }
+    },
+    "failure": {
+      "ok": false,
+      "failure": "SandAgentLimitError: limite de agentes atingido"
+    }
+  }
+}

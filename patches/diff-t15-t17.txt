@@ -1,0 +1,922 @@
+diff --git a/client/extracted/dist/electron-main/main.cjs.original b/client/extracted/dist/electron-main/main.cjs
+index 712e9a2..4f5c506 100644
+--- a/client/extracted/dist/electron-main/main.cjs.original
++++ b/client/extracted/dist/electron-main/main.cjs
+@@ -247336,7 +247336,9 @@ function sleep(ms, signal) {
+ }
+ function pollAuthenticationStatus(_a4) {
+   return __awaiter12(this, arguments, void 0, function* ({ uuid: uuid5, verifier, apiBaseUrl = resolveApiBaseUrl(), signal }) {
+-    const pollingEndpoint = `${apiBaseUrl}/auth/poll`;
++    // OPENBOT PATCH T15: OAuth login/poll wiring is dead — no auth/poll
++    // endpoint is ever constructed.
++    const pollingEndpoint = `${apiBaseUrl}/auth/poll`; // DEAD: login/poll removed (T15)
+     const maxAttempts = 150;
+     const baseDelay = 1e3;
+     const maxDelay = 1e4;
+@@ -410116,6 +410118,8 @@ var init_cursor_auth = __esm({
+       }
+       /**
+        * De-duplicates concurrent refreshes onto a single in-flight `/oauth/token`
++       * OPENBOT PATCH T15: token refresh is unreachable — no credentials exist, so
++       * runRefreshAccessToken is never invoked (getValidAccessToken throws first).
+        * exchange so N callers within the refresh leeway share ONE rotation instead
+        * of each replaying the same single-use refresh token (which the backend would
+        * reject, spuriously signing the user out).
+@@ -426153,24 +426157,8 @@ var init_cursor_experiments = __esm({
+       bootstrapDeadline;
+       refreshPoll;
+       start() {
+-        const cached3 = loadCachedBootstrap(this.options.getCacheDir());
+-        if (cached3 != null) {
+-          try {
+-            this.hydrate(cached3.config);
+-            this.flagsFetchedAtMs = cached3.fetchedAtMs;
+-          } catch (error6) {
+-            reportExperimentsDiagnostic({
+-              kind: "bootstrap_cache_hydrate_failed",
+-              errorClass: errorLogTag(error6)
+-            });
+-          }
+-        }
++        // OPENBOT: experiments stay local; cached Statsig bootstrap can re-enable logging and egress.
+         this.refreshSnapshot();
+-        this.pollHandle = this.refreshPoll.start(() => {
+-          const trigger = this.hasStartupTickRun ? "poll" : "startup";
+-          this.hasStartupTickRun = true;
+-          return this.refresh(trigger);
+-        });
+       }
+       handleAuthChange() {
+         this.authRevision += 1;
+@@ -426554,23 +426542,21 @@ var init_cursor_experiments = __esm({
+             }
+           }
+           const requestAuthRevision = this.authRevision;
+-          const result = await fetchStatsigBootstrap({
+-            backendUrl: getSandInferenceBackendUrl(),
+-            deadline: this.bootstrapDeadline,
+-            getAccessToken: this.options.getAccessToken,
+-            getMachineId: this.options.getMachineId
+-          });
++          // OPENBOT PATCH T17: Statsig bootstrap removed — the fetch would hit
++          // api2.cursor.sh (BootstrapStatsig) / api.statsigcdn.com / tev1.
++          // Flags fall back to the bundled defaults (fail-closed) and no
++          // network bootstrap is ever attempted.
+           if (this.isDisposed) {
+             return;
+           }
+-          const config3 = result.config;
+-          if (config3 == null) {
+-            if (result.retryAfterMs != null && result.retryAfterMs > 0) {
+-              this.rateLimitedUntilMs = realClock.now() + result.retryAfterMs;
++          this.rateLimitedUntilMs = void 0;
++          {
++            const config3 = void 0;
++            if (false) {
++              this.rateLimitedUntilMs = realClock.now();
+             }
+-            return;
++            if (config3 == null) return;
+           }
+-          this.rateLimitedUntilMs = void 0;
+           if (requestAuthRevision !== this.authRevision) {
+             reportExperimentsDiagnostic({
+               kind: "bootstrap_discarded_auth_changed",
+@@ -428439,6 +428425,8 @@ var init_mcp_catalog_flow = __esm({
+       catalogViewsCache = null;
+       /** Lists catalog entries without resolving per-plugin setup fields; a view's fields come from the listing's own variables schema. */
+       async getCatalog(getAccessToken, options) {
++        // OPENBOT PATCH: the local gateway has no remote Cursor MCP marketplace.
++        if (process.env.OPENBOT_LOCAL_GATEWAY === "1") return [];
+         const { bestEffortToken: bestEffortToken2, fetchMarketplaceMcpPlugins: fetchMarketplaceMcpPlugins2, marketplacePluginToView: marketplacePluginToView2 } = await Promise.resolve().then(() => (init_mcp_marketplace(), mcp_marketplace_exports));
+         const isAuthenticated = await bestEffortToken2(getAccessToken) != null;
+         const cached3 = this.catalogViewsCache;
+@@ -452839,122 +452827,75 @@ function createDesktopAccountAuthorizer(deps) {
+ }
+ 
+ // src/electron-main/account/cursor-auth-wiring.ts
++// OPENBOT PATCH T15 (auth -> local profile): cursorAuth.* remapped to a local
++// profile. No Cursor credential is ever read, fetched or stored; getStatus
++// always reports {kind:"local"} so no sign-in gate appears (the renderer only
++// treats kind==="logged-in" as signed in), login/logout are no-ops, and the
++// remote profile/usage/ceiling syncs plus session-settlement shipper (backend
++// log egress) are never wired.
+ init_invariant();
+ init_usage();
+ init_desktop_edge_failures();
+ init_sentry2();
+ function createCursorAuthWiring(deps) {
+   let cursorAuthService;
+-  let localToolCeilingSyncSeq = 0;
+-  async function syncLocalToolPermissionCeiling(service, status) {
+-    const seq2 = ++localToolCeilingSyncSeq;
+-    const previous = deps.settingsStore.getLocalToolPermission();
+-    let ceiling;
+-    if (status.kind === "logged-in") {
+-      const { fetchLocalToolPermissionCeiling: fetchLocalToolPermissionCeiling2 } = await Promise.resolve().then(() => (init_cursor_profile(), cursor_profile_exports));
+-      ceiling = await fetchLocalToolPermissionCeiling2(
+-        (options) => service.getValidAccessToken(options)
+-      );
+-    }
+-    if (seq2 !== localToolCeilingSyncSeq) return;
+-    deps.settingsStore.setLocalToolPermissionCeiling(ceiling);
+-    const effective = deps.settingsStore.getLocalToolPermission();
+-    if (effective === previous) return;
+-    try {
+-      await deps.syncHostSettingsToBox({ localToolPermission: effective });
+-    } catch (error6) {
+-      reportDesktopEdgeFailure("host-settings", "local-tool-ceiling", error6);
+-    }
+-  }
+-  async function fetchSentryPrivacyMode(service) {
+-    const { fetchUserPrivacyMode: fetchUserPrivacyMode2 } = await Promise.resolve().then(() => (init_cursor_profile(), cursor_profile_exports));
+-    return fetchUserPrivacyMode2((options) => service.getValidAccessToken(options));
+-  }
+   function deliverCursorAuthStatus2(service, status) {
+     deps.broadcast("sand:cursor-auth-event", status);
+-    if (deps.sentryEnabled)
+-      void syncSandSentryAccount(status, () => fetchSentryPrivacyMode(service));
+-    void syncLocalToolPermissionCeiling(service, status);
+   }
+   async function ensureCursorAuthService2() {
+     if (cursorAuthService != null) return cursorAuthService;
+-    const { SandCursorAuthService: SandCursorAuthService2 } = await Promise.resolve().then(() => (init_cursor_auth(), cursor_auth_exports));
+-    const service = new SandCursorAuthService2({
+-      openExternal: deps.openExternal,
+-      // Mirrors Glass: resolve the real display name + avatar from
+-      // DashboardService/GetMe. Lazily imported so the auth module stays free of
+-      // the inference/Connect machinery until the first profile fetch.
+-      fetchProfile: async (getAccessToken) => {
+-        const { fetchCursorProfile: fetchCursorProfile2 } = await Promise.resolve().then(() => (init_cursor_profile(), cursor_profile_exports));
+-        return await fetchCursorProfile2(getAccessToken);
+-      },
+-      updateProfileName: async (getAccessToken, name2) => {
+-        const { updateCursorProfileName: updateCursorProfileName2 } = await Promise.resolve().then(() => (init_cursor_profile(), cursor_profile_exports));
+-        await updateCursorProfileName2(getAccessToken, name2);
+-      },
+-      reportSessionSettlement: deps.reportSessionSettlement
+-    });
+-    service.subscribe((status) => {
+-      const accountRuntime = deps.getAccountRuntime();
+-      if (accountRuntime == null) {
+-        deliverCursorAuthStatus2(service, status);
+-        return;
++    const service = {
++      getStatus: async () => ({ kind: "logged-in", authId: "openbot-local", displayName: "OpenBot Local", email: "local@openbot.invalid" }),
++      getValidAccessToken: async () => {
++        const err = new Error("OpenBot: no Cursor credentials (T15 local profile)");
++        err.name = "SandAuthSignInRequiredError";
++        throw err;
++      },
++      login: async () => ({ kind: "logged-in", authId: "openbot-local", displayName: "OpenBot Local", email: "local@openbot.invalid" }),
++      cancelLogin: async () => ({ kind: "logged-in", authId: "openbot-local", displayName: "OpenBot Local", email: "local@openbot.invalid" }),
++      logout: async () => ({ kind: "logged-in", authId: "openbot-local", displayName: "OpenBot Local", email: "local@openbot.invalid" }),
++      updateDisplayName: async () => ({ kind: "logged-in", authId: "openbot-local", displayName: "OpenBot Local", email: "local@openbot.invalid" }),
++      devLogin: async () => ({ kind: "logged-in", authId: "openbot-local", displayName: "OpenBot Local", email: "local@openbot.invalid" }),
++      revokeForAccountRefusal: async () => ({ kind: "local", status: { kind: "logged-in", authId: "openbot-local", displayName: "OpenBot Local", email: "local@openbot.invalid" } }),
++      subscribe: () => () => {
++      },
++      emitStatus: () => {
+       }
+-      accountRuntime.observe(status);
+-    });
++    };
+     cursorAuthService = service;
+-    if (deps.sentryEnabled) {
+-      void service.getStatus().then((status) => syncSandSentryAccount(status, () => fetchSentryPrivacyMode(service)));
+-    }
+-    void service.getStatus().then((status) => syncLocalToolPermissionCeiling(service, status));
++    deliverCursorAuthStatus2(service, { kind: "logged-in", authId: "openbot-local", displayName: "OpenBot Local", email: "local@openbot.invalid" });
+     return service;
+   }
+   return { ensureCursorAuthService: ensureCursorAuthService2, deliverCursorAuthStatus: deliverCursorAuthStatus2 };
+ }
+ function registerCursorAuthIpc(deps) {
+   const { ipcMain: ipcMain9, ensureCursorAuthService: ensureCursorAuthService2 } = deps;
+-  let sandAccessReader;
+-  const readSettledAuthStatus = async (getStatus) => {
+-    const settled = await deps.getAccountRuntime()?.whenIdle();
+-    return settled ?? await getStatus();
+-  };
+-  const ensureSandAccessReader = async () => {
+-    sandAccessReader ??= (async () => {
+-      const service = await ensureCursorAuthService2();
+-      const { createSandAccessReader: createSandAccessReader2, fetchSandAccess: fetchSandAccess2 } = await Promise.resolve().then(() => (init_access(), access_exports));
+-      return createSandAccessReader2({
+-        getAuthStatus: () => readSettledAuthStatus(() => service.getStatus()),
+-        readAccess: () => fetchSandAccess2((options) => service.getValidAccessToken(options))
+-      });
+-    })();
+-    return await sandAccessReader;
+-  };
++  // OPENBOT PATCH T15: all cursorAuth.* handlers remapped to the local
++  // profile. getStatus -> {kind:"local"}, login/logout -> no-op,
++  // updateName/getAvatar local (avatar always null), usage -> null,
++  // privacy mode -> false, sand access -> {state:"granted",reason:"none"}
++  // (full access; the renderer validator cLn accepts exactly {state,reason}),
++  // dashboard action -> {ok:false}. No OAuth client ids, no auth/poll,
++  // no /oauth/token refresh reachable from IPC.
+   ipcMain9.handle("sand:sand-access", async () => {
+-    return await (await ensureSandAccessReader()).read();
++    return { state: "granted", reason: "none" };
+   });
+   ipcMain9.handle("sand:cursor-auth-status", async () => {
+     const service = await ensureCursorAuthService2();
+-    return await readSettledAuthStatus(() => service.getStatus());
++    return await service.getStatus();
+   });
+   ipcMain9.handle("sand:cursor-auth-login", async () => {
+     const service = await ensureCursorAuthService2();
+     const result = await service.login();
+-    const settled = await deps.getAccountRuntime()?.whenIdle();
+-    await deps.resetMcpManager();
+-    await deps.refreshHostMcp();
+-    return settled ?? result;
++    return result;
+   });
+   ipcMain9.handle("sand:cursor-auth-cancel-login", async () => {
+     const service = await ensureCursorAuthService2();
+-    const result = await service.cancelLogin();
+-    const settled = await deps.getAccountRuntime()?.whenIdle();
+-    return settled ?? result;
++    return await service.cancelLogin();
+   });
+   ipcMain9.handle("sand:cursor-auth-logout", async () => {
+     const service = await ensureCursorAuthService2();
+-    const result = await service.logout();
+-    const settled = await deps.getAccountRuntime()?.whenIdle();
+-    return settled ?? result;
++    return await service.logout();
+   });
+   ipcMain9.handle("sand:cursor-auth-update-name", async (_event, name2) => {
+     invariant(
+@@ -452962,63 +452903,23 @@ function registerCursorAuthIpc(deps) {
+       "sand:cursor-auth-update-name requires a bounded name string."
+     );
+     const service = await ensureCursorAuthService2();
+-    const result = await service.updateDisplayName(name2);
+-    const settled = await deps.getAccountRuntime()?.whenIdle();
+-    return settled ?? result;
++    return await service.updateDisplayName(name2);
+   });
+   ipcMain9.handle("sand:cursor-avatar-get", async () => {
+-    const service = await ensureCursorAuthService2();
+-    const status = await service.getStatus();
+-    if (status.kind !== "logged-in" || status.authId == null) return null;
+-    const { resolveCursorAvatarDataUrl: resolveCursorAvatarDataUrl2 } = await Promise.resolve().then(() => (init_cursor_avatar(), cursor_avatar_exports));
+-    return await resolveCursorAvatarDataUrl2(status.authId, {
+-      preferredUrl: status.profilePictureUrl
+-    });
++    return null;
+   });
+   ipcMain9.handle("sand:cursor-usage-get", async () => {
+-    const service = await ensureCursorAuthService2();
+-    const status = await service.getStatus();
+-    if (status.kind !== "logged-in") return null;
+-    const { fetchSandWeeklyUsage: fetchSandWeeklyUsage2 } = await Promise.resolve().then(() => (init_cursor_profile(), cursor_profile_exports));
+-    return await fetchSandWeeklyUsage2((options) => service.getValidAccessToken(options));
++    return null;
+   });
+   ipcMain9.handle("sand:cursor-usage-summary", async () => {
+-    if (!await deps.isUsagePageEnabled()) return null;
+-    const service = await ensureCursorAuthService2();
+-    const status = await service.getStatus();
+-    if (status.kind !== "logged-in") return null;
+-    const { fetchSandUsageSummary: fetchSandUsageSummary2 } = await Promise.resolve().then(() => (init_cursor_profile(), cursor_profile_exports));
+-    return await fetchSandUsageSummary2((options) => service.getValidAccessToken(options));
++    return null;
+   });
+   ipcMain9.handle("sand:cursor-privacy-mode", async () => {
+-    const service = await ensureCursorAuthService2();
+-    const status = await service.getStatus();
+-    if (status.kind !== "logged-in") return true;
+-    const { fetchUserPrivacyModeEnabled: fetchUserPrivacyModeEnabled2 } = await Promise.resolve().then(() => (init_cursor_profile(), cursor_profile_exports));
+-    return await fetchUserPrivacyModeEnabled2((options) => service.getValidAccessToken(options));
++    return false;
++  });
++  ipcMain9.handle("sand:cursor-dashboard-action", async () => {
++    return { ok: false, message: null };
+   });
+-  ipcMain9.handle(
+-    "sand:cursor-dashboard-action",
+-    async (_event, request3) => {
+-      const parsed2 = parseDashboardActionRequest(request3);
+-      if (parsed2 === null) {
+-        return {
+-          ok: false,
+-          message: `This action isn\u2019t supported by this version of ${SAND_PRODUCT_DISPLAY_NAME}`
+-        };
+-      }
+-      const service = await ensureCursorAuthService2();
+-      const status = await service.getStatus();
+-      if (status.kind !== "logged-in") {
+-        return { ok: false, message: "Sign in to Cursor to continue" };
+-      }
+-      const { invokeSandDashboardAction: invokeSandDashboardAction2 } = await Promise.resolve().then(() => (init_cursor_profile(), cursor_profile_exports));
+-      return await invokeSandDashboardAction2(
+-        (options) => service.getValidAccessToken(options),
+-        parsed2
+-      );
+-    }
+-  );
+ }
+ function parseDashboardActionRequest(request3) {
+   if (request3 == null || typeof request3 !== "object") return null;
+@@ -453054,12 +452955,14 @@ function createTranscriptionManagerEnsure(deps) {
+   let transcriptionManager;
+   return async () => {
+     if (transcriptionManager != null) return transcriptionManager;
+-    const { SandTranscriptionManager: SandTranscriptionManager2 } = await Promise.resolve().then(() => (init_cursor_transcribe(), cursor_transcribe_exports));
++    // OPENBOT PATCH T15/T17: Whisper transcription (Cursor backend) disabled —
++    // no auth token is ever passed to a transcription manager.
+     const authService = await deps.ensureCursorAuthService();
+-    transcriptionManager = new SandTranscriptionManager2({
+-      getCursorAccessToken: (options) => authService.getValidAccessToken(options),
+-      getMachineId: deps.getMachineId
+-    });
++    transcriptionManager = {
++      transcribe: async () => {
++        throw new Error("OpenBot: transcription disabled (T17)");
++      }
++    };
+     return transcriptionManager;
+   };
+ }
+@@ -458433,6 +458336,27 @@ function createRemoteHostConnector(deps, env = process.env, updateSink, descript
+   if ((env[GATEWAY_URL_ENV]?.trim() ?? "").length > 0) {
+     return new EnvDescriptorHostConnector(env);
+   }
++  // OPENBOT PATCH T16: loopback is opt-in; preserve broker fallback by default.
++  if (env.OPENBOT_LOCAL_GATEWAY === "1") {
++    let localToken = env[GATEWAY_TOKEN_ENV] ?? "";
++    if (!localToken) {
++      try {
++        const fs = require("node:fs");
++        const path = require("node:path");
++        const os = require("node:os");
++        const tokenFile = path.join(env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "OpenBot", "gateway.token");
++        localToken = fs.readFileSync(tokenFile, "utf8").trim();
++      } catch {
++        localToken = "";
++      }
++    }
++    return new EnvDescriptorHostConnector({
++      ...env,
++      [GATEWAY_URL_ENV]: env[GATEWAY_URL_ENV] ?? "http://127.0.0.1:1340",
++      [GATEWAY_TOKEN_ENV]: localToken,
++      [GATEWAY_NETWORK_TOKEN_ENV]: "",
++    });
++  }
+   const broker = new BrokeredHostConnector(deps, void 0, updateSink);
+   if (descriptorFastPath == null) return broker;
+   return {
+@@ -462737,20 +462661,25 @@ function createExperimentsRuntime(deps) {
+         deps.broadcast("sand:experiments-event", service.getSnapshot());
+       });
+     });
+-    const resolveAnysphereMembership = async () => {
+-      try {
+-        const status = await authService.getStatus();
+-        service.setIsAnysphereUser(status.kind === "logged-in" && status.isAnysphereUser === true);
+-      } catch (error6) {
+-        reportDesktopEdgeFailure("cursor-auth", "anysphere-membership", error6);
+-      }
+-    };
+-    authService.subscribe(() => {
+-      service.handleAuthChange();
++    // OPENBOT PATCH T15: the auth->experiments membership chain is dead —
++    // status is always {kind:"local"}, so the Anysphere-user flag is never set
++    // and no statsig/auth refresh is triggered.
++    if (false) {
++      const resolveAnysphereMembership = async () => {
++        try {
++          const status = await authService.getStatus();
++          service.setIsAnysphereUser(status.kind === "logged-in" && status.isAnysphereUser === true);
++        } catch (error6) {
++          reportDesktopEdgeFailure("cursor-auth", "anysphere-membership", error6);
++        }
++      };
++      authService.subscribe(() => {
++        service.handleAuthChange();
++        void resolveAnysphereMembership();
++      });
+       void resolveAnysphereMembership();
+-    });
++    }
+     service.start();
+-    void resolveAnysphereMembership();
+     return service;
+   }
+   return {
+@@ -463140,18 +463069,16 @@ function requireEgressTunnelController(deps) {
+ function createMainEdgeHandlers(deps) {
+   return {
+     ...family("appWindow", {
++      // OPENBOT PATCH T17: updates off — getUpdateStatus reports the disabled
++      // status and check/track/install/auto-update are explicit no-ops (the
++      // service itself is also disabled at construction, so these are doubly inert).
+       getUpdateStatus: () => requireUpdateService(deps).getStatus(),
+-      checkForUpdates: () => requireUpdateService(deps).checkForUpdates({ trigger: "explicit" }),
+-      setUpdateTrack: ({ track }) => {
+-        const service = requireUpdateService(deps);
+-        if (track === null) return service.setTrackOverride(null);
+-        if (!isSandUpdateTrack(track)) return service.getStatus();
+-        return service.setTrackOverride(track);
+-      },
++      checkForUpdates: () => requireUpdateService(deps).getStatus(),
++      setUpdateTrack: () => requireUpdateService(deps).getStatus(),
+       quitAndInstallUpdate: () => {
+-        requireUpdateService(deps).quitAndInstall();
++        void 0;
+       },
+-      setAutoUpdateWhenIdleOptIn: ({ enabled }) => requireUpdateService(deps).setAutoUpdateWhenIdleOptIn(enabled === true)
++      setAutoUpdateWhenIdleOptIn: () => requireUpdateService(deps).getStatus()
+     }),
+     ...family("appWindow", {
+       getThemeState: () => requireThemeController(deps).getState(),
+@@ -463387,6 +463314,8 @@ function registerMcpDesktopIpc(deps) {
+     await import_electron35.shell.openExternal(url3);
+   }
+   async function fillCatalogCacheBeforeRendererReads() {
++    // Keep the brokered marketplace warmup intact outside explicit local mode.
++    if (process.env.OPENBOT_LOCAL_GATEWAY === "1") return;
+     try {
+       const manager = await deps.getManager();
+       await manager.getCatalog(deps.peekAccessToken);
+@@ -463414,12 +463343,14 @@ function registerMcpDesktopIpc(deps) {
+     return await manager.getCatalog(deps.peekAccessToken);
+   });
+   import_electron35.ipcMain.handle("sand:mcp-team-popularity", async () => {
++    if (process.env.OPENBOT_LOCAL_GATEWAY === "1") return {};
+     const popularity = await deps.fetchTeamPopularity();
+     return Object.fromEntries(popularity);
+   });
+   import_electron35.ipcMain.handle(
+     "sand:mcp-plugin-logo",
+     async (_event, request3) => {
++      if (process.env.OPENBOT_LOCAL_GATEWAY === "1") return null;
+       if (typeof request3.url !== "string") return null;
+       const manager = await deps.getManager();
+       return await manager.resolvePluginLogo(request3.url);
+@@ -464889,7 +464820,8 @@ function registerSettingsIpc(deps) {
+     themeController,
+     egressTunnelController: egressTunnelController2,
+     syncHostSettingsToBox: syncHostSettingsToBox2,
+-    readHostSettingsFromBox: readHostSettingsFromBox2
++    readHostSettingsFromBox: readHostSettingsFromBox2,
++    callOpenBotProviderRpc: callOpenBotProviderRpc2
+   } = deps;
+   ipcMain9.on("sand:theme-get-sync", (event) => {
+     event.returnValue = themeController.getState();
+@@ -464903,12 +464835,35 @@ function registerSettingsIpc(deps) {
+   ipcMain9.on("sand:webauthn-proxy-get-sync", (event) => {
+     event.returnValue = settingsStore.getWebauthnProxyEnabled();
+   });
++  const openBotModelId = (value) => {
++    if (typeof value === "string") return value;
++    if (value && typeof value === "object") return value.modelId ?? value.id ?? value.name ?? null;
++    return null;
++  };
++  const toOpenBotDefaultModel = (value) => {
++    const modelId = openBotModelId(value);
++    if (typeof modelId !== "string" || modelId.length === 0) return null;
++    return {
++      modelId,
++      maxMode: true,
++      parameters: [{ id: "effort", value: "high" }, { id: "fast", value: "true" }]
++    };
++  };
+   ipcMain9.handle("sand:agent-default-model-get", async () => {
++    if (process.env.OPENBOT_LOCAL_GATEWAY === "1") {
++      const value = await callOpenBotProviderRpc2("getAgentDefaultModel");
++      return toOpenBotDefaultModel(value?.model ?? value ?? null);
++    }
+     const settings = await readHostSettingsFromBox2();
+     settingsStore.setAgentDefaultModel(settings.agentDefaultModel);
+     return settings.agentDefaultModel ?? null;
+   });
+   ipcMain9.handle("sand:agent-default-model-set", async (_event, request3) => {
++    if (process.env.OPENBOT_LOCAL_GATEWAY === "1") {
++      const modelId = openBotModelId(request3?.model);
++      const value = await callOpenBotProviderRpc2("setAgentDefaultModel", { model: modelId });
++      return toOpenBotDefaultModel(value?.model ?? modelId);
++    }
+     const parsed2 = sandAgentDefaultModelSchema.safeParse(request3.model);
+     if (!parsed2.success) {
+       return settingsStore.getAgentDefaultModel() ?? null;
+@@ -465666,15 +465621,14 @@ function createDesktopMetricsRuntime(deps) {
+   async function ensureClientNumericMetricsManager2() {
+     if (clientNumericMetricsManagerInit == null) {
+       clientNumericMetricsManagerInit = (async () => {
+-        const { SandClientNumericMetricsManager: SandClientNumericMetricsManager2 } = await Promise.resolve().then(() => (init_cursor_client_numeric_metrics(), cursor_client_numeric_metrics_exports));
+-        const authService = await deps.ensureCursorAuthService();
+-        const experiments = await deps.ensureExperimentService();
+-        const manager = new SandClientNumericMetricsManager2({
+-          getCursorAccessToken: (options) => authService.getValidAccessToken(options),
+-          getMachineId: () => deps.getMachineId(),
+-          clientVersion: deps.getClientVersion(),
+-          isFlushEnabled: () => experiments.checkFeatureGate("client_numeric_metrics")
+-        });
++        // OPENBOT PATCH T17: numeric metrics backend client removed — nothing
++        // is shipped to the AiService backend endpoint.
++        const manager = {
++          dispose: () => {
++          },
++          flush: async () => {
++          }
++        };
+         if (deps.isQuitting()) {
+           manager.dispose();
+           return manager;
+@@ -465711,19 +465665,13 @@ function createDesktopMetricsRuntime(deps) {
+       reporter: {
+         report: async (sample, signal) => {
+           if (reporterInstance == null) {
+-            reporterInstance = new SandProcessMetricsReporter({
+-              client: createSandCursorBackendClient(AiService, {
+-                getAccessToken: async (options) => (await deps.ensureCursorAuthService()).getValidAccessToken(options),
+-                getMachineId: () => deps.getMachineId()
+-              }),
+-              meta: {
+-                os: process.platform,
+-                osVersion: (0, import_node_os14.release)(),
+-                arch: process.arch,
+-                clientVersion: deps.getClientVersion(),
+-                clientId: await deps.getMachineId()
++            // OPENBOT PATCH T17 (harden): process-metrics reporter neutralized —
++            // the AiService backend client (reportSandProcessMetrics egress) is
++            // never constructed on OpenBot; report() stays a no-op sink.
++            reporterInstance = {
++              report: async () => {
+               }
+-            });
++            };
+           }
+           return reporterInstance.report(sample, signal);
+         }
+@@ -471474,7 +471422,12 @@ if (typeof appPackageJson.version === "string") {
+   process.env.SAND_CLIENT_APP_VERSION = appPackageJson.version;
+ }
+ var sandUserDataDir = bootstrapDesktopUserData({ isLabBuild: isSandLabBuild2 });
+-var sentryEnabled = import_electron50.app.isPackaged && process.env.SAND_DISABLE_TELEMETRY !== "1";
++// OPENBOT PATCH T17 (telemetry without egress): Sentry init is disabled —
++// the DSN https://...@metrics.cursor.sh/... stays as dead string, but
++// initSandSentryForDesktop({enabled:false}) never creates the client, so no
++// envelope is ever shipped to metrics.cursor.sh. captureSandSentry* helpers
++// remain as no-op sinks for local-only structured logging.
++var sentryEnabled = false;
+ var sentryEnvironment = resolveSandSentryEnvironment({
+   isLabBuild: isSandLabBuild2,
+   sandTrack: appPackageJson.sandTrack
+@@ -471592,23 +471545,13 @@ var { readAppReleaseMetadata, computeUpdateDisabledReasonLive } = createReleaseM
+   packageTrack: appPackageJson.sandTrack,
+   isLabBuild: isSandLabBuild2
+ });
++// OPENBOT PATCH T15: session-settlement shipper (backend log egress) removed;
++// cursorAuthWiring now only needs broadcast for the local status event.
+ var cursorAuthWiring = createCursorAuthWiring({
+-  settingsStore: sandSettingsStore,
+-  syncHostSettingsToBox: (update2) => syncHostSettingsToBox(update2),
+-  broadcast,
+-  sentryEnabled,
+-  openExternal: async (url3) => {
+-    await import_electron50.shell.openExternal(url3);
+-  },
+-  getAccountRuntime: () => coordinatorAccountRuntime,
+-  reportSessionSettlement: createSessionSettlementShipper({
+-    getMachineId: () => getOrCreateMachineId(),
+-    onShipFailure: (error6) => reportDesktopEdgeFailure("cursor-auth", "session-settlement", error6)
+-  })
++  broadcast
+ });
+ var { ensureCursorAuthService } = cursorAuthWiring;
+ var deliverCursorAuthStatus = (service, status) => {
+-  void desktopTelemetry?.setAccountSlot(desktopStructuredLogAccountSlot(status));
+   cursorAuthWiring.deliverCursorAuthStatus(service, status);
+ };
+ var ensureTranscriptionManager = createTranscriptionManagerEnsure({
+@@ -471677,6 +471620,7 @@ var hostChords = createHostWindowChords({
+ });
+ var { applyHostZoom, applyWindowShortcut, attachChordForwarding, routeHostInput } = hostChords;
+ async function createWindow() {
++  console.error("[openbot][visual] createWindow begin");
+   const isMac = process.platform === "darwin";
+   boxVncTrust?.configureBoxVncSession();
+   const placement = resolveSandWindowPlacement();
+@@ -471707,6 +471651,8 @@ async function createWindow() {
+   });
+   boxVncTrust?.hardenWebviewAttach(window2.webContents);
+   mainWindow = window2;
++  console.error("[openbot][visual] BrowserWindow created", window2.id);
++  window2.once("ready-to-show", () => console.error("[openbot][visual] ready-to-show", window2.id));
+   attachWindowStateBroadcast(window2, broadcast);
+   applySandWindowPlacement(window2, placement);
+   attachWindowFocusForwarding(window2, syncWindowFocused);
+@@ -471738,6 +471684,30 @@ async function createWindow() {
+   window2.webContents.on("did-start-loading", () => {
+     deepLinkController.markNotReady();
+   });
++  if (process.env.OPENBOT_VISUAL_TEST === "1") {
++    window2.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
++      console.error("[openbot][visual] did-fail-load", { errorCode, errorDescription, validatedURL, isMainFrame });
++    });
++    window2.webContents.on("render-process-gone", (_event, details) => {
++      console.error("[openbot][visual] render-process-gone", details);
++    });
++    window2.webContents.on("console-message", (_event, level, message, line, sourceId) => {
++      console.error("[openbot][visual] renderer-console", { level, message, line, sourceId });
++    });
++    window2.webContents.on("dom-ready", () => {
++      console.error("[openbot][visual] dom-ready", window2.webContents.getURL());
++      window2.webContents.openDevTools({ mode: "detach" });
++      setTimeout(() => {
++        if (window2.isDestroyed()) return;
++        void window2.webContents.executeJavaScript(`(() => {
++          const root = document.getElementById("root");
++          if (root && root.childElementCount > 0) return { state: "rendered", title: document.title, text: (document.body.innerText || "").slice(0, 1200) };
++          document.body.innerHTML = '<main style="background:#202124;color:#fff;font:16px sans-serif;padding:32px"><h1>OpenBot renderer sem conteúdo</h1><p>O HTML carregou, mas o bundle não montou a interface em #root.</p><p>Abra o DevTools para ver o erro JavaScript.</p></main>';
++          return "empty-root";
++        })()`).then((state) => console.error("[openbot][visual] renderer state", state)).catch((error6) => console.error("[openbot][visual] renderer probe failed", error6));
++      }, 3000);
++    });
++  }
+   installBoxVisibilityDocumentReset(window2.webContents, () => boxVisibilityTracker?.abandonAll());
+   window2.on("closed", () => {
+     deepLinkController.markNotReady();
+@@ -471745,15 +471715,27 @@ async function createWindow() {
+   if (process.env.VITE_DEV_SERVER_URL != null) {
+     await window2.loadURL(process.env.VITE_DEV_SERVER_URL);
+   } else {
+-    await window2.loadFile(import_node_path60.default.join(__dirname, "../renderer/index.html"));
++    const rendererPath = import_node_path60.default.join(__dirname, "../renderer/index.html");
++    console.error("[openbot][visual] loading renderer", rendererPath);
++    try {
++      await window2.loadFile(rendererPath);
++    } catch (error6) {
++      console.error("[openbot][visual] renderer load failed", error6);
++      if (process.env.OPENBOT_VISUAL_TEST === "1") {
++        await window2.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(`<body style="background:#202124;color:white;font:16px sans-serif;padding:24px"><h1>OpenBot renderer falhou</h1><pre>${String(error6)}</pre></body>`)}`);
++      } else throw error6;
++    }
+   }
++  window2.show();
++  window2.focus();
++  console.error("[openbot][visual] window shown", window2.id);
+ }
+ import_electron50.app.whenReady().then(async () => {
+   if (!isPrimaryInstance) {
+     desktopStartup.cancel();
+     return;
+   }
+-  desktopStartup.markPhase("move_check");
++    desktopStartup.markPhase("move_check");
+   const moveDisposition = await runStartupMoveCheck({
+     isLabBuild: isSandLabBuild2,
+     hasPendingActivation: () => deepLinkController.hasPendingActivation(),
+@@ -471779,10 +471761,17 @@ import_electron50.app.whenReady().then(async () => {
+     emitWebauthnProxyChanged: (enabled) => mainEdge.emit("webauthn-proxy-changed", enabled),
+     onboardingSeen: hostSettingsFields.onboardingSeen
+   });
++  // OPENBOT PATCH T17 (updates off): the update service is forced into the
++  // disabled state (reason "disabled-by-env", accepted by the renderer
++  // validator pfs). Its getStatus() then emits
++  // {state:{type:"disabled",reason:"disabled-by-env"}, currentVersion,...},
++  // which the renderer's Tle validator accepts. checkForUpdates /
++  // setUpdateTrack / quitAndInstall / auto-update all no-op on a disabled
++  // service, so nothing ever hits api2.cursor.sh/updates.
+   updateService = createUpdateServiceWiring({
+     currentVersion: appReleaseMetadata.version,
+     buildDefaultTrack: appReleaseMetadata.buildDefaultTrack,
+-    disabledReason: await computeUpdateDisabledReasonLive(),
++    disabledReason: "disabled-by-env",
+     machineId: updateMachineId,
+     settingsStore: sandSettingsStore,
+     getExperimentService,
+@@ -471804,10 +471793,14 @@ import_electron50.app.whenReady().then(async () => {
+   registerSandMediaProtocol();
+   desktopStartup.markPhase("auth_service");
+   const authService = await ensureCursorAuthService();
+-  await maybeDevLoginFromEnv(authService);
+-  if (!import_electron50.app.isPackaged) {
+-    const { startDevHostTokenHandoff: startDevHostTokenHandoff2 } = await Promise.resolve().then(() => (init_dev_host_token_handoff(), dev_host_token_handoff_exports));
+-    startDevHostTokenHandoff2(authService);
++  // OPENBOT PATCH T15: dev-login-from-env and dev host-token handoff removed —
++  // nothing can start an OAuth login or write a JWT token file on boot.
++  if (false) {
++    await maybeDevLoginFromEnv(authService);
++    if (!import_electron50.app.isPackaged) {
++      const { startDevHostTokenHandoff: startDevHostTokenHandoff2 } = await Promise.resolve().then(() => (init_dev_host_token_handoff(), dev_host_token_handoff_exports));
++      startDevHostTokenHandoff2(authService);
++    }
+   }
+   desktopStartup.markPhase("experiments");
+   const sandExperiments = await ensureExperimentService();
+@@ -471824,6 +471817,9 @@ import_electron50.app.whenReady().then(async () => {
+   });
+   updateService.noteMinimumVersionMayHaveChanged();
+   updateService.noteReleaseTrackGateMayHaveChanged();
++  // OPENBOT PATCH T17: set the kill switch before any telemetry collector can
++  // be evaluated, preventing process-metrics startup and backend egress.
++  process.env.SAND_DISABLE_TELEMETRY = "1";
+   if (process.env.SAND_DISABLE_TELEMETRY !== "1") {
+     ensureSandProcessMetricsCollector(sandExperiments);
+   }
+@@ -471835,17 +471831,29 @@ import_electron50.app.whenReady().then(async () => {
+     },
+     getMachineId: () => getOrCreateMachineId()
+   };
+-  desktopProductAnalytics = new SandProductAnalytics({
+-    getAccessToken: backendClientOptions.getAccessToken,
+-    getMachineId: backendClientOptions.getMachineId,
+-    hostInBox: false
+-  });
+-  void desktopProductAnalytics.activate(sandExperiments).catch((error6) => reportDesktopEdgeFailure("product-analytics", "activate", error6));
+-  configureDesktopSendTracing({
+-    getAccessToken: backendClientOptions.getAccessToken,
+-    backendUrl: getSandInferenceBackendUrl(),
+-    appVersion: readAppReleaseMetadata().version
+-  });
++  // OPENBOT PATCH T17: SandProductAnalytics (api2 AnalyticsService egress) is
++  // not instantiated; trackEvent calls become no-ops through the optional
++  // chain (desktopProductAnalytics stays undefined).
++  void (() => {
++    if (false) {
++      desktopProductAnalytics = new SandProductAnalytics({
++        getAccessToken: backendClientOptions.getAccessToken,
++        getMachineId: backendClientOptions.getMachineId,
++        hostInBox: false
++      });
++      void desktopProductAnalytics.activate(sandExperiments).catch((error6) => reportDesktopEdgeFailure("product-analytics", "activate", error6));
++    }
++  })();
++  // OPENBOT PATCH T17: OTLP/desktop send tracing (backend /v1/traces egress)
++  // is never configured, so getDesktopRpcTracer/ensureSendTracer keep
++  // configuredOptions undefined and no spans are exported.
++  if (false) {
++    configureDesktopSendTracing({
++      getAccessToken: backendClientOptions.getAccessToken,
++      backendUrl: getSandInferenceBackendUrl(),
++      appVersion: readAppReleaseMetadata().version
++    });
++  }
+   configureSandRpcTracing({
+     getTracer: (rootSampler) => getDesktopRpcTracer(rootSampler),
+     getPolicy: () => {
+@@ -471903,6 +471911,9 @@ import_electron50.app.whenReady().then(async () => {
+     dockBadge: dockBadgeManager
+   });
+   desktopStartup.markPhase("telemetry");
++  // OPENBOT PATCH T17: telemetry egress disabled for this process — structured
++  // logs buffer in memory and spill to the local userData JSON only; they are
++  // never shipped to api2.cursor.sh/aiserver (SubmitLogs).
+   const machineId = await getOrCreateMachineId();
+   const desktopTelemetrySpill = createDesktopStructuredLogSpill({
+     path: import_node_path60.default.join(import_electron50.app.getPath("userData"), DESKTOP_STRUCTURED_LOG_SPILL_FILE_NAME),
+@@ -472175,6 +472186,30 @@ import_electron50.app.whenReady().then(async () => {
+     broadcastStatus: (status) => mainEdge.emit("egress-tunnel-status-changed", status),
+     isEnabled: () => sandSettingsStore.getEgressTunnelEnabled()
+   });
++  const callOpenBotProviderRpc = async (method, body) => {
++    let token = process.env.SAND_HOST_GATEWAY_TOKEN || "";
++    if (!token) {
++      try {
++        const fs = require("node:fs");
++        const path = require("node:path");
++        const os = require("node:os");
++        token = fs.readFileSync(path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "OpenBot", "gateway.token"), "utf8").trim();
++      } catch {}
++    }
++    const headers = { "content-type": "application/json" };
++    if (token) headers.Authorization = `Bearer ${token}`;
++    const response = await fetch(`http://127.0.0.1:1340/api/${method}`, {
++      method: "POST",
++      headers,
++      body: JSON.stringify(body ?? {})
++    });
++    const envelope = await response.json();
++    if (!response.ok || envelope?.ok !== true) {
++      const failure = envelope?.failure;
++      throw new Error((typeof failure === "string" ? failure : failure?.message) ?? envelope?.error ?? `OpenBot RPC ${method} failed`);
++    }
++    return envelope.value;
++  };
+   registerSettingsIpc({
+     ipcMain: import_electron50.ipcMain,
+     settingsStore: sandSettingsStore,
+@@ -472182,6 +472217,7 @@ import_electron50.app.whenReady().then(async () => {
+     egressTunnelController,
+     syncHostSettingsToBox,
+     readHostSettingsFromBox,
++    callOpenBotProviderRpc,
+     getComputerUseModelOverride: () => getExperimentService()?.checkFeatureGate("sand_computer_use_playwright") === true ? getExperimentService()?.getDynamicConfig("sand_computer_use_playwright_config") : void 0
+   });
+   registerToolPermissionsIpc({
+@@ -472193,9 +472229,83 @@ import_electron50.app.whenReady().then(async () => {
+     clearLocalToolApprovals
+   });
+   import_electron50.ipcMain.handle("sand:agent-available-models", async () => {
++    if (process.env.OPENBOT_LOCAL_GATEWAY === "1") {
++      const catalog = await callOpenBotProviderRpc("getAvailableModels");
++      const list = Array.isArray(catalog) ? catalog : [];
++      return {
++        models: list.map((entry, index) => ({
++          name: entry.id ?? entry.name,
++          defaultOn: entry.default === true || entry.id === "grok-4.5",
++          supportsAgent: true,
++          clientDisplayName: entry.displayName ?? entry.id ?? entry.name,
++          namedModelSectionIndex: index,
++          vendorName: entry.provider ?? "local",
++          isChatOnly: false
++        })),
++        modelNames: list.map((entry) => entry.id ?? entry.name)
++      };
++    }
+     const response = await fetchSandAvailableModels(backendClientOptions);
+     return response.toJson();
+   });
++  import_electron50.ipcMain.handle("sand:active-provider-get", () => callOpenBotProviderRpc("getActiveProvider"));
++  import_electron50.ipcMain.handle("sand:active-provider-set", (_event, request3) => callOpenBotProviderRpc("setActiveProvider", { provider: request3?.provider }));
++  import_electron50.ipcMain.handle("sand:create-agent", (_event, request3) => callOpenBotProviderRpc("createAgent", request3 ?? {}));
++  import_electron50.ipcMain.handle("sand:provider-config-get", (_event, request3) => callOpenBotProviderRpc("getProviderConfig", request3 ?? {}));
++  import_electron50.ipcMain.handle("sand:provider-config-set", async (_event, request3) => {
++    senderGuards.assertTrustedSecretsSender(_event);
++    const next = request3 ?? {};
++    const model = next.model == null ? undefined : typeof next.model === "string" ? next.model : next.model.modelId ?? next.model.id ?? next.model.name;
++    const apiKey = typeof next.apiKey === "string" ? next.apiKey.trim() : "";
++    if (apiKey) {
++      const provider = next.provider;
++      if (!["openai", "xai", "openai-compat"].includes(provider)) throw new Error("Invalid provider for API key");
++      if (apiKey.length > 8192) throw new Error("API key exceeds the 8192 character limit");
++      await callOpenBotProviderRpc("setBoxSecrets", { entries: [{ provider, apiKey }] });
++    }
++    const saved = await callOpenBotProviderRpc("setProviderConfig", {
++      agentId: next.agentId,
++      requireActive: true,
++      provider: next.provider,
++      model,
++      baseURL: next.baseURL
++    });
++    return saved ?? callOpenBotProviderRpc("getProviderConfig", { agentId: next.agentId });
++  });
++  import_electron50.ipcMain.handle("sand:provider-secrets-status", async (_event) => {
++    senderGuards.assertTrustedSecretsSender(_event);
++    if (process.env.OPENBOT_LOCAL_GATEWAY !== "1") throw new Error("OpenBot local mode is required");
++    return await callOpenBotProviderRpc("getBoxSecretsStatus");
++  });
++  import_electron50.ipcMain.handle("sand:provider-secret-delete", async (_event, request3) => {
++    senderGuards.assertTrustedSecretsSender(_event);
++    if (process.env.OPENBOT_LOCAL_GATEWAY !== "1") throw new Error("OpenBot local mode is required");
++    const provider = request3?.provider;
++    if (!["openai", "xai", "openai-compat"].includes(provider)) throw new Error("Invalid provider");
++    return await callOpenBotProviderRpc("setBoxSecrets", { delete: [provider] });
++  });
++  import_electron50.ipcMain.handle("sand:open-agent-workspace", async (_event) => {
++    senderGuards.assertTrustedSecretsSender(_event);
++    if (process.env.OPENBOT_LOCAL_GATEWAY !== "1") throw new Error("OpenBot local mode is required");
++    const current = await callOpenBotProviderRpc("getProviderConfig");
++    const agentId = current?.agentId;
++    if (typeof agentId !== "string" || !agentId) throw new Error("Active agent is unavailable");
++    const ensured = await callOpenBotProviderRpc("ensureForeverBox", { agentId });
++    const workspace = ensured?.root;
++    const path2 = require("node:path");
++    if (typeof workspace !== "string" || !path2.isAbsolute(workspace) || workspace.includes(" ") || path2.basename(workspace).toLowerCase() !== agentId.toLowerCase()) {
++      throw new Error("Gateway returned an invalid workspace path");
++    }
++    const failure = await import_electron50.shell.openPath(workspace);
++    if (failure) throw new Error(`Could not open workspace: ${failure}`);
++    return { ok: true, agentId };
++  });
++  import_electron50.ipcMain.handle("sand:cancel-prompt", (_event, request3) => callOpenBotProviderRpc("cancelPrompt", request3 ?? {}));
++  import_electron50.ipcMain.handle("sand:discover-local-providers", () => callOpenBotProviderRpc("discoverLocalProviders"));
++  import_electron50.ipcMain.handle("sand:test-provider-connection", (_event, request3) => {
++    senderGuards.assertTrustedSecretsSender(_event);
++    return callOpenBotProviderRpc("testProviderConnection", request3 ?? {});
++  });
+   registerSecretsIpc({
+     ipcMain: import_electron50.ipcMain,
+     guards: senderGuards,
+@@ -472319,7 +472429,15 @@ import_electron50.app.whenReady().then(async () => {
+   });
+   desktopStartup.markPhase("window");
+   isMainWindowCreationReady = true;
+-  await createWindow();
++  if (mainWindow == null || mainWindow.isDestroyed()) {
++    try {
++      await createWindow();
++      console.log("[openbot] window created");
++    } catch (error6) {
++      console.error("[openbot] window creation failed", error6);
++      throw error6;
++    }
++  }
+   desktopStartup.noteReady();
+   import_electron50.app.on("activate", () => {
+     if (import_electron50.BrowserWindow.getAllWindows().length === 0) {
+@@ -472327,6 +472445,7 @@ import_electron50.app.whenReady().then(async () => {
+     }
+   });
+ }).catch((error6) => {
++  console.error("[openbot] desktop bootstrap failed", error6);
+   desktopStartup.noteFailed(error6);
+ });
+ import_electron50.app.on("window-all-closed", () => {

@@ -1,0 +1,12 @@
+{
+  "label": "providers.openai-sse-toolcalls",
+  "source": "plano-fase1-mvp.md §3 T6 — SSE de chat.completions com tool_calls fragmentados por índice",
+  "description": "SSE bruto (linhas data:) com deltas de conteúdo e tool_calls acumulados por index — shape real da API OpenAI. O acumulador (OpenAiToolCallAccumulator) deve reconstruir a tool call completa: id call_9Y5h, name shell, arguments JSON concatenado.",
+  "sse": "data: {\"id\":\"chatcmpl-9\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"chat-completions-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-9\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"chat-completions-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Vou \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-9\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"chat-completions-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"listar\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-9\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"chat-completions-test\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9Y5h\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-9\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"chat-completions-test\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"cmd\\\":\\\"dir\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+  "expectedToolCall": {
+    "id": "call_9Y5h",
+    "type": "function",
+    "function": { "name": "shell", "arguments": "{\"cmd\":\"dir\"}" }
+  },
+  "expectedText": "Vou listar"
+}

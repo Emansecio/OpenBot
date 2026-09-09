@@ -1,0 +1,37 @@
+{
+  "label": "transcript-page.tail",
+  "source": "src/shared/contracts.ts (SandTranscriptPage {entries[], nextBeforeSeq?})",
+  "value": {
+    "entries": [
+      {
+        "kind": "message",
+        "id": "ai:00000000-0000-0000-0000-000000000001",
+        "role": "assistant",
+        "content": "Olá! Sou seu agente local. Como posso ajudar?",
+        "timestampMs": 1754323200000,
+        "streaming": false
+      },
+      {
+        "kind": "user-attachment",
+        "file_name": "notas.md",
+        "file_path": "C:\\Users\\openbot\\Documents\\notas.md",
+        "clientNonce": "nonce:abc123"
+      },
+      {
+        "kind": "tool-call",
+        "name": "read_file",
+        "summary": "Lendo notas.md",
+        "status": "completed"
+      },
+      {
+        "kind": "notice",
+        "text": "Arquivo lido."
+      },
+      {
+        "kind": "event",
+        "type": "automation-changed"
+      }
+    ],
+    "nextBeforeSeq": 1
+  }
+}

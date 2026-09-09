@@ -1,0 +1,1 @@
+import{c as i,j as r,S as c}from"./index-DVUCYGay.js";function a(s){const t=i.c(2),{description:e}=s;let n;return t[0]!==e?(n=r.jsx(c,{isTruncating:!0,title:e,children:e}),t[0]=e,t[1]=n):n=t[1],n}export{a as default};

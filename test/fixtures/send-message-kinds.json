@@ -1,0 +1,70 @@
+{
+  "label": "send-message.kinds",
+  "source": "mapa-frontend.md §3.3 (union message.type dos cards — nenhum card missing)",
+  "value": {
+    "entries": [
+      {
+        "kind": "send-message",
+        "message": { "type": "text", "text": "Resposta textual" },
+        "author": "openbot-default",
+        "streaming": false
+      },
+      {
+        "kind": "send-message",
+        "message": { "type": "attachment", "url": "sand-media:/attachment/1", "file_name": "relatorio.pdf" }
+      },
+      {
+        "kind": "send-message",
+        "message": { "type": "widget", "prompt": "Confirme a ação?" }
+      },
+      {
+        "kind": "send-message",
+        "message": { "type": "cursor-agent", "title": "Agente subordinado" }
+      },
+      {
+        "kind": "send-message",
+        "message": { "type": "secret-request", "label": "Chave da API OpenAI" }
+      },
+      {
+        "kind": "send-message",
+        "message": { "type": "email-draft", "subject": "Assunto", "body": "Corpo do e-mail" }
+      },
+      {
+        "kind": "send-message",
+        "message": { "type": "slack-draft", "body": "Corpo do Slack" }
+      },
+      {
+        "kind": "send-message",
+        "message": { "type": "permission-request", "title": "Permissão de shell" }
+      },
+      {
+        "kind": "send-message",
+        "message": { "type": "auto-review-approval", "approval": { "summary": "Revisão automática" } }
+      },
+      {
+        "kind": "send-message",
+        "message": {
+          "type": "local-tool-permission",
+          "ask": {
+            "status": "pending",
+            "requestId": "local-tool-permission:fixture-1",
+            "action": "run-command",
+            "target": "shell"
+          }
+        }
+      },
+      {
+        "kind": "send-message",
+        "message": { "type": "connector", "variant": "github", "connected": true }
+      },
+      {
+        "kind": "send-message",
+        "message": { "type": "connectors" }
+      },
+      {
+        "kind": "send-message",
+        "message": { "type": "listener-connect", "platform": "slack" }
+      }
+    ]
+  }
+}

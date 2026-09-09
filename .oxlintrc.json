@@ -1,0 +1,105 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["import", "node", "promise", "typescript", "vitest"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "perf": "warn"
+  },
+  "options": {
+    "typeAware": true,
+    "reportUnusedDisableDirectives": "error"
+  },
+  "ignorePatterns": [
+    ".chatgpt-backups/**",
+    ".pi/**",
+    ".slim/**",
+    ".zz-*/**",
+    "analysis_outputs/**",
+    "assets/**",
+    "client/**",
+    "dist/**",
+    "docs/**",
+    "logs/**",
+    "native/**",
+    "node_modules/**",
+    "patches/**",
+    "provenance/**",
+    "release/**",
+    "runtime/**",
+    "SuperAgentopenbot/**"
+  ],
+  "rules": {
+    "eslint/eqeqeq": ["error", "always", { "null": "ignore" }],
+    "eslint/no-control-regex": "off",
+    "eslint/no-debugger": "error",
+    "eslint/no-eval": "error",
+    "eslint/no-implied-eval": "error",
+    "eslint/no-new-func": "error",
+    "eslint/no-unsafe-finally": "warn",
+    "eslint/no-unused-vars": [
+      "error",
+      {
+        "argsIgnorePattern": "^_",
+        "caughtErrorsIgnorePattern": "^_",
+        "destructuredArrayIgnorePattern": "^_",
+        "ignoreRestSiblings": true
+      }
+    ],
+    "import/no-cycle": "warn",
+    "import/no-duplicates": "error",
+    "import/no-self-import": "error",
+    "promise/no-multiple-resolved": "warn",
+    "typescript/await-thenable": "error",
+    "typescript/no-base-to-string": "warn",
+    "typescript/no-floating-promises": "error",
+    "typescript/no-for-in-array": "error",
+    "typescript/no-misused-promises": "warn",
+    "typescript/no-misused-spread": "warn",
+    "typescript/no-redundant-type-constituents": "warn",
+    "typescript/no-unsafe-type-assertion": "warn",
+    "typescript/no-unnecessary-type-assertion": "warn",
+    "typescript/only-throw-error": "warn",
+    "typescript/prefer-promise-reject-errors": "warn",
+    "typescript/unbound-method": "warn",
+    "unicorn/no-array-reverse": "warn",
+    "unicorn/no-array-sort": "warn",
+    "unicorn/no-new-array": "warn",
+    "unicorn/no-useless-fallback-in-spread": "warn",
+    "unicorn/no-useless-spread": "warn",
+    "vitest/expect-expect": "warn",
+    "vitest/no-conditional-expect": "warn",
+    "vitest/require-mock-type-parameters": "warn",
+    "vitest/require-to-throw-message": "warn",
+    "vitest/valid-expect": "warn"
+  },
+  "overrides": [
+    {
+      "files": ["test/**/*.ts"],
+      "rules": {
+        "eslint/no-implied-eval": "warn",
+        "eslint/no-new-func": "warn",
+        "eslint/no-unsafe-optional-chaining": "warn",
+        "eslint/no-useless-escape": "warn",
+        "eslint/no-unused-vars": "warn",
+        "import/no-duplicates": "warn",
+        "typescript/await-thenable": "warn",
+        "typescript/no-floating-promises": "warn",
+        "typescript/require-array-sort-compare": "warn",
+        "typescript/restrict-template-expressions": "warn"
+      }
+    },
+    {
+      "files": ["scripts/**/*.{js,cjs,mjs}", "vitest.config.ts"],
+      "rules": {
+        "eslint/no-useless-escape": "warn",
+        "eslint/no-unused-vars": "warn",
+        "import/no-duplicates": "warn",
+        "typescript/await-thenable": "warn",
+        "typescript/no-floating-promises": "warn",
+        "typescript/require-array-sort-compare": "warn",
+        "typescript/restrict-template-expressions": "warn"
+      }
+    }
+  ]
+}

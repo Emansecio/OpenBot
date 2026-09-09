@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "manifestVersion": "0.16.0-openbot-local",
+  "clientVersion": "0.16.0",
+  "canonicalRoot": "client/extracted/dist",
+  "source": {
+    "kind": "explicit-manifest",
+    "package": "client/extracted/package.json",
+    "packageSha256": "d22ec76444c6afff02e8612d7653cf5b767ff92887c12c319fe38f1b5cd57e4a",
+    "provenance": "Local extracted Electron client. The OpenBot overlay is represented by patch metadata; no proprietary source is copied here."
+  },
+  "artifacts": {
+    "main": {
+      "path": "client/extracted/dist/electron-main/main.cjs",
+      "version": "0.16.0",
+      "sha256": "a8260b2021ecf5f4a0ebbb8d23df3f319d68cbd575951578cc18c21abf1ebc3f",
+      "sourceMap": {
+        "path": "client/extracted/dist/electron-main/main.cjs.map",
+        "status": "removed",
+        "reason": "The stale sourceMappingURL reference was removed after the local OpenBot main-process patch overlay changed the extracted bundle; retain the map only as forensic evidence."
+      }
+    },
+    "preload": {
+      "path": "client/extracted/dist/electron-preload/preload.cjs",
+      "version": "0.16.0",
+      "sha256": "9e16e28682a75c15d48eb9a220711f718f62c53b423f59e88eccb206088b60fd",
+      "sourceMap": {
+        "path": "client/extracted/dist/electron-preload/preload.cjs.map",
+        "status": "removed",
+        "reason": "The stale sourceMappingURL reference was removed after the local OpenBot preload bridge overlay changed the extracted bundle; retain the map only as forensic evidence."
+      }
+    },
+    "coordinatorTranscriptAdapter": {
+      "path": "client/extracted/dist/node-agent-coordinator/openbot-transcript-adapter.cjs",
+      "version": "openbot-transcript-adapter-v5-tool-notices",
+      "sha256": "b107184c402f7bb28dbf26b2f74a39dc9a1587d19b298e16234a55e89eefe499",
+      "sourceMap": {
+        "status": "not-applicable"
+      }
+    },
+    "rendererInjected": {
+      "path": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v44-physical-home",
+      "sha256": "cd72723d206e139520b91a32bdce1acbd1ba58fdd571d7f959436bdc6d67ae7b",
+      "sourceMap": {
+        "status": "not-applicable"
+      }
+    },
+    "rendererMemoryUi": {
+      "path": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
+      "version": "openbot-memory-ui-v11-forgetting",
+      "sha256": "4bb3cd8d94a8f0fdf5cd00d84da734e948f2b2b80d928fae02378bc377a2ff15",
+      "sourceMap": {
+        "status": "not-applicable"
+      }
+    },
+    "coordinatorMain": {
+      "path": "client/extracted/dist/node-agent-coordinator/main.cjs",
+      "version": "openbot-ui-contract-v2-local-user-echo",
+      "sha256": "1fa446a6f3c5ffb174cc616d9982e545f8da36257d64ee0bb50af87e5b3476bf",
+      "sourceMap": {
+        "path": "client/extracted/dist/node-agent-coordinator/main.cjs.map",
+        "reference": "main.cjs.map",
+        "status": "intentionally-stale",
+        "reason": "The extracted source map predates the local coordinator RPC and transcript projection patches."
+      }
+    }
+  },
+  "renderer": {
+    "index": {
+      "path": "client/extracted/dist/renderer/index.html",
+      "sha256": "ce37c30c5fb5d9659fe67c53abd0230dc1d11530eeba019a050e9fa64050d1e6"
+    },
+    "assetsDirectory": "client/extracted/dist/renderer/assets",
+    "requiredAssets": [
+      {
+        "path": "client/extracted/dist/renderer/assets/index-DVUCYGay.js",
+        "sha256": "a2f2c4b816ccb131c62bb63ec7ba0b330ef168ca126a5182595ecf96964d7e33",
+        "role": "entry"
+      },
+      {
+        "path": "client/extracted/dist/renderer/assets/index-CqsZ1Ga4.css",
+        "sha256": "720797be84a55ceda73f7c80c597946bc326b1cb2bbf57f4aa22b445c9560efd",
+        "role": "style"
+      },
+      {
+        "path": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+        "sha256": "cd72723d206e139520b91a32bdce1acbd1ba58fdd571d7f959436bdc6d67ae7b",
+        "role": "injected"
+      },
+      {
+        "path": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
+        "sha256": "4bb3cd8d94a8f0fdf5cd00d84da734e948f2b2b80d928fae02378bc377a2ff15",
+        "role": "injected"
+      },
+      {
+        "path": "client/extracted/dist/renderer/assets/openbot-welcome-renaissance.png",
+        "sha256": "0386bd09883b79e380a83d14c8e71b2f02ed431ac5b85c15b299d8a6d1134cea",
+        "role": "welcome-art"
+      }
+    ],
+    "boundary": {
+      "schemaVersion": 1,
+      "algorithm": "sha256(sorted-lowercase-posix-relative-path-nul-file-sha256-lf)-v1",
+      "immutableAggregateSha256": "8be890dd0e54aa5b31fb2821b08c89dcc3bba6a6faa28c11de8ea613089d460d"
+    }
+  },
+  "patchMetadata": "patches/client-artifacts.json"
+}

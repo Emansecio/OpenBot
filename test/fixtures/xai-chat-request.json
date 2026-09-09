@@ -1,0 +1,44 @@
+{
+  "label": "providers.xai-chat-request",
+  "source": "plano-fase1-mvp.md §3 T7 — corpo chat.completions (stream:true + tools) montado por buildChatBody (helper reusado de T6)",
+  "description": "Corpo do POST /v1/chat/completions do adapter xAI: modelo grok-* (default do produto), system como primeira mensagem, tools (schema function), temperature e max_tokens opcionais. Mesmo wire format do T6 (API OpenAI-compatible da xAI).",
+  "request": {
+    "model": "grok-4.6",
+    "system": "Você é o OpenBot — assistente local.",
+    "messages": [
+      { "role": "user", "content": "Liste os arquivos do diretório atual." }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "shell",
+          "description": "Executa um comando no shell",
+          "parameters": { "type": "object", "properties": { "cmd": { "type": "string" } }, "required": ["cmd"] }
+        }
+      }
+    ],
+    "temperature": 0.2,
+    "maxTokens": 512
+  },
+  "expectedBody": {
+    "model": "grok-4.6",
+    "messages": [
+      { "role": "system", "content": "Você é o OpenBot — assistente local." },
+      { "role": "user", "content": "Liste os arquivos do diretório atual." }
+    ],
+    "stream": true,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "shell",
+          "description": "Executa um comando no shell",
+          "parameters": { "type": "object", "properties": { "cmd": { "type": "string" } }, "required": ["cmd"] }
+        }
+      }
+    ],
+    "temperature": 0.2,
+    "max_tokens": 512
+  }
+}

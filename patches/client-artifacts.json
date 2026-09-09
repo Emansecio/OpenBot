@@ -1,0 +1,666 @@
+{
+  "schemaVersion": 1,
+  "manifest": "client/client-artifacts.manifest.json",
+  "canonicalRoot": "client/extracted/dist",
+  "patches": [
+    {
+      "id": "openbot-fast-mode-settings",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-fast-mode-v1",
+      "sha256": "29eb658d8fdd130035530f6a2e0e8fe4df8eef84709f103701638e807c8f2921",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-fast-mode-ipc",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-fast-mode-v1",
+      "sha256": "a8260b2021ecf5f4a0ebbb8d23df3f319d68cbd575951578cc18c21abf1ebc3f",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-sidebar-profile-avatar",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-profile-v4",
+      "sha256": "f5fe9655a6bc202448c75df5b5128233c8a35f48b6a396751207dbc2c6ff4c48",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-profile-interaction-polish",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-profile-v3",
+      "sha256": "a703579a21d86e8570f1cbd5a769b1ae386cf2283903976eacc3020fd10472f0",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-native-account-local-profile",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-profile-v2",
+      "sha256": "702a92f4f163cfe17b1b41d47a0431590b89cbb76e75eafdb224c1409fc6613b",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-account-menu-before-paint",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-account-menu-v1",
+      "sha256": "ac13da5cd65ef03df1fc73575d13b19ea16ac2e3298cc74e13ea411b9bc8e2cf",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-native-working-indicator",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-activity-v1",
+      "sha256": "284fb2fbad2892955035db25e8d25240ba1d2303fb4130345fd15db6c2cb3191",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-legacy-send-journal-preservation",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-send-journal-v2",
+      "sha256": "adb985ab081a1ca3beed24c37eeedf0a30eee58f17585044eb969ae677075a51",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-stop-accepted-centered",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-stop-v2",
+      "sha256": "3bb4604d105fda8b8d0922318a8d20bf348cf79b1370e76e37179cae023239bb",
+      "status": "applied"
+    },
+    {
+      "id": "T15-T17",
+      "record": "patches/diff-t15-t17.txt",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-local-settings",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v9",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "desktop-local-single-instance",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-lifecycle-v1",
+      "status": "applied"
+    },
+    {
+      "id": "desktop-explicit-data-root-token",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-lifecycle-v1",
+      "status": "applied"
+    },
+    {
+      "id": "chat-provider-resilience-main",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-chat-resilience-v1",
+      "status": "applied"
+    },
+    {
+      "id": "chat-provider-resilience-preload",
+      "target": "client/extracted/dist/electron-preload/preload.cjs",
+      "version": "openbot-chat-resilience-v1",
+      "status": "applied"
+    },
+    {
+      "id": "chat-provider-resilience-renderer",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-chat-resilience-v1",
+      "status": "applied"
+    },
+    {
+      "id": "turn-crash-recovery-main",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-turn-recovery-v1",
+      "status": "applied"
+    },
+    {
+      "id": "turn-crash-recovery-renderer",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-turn-recovery-v1",
+      "status": "applied"
+    },
+    {
+      "id": "desktop-motion-polish-renderer",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-motion-v1",
+      "status": "applied"
+    },
+    {
+      "id": "conversation-memory-ui-renderer",
+      "target": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
+      "version": "openbot-memory-ui-v2",
+      "status": "applied"
+    },
+    {
+      "id": "p22-async-task-bridge-main",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-p22-tasks-v1",
+      "status": "applied"
+    },
+    {
+      "id": "p22-async-task-bridge-preload",
+      "target": "client/extracted/dist/electron-preload/preload.cjs",
+      "version": "openbot-p22-tasks-v1",
+      "status": "applied"
+    },
+    {
+      "id": "ui-contract-retry-resync-repair",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-ui-contract-v1",
+      "status": "applied"
+    },
+    {
+      "id": "ui-contract-runtime-ipc",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-ui-contract-v1",
+      "status": "applied"
+    },
+    {
+      "id": "ui-contract-runtime-preload",
+      "target": "client/extracted/dist/electron-preload/preload.cjs",
+      "version": "openbot-ui-contract-v1",
+      "status": "applied"
+    },
+    {
+      "id": "ui-contract-coordinator-resync",
+      "target": "client/extracted/dist/node-agent-coordinator/main.cjs",
+      "version": "openbot-ui-contract-v2-local-user-echo",
+      "status": "applied",
+      "sha256": "1fa446a6f3c5ffb174cc616d9982e545f8da36257d64ee0bb50af87e5b3476bf"
+    },
+    {
+      "id": "ui-contract-coordinator-transcript-adapter",
+      "target": "client/extracted/dist/node-agent-coordinator/openbot-transcript-adapter.cjs",
+      "version": "openbot-transcript-adapter-v4-local-user-echo",
+      "status": "applied",
+      "sha256": "31dc6d8102468ae326c84e0bcdfb9caec594ad1d6f3e1b6a3ab11b41ce80556d"
+    },
+    {
+      "id": "p23-attachment-bridge-main",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-p23-attachments-v1",
+      "status": "applied"
+    },
+    {
+      "id": "p22p23-surfaces-renderer",
+      "target": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
+      "version": "openbot-memory-ui-v3-p22p23",
+      "sha256": "c42a862362acfd4204b97f37c224fcf29e539e6e8a06ca1fb8b3957a04073f2c",
+      "status": "applied"
+    },
+    {
+      "id": "p23-search-cursor-preload",
+      "target": "client/extracted/dist/electron-preload/preload.cjs",
+      "version": "openbot-p23-cursor-v1",
+      "status": "applied"
+    },
+    {
+      "id": "p23-search-cursor-main",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-p23-cursor-v1",
+      "status": "applied"
+    },
+    {
+      "id": "desktop-local-gateway-empty-url-fallback",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-local-gateway-url-v1",
+      "status": "applied"
+    },
+    {
+      "id": "desktop-hide-sand-restore-wall",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v3",
+      "status": "applied"
+    },
+    {
+      "id": "desktop-local-account-slot",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-local-account-v1",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-client-persistence-bridge",
+      "target": "client/extracted/dist/electron-preload/preload.cjs",
+      "version": "openbot-client-persistence-v1",
+      "status": "applied"
+    },
+    {
+      "id": "provider-oauth-main",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-provider-oauth-v1",
+      "status": "applied"
+    },
+    {
+      "id": "provider-oauth-preload",
+      "target": "client/extracted/dist/electron-preload/preload.cjs",
+      "version": "openbot-provider-oauth-v1",
+      "status": "applied"
+    },
+    {
+      "id": "provider-oauth-renderer",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-provider-oauth-v1",
+      "status": "applied"
+    },
+    {
+      "id": "local-account-settings-stability",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-account-settings-v1",
+      "status": "applied"
+    },
+    {
+      "id": "global-provider-settings",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-global-provider-settings-v2",
+      "status": "applied"
+    },
+    {
+      "id": "grok-018-ui-polish",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-grok-018-ui-polish-v10",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-performance-runtime",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v11-performance",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-memory-performance",
+      "target": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
+      "version": "openbot-memory-ui-v4-performance",
+      "sha256": "a53bcc65e4ac7e83f81d0a6c06bf626e07799ff2ec28372d951c4ae56aed06a2",
+      "status": "applied"
+    },
+    {
+      "id": "prompt-control-active-agent-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v12-agent-control",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "desktop-dev-control-local-gate-v1",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-dev-control-v1",
+      "sha256": "9c55d46aaf3589f43898a49b237f151219bbd8adde2abef6280f409f913ec4fc",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-secret-read-boundary-main-v1",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-secret-boundary-v1",
+      "sha256": "9c55d46aaf3589f43898a49b237f151219bbd8adde2abef6280f409f913ec4fc",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-secret-read-boundary-preload-v1",
+      "target": "client/extracted/dist/electron-preload/preload.cjs",
+      "version": "openbot-secret-boundary-v1",
+      "sha256": "9e16e28682a75c15d48eb9a220711f718f62c53b423f59e88eccb206088b60fd",
+      "status": "applied"
+    },
+    {
+      "id": "remove-whatsapp-setting-renderer-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v13-settings-cleanup",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "remove-whatsapp-setting-main-v1",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-settings-cleanup-v1",
+      "sha256": "9c55d46aaf3589f43898a49b237f151219bbd8adde2abef6280f409f913ec4fc",
+      "status": "applied"
+    },
+    {
+      "id": "remove-whatsapp-setting-preload-v1",
+      "target": "client/extracted/dist/electron-preload/preload.cjs",
+      "version": "openbot-settings-cleanup-v1",
+      "sha256": "9e16e28682a75c15d48eb9a220711f718f62c53b423f59e88eccb206088b60fd",
+      "status": "applied"
+    },
+    {
+      "id": "provider-reasoning-effort-bridge-main-v1",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-provider-reasoning-effort-v1",
+      "sha256": "9c55d46aaf3589f43898a49b237f151219bbd8adde2abef6280f409f913ec4fc",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-chat-bubble-sides-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v14-chat-sides",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-visual-stability-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v15-visual-stability",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-ui-consistency-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v16-ui-consistency",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-message-identity-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v17-message-identity",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-placeholder-legibility-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v18-placeholder-legibility",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-avatar-alignment-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v19-avatar-alignment",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-composer-alignment-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v20-composer-alignment",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-settings-harmony-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v21-settings-harmony",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "memory-pagination-main-v1",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-memory-pagination-v1",
+      "sha256": "9c55d46aaf3589f43898a49b237f151219bbd8adde2abef6280f409f913ec4fc",
+      "status": "applied"
+    },
+    {
+      "id": "memory-pagination-preload-v1",
+      "target": "client/extracted/dist/electron-preload/preload.cjs",
+      "version": "openbot-memory-pagination-v1",
+      "sha256": "9e16e28682a75c15d48eb9a220711f718f62c53b423f59e88eccb206088b60fd",
+      "status": "applied"
+    },
+    {
+      "id": "memory-pagination-renderer-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
+      "version": "openbot-memory-ui-v5-pagination",
+      "sha256": "fd353eba384b8e33cffd62f52bca8c4c4c315f7db9ad78456e2e5b456065faa6",
+      "status": "applied"
+    },
+    {
+      "id": "provider-reasoning-effort-values-main-v2",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-provider-reasoning-effort-v2",
+      "sha256": "9c55d46aaf3589f43898a49b237f151219bbd8adde2abef6280f409f913ec4fc",
+      "status": "applied"
+    },
+    {
+      "id": "trusted-host-permission-lock-main-v1",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-trusted-host-permission-lock-v1",
+      "sha256": "9c55d46aaf3589f43898a49b237f151219bbd8adde2abef6280f409f913ec4fc",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-close-legacy-screen-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v22-screen-close",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-composer-focus-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v23-composer-focus",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-attachment-layout-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v24-attachment-layout",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "main-windows-attachment-preview-v1",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-windows-attachment-preview-v1",
+      "sha256": "9c55d46aaf3589f43898a49b237f151219bbd8adde2abef6280f409f913ec4fc",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-composer-preview-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v25-composer-preview",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-composer-top-alignment-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v26-composer-top-alignment",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-screen-save-close-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v28-screen-save-close",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-screen-transition-close-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v29-screen-transition-close",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-screen-prepaint-hide-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v30-screen-prepaint-hide",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-composer-action-clearance-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v31-composer-action-clearance",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-user-author-alignment-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v32-user-author-alignment",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-dialog-base-toolbar-removal-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
+      "version": "openbot-memory-ui-v7-toolbar-removed",
+      "sha256": "ebd664a65ddf2e39b7f47e117b6ca9efe1de8934b7917d30a52661a834b6ccda",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-memory-ui-shared-profile-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
+      "version": "openbot-memory-ui-v8-shared-profile",
+      "sha256": "18bd34ea4265ea6e766758cd778fbdd32659576b0f17aa3025932bcbb2fc0a77",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-ui-harmony-toolbar-removal-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v34-toolbar-removed",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-ui-harmony-header-border-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v35-header-border",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-settings-recovery-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v36-settings-recovery",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "renderer-memory-search-focus-v1",
+      "target": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
+      "version": "openbot-memory-ui-v9-search-focus",
+      "sha256": "fc2c99ad3c6a5bef148f51da4ee4e1d949d4221c583d617d231a458d4c91c7ea",
+      "status": "applied"
+    },
+    {
+      "id": "native-selected-agent-controls",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-selected-agent-v1",
+      "status": "applied"
+    },
+    {
+      "id": "native-selected-agent-attachment-commit",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-native-attachments-v1",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-local-settings-v39-execution-controls",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v39-execution-controls",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-memory-ui-v10-settings-recovery",
+      "target": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
+      "version": "openbot-memory-ui-v10-settings-recovery",
+      "sha256": "5ae12762f71ad7619b40445345ad3de691c9fea6a2bb421545730a60313e1073",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-provider-selected-save-v1",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-provider-selected-save-v1",
+      "sha256": "9c55d46aaf3589f43898a49b237f151219bbd8adde2abef6280f409f913ec4fc",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-transcript-adapter-v5-tool-notices",
+      "target": "client/extracted/dist/node-agent-coordinator/openbot-transcript-adapter.cjs",
+      "version": "openbot-transcript-adapter-v5-tool-notices",
+      "sha256": "b107184c402f7bb28dbf26b2f74a39dc9a1587d19b298e16234a55e89eefe499",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-local-settings-v40-recovery-controls",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v40-recovery-controls",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-memory-ui-v11-forgetting",
+      "target": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
+      "version": "openbot-memory-ui-v11-forgetting",
+      "sha256": "4bb3cd8d94a8f0fdf5cd00d84da734e948f2b2b80d928fae02378bc377a2ff15",
+      "status": "applied"
+    },
+    {
+      "id": "provider-model-catalog-main",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "model-catalog-v1",
+      "status": "applied"
+    },
+    {
+      "id": "provider-model-catalog-preload",
+      "target": "client/extracted/dist/electron-preload/preload.cjs",
+      "version": "model-catalog-v1",
+      "status": "applied"
+    },
+    {
+      "id": "provider-model-catalog-settings",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "model-catalog-v1",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-flat-sidebar",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v41-flat-sidebar",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-create-close-no-drag",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v42-create-close",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-send-feedback",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v43-send-feedback",
+      "sha256": "b0f055b2e39b2a21874428ac7e2fcf20106dca04670b4577b5a3c92747134c48",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-prompt-delivery-preload",
+      "target": "client/extracted/dist/electron-preload/preload.cjs",
+      "version": "openbot-prompt-delivery-v1",
+      "sha256": "9e16e28682a75c15d48eb9a220711f718f62c53b423f59e88eccb206088b60fd",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-physical-home-documents",
+      "target": "client/extracted/dist/electron-main/main.cjs",
+      "version": "openbot-physical-home-v1",
+      "sha256": "40a59a72e7d6c5a3b09ae30d4de9b1fd1ce57bfad90634c490a67c6a3839273e",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-physical-home-settings",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v44-physical-home",
+      "sha256": "fe12622fff17665cda3d485b4a345db8e6e76406da632b711a0d8c58324e25c6",
+      "status": "applied"
+    }
+  ],
+  "sourceMapPolicy": {
+    "client/extracted/dist/electron-main/main.cjs": "removed",
+    "client/extracted/dist/electron-preload/preload.cjs": "removed",
+    "client/extracted/dist/node-agent-coordinator/main.cjs": "intentionally-stale"
+  },
+  "provenance": "Metadata only. Do not regenerate or copy proprietary client source; the explicit artifact manifest and local patch record are the source of truth for this checkout."
+}

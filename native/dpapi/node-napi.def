@@ -1,0 +1,7 @@
+EXPORTS
+  napi_create_buffer_copy
+  napi_create_function
+  napi_get_buffer_info
+  napi_get_cb_info
+  napi_set_named_property
+  napi_throw_error
