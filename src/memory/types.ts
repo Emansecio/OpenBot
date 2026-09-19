@@ -317,6 +317,14 @@ export interface MemoryStore {
   isConversationActive(agentId: string, conversationId: string): boolean;
   claimJob(agentId: string, jobId?: string, nowMs?: number): MemoryJob | null;
   completeJob(agentId: string, jobId: string, nowMs?: number): MemoryJob | null;
+  /**
+   * Requeues a running job whose reflection payload could only cover a
+   * contiguous prefix of its range. The job keeps its identity and
+   * throughSequenceId; fromSequenceId advances to the first unexamined entry
+   * so the deferred tail is claimed again instead of spawning a conflicting
+   * job row.
+   */
+  deferJob(agentId: string, jobId: string, fromSequenceId: number, nowMs?: number): MemoryJob | null;
   retryJob(agentId: string, jobId: string, error?: MemoryJobError, nowMs?: number, policy?: MemoryJobRetryPolicy): MemoryJob | null;
   deadJob(agentId: string, jobId: string, error?: MemoryJobError, nowMs?: number): MemoryJob | null;
   cancelConversationJobs(agentId: string, conversationId: string, error?: MemoryJobError, nowMs?: number): number;

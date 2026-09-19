@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, parse as parsePath, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { writeShortcutAppId } from "./shortcut-appid.mjs";
 
 const execFile = promisify(execFileCallback);
 
@@ -511,7 +512,8 @@ export async function atomicWriteFile(path, contents) {
       // Windows may reject replacing an existing file while another reader has
       // it open. Keep the operation recoverable, then retry the final rename.
       if (error?.code !== "EEXIST" && error?.code !== "EPERM" && error?.code !== "ENOTEMPTY") throw error;
-      await fs.rm(path, { force: true });
+      // Never remove the only valid destination before a replacement is
+      // guaranteed: a failed retry must leave the previous version intact.
       await fs.rename(temporary, path);
     }
   } finally {
@@ -746,9 +748,12 @@ export async function createShortcut(target, shortcutPath, options = {}) {
     throw new Error(`Simulated shortcut creation failure: ${shortcutPath}`);
   }
   if (process.env.OPENBOT_SKIP_SHORTCUTS === "1" || options.skip === true) return { path: shortcutPath, skipped: true };
+  await assertNoReparsePath(shortcutPath, { allowMissing: true });
+  const temporary = join(dirname(shortcutPath), `.openbot-shortcut-${randomSuffix()}.lnk`);
   const script = [
+    "$ErrorActionPreference = 'Stop'",
     "$shell = New-Object -ComObject WScript.Shell",
-    `$shortcut = $shell.CreateShortcut(${psQuote(shortcutPath)})`,
+    `$shortcut = $shell.CreateShortcut(${psQuote(temporary)})`,
     `$shortcut.TargetPath = ${psQuote(target)}`,
     `$shortcut.Arguments = ${psQuote(options.arguments ?? "")}`,
     `$shortcut.WorkingDirectory = ${psQuote(options.workingDirectory ?? dirname(target))}`,
@@ -758,17 +763,107 @@ export async function createShortcut(target, shortcutPath, options = {}) {
     "$shortcut.Save()",
   ].join("; ");
   try {
-    await execFile("powershell.exe", ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
+    await execFile("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
       windowsHide: true,
       maxBuffer: 1024 * 1024,
     });
+    // Set identity on a newly generated shortcut, never rewrite foreign property stores.
+    if (options.appUserModelId != null) await writeShortcutAppId(temporary, options.appUserModelId);
+    await assertNoReparsePath(shortcutPath, { allowMissing: true });
+    await fs.rename(temporary, shortcutPath);
     return { path: shortcutPath, skipped: false, fallback: false };
   } catch (error) {
-    if (options.allowFallback === false) throw error;
-    // CI and stripped-down Windows images can lack the WScript.Shell COM
-    // registration. Preserve a deterministic cleanup target in that case.
+    if (options.allowFallback === false || options.appUserModelId != null) throw error;
+    // Generic CI-only fallback. Product shortcuts must fail rather than publish a fake .lnk.
     await fs.writeFile(shortcutPath, `OpenBot shortcut\nTarget=${target}\nIcon=${options.iconLocation ?? ""}\n`, "utf8");
     return { path: shortcutPath, skipped: false, fallback: true };
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
+}
+
+/**
+ * Remove the legacy Electron taskbar alias owned by older OpenBot builds.
+ *
+ * Explorer groups a running window by the shortcut AppUserModelID. Older
+ * builds left an Electron.lnk carrying OpenBot.Desktop behind, so Explorer
+ * could resolve the taskbar button to Electron's stock icon. Only an alias
+ * whose AppID is ours and whose target is actually electron.exe is removed;
+ * foreign links are never silently claimed.
+ */
+export async function removeOwnedElectronTaskbarAlias(startMenuShortcut, options = {}) {
+  if (process.platform !== "win32" || extname(startMenuShortcut).toLowerCase() !== ".lnk") return false;
+  const canonicalShortcut = resolve(startMenuShortcut);
+  const legacyShortcut = join(dirname(canonicalShortcut), "Electron.lnk");
+  let before;
+  try {
+    await assertNoReparseAncestors(legacyShortcut);
+    before = await fs.lstat(legacyShortcut);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) return false;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)",
+    `$link = (New-Object -ComObject WScript.Shell).CreateShortcut(${psQuote(legacyShortcut)})`,
+    `$folder = (New-Object -ComObject Shell.Application).Namespace([IO.Path]::GetDirectoryName(${psQuote(legacyShortcut)}))`,
+    `$item = $folder.ParseName([IO.Path]::GetFileName(${psQuote(legacyShortcut)}))`,
+    "[pscustomobject]@{ target=$link.TargetPath; arguments=$link.Arguments; appId=$item.ExtendedProperty('System.AppUserModel.ID') } | ConvertTo-Json -Compress",
+  ].join("; ");
+  const { stdout } = await execFile("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
+    windowsHide: true, encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024,
+  });
+  const link = JSON.parse(stdout);
+  if (link.appId !== (options.appUserModelId ?? DEFAULT_APP_ID)) return false;
+  const target = typeof link.target === "string" && isAbsolute(link.target) ? resolve(link.target) : null;
+  const electronTarget = target != null && basename(target).toLowerCase() === "electron.exe";
+  if (!electronTarget || typeof link.arguments !== "string" || link.arguments.trim() !== "") {
+    throw new Error(`Refusing to replace another application's taskbar shortcut: ${legacyShortcut}`);
+  }
+  const after = await fs.lstat(legacyShortcut);
+  if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
+    || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+    throw new Error(`Taskbar shortcut changed before cleanup: ${legacyShortcut}`);
+  }
+  await fs.unlink(legacyShortcut);
+  return true;
+}
+
+/** Read native shell fields before claiming/removing a shortcut from a managed install. */
+export async function shortcutBelongsToInstall(shortcutPath, installRoot) {
+  if (process.platform !== "win32" || extname(shortcutPath).toLowerCase() !== ".lnk") return false;
+  try {
+    await assertNoReparseAncestors(shortcutPath);
+    const before = await fs.lstat(shortcutPath);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) return false;
+    const script = [
+      "$ErrorActionPreference = 'Stop'",
+      "$ProgressPreference = 'SilentlyContinue'",
+      "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)",
+      `$link = (New-Object -ComObject WScript.Shell).CreateShortcut(${psQuote(resolve(shortcutPath))})`,
+      "[pscustomobject]@{ target=$link.TargetPath; arguments=$link.Arguments } | ConvertTo-Json -Compress",
+    ].join("; ");
+    const { stdout } = await execFile("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+      windowsHide: true, encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024,
+    });
+    const link = JSON.parse(stdout);
+    const after = await fs.lstat(shortcutPath);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) return false;
+    if (typeof link.target !== "string" || !isAbsolute(link.target) || typeof link.arguments !== "string") return false;
+    const target = resolve(link.target).toLowerCase();
+    const args = link.arguments.trim();
+    const vbs = join(resolve(installRoot), "OpenBot.vbs");
+    const cmd = join(resolve(installRoot), "OpenBot.cmd");
+    const exe = join(resolve(installRoot), "OpenBot.exe");
+    if (args === "" && [vbs, cmd, exe].some(path => target === path.toLowerCase())) return true;
+    const wscript = join(process.env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
+    return target === wscript.toLowerCase() && args.toLowerCase() === `"${vbs}"`.toLowerCase();
+  } catch {
+    // Missing, malformed, inaccessible or reassigned links are not ours to mutate.
+    return false;
   }
 }
 
@@ -1157,6 +1252,7 @@ export function lifecycleWrapperContents(kind, options = {}) {
     'if not exist "%OPENBOT_TEMP%" mkdir "%OPENBOT_TEMP%" >nul 2>&1 || goto :openbot_inner_fail',
     'copy /Y "%OPENBOT_SOURCE%\\runtime\\node.exe" "%OPENBOT_TEMP%\\node.exe" >nul || goto :openbot_inner_fail',
     `copy /Y "%OPENBOT_SOURCE%\\scripts\\release-common.mjs" "%OPENBOT_TEMP%\\release-common.mjs" >nul || goto :openbot_inner_fail`,
+    'if exist "%OPENBOT_SOURCE%\\scripts\\shortcut-appid.mjs" (copy /Y "%OPENBOT_SOURCE%\\scripts\\shortcut-appid.mjs" "%OPENBOT_TEMP%\\shortcut-appid.mjs" >nul || goto :openbot_inner_fail)',
     `copy /Y "%OPENBOT_SOURCE%\\scripts\\${script}" "%OPENBOT_TEMP%\\${script}" >nul || goto :openbot_inner_fail`,
     ...argumentsBlock,
     ...(isRepair ? ['copy /Y "%OPENBOT_SOURCE%\\scripts\\update.mjs" "%OPENBOT_TEMP%\\update.mjs" >nul || goto :openbot_inner_fail'] : []),

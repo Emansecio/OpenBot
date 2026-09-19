@@ -67,6 +67,7 @@ function fixture(mode = "success") {
     catalogConnectionKey: async () => connectionFingerprint("codex-fixture"),
     resolveCredential: vi.fn(async () => ({ accessToken: "fixture-access-secret", accountId: "fixture-account" })),
     refreshCredential: vi.fn(async () => ({ accessToken: "fixture-renewed-secret", accountId: "fixture-account" })),
+    hasCredential: async () => true,
   };
   const source = createCodexCatalogSource({
     stateDirectory: join(directory, "state"), oauth, resolveExecutable: () => process.execPath,
@@ -107,7 +108,7 @@ it.each(["incompatible", "timeout"])("sanitizes %s and terminates its process", 
 });
 
 it("reports missing executable without launching or authenticating", async () => {
-  const oauth = { catalogConnectionKey: async () => connectionFingerprint("none"), resolveCredential: vi.fn(), refreshCredential: vi.fn() };
+  const oauth = { catalogConnectionKey: async () => connectionFingerprint("none"), resolveCredential: vi.fn(), refreshCredential: vi.fn(), hasCredential: async () => false };
   const source = createCodexCatalogSource({ oauth, stateDirectory: "unused", resolveExecutable: () => { throw new Error("Codex não encontrado"); } });
   await expect(source.discover(new AbortController().signal)).rejects.toThrow("Codex não encontrado");
   expect(oauth.resolveCredential).not.toHaveBeenCalled();

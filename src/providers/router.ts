@@ -21,7 +21,9 @@
  * Regra de uso: `streamChat` nunca lança — o erro sai como evento `error`.
  */
 
+import { randomUUID } from "node:crypto";
 import type { ReasoningEffort } from "../shared/contracts.js";
+import type { ProviderUsage } from "./usage.js";
 import { ProviderAdmissionError, type ProviderAdmissionLease, type ProviderAdmissionScheduler } from "./admission.js";
 import { resolveProviderCapabilities } from "./capabilities.js";
 import { ResumeProtocolError, validateOpaqueResumeCursor } from "./resume.js";
@@ -68,13 +70,16 @@ export type ProviderChatMessage = {
  * `signal` propaga o cancelamento do turno (AbortSignal do consumidor).
  */
 export interface ProviderChatRequest {
+  requestId?: string;
+  operationId?: string;
+  onTransportStart?: (protocol: "chat" | "responses" | "codex" | "messages") => void;
   /** Host-owned stable conversation identity; never serialized in the body. */
   sessionId?: string;
   modelResolution?: import("./model-catalog.js").ModelResolution;
   /** Modelo global único resolvido pelo catálogo (T13); id como em models.ts. */
   model: string;
   /** Local-only purpose tag. Never serialized into the provider JSON body. */
-  purpose?: "turn" | "memory-reflection";
+  purpose?: "turn" | "memory-reflection" | "async-task" | "kickstart" | "resume";
   /** System prompt montado pelo turn runner (T10). */
   system?: string;
   /** Histórico do diálogo (transcript) até o turno atual. */
@@ -98,6 +103,7 @@ export interface ProviderChatRequest {
  * `error` são terminais — exatamente UM deles encerra o stream.
  */
 export type ProviderStreamEvent =
+  | { type: "usage"; usage: ProviderUsage }
   | { type: "service-tier"; actual: "priority" | "default" | "unknown" }
   | {
       type: "delta";
@@ -287,6 +293,8 @@ function extractCode(err: unknown): string | undefined {
 }
 
 const MAX_RETRY_AFTER_MS = 60_000;
+/** Reflection jobs keep ~2/3 of their 30s execution deadline for the model call. */
+const MEMORY_REFLECTION_ADMISSION_MAX_WAIT_MS = 10_000;
 
 function normalizeRetryAfterMs(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
@@ -315,6 +323,7 @@ function isAbortError(err: unknown): boolean {
  *   3. respeita `req.signal` (abort encerra o stream com `AbortError`).
  */
 export interface ProviderAdapter {
+  readonly tracksTransport?: boolean;
   /** Nome canônico do provider: "openai" | "xai" | "openai-compat" (+ fake em test). */
   readonly name: string;
   /** Exact provider payload used both by the byte gate and the transport. */
@@ -358,6 +367,7 @@ export interface ProviderRegistry {
 }
 
 export interface RouterOptions {
+  onAttempt?: (attempt: ProviderAttempt) => void;
   /** Registro de adapters; default: um Map interno (`createProviderRegistry()`). */
   registry?: ProviderRegistry;
   /** Número máximo de novas tentativas para falhas transitórias sem saída observável. */
@@ -368,6 +378,14 @@ export interface RouterOptions {
   admission?: ProviderAdmissionScheduler;
   /** Stable identity used by admission fairness (never sent to providers). */
   agentId?: string;
+  /**
+   * Observa o limite real da admissão: `true` antes de esperar por uma vaga,
+   * `false` quando o lease foi concedido. É um fato da execução (não polling)
+   * e existe apenas para o estado ao vivo do turno.
+   */
+  onAdmissionWait?: (waiting: boolean) => void;
+  /** Observa o instante em que a requisição foi efetivamente entregue ao transporte. */
+  onTransportStart?: (protocol: "chat" | "responses" | "codex" | "messages") => void;
 }
 
 /**
@@ -406,6 +424,7 @@ export class DeltaAccumulator {
 }
 
 export interface StreamChatResult {
+  attempts?: ProviderAttempt[];
   /** Mensagem completa final (assistente) ou `undefined` se o turno não rendeu texto. */
   message?: ProviderAssistantMessage;
   /** true quando o stream terminou por cancelamento (AbortSignal). */
@@ -414,6 +433,26 @@ export interface StreamChatResult {
   error?: ProviderError;
   /** Last bounded opaque cursor emitted at a provider boundary. */
   cursor?: string;
+}
+
+export interface ProviderAttempt {
+  requestId: string;
+  operationId?: string;
+  attemptId: string;
+  attempt: number;
+  provider: string;
+  model: string;
+  purpose: NonNullable<ProviderChatRequest["purpose"]>;
+  protocol: "chat" | "responses" | "codex" | "messages";
+  startedAtMs: number;
+  durationMs: number;
+  outcome: "success" | "error" | "aborted";
+  errorKind?: ProviderErrorKind;
+  usage?: ProviderUsage;
+}
+
+function logProviderTelemetry(stage: string, fields: object): void {
+  if (process.env.NODE_ENV !== "test") console.info(`[openbot][${stage}] ${JSON.stringify(fields)}`);
 }
 
 function retrySleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
@@ -447,6 +486,33 @@ function retrySleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
  * @param onEvent      observador opcional de TODOS os eventos emitidos.
  */
 export async function streamChat(
+  providerName: string,
+  req: ProviderChatRequest,
+  onEvent?: (event: ProviderStreamEvent) => void,
+  opts: RouterOptions = {},
+): Promise<StreamChatResult> {
+  const requestId = req.requestId ?? randomUUID();
+  const tracksTransport = (opts.registry ?? defaultRegistry).get(providerName)?.tracksTransport === true;
+  const attempts: ProviderAttempt[] = [];
+  const startedAtMs = Date.now();
+  const result = await streamChatInternal(providerName, { ...req, requestId }, onEvent, {
+    ...opts,
+    onAttempt: (attempt) => {
+      attempts.push(attempt);
+      logProviderTelemetry("provider-attempt", attempt);
+      try { opts.onAttempt?.(attempt); } catch { /* Telemetry cannot change inference. */ }
+    },
+  });
+  logProviderTelemetry("provider-result", {
+    requestId, operationId: req.operationId, provider: providerName, model: req.model, purpose: req.purpose ?? "turn",
+    attempts: tracksTransport ? attempts.length : undefined, startedAtMs, durationMs: Date.now() - startedAtMs,
+    outcome: result.aborted ? "aborted" : result.error ? "error" : "success",
+    errorKind: result.error?.kind,
+  });
+  return { ...result, ...(tracksTransport ? { attempts } : {}) };
+}
+
+async function streamChatInternal(
   providerName: string,
   req: ProviderChatRequest,
   onEvent?: (event: ProviderStreamEvent) => void,
@@ -542,11 +608,41 @@ export async function streamChat(
     let terminalError: ProviderError | undefined;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       let admissionLease: ProviderAdmissionLease | undefined;
+      let observation: ProviderAttempt | undefined;
+      let usage: ProviderUsage | undefined;
+      const finishAttempt = (error?: ProviderError): void => {
+        if (!observation) return;
+        observation.durationMs = Date.now() - observation.startedAtMs;
+        observation.outcome = req.signal?.aborted ? "aborted" : error ? "error" : "success";
+        observation.errorKind = req.signal?.aborted ? "aborted" : error?.kind;
+        observation.usage = usage;
+        opts.onAttempt?.(observation);
+        observation = undefined;
+      };
       try {
         const admission = opts.admission;
         if (admission !== undefined) {
-          admissionLease = await admission.acquire(opts.agentId ?? "default", req.signal);
+          // Maintenance work (memory reflection) yields to interactive turns and
+          // never burns its whole execution deadline waiting for a slot.
+          try { opts.onAdmissionWait?.(true); } catch { /* status observation cannot change inference */ }
+          try {
+            admissionLease = await admission.acquire(opts.agentId ?? "default",
+              req.purpose === "memory-reflection"
+                ? { signal: req.signal, priority: "maintenance", maxWaitMs: MEMORY_REFLECTION_ADMISSION_MAX_WAIT_MS }
+                : req.signal);
+          } finally {
+            try { opts.onAdmissionWait?.(false); } catch { /* status observation cannot change inference */ }
+          }
         }
+        effectiveRequest.onTransportStart = (protocol) => {
+          observation = {
+            requestId: req.requestId!, attemptId: randomUUID(), attempt: attempt + 1,
+            operationId: req.operationId,
+            provider: providerName, model: req.model, purpose: req.purpose ?? "turn", protocol,
+            startedAtMs: Date.now(), durationMs: 0, outcome: "success",
+          };
+          try { opts.onTransportStart?.(protocol); } catch { /* status observation cannot change inference */ }
+        };
         const requestForAdapter = resumeRequested
           ? (() => {
             const { resume: _resume, ...withoutResume } = effectiveRequest;
@@ -556,6 +652,10 @@ export async function streamChat(
         const stream = resumeRequested
           ? adapter.resumeChat!(requestForAdapter, resumeCursor!, (event) => {
             switch (event.type) {
+              case "usage":
+                usage = { ...usage, ...event.usage };
+                forward(event);
+                break;
               case "resume-cursor":
                 if (capability.resume !== "cursor") throw new ProviderError("resume cursor emitted without capability", { kind: "validation", code: "invalid_cursor" });
                 resumeCursor = validateOpaqueResumeCursor(event.cursor);
@@ -591,6 +691,10 @@ export async function streamChat(
           })
           : adapter.streamChat(requestForAdapter, (event) => {
           switch (event.type) {
+            case "usage":
+              usage = { ...usage, ...event.usage };
+              forward(event);
+              break;
             case "service-tier":
               forward(event);
               break;
@@ -632,8 +736,10 @@ export async function streamChat(
           }
           });
         await stream;
+        finishAttempt();
         break;
       } catch (err) {
+        finishAttempt(classifyProviderError(err));
         if (observerFailed) return observerErrorResult();
         const classified = err instanceof ProviderAdmissionError
           ? new ProviderError(err.message, {
@@ -652,6 +758,11 @@ export async function streamChat(
         }
         if (!observedOutput && classified.retryable && attempt < maxRetries && !req.signal?.aborted) {
           const backoffMs = 250 * 2 ** attempt;
+          // The lease wraps only the provider attempt itself. A backoff sleep
+          // must not occupy a global admission slot: release it before waiting
+          // and let the next attempt re-enter the queue fairly.
+          admissionLease?.release();
+          admissionLease = undefined;
           await sleep(Math.max(backoffMs, classified.retryAfterMs ?? 0), req.signal);
           if (req.signal?.aborted) break;
           continue;

@@ -1,12 +1,12 @@
-import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { MODEL_CATALOG } from "../config/models.js";
 import { REASONING_EFFORTS, type ModelCatalogEntry, type ReasoningEffort } from "../shared/contracts.js";
+import { writeFileAtomicSync } from "../shared/fs-atomic.js";
 import { resolveProviderCapabilities, type ProviderCapability } from "./capabilities.js";
 import { resolveModelCapabilities } from "../memory/model-context.js";
 
-export const CATALOG_PROVIDERS = ["openai", "xai", "opencode-go"] as const;
+export const CATALOG_PROVIDERS = ["openai", "xai", "opencode-go", "openai-compat"] as const;
 export type CatalogProvider = typeof CATALOG_PROVIDERS[number];
 export type ModelProtocol = "codex" | "chat" | "responses" | "messages";
 export type ServiceTier = "default" | "priority";
@@ -18,6 +18,8 @@ export interface DiscoveredModel {
   aliases?: string[];
   inputModalities?: string[];
   contextWindow?: number;
+  maxOutputTokens?: number;
+  maxRequestBytes?: number;
   supportedReasoningEfforts?: ReasoningEffort[];
   defaultReasoningEffort?: ReasoningEffort;
 }
@@ -46,6 +48,8 @@ export interface ProviderModelCatalog {
   state: "fresh" | "stale" | "unavailable" | "empty";
   source: "remote" | "cache" | "local";
   access: "public" | "connection";
+  /** false quando a fonte reporta ausência de credencial/conexão utilizável. */
+  connected?: boolean;
   updatedAt: number | null;
   error?: string;
   models: CatalogModel[];
@@ -54,6 +58,8 @@ export interface ProviderModelCatalog {
 export interface CatalogSource {
   /** Opaque connection fingerprint, never a token. Must not perform network I/O. */
   connectionKey(): Promise<string>;
+  /** True quando há credencial/conexão utilizável. Sem I/O de rede — leitura local. */
+  hasConnection?(): Promise<boolean>;
   discover(signal: AbortSignal): Promise<DiscoveredModel[]>;
 }
 
@@ -65,6 +71,8 @@ interface SavedCatalog {
 }
 interface ProviderState {
   connection?: string;
+  /** Resultado do último hasConnection() do source; undefined = desconhecido. */
+  connected?: boolean;
   saved?: SavedCatalog;
   source: "remote" | "cache" | "local";
   error?: string;
@@ -91,6 +99,8 @@ function cleanModel(value: DiscoveredModel): DiscoveredModel {
     ...(Array.isArray(value.aliases) ? { aliases: [...new Set(value.aliases.filter(validModelId))].slice(0, 64) } : {}),
     ...(Array.isArray(value.inputModalities) ? { inputModalities: [...new Set(value.inputModalities.filter(text))].slice(0, 16) } : {}),
     ...(Number.isSafeInteger(value.contextWindow) && value.contextWindow! > 0 ? { contextWindow: value.contextWindow } : {}),
+    ...(Number.isSafeInteger(value.maxOutputTokens) && value.maxOutputTokens! > 0 ? { maxOutputTokens: value.maxOutputTokens } : {}),
+    ...(Number.isSafeInteger(value.maxRequestBytes) && value.maxRequestBytes! > 0 ? { maxRequestBytes: value.maxRequestBytes } : {}),
     ...(Array.isArray(value.supportedReasoningEfforts) ? { supportedReasoningEfforts: [...new Set(value.supportedReasoningEfforts.filter(e => REASONING_EFFORTS.includes(e)))] } : {}),
     ...(REASONING_EFFORTS.includes(value.defaultReasoningEffort!) ? { defaultReasoningEffort: value.defaultReasoningEffort } : {}),
   };
@@ -134,7 +144,8 @@ export class ModelCatalogService {
 
   private protocol(provider: string, id: string): ModelProtocol | undefined {
     return this.options.protocols?.[`${provider}:${id}`]
-      ?? (provider === "openai" ? "codex" : provider === "xai" ? "chat" : undefined);
+      ?? (provider === "openai" ? "codex"
+        : provider === "xai" || provider === "openai-compat" ? "chat" : undefined);
   }
 
   private capability(provider: string, id: string): ProviderCapability {
@@ -147,11 +158,13 @@ export class ModelCatalogService {
     if (!source) return;
     const generation = state.generation;
     const connection = await source.connectionKey();
+    const connected = source.hasConnection === undefined ? true : await source.hasConnection.call(source);
     if (this.closed) return;
     if (state.generation !== generation) return this.synchronize(provider);
     if (!/^[a-f0-9]{64}$/u.test(connection)) throw new Error("Identidade de conexão inválida.");
     if (state.connection !== undefined && state.connection !== connection) this.invalidate(provider);
     state.connection = connection;
+    state.connected = connected;
     if (state.saved && state.saved.connection !== connection) {
       state.saved = undefined;
       state.source = "local";
@@ -174,20 +187,33 @@ export class ModelCatalogService {
       const remote = discovered.get(id);
       const removed = saved !== undefined && remote === undefined;
       const capability = this.capability(provider, id);
+      const compatFallback = provider === "openai-compat" && !known
+        ? local.get("openai-compatible")
+        : undefined;
       const entry: ModelCatalogEntry = {
-        ...(known ?? { id, provider, displayName: id }),
+        ...(compatFallback ? { ...compatFallback, id, displayName: id } : known ?? { id, provider, displayName: id }),
         ...(remote?.displayName ? { displayName: remote.displayName } : {}),
         ...(remote?.contextWindow ? { contextWindow: remote.contextWindow } : {}),
+        ...(remote?.maxOutputTokens ? { maxOutputTokens: remote.maxOutputTokens } : {}),
+        ...(remote?.maxRequestBytes ? { maxRequestBytes: remote.maxRequestBytes } : {}),
         ...(remote?.inputModalities ? { supportsVision: capability.images && remote.inputModalities.includes("image") } : {}),
       };
       let reason: string | undefined;
-      if (!known || !this.protocol(provider, id) || !capability.streaming || !capability.tools
+      // `!known` só bloqueia quando o modelo também não veio do endpoint — um
+      // id descoberto com limites + protocolo + capacidade resolvidos é
+      // selecionável (é assim que modelos openai-compat entram no catálogo).
+      if ((!known && remote === undefined) || !this.protocol(provider, id) || !capability.streaming || !capability.tools
         || !entry.contextWindow || !entry.maxOutputTokens) reason = "Suporte pendente: protocolo, limites ou capacidades não confirmados.";
       else {
         try { resolveModelCapabilities(entry); } catch { reason = "Suporte pendente: limites do modelo inconsistentes."; }
       }
       if (provider === "openai" && remote && !remote.supportedReasoningEfforts?.length) reason = "Suporte pendente: esforços de raciocínio incompatíveis.";
       if (removed) reason = "Modelo ausente do último catálogo recebido.";
+      // Modelo já bloqueado + conta desconectada: a ação correta é reconectar,
+      // não "atualizar catálogo". Seleção continua baseada em capability —
+      // `resolve()` é usado para admissão de config e deve tolerar a conta
+      // ainda não conectada.
+      if (reason && state.connected === false) reason = "Conecte a conta do provedor para usar este modelo.";
       return {
         ...entry, selectable: !reason, availability: removed ? "removed" : remote ? "listed" : "unverified",
         ...(remote?.serviceTiers ? { serviceTiers: remote.serviceTiers } : {}),
@@ -200,6 +226,7 @@ export class ModelCatalogService {
     return structuredClone({
       provider, state: saved ? fresh ? saved.models.length ? "fresh" : "empty" : "stale" : "unavailable",
       source: saved ? state.source : "local", access: provider === "opencode-go" ? "public" : "connection",
+      ...(state.connected !== undefined ? { connected: state.connected } : {}),
       updatedAt: saved?.updatedAt ?? null, ...(state.error ? { error: state.error } : {}), models,
     });
   }
@@ -250,11 +277,11 @@ export class ModelCatalogService {
   }
 
   available(): ModelCatalogEntry[] {
-    return [...CATALOG_PROVIDERS.flatMap(p => this.peek(p).models.filter(m => m.selectable).map(model => {
+    return CATALOG_PROVIDERS.flatMap(p => this.peek(p).models.filter(m => m.selectable).map(model => {
       const { selectable: _selectable, availability: _availability, reason: _reason, aliases: _aliases,
         supportedReasoningEfforts: _efforts, defaultReasoningEffort: _defaultEffort, ...entry } = model;
       return entry;
-    })), ...this.local("openai-compat")];
+    }));
   }
 
   find(model: string, provider?: string): ModelCatalogEntry | undefined {
@@ -263,7 +290,16 @@ export class ModelCatalogService {
 
   resolve(provider: string, model: string, effort?: ReasoningEffort, serviceTier?: ServiceTier): ModelResolution {
     if (!isCatalogProvider(provider)) throw new Error("Provedor fora do catálogo gerenciado.");
-    const entry = this.peek(provider).models.find(m => m.id === model);
+    const state = this.states.get(provider)!;
+    let entry = this.peek(provider).models.find(m => m.id === model);
+    if (entry === undefined && provider === "openai-compat" && state.saved === undefined) {
+      // Endpoint nunca consultado: um id de modelo custom usa os limites
+      // conservadores da entrada genérica (comportamento anterior à
+      // descoberta). Com catálogo descoberto, o modelo precisa constar na
+      // lista do endpoint.
+      const generic = this.local("openai-compat").find(m => m.id === "openai-compatible");
+      if (generic) entry = { ...generic, id: model, displayName: model, selectable: true, availability: "unverified", aliases: [] };
+    }
     if (!entry?.selectable) throw new Error(entry?.reason ?? "Modelo não validado. Atualize o catálogo nas configurações.");
     if (serviceTier === "priority" && (provider !== "openai" || !entry.serviceTiers?.includes("priority"))) {
       throw new Error("Fast não confirmado para este modelo. Atualize o catálogo ou selecione Padrão.");
@@ -298,13 +334,7 @@ export class ModelCatalogService {
 
   private persist(provider: CatalogProvider, saved: SavedCatalog): void {
     if (!this.options.directory) return;
-    mkdirSync(this.options.directory, { recursive: true });
-    const target = join(this.options.directory, `${provider}.json`);
-    const temporary = `${target}.${randomUUID()}.tmp`;
-    try {
-      writeFileSync(temporary, JSON.stringify(saved), { mode: 0o600, flag: "wx" });
-      renameSync(temporary, target);
-    } finally { rmSync(temporary, { force: true }); }
+    writeFileAtomicSync(join(this.options.directory, `${provider}.json`), JSON.stringify(saved));
   }
 }
 

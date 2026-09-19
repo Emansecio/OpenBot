@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AgentHomeStore } from "../src/execution/home.js";
 import { HomeWorkspaceBackend } from "../src/execution/home-backend.js";
 import { detectDrift, readUsageBaseline, writeUsageBaseline } from "../src/execution/home-drift.js";
+import { LocalFileExecutor } from "../src/execution/files.js";
 import { WorkspaceQuota, WorkspaceQuotaError } from "../src/execution/quota.js";
 import { WorkspaceSandbox } from "../src/execution/workspace.js";
 
@@ -24,6 +25,115 @@ const sandboxFor = async (root: string): Promise<WorkspaceSandbox> =>
   WorkspaceSandbox.create(root, { allowAncestorLinks: true });
 
 describe("scoped workspace quota (melhoria 6)", () => {
+  it("aplica a cota no destino de mkdir/copy e rebalanceia move entre escopos", async () => {
+    const root = await tempDir("openbot-quota-operations-");
+    await mkdir(join(root, "Downloads"), { recursive: true });
+    await mkdir(join(root, "Projects"), { recursive: true });
+    await writeFile(join(root, "source.txt"), "123456");
+    const workspace = await sandboxFor(root);
+    const quota = new WorkspaceQuota(workspace, {
+      maxBytes: 1024,
+      maxFiles: 100,
+      maxEntries: 100,
+      scopes: {
+        downloads: { maxBytes: 5, maxFiles: 10, maxEntries: 10 },
+        projects: { maxBytes: 100, maxFiles: 10, maxEntries: 10 },
+      },
+    });
+    const executor = LocalFileExecutor.fromWorkspace(workspace, quota);
+
+    await expect(executor.execute({ operation: "file.copy", source: "source.txt", destination: "Downloads/copy.txt" }))
+      .resolves.toMatchObject({ ok: false, operation: "file.copy", code: "quota_exceeded" });
+    await expect(executor.execute({ operation: "file.move", source: "source.txt", destination: "Downloads/moved.txt" }))
+      .resolves.toMatchObject({ ok: false, operation: "file.move", code: "quota_exceeded" });
+    await expect(executor.execute({ operation: "file.mkdir", path: "Downloads/one" }))
+      .resolves.toMatchObject({ ok: true, operation: "file.mkdir" });
+
+    await writeFile(join(root, "Projects", "source.txt"), "123456");
+    const balancedQuota = new WorkspaceQuota(workspace, {
+      maxBytes: 1024,
+      maxFiles: 100,
+      maxEntries: 100,
+      scopes: {
+        downloads: { maxBytes: 6, maxFiles: 10, maxEntries: 10 },
+        projects: { maxBytes: 100, maxFiles: 10, maxEntries: 10 },
+      },
+    });
+    const balancedExecutor = LocalFileExecutor.fromWorkspace(workspace, balancedQuota);
+    await expect(balancedExecutor.execute({ operation: "file.move", source: "Projects/source.txt", destination: "Downloads/accepted.txt" }))
+      .resolves.toEqual({ ok: true, operation: "file.move" });
+    await expect(balancedExecutor.execute({ operation: "file.write", path: "Downloads/extra.txt", content: "x", encoding: "utf8" }))
+      .resolves.toMatchObject({ ok: false, operation: "file.write", code: "quota_exceeded" });
+    await expect(readFile(join(root, "Projects", "source.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(root, "Downloads", "accepted.txt"), "utf8")).resolves.toBe("123456");
+    await expect(balancedQuota.usage()).resolves.toMatchObject({ bytes: 12, files: 2 });
+  });
+
+  it("aplica a cota de destino em cópia de uma montagem compartilhada", async () => {
+    const profile = await tempDir("openbot-quota-shared-profile-");
+    await mkdir(join(profile, "Documents"), { recursive: true });
+    await writeFile(join(profile, "Documents", "source.txt"), "123456");
+    const homeRoot = await tempDir("openbot-quota-shared-home-");
+    await mkdir(join(homeRoot, "Downloads"), { recursive: true });
+    const backend = await HomeWorkspaceBackend.create(homeRoot, {
+      userProfile: profile,
+      quota: {
+        maxBytes: 1024,
+        maxFiles: 100,
+        maxEntries: 100,
+        scopes: { downloads: { maxBytes: 5, maxFiles: 10, maxEntries: 10 } },
+      },
+    });
+
+    await expect(backend.execute({
+      operation: "file.copy",
+      source: "shared://Documents/source.txt",
+      destination: "Downloads/copy.txt",
+    })).rejects.toBeInstanceOf(WorkspaceQuotaError);
+    await expect(readFile(join(profile, "Documents", "source.txt"), "utf8")).resolves.toBe("123456");
+    await expect(readFile(join(homeRoot, "Downloads", "copy.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("serializa transferências concorrentes para não ultrapassar o escopo", async () => {
+    const root = await tempDir("openbot-quota-transfer-race-");
+    await mkdir(join(root, "Downloads"), { recursive: true });
+    await mkdir(join(root, "Projects"), { recursive: true });
+    await writeFile(join(root, "Projects", "one.txt"), "1234");
+    await writeFile(join(root, "Projects", "two.txt"), "5678");
+    const workspace = await sandboxFor(root);
+    const quota = new WorkspaceQuota(workspace, {
+      maxBytes: 1024,
+      maxFiles: 100,
+      maxEntries: 100,
+      scopes: { downloads: { maxBytes: 5, maxFiles: 10, maxEntries: 10 }, projects: { maxBytes: 100, maxFiles: 10, maxEntries: 10 } },
+    });
+    const executor = LocalFileExecutor.fromWorkspace(workspace, quota);
+    const results = await Promise.all([
+      executor.execute({ operation: "file.move", source: "Projects/one.txt", destination: "Downloads/one.txt" }),
+      executor.execute({ operation: "file.move", source: "Projects/two.txt", destination: "Downloads/two.txt" }),
+    ]);
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(results.filter((result) => !result.ok && result.code === "quota_exceeded")).toHaveLength(1);
+    await expect(quota.usage()).resolves.toMatchObject({ bytes: 8, files: 2 });
+  });
+
+  it("conta a estrutura da lixeira no escopo .openbot antes de mover", async () => {
+    const root = await tempDir("openbot-quota-trash-scope-");
+    await writeFile(join(root, "source.txt"), "x");
+    const workspace = await sandboxFor(root);
+    const quota = new WorkspaceQuota(workspace, {
+      maxBytes: 1024,
+      maxFiles: 100,
+      maxEntries: 100,
+      scopes: { ".openbot": { maxBytes: 1024, maxFiles: 100, maxEntries: 3 } },
+    });
+    const executor = LocalFileExecutor.fromWorkspace(workspace, quota);
+
+    await expect(executor.execute({ operation: "file.trash", path: "source.txt" }))
+      .resolves.toMatchObject({ ok: false, operation: "file.trash", code: "quota_exceeded" });
+    await expect(readFile(join(root, "source.txt"), "utf8")).resolves.toBe("x");
+  });
+
   it("enforces the Downloads sub-quota independently of the global limit", async () => {
     const root = await tempDir("openbot-quota-scope-");
     await mkdir(join(root, "Downloads"), { recursive: true });

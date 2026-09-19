@@ -1,15 +1,21 @@
+import { randomUUID } from "node:crypto";
 import type { ModelCatalogEntry, ModelTokenizerStrategy, ProviderKind } from "../shared/contracts.js";
-import type { ProviderChatMessage } from "../providers/router.js";
+import type { ProviderChatMessage, ProviderUserContentPart } from "../providers/router.js";
 import { MODEL_CATALOG } from "../config/models.js";
 import { providerRequestBodyBytes } from "../providers/request-bodies.js";
 
-/** Safe finite defaults for a model whose tokenizer/capabilities are unknown. */
+/**
+ * Safe finite defaults for a model whose tokenizer/capabilities are unknown.
+ * The old 16k/2k/256KiB floor rejected otherwise valid multi-step prompts
+ * before the provider could answer. This remains bounded, but is no longer a
+ * special-case miniature model window.
+ */
 export const DEFAULT_UNKNOWN_MODEL_CAPABILITIES: ModelCapabilities = Object.freeze({
-  contextWindow: 16_384,
-  maxOutputTokens: 2_048,
-  maxRequestBytes: 256 * 1024,
+  contextWindow: 32_000,
+  maxOutputTokens: 4_096,
+  maxRequestBytes: 512 * 1024,
   tokenizerStrategy: "estimated",
-  safetyMargin: 0.2,
+  safetyMargin: 0.1,
 });
 
 export interface ModelCapabilities {
@@ -151,6 +157,9 @@ export interface ProviderRoundPreparation {
   request: import("../providers/router.js").ProviderChatRequest;
   budget: ModelContextBudget;
   telemetry: {
+    requestId: string;
+    operationId?: string;
+    purpose?: import("../providers/router.js").ProviderChatRequest["purpose"];
     estimatedInputTokens: number;
     serializedRequestBytes: number;
     retainedTurns: number;
@@ -262,7 +271,7 @@ export function prepareProviderRound(
     requestedOutputTokens: options.requestedOutputTokens ?? request.maxTokens ?? options.capabilities.maxOutputTokens,
   });
   const tokenFitted = selectCompleteMessageGroups(request.messages, tokenizer, budget.availableContentTokens);
-  const tokenTruncated = JSON.stringify(tokenFitted) !== JSON.stringify(request.messages);
+  const tokenTruncated = !providerMessagesIdentical(tokenFitted, request.messages);
   const requestWithOutput = {
     ...request,
     messages: [],
@@ -278,23 +287,24 @@ export function prepareProviderRound(
   let byteBudget = Math.max(0, options.maxBytes - envelopeEmptyBytes + 2);
   let fitted = fitProviderMessagesToByteBudget(tokenFitted, byteBudget);
   let finalRequest = { ...requestWithOutput, messages: fitted };
-  for (let attempt = 0; attempt < 32 && measure(finalRequest) > options.maxBytes && byteBudget > 0; attempt += 1) {
-    const over = measure(finalRequest) - options.maxBytes;
-    byteBudget = Math.max(0, byteBudget - Math.max(1, over));
+  let finalBodyBytes = measure(finalRequest);
+  for (let attempt = 0; attempt < 32 && finalBodyBytes > options.maxBytes && byteBudget > 0; attempt += 1) {
+    byteBudget = Math.max(0, byteBudget - Math.max(1, finalBodyBytes - options.maxBytes));
     fitted = fitProviderMessagesToByteBudget(tokenFitted, byteBudget);
     finalRequest = { ...requestWithOutput, messages: fitted };
+    finalBodyBytes = measure(finalRequest);
   }
+  const messageTokens = classifyProviderMessageTokens(fitted, tokenizer);
+  finalRequest = { ...finalRequest, requestId: randomUUID() };
   const finalBudget: ModelContextBudget = {
     ...budget,
     used: {
       ...budget.used,
-      ...classifyProviderMessageTokens(fitted, tokenizer),
+      ...messageTokens,
     },
-    truncated: JSON.stringify(fitted) !== JSON.stringify(request.messages) || budget.truncated,
+    truncated: !providerMessagesIdentical(fitted, request.messages) || budget.truncated,
   };
-  const finalBodyBytes = measure(finalRequest);
-  const wireTruncated = JSON.stringify(fitted) !== JSON.stringify(tokenFitted);
-  const messageTokens = classifyProviderMessageTokens(fitted, tokenizer);
+  const wireTruncated = !providerMessagesIdentical(fitted, tokenFitted);
   const originalTurns = request.messages.filter((message) => message.role === "user").length;
   const retainedTurns = fitted.filter((message) => message.role === "user").length;
   const exhausted = envelopeEmptyBytes > options.maxBytes || finalBodyBytes > options.maxBytes || budget.outputReserveTokens <= 0 || (request.messages.length > 0 && fitted.length === 0 && byteBudget > 0);
@@ -302,6 +312,9 @@ export function prepareProviderRound(
     request: finalRequest,
     budget: finalBudget,
     telemetry: {
+      requestId: finalRequest.requestId!,
+      operationId: request.operationId,
+      purpose: request.purpose,
       estimatedInputTokens: budget.used.system + budget.used.tools + messageTokens.transcript + messageTokens.memory + messageTokens.attachments,
       serializedRequestBytes: finalBodyBytes,
       retainedTurns,
@@ -326,9 +339,7 @@ function providerMessageBytes(message: ProviderChatMessage): number {
 function shrinkProviderMessage(message: ProviderChatMessage, maxBytes: number): ProviderChatMessage | undefined {
   if (providerMessageBytes(message) <= maxBytes) return message;
   if (message.role === "user" && Array.isArray(message.content)) {
-    let parts = message.content.map((part) => part.type === "image_url"
-      ? { type: "text" as const, text: "[image omitted by context byte budget]" }
-      : part);
+    let parts = replaceOversizedImages(message, BYTE_IMAGE_MARKER).content as ProviderUserContentPart[];
     let candidate: ProviderChatMessage = { ...message, content: parts };
     while (providerMessageBytes(candidate) > maxBytes && parts.length > 1) {
       parts = parts.slice(0, -1);
@@ -434,13 +445,69 @@ export function fitProviderMessagesToByteBudget(messages: readonly ProviderChatM
   return Buffer.byteLength(JSON.stringify(result), "utf8") <= maxBytes ? result : [];
 }
 
+interface CachedMessageTokenCount {
+  /** Identity-pinned inputs — the entry is only valid while all three match. */
+  content: ProviderChatMessage["content"];
+  role: ProviderChatMessage["role"];
+  toolCalls: Extract<ProviderChatMessage, { role: "assistant" }>["toolCalls"];
+  joinedContent: string;
+  contentTokens: number;
+  callTokens: number;
+}
+
+/**
+ * Fitting helpers re-tokenize the same message objects across passes
+ * (select → classify → per-round recount).  Message objects flow unchanged
+ * through slices/filters, so a WeakMap keyed on the object memoizes every
+ * repeated count; inner key is the tokenizer (by strategy for the built-in
+ * pure strategies, by object identity for externally supplied ones).
+ */
+const MESSAGE_TOKEN_CACHE = new WeakMap<ProviderChatMessage, Map<unknown, CachedMessageTokenCount>>();
+
+function messageTokenCount(message: ProviderChatMessage, tokenizer: ContextTokenizer): CachedMessageTokenCount {
+  const key: unknown = tokenizer.strategy === "provider" ? tokenizer : tokenizer.strategy;
+  let slots = MESSAGE_TOKEN_CACHE.get(message);
+  const toolCalls = message.role === "assistant" ? message.toolCalls : undefined;
+  const hit = slots?.get(key);
+  if (hit !== undefined
+    && hit.content === message.content
+    && hit.role === message.role
+    && hit.toolCalls === toolCalls) {
+    return hit;
+  }
+  const joinedContent = typeof message.content === "string"
+    ? message.content
+    : message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join(" ");
+  const imageParts = typeof message.content === "string"
+    ? 0
+    : message.content.reduce((count, part) => count + (part.type === "image_url" ? 1 : 0), 0);
+  const entry: CachedMessageTokenCount = {
+    content: message.content,
+    role: message.role,
+    toolCalls,
+    joinedContent,
+    contentTokens: countTokens(tokenizer, joinedContent) + imageParts * IMAGE_PART_TOKEN_ESTIMATE,
+    callTokens: message.role === "assistant"
+      ? (message.toolCalls ?? []).reduce((sum, call) => sum + countTokens(tokenizer, `${call.id}${call.function.name}${call.function.arguments}`), 0)
+      : 0,
+  };
+  if (slots === undefined) {
+    slots = new Map();
+    MESSAGE_TOKEN_CACHE.set(message, slots);
+  }
+  slots.set(key, entry);
+  return entry;
+}
+
+/** Fitting helpers preserve element identity when nothing was dropped or transformed. */
+export function providerMessagesIdentical(a: readonly ProviderChatMessage[], b: readonly ProviderChatMessage[]): boolean {
+  return a.length === b.length && a.every((message, index) => message === b[index]);
+}
+
 export function countProviderMessageTokens(messages: readonly ProviderChatMessage[], tokenizer: ContextTokenizer): number {
   return messages.reduce((total, message) => {
-    const content = typeof message.content === "string"
-      ? message.content
-      : message.content.map((part) => part.type === "text" ? part.text : part.image_url.url).join(" ");
-    const calls = message.role === "assistant" ? (message.toolCalls ?? []).reduce((sum, call) => sum + countTokens(tokenizer, `${call.id}${call.function.name}${call.function.arguments}`), 0) : 0;
-    return total + countTokens(tokenizer, content) + calls + 1;
+    const counted = messageTokenCount(message, tokenizer);
+    return total + counted.contentTokens + counted.callTokens + 1;
   }, 0);
 }
 
@@ -449,12 +516,10 @@ export function classifyProviderMessageTokens(
   tokenizer: ContextTokenizer,
 ): { transcript: number; memory: number; attachments: number } {
   return messages.reduce((used, message) => {
-    const content = typeof message.content === "string"
-      ? message.content
-      : message.content.map((part) => part.type === "text" ? part.text : part.image_url.url).join(" ");
-    const tokens = countTokens(tokenizer, content) + 1;
-    if (content.includes("OPENBOT_UNTRUSTED_MEMORY_CONTEXT_BEGIN")) used.memory += tokens;
-    else if (content.includes("OPENBOT_UNTRUSTED_ATTACHMENT_BEGIN")) used.attachments += tokens;
+    const counted = messageTokenCount(message, tokenizer);
+    const tokens = counted.contentTokens + counted.callTokens + 1;
+    if (counted.joinedContent.includes("OPENBOT_UNTRUSTED_MEMORY_CONTEXT_BEGIN")) used.memory += tokens;
+    else if (counted.joinedContent.includes("OPENBOT_UNTRUSTED_ATTACHMENT_BEGIN")) used.attachments += tokens;
     else used.transcript += tokens;
     return used;
   }, { transcript: 0, memory: 0, attachments: 0 });
@@ -466,6 +531,15 @@ function isToolResult(message: ProviderChatMessage): message is Extract<Provider
 
 const TOKEN_IMAGE_MARKER = "[image omitted by context token budget]";
 const BYTE_IMAGE_MARKER = "[image omitted by context byte budget]";
+
+/**
+ * Flat per-image token estimate. Adapters expose no visual token estimator,
+ * so the token budget applies this explicit conservative cost per image part
+ * (~1MP high-detail across current providers) instead of tokenizing base64
+ * transport bytes as prose. Serialized transport bytes are still bounded by
+ * the byte-budget pass, which marker-replaces oversized images.
+ */
+const IMAGE_PART_TOKEN_ESTIMATE = 1_500;
 
 function isMultimodalUser(message: ProviderChatMessage): message is Extract<ProviderChatMessage, { role: "user" }> {
   return message.role === "user" && Array.isArray(message.content);
@@ -487,9 +561,13 @@ function hasCompleteToolExchange(group: readonly ProviderChatMessage[]): boolean
 
 function replaceOversizedImages(message: Extract<ProviderChatMessage, { role: "user" }>, marker: string): ProviderChatMessage {
   if (!Array.isArray(message.content)) return message;
+  const imageTotal = message.content.reduce((count, part) => count + (part.type === "image_url" ? 1 : 0), 0);
+  let imageIndex = 0;
   return {
     ...message,
-    content: message.content.map((part) => part.type === "image_url" ? { type: "text" as const, text: marker } : part),
+    content: message.content.map((part) => part.type === "image_url"
+      ? { type: "text" as const, text: `${marker} (image ${imageIndex += 1} of ${imageTotal})` }
+      : part),
   };
 }
 

@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $scriptDir
 $nodePath = (Get-Command node -ErrorAction Stop).Source
-$electronMain = Join-Path $repoRoot 'client\extracted\dist\electron-main\main.cjs'
+$electronMain = Join-Path $repoRoot 'scripts\openbot-electron.cjs'
 $fixturePath = Join-Path $repoRoot 'test\e2e-desktop\fixture.mjs'
 $checkerPath = Join-Path $repoRoot 'test\e2e-desktop\cdp-check.mjs'
 $distMain = Join-Path $repoRoot 'dist\main.js'
@@ -458,7 +458,7 @@ try {
 } finally {
     try {
         if ($null -ne $electronProcess) {
-            Stop-OwnTree -ProcessId $electronProcess.Id -ExpectedCommandPart 'main.cjs' -ExpectedRoot $userData -InitialSnapshot $initialProcessSnapshot
+            Stop-OwnTree -ProcessId $electronProcess.Id -ExpectedCommandPart $electronMain -ExpectedRoot $userData -InitialSnapshot $initialProcessSnapshot
         }
     } catch {
         $processesAbsent = $false

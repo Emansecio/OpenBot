@@ -368,16 +368,24 @@ export class WslProvisioner {
           rollbackError = rollbackFailure;
         }
       }
-      await rm(backupArchive, { force: true }).catch(() => undefined);
-      await rm(oldCurrentArchive, { force: true }).catch(() => undefined);
-      await rm(oldPreviousArchive, { force: true }).catch(() => undefined);
       if (candidateCleanupError !== undefined || rollbackError !== undefined) {
         const failures = [error, candidateCleanupError, rollbackError].filter((failure): failure is unknown => failure !== undefined);
+        const recoveryArtifacts = [
+          ...(backupCreated ? [backupArchive] : []),
+          ...(currentArchiveSnapshot ? [oldCurrentArchive] : []),
+          ...(previousArchiveSnapshot ? [oldPreviousArchive] : []),
+        ];
+        const recoveryHint = recoveryArtifacts.length === 0
+          ? "; no recovery artifacts were created"
+          : `; recovery artifacts preserved at: ${recoveryArtifacts.join(", ")}`;
         throw new RuntimeInstallationError(
-          "runtime package installation and rollback failed",
+          `runtime package installation and rollback failed${recoveryHint}`,
           new AggregateError(failures, "runtime package cleanup or rollback failed"),
         );
       }
+      await rm(backupArchive, { force: true }).catch(() => undefined);
+      await rm(oldCurrentArchive, { force: true }).catch(() => undefined);
+      await rm(oldPreviousArchive, { force: true }).catch(() => undefined);
       if (error instanceof RuntimeInstallationError) throw error;
       throw new RuntimeInstallationError("managed runtime package installation failed", error);
     }

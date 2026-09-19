@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 
-export const OPENBOT_SCHEMA_VERSION = 16;
+export const OPENBOT_SCHEMA_VERSION = 19;
 
 const CONVERSATION_BOUND_TABLES = [
   "transcript_entries",
@@ -213,6 +213,7 @@ function createAsyncTaskSchema(db: Database.Database): void {
       lease_owner TEXT,
       lease_expires_at_ms INTEGER,
       lease_version INTEGER,
+      unsafe_effect_started INTEGER NOT NULL DEFAULT 0 CHECK (unsafe_effect_started IN (0, 1)),
       error_json TEXT,
       FOREIGN KEY (task_id) REFERENCES async_tasks(task_id) ON DELETE CASCADE,
       UNIQUE(task_id, attempt),
@@ -620,6 +621,12 @@ function createMemorySchema(db: Database.Database): void {
       content,
       sequence_id UNINDEXED
     );
+    CREATE TABLE IF NOT EXISTS history_fts_source_map (
+      fts_rowid INTEGER PRIMARY KEY,
+      source_id TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_history_fts_source_map_source
+      ON history_fts_source_map(source_id);
 
     CREATE TRIGGER IF NOT EXISTS agent_memories_fts_ai
     AFTER INSERT ON agent_memories
@@ -648,70 +655,272 @@ function createMemorySchema(db: Database.Database): void {
       DELETE FROM memory_fts WHERE memory_id = OLD.id;
     END;
 
-    CREATE TRIGGER IF NOT EXISTS transcript_entries_history_fts_ai
+    DROP TRIGGER IF EXISTS transcript_entries_history_fts_ai;
+    DROP TRIGGER IF EXISTS transcript_entries_history_fts_au;
+    DROP TRIGGER IF EXISTS transcript_entries_history_fts_ad;
+    DROP TRIGGER IF EXISTS conversation_summaries_history_fts_ai;
+    DROP TRIGGER IF EXISTS conversation_summaries_history_fts_au;
+    DROP TRIGGER IF EXISTS conversation_summaries_history_fts_ad;
+
+    CREATE TRIGGER transcript_entries_history_fts_ai
     AFTER INSERT ON transcript_entries
     WHEN NEW.kind = 'message' AND length(trim(COALESCE(json_extract(NEW.payload_json, '$.content'), ''))) > 0
       AND NOT EXISTS (
         SELECT 1 FROM agent_conversations
         WHERE id = NEW.conversation_id AND agent_id = NEW.agent_id AND temporary = 1
-      )
+    )
     BEGIN
-      INSERT INTO history_fts(source_id, agent_id, conversation_id, source_type, content, sequence_id)
-      VALUES ('entry:' || NEW.sequence_id, NEW.agent_id, NEW.conversation_id, 'message',
-        json_extract(NEW.payload_json, '$.content'), NEW.sequence_id);
-    END;
-    CREATE TRIGGER IF NOT EXISTS transcript_entries_history_fts_au
-    AFTER UPDATE ON transcript_entries
-    BEGIN
-      DELETE FROM history_fts WHERE source_id = 'entry:' || OLD.sequence_id;
-      INSERT INTO history_fts(source_id, agent_id, conversation_id, source_type, content, sequence_id)
-      SELECT 'entry:' || NEW.sequence_id, NEW.agent_id, NEW.conversation_id, 'message',
+      INSERT INTO history_fts_source_map(source_id)
+      VALUES ('entry:' || NEW.sequence_id);
+      INSERT INTO history_fts(rowid, source_id, agent_id, conversation_id, source_type, content, sequence_id)
+      SELECT fts_rowid, 'entry:' || NEW.sequence_id, NEW.agent_id, NEW.conversation_id, 'message',
         json_extract(NEW.payload_json, '$.content'), NEW.sequence_id
+      FROM history_fts_source_map
+      WHERE source_id = 'entry:' || NEW.sequence_id;
+    END;
+    CREATE TRIGGER transcript_entries_history_fts_au
+    AFTER UPDATE ON transcript_entries
+    WHEN OLD.sequence_id IS NOT NEW.sequence_id
+      OR OLD.agent_id IS NOT NEW.agent_id
+      OR OLD.conversation_id IS NOT NEW.conversation_id
+      OR OLD.kind IS NOT NEW.kind
+      OR json_extract(OLD.payload_json, '$.content') IS NOT json_extract(NEW.payload_json, '$.content')
+    BEGIN
+      DELETE FROM history_fts
+      WHERE rowid = (
+        SELECT fts_rowid FROM history_fts_source_map
+        WHERE source_id = 'entry:' || OLD.sequence_id
+      );
+      DELETE FROM history_fts_source_map WHERE source_id = 'entry:' || OLD.sequence_id;
+      INSERT INTO history_fts_source_map(source_id)
+      SELECT 'entry:' || NEW.sequence_id
       WHERE NEW.kind = 'message' AND length(trim(COALESCE(json_extract(NEW.payload_json, '$.content'), ''))) > 0
         AND NOT EXISTS (
           SELECT 1 FROM agent_conversations
           WHERE id = NEW.conversation_id AND agent_id = NEW.agent_id AND temporary = 1
         );
+      INSERT INTO history_fts(rowid, source_id, agent_id, conversation_id, source_type, content, sequence_id)
+      SELECT fts_rowid, 'entry:' || NEW.sequence_id, NEW.agent_id, NEW.conversation_id, 'message',
+        json_extract(NEW.payload_json, '$.content'), NEW.sequence_id
+      FROM history_fts_source_map
+      WHERE source_id = 'entry:' || NEW.sequence_id;
     END;
-    CREATE TRIGGER IF NOT EXISTS transcript_entries_history_fts_ad
+    CREATE TRIGGER transcript_entries_history_fts_ad
     AFTER DELETE ON transcript_entries
     BEGIN
-      DELETE FROM history_fts WHERE source_id = 'entry:' || OLD.sequence_id;
+      DELETE FROM history_fts
+      WHERE rowid = (
+        SELECT fts_rowid FROM history_fts_source_map
+        WHERE source_id = 'entry:' || OLD.sequence_id
+      );
+      DELETE FROM history_fts_source_map WHERE source_id = 'entry:' || OLD.sequence_id;
     END;
 
   `);
   createConversationSummaryHistoryTriggers(db);
 }
 
+/** Tracks writes that can change the forgotten-source provenance walk. The
+ * marker is deliberately narrower than SQLite's connection-wide change
+ * counter, while the data_version component in the reader still covers
+ * writers using another connection. */
+function createMemoryProvenanceVersionSchema(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_provenance_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0)
+    );
+    INSERT OR IGNORE INTO memory_provenance_state(id, version) VALUES (1, 0);
+
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_transcript_ai
+    AFTER INSERT ON transcript_entries
+    BEGIN
+      UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_transcript_ad
+    AFTER DELETE ON transcript_entries
+    BEGIN
+      UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_transcript_au
+    AFTER UPDATE ON transcript_entries
+    WHEN OLD.sequence_id IS NOT NEW.sequence_id
+      OR OLD.agent_id IS NOT NEW.agent_id
+      OR OLD.conversation_id IS NOT NEW.conversation_id
+      OR OLD.entry_id IS NOT NEW.entry_id
+      OR OLD.kind IS NOT NEW.kind
+      OR json_extract(OLD.payload_json, '$.role') IS NOT json_extract(NEW.payload_json, '$.role')
+      OR json_extract(OLD.payload_json, '$.memoryContextSources') IS NOT json_extract(NEW.payload_json, '$.memoryContextSources')
+    BEGIN
+      UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_memory_ai
+    AFTER INSERT ON agent_memories
+    BEGIN
+      UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_memory_ad
+    AFTER DELETE ON agent_memories
+    BEGIN
+      UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_memory_au
+    AFTER UPDATE ON agent_memories
+    WHEN OLD.id IS NOT NEW.id
+      OR OLD.agent_id IS NOT NEW.agent_id
+      OR OLD.status IS NOT NEW.status
+      OR OLD.source_conversation_id IS NOT NEW.source_conversation_id
+      OR OLD.source_entry_ids_json IS NOT NEW.source_entry_ids_json
+      OR OLD.superseded_by IS NOT NEW.superseded_by
+      OR (OLD.status = 'forgotten' AND OLD.updated_at_ms IS NOT NEW.updated_at_ms)
+      OR (NEW.status = 'forgotten' AND OLD.updated_at_ms IS NOT NEW.updated_at_ms)
+    BEGIN
+      UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_revision_ai
+    AFTER INSERT ON memory_revisions
+    WHEN EXISTS (
+      SELECT 1 FROM agent_memories AS memory
+      WHERE memory.id = NEW.memory_id AND memory.status = 'forgotten'
+    )
+    BEGIN
+      UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_revision_ad
+    AFTER DELETE ON memory_revisions
+    WHEN EXISTS (
+      SELECT 1 FROM agent_memories AS memory
+      WHERE memory.id = OLD.memory_id AND memory.status = 'forgotten'
+    )
+    BEGIN
+      UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_revision_au
+    AFTER UPDATE ON memory_revisions
+    WHEN EXISTS (
+      SELECT 1 FROM agent_memories AS memory
+      WHERE memory.id IN (OLD.memory_id, NEW.memory_id) AND memory.status = 'forgotten'
+    ) AND (
+      OLD.memory_id IS NOT NEW.memory_id
+      OR OLD.revision IS NOT NEW.revision
+      OR OLD.snapshot_json IS NOT NEW.snapshot_json
+      OR OLD.reason IS NOT NEW.reason
+      OR OLD.created_at_ms IS NOT NEW.created_at_ms
+    )
+    BEGIN
+      UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_conversation_ai
+    AFTER INSERT ON agent_conversations
+    BEGIN
+      UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_conversation_ad
+    AFTER DELETE ON agent_conversations
+    BEGIN
+      UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_conversation_au
+    AFTER UPDATE ON agent_conversations
+    WHEN OLD.id IS NOT NEW.id OR OLD.agent_id IS NOT NEW.agent_id
+    BEGIN
+      UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
+    END;
+  `);
+}
+
 function createConversationSummaryHistoryTriggers(db: Database.Database): void {
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS conversation_summaries_history_fts_ai
+    DROP TRIGGER IF EXISTS conversation_summaries_history_fts_ai;
+    DROP TRIGGER IF EXISTS conversation_summaries_history_fts_au;
+    DROP TRIGGER IF EXISTS conversation_summaries_history_fts_ad;
+
+    CREATE TRIGGER conversation_summaries_history_fts_ai
     AFTER INSERT ON conversation_summaries
     WHEN NOT EXISTS (
       SELECT 1 FROM agent_conversations
       WHERE id = NEW.conversation_id AND agent_id = NEW.agent_id AND temporary = 1
     )
     BEGIN
-      INSERT INTO history_fts(source_id, agent_id, conversation_id, source_type, content, sequence_id)
-      VALUES ('summary:' || NEW.conversation_id, NEW.agent_id, NEW.conversation_id, 'summary', NEW.rendered_text, NEW.through_sequence_id);
+      INSERT INTO history_fts_source_map(source_id)
+      VALUES ('summary:' || NEW.conversation_id);
+      INSERT INTO history_fts(rowid, source_id, agent_id, conversation_id, source_type, content, sequence_id)
+      SELECT fts_rowid, 'summary:' || NEW.conversation_id, NEW.agent_id, NEW.conversation_id, 'summary', NEW.rendered_text, NEW.through_sequence_id
+      FROM history_fts_source_map
+      WHERE source_id = 'summary:' || NEW.conversation_id;
     END;
-    CREATE TRIGGER IF NOT EXISTS conversation_summaries_history_fts_au
+    CREATE TRIGGER conversation_summaries_history_fts_au
     AFTER UPDATE ON conversation_summaries
     BEGIN
-      DELETE FROM history_fts WHERE source_id = 'summary:' || OLD.conversation_id;
-      INSERT INTO history_fts(source_id, agent_id, conversation_id, source_type, content, sequence_id)
-      SELECT 'summary:' || NEW.conversation_id, NEW.agent_id, NEW.conversation_id, 'summary', NEW.rendered_text, NEW.through_sequence_id
+      DELETE FROM history_fts
+      WHERE rowid = (
+        SELECT fts_rowid FROM history_fts_source_map
+        WHERE source_id = 'summary:' || OLD.conversation_id
+      );
+      DELETE FROM history_fts_source_map WHERE source_id = 'summary:' || OLD.conversation_id;
+      INSERT INTO history_fts_source_map(source_id)
+      SELECT 'summary:' || NEW.conversation_id
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_conversations
         WHERE id = NEW.conversation_id AND agent_id = NEW.agent_id AND temporary = 1
       );
+      INSERT INTO history_fts(rowid, source_id, agent_id, conversation_id, source_type, content, sequence_id)
+      SELECT fts_rowid, 'summary:' || NEW.conversation_id, NEW.agent_id, NEW.conversation_id, 'summary', NEW.rendered_text, NEW.through_sequence_id
+      FROM history_fts_source_map
+      WHERE source_id = 'summary:' || NEW.conversation_id;
     END;
-    CREATE TRIGGER IF NOT EXISTS conversation_summaries_history_fts_ad
+    CREATE TRIGGER conversation_summaries_history_fts_ad
     AFTER DELETE ON conversation_summaries
     BEGIN
-      DELETE FROM history_fts WHERE source_id = 'summary:' || OLD.conversation_id;
+      DELETE FROM history_fts
+      WHERE rowid = (
+        SELECT fts_rowid FROM history_fts_source_map
+        WHERE source_id = 'summary:' || OLD.conversation_id
+      );
+      DELETE FROM history_fts_source_map WHERE source_id = 'summary:' || OLD.conversation_id;
     END;
   `);
+}
+
+/**
+ * Backfills the real FTS rowids for databases created before the source map
+ * existed.  The mapping is the only identity used by mutation triggers; it
+ * must be one-to-one with the current virtual-table rows before any migrated
+ * write can run.
+ */
+function ensureHistoryFtsSourceMap(db: Database.Database): void {
+  const counts = db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM history_fts) AS fts_count,
+      (SELECT COUNT(*) FROM history_fts_source_map) AS map_count
+  `).get() as { fts_count: number; map_count: number };
+  if (counts.fts_count === counts.map_count) return;
+
+  const invalid = db.prepare(`
+    SELECT rowid
+    FROM history_fts
+    WHERE source_id IS NULL
+    LIMIT 1
+  `).get() as { rowid: number } | undefined;
+  if (invalid !== undefined) throw new Error("history_fts contém source_id nulo");
+
+  const duplicate = db.prepare(`
+    SELECT source_id
+    FROM history_fts
+    GROUP BY source_id
+    HAVING COUNT(*) > 1
+    LIMIT 1
+  `).get() as { source_id: string } | undefined;
+  if (duplicate !== undefined) throw new Error(`history_fts contém source_id duplicado: ${duplicate.source_id}`);
+
+  db.prepare("DELETE FROM history_fts_source_map").run();
+  db.prepare(`
+    INSERT INTO history_fts_source_map(fts_rowid, source_id)
+    SELECT rowid, source_id FROM history_fts ORDER BY rowid ASC
+  `).run();
 }
 
 export function rebuildOpenBotFts(db: Database.Database, now = Date.now()): void {
@@ -731,8 +940,15 @@ export function rebuildOpenBotFts(db: Database.Database, now = Date.now()): void
       content,
       sequence_id UNINDEXED
     );
+    CREATE TABLE IF NOT EXISTS history_fts_source_map (
+      fts_rowid INTEGER PRIMARY KEY,
+      source_id TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_history_fts_source_map_source
+      ON history_fts_source_map(source_id);
     DELETE FROM memory_fts;
     DELETE FROM history_fts;
+    DELETE FROM history_fts_source_map;
   `);
   db.prepare(`
     INSERT INTO memory_fts(memory_id, agent_id, canonical_key, text, value_text)
@@ -746,8 +962,8 @@ export function rebuildOpenBotFts(db: Database.Database, now = Date.now()): void
       )
   `).run(now, now, now);
   db.prepare(`
-    INSERT INTO history_fts(source_id, agent_id, conversation_id, source_type, content, sequence_id)
-    SELECT 'entry:' || t.sequence_id, t.agent_id, t.conversation_id, 'message', json_extract(t.payload_json, '$.content'), t.sequence_id
+    INSERT INTO history_fts_source_map(source_id)
+    SELECT 'entry:' || t.sequence_id
     FROM transcript_entries t
     WHERE t.kind = 'message' AND length(trim(COALESCE(json_extract(t.payload_json, '$.content'), ''))) > 0
       AND NOT EXISTS (
@@ -756,9 +972,30 @@ export function rebuildOpenBotFts(db: Database.Database, now = Date.now()): void
       )
   `).run();
   db.prepare(`
-    INSERT INTO history_fts(source_id, agent_id, conversation_id, source_type, content, sequence_id)
-    SELECT 'summary:' || s.conversation_id, s.agent_id, s.conversation_id, 'summary', s.rendered_text, s.through_sequence_id
+    INSERT INTO history_fts(rowid, source_id, agent_id, conversation_id, source_type, content, sequence_id)
+    SELECT map.fts_rowid, 'entry:' || t.sequence_id, t.agent_id, t.conversation_id, 'message', json_extract(t.payload_json, '$.content'), t.sequence_id
+    FROM transcript_entries t
+    JOIN history_fts_source_map AS map ON map.source_id = 'entry:' || t.sequence_id
+    WHERE t.kind = 'message' AND length(trim(COALESCE(json_extract(t.payload_json, '$.content'), ''))) > 0
+      AND NOT EXISTS (
+        SELECT 1 FROM agent_conversations c
+        WHERE c.id = t.conversation_id AND c.agent_id = t.agent_id AND c.temporary = 1
+      )
+  `).run();
+  db.prepare(`
+    INSERT INTO history_fts_source_map(source_id)
+    SELECT 'summary:' || s.conversation_id
     FROM conversation_summaries s
+    WHERE NOT EXISTS (
+      SELECT 1 FROM agent_conversations c
+      WHERE c.id = s.conversation_id AND c.agent_id = s.agent_id AND c.temporary = 1
+    )
+  `).run();
+  db.prepare(`
+    INSERT INTO history_fts(rowid, source_id, agent_id, conversation_id, source_type, content, sequence_id)
+    SELECT map.fts_rowid, 'summary:' || s.conversation_id, s.agent_id, s.conversation_id, 'summary', s.rendered_text, s.through_sequence_id
+    FROM conversation_summaries s
+    JOIN history_fts_source_map AS map ON map.source_id = 'summary:' || s.conversation_id
     WHERE NOT EXISTS (
       SELECT 1 FROM agent_conversations c
       WHERE c.id = s.conversation_id AND c.agent_id = s.agent_id AND c.temporary = 1
@@ -1020,13 +1257,27 @@ function migrateConversationSummaryRetention(db: Database.Database): void {
   db.exec(insertSql);
   db.exec(`
     DROP TABLE conversation_summaries_legacy_v6;
-    DELETE FROM history_fts WHERE source_id LIKE 'summary:%';
+    DELETE FROM history_fts
+    WHERE rowid IN (
+      SELECT fts_rowid FROM history_fts_source_map WHERE source_id LIKE 'summary:%'
+    );
+    DELETE FROM history_fts_source_map WHERE source_id LIKE 'summary:%';
   `);
   createConversationSummaryHistoryTriggers(db);
   db.prepare(`
-    INSERT INTO history_fts(source_id, agent_id, conversation_id, source_type, content, sequence_id)
-    SELECT 'summary:' || s.conversation_id, s.agent_id, s.conversation_id, 'summary', s.rendered_text, s.through_sequence_id
+    INSERT INTO history_fts_source_map(source_id)
+    SELECT 'summary:' || s.conversation_id
     FROM conversation_summaries s
+    WHERE NOT EXISTS (
+      SELECT 1 FROM agent_conversations c
+      WHERE c.id = s.conversation_id AND c.agent_id = s.agent_id AND c.temporary = 1
+    )
+  `).run();
+  db.prepare(`
+    INSERT INTO history_fts(rowid, source_id, agent_id, conversation_id, source_type, content, sequence_id)
+    SELECT map.fts_rowid, 'summary:' || s.conversation_id, s.agent_id, s.conversation_id, 'summary', s.rendered_text, s.through_sequence_id
+    FROM conversation_summaries s
+    JOIN history_fts_source_map AS map ON map.source_id = 'summary:' || s.conversation_id
     WHERE NOT EXISTS (
       SELECT 1 FROM agent_conversations c
       WHERE c.id = s.conversation_id AND c.agent_id = s.agent_id AND c.temporary = 1
@@ -1172,15 +1423,37 @@ export function migrateOpenBotSchema(db: Database.Database): void {
   db.pragma("foreign_keys = ON");
   createBaseSchema(db);
   createMemorySchema(db);
+  createMemoryProvenanceVersionSchema(db);
   createAsyncTaskSchema(db);
   createA2ASchema(db);
   createP23Schema(db);
+  db.exec(`CREATE TABLE IF NOT EXISTS prompt_queue (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    inference_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('queued','running','completed','cancelled','interrupted')),
+    UNIQUE(agent_id, conversation_id, nonce)
+  );
+  CREATE INDEX IF NOT EXISTS idx_prompt_queue_pending ON prompt_queue(agent_id,state,sequence);`);
   createP24Schema(db);
   createP26Schema(db);
   createP28Schema(db);
   createAgentDeletionSchema(db);
   migrateA2AIdentitySchema(db);
   migrateA2AProjectionSchema(db);
+  // Keep schema repairs and their backfills in one SQLite transaction. In
+  // particular, a legacy attempt must never be left with the default
+  // `unsafe_effect_started = 0` after a crash between ADD COLUMN and the
+  // conservative backfill.
+  const migrate = db.transaction(() => {
+  const queueColumns = tableColumns(db, "prompt_queue");
+  if (!queueColumns.has("payload_digest")) db.exec("ALTER TABLE prompt_queue ADD COLUMN payload_digest TEXT NOT NULL DEFAULT ''");
+  if (!queueColumns.has("payload_compacted")) db.exec("ALTER TABLE prompt_queue ADD COLUMN payload_compacted INTEGER NOT NULL DEFAULT 0 CHECK(payload_compacted IN (0,1))");
+  if (!queueColumns.has("recovery_of")) db.exec("ALTER TABLE prompt_queue ADD COLUMN recovery_of TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_compaction ON prompt_queue(payload_compacted,state,sequence)");
   const asyncTaskColumns = tableColumns(db, "async_tasks");
   if (!asyncTaskColumns.has("input_json")) {
     db.exec("ALTER TABLE async_tasks ADD COLUMN input_json TEXT");
@@ -1209,6 +1482,17 @@ export function migrateOpenBotSchema(db: Database.Database): void {
   ) WHERE input_json IS NULL`);
   if (!asyncTaskColumns.has("settled_at_ms")) db.exec("ALTER TABLE async_tasks ADD COLUMN settled_at_ms INTEGER");
   if (!asyncTaskColumns.has("settlement_nonce")) db.exec("ALTER TABLE async_tasks ADD COLUMN settlement_nonce TEXT");
+  const asyncTaskAttemptColumns = tableColumns(db, "async_task_attempts");
+  if (!asyncTaskAttemptColumns.has("unsafe_effect_started")) {
+    db.exec("ALTER TABLE async_task_attempts ADD COLUMN unsafe_effect_started INTEGER NOT NULL DEFAULT 0 CHECK (unsafe_effect_started IN (0, 1))");
+    // Older workers did not persist whether an effect crossed the external
+    // boundary. Active, retryable, and abandoned attempts are therefore
+    // conservatively treated as uncertain; terminal attempts cannot be
+    // claimed again and remain historical evidence only.
+    db.exec(`UPDATE async_task_attempts
+      SET unsafe_effect_started = 1
+      WHERE status IN ('admitted', 'running', 'retry_wait', 'cancelling', 'abandoned')`);
+  }
   const projectionColumns = tableColumns(db, "async_task_projection_outbox");
   if (!projectionColumns.has("source_outbox_id")) {
     db.exec("ALTER TABLE async_task_projection_outbox ADD COLUMN source_outbox_id TEXT");
@@ -1223,7 +1507,6 @@ export function migrateOpenBotSchema(db: Database.Database): void {
   if (!ownerColumns.has("process_started_at_ms")) db.exec("ALTER TABLE runtime_owners ADD COLUMN process_started_at_ms REAL");
   if (!ownerColumns.has("executable_path")) db.exec("ALTER TABLE runtime_owners ADD COLUMN executable_path TEXT");
 
-  const migrate = db.transaction(() => {
     for (const table of CONVERSATION_BOUND_TABLES) ensureConversationColumn(db, table);
     db.exec(`
       CREATE INDEX IF NOT EXISTS idx_transcript_agent_conversation_sequence
@@ -1250,8 +1533,20 @@ export function migrateOpenBotSchema(db: Database.Database): void {
     migrateNoncePrimaryKeys(db);
     migrateMemoryJobProviderModel(db);
     migrateMemoryJobOutputs(db);
+    ensureHistoryFtsSourceMap(db);
     migrateConversationSummaryRetention(db);
-    if (version < OPENBOT_SCHEMA_VERSION) rebuildOpenBotFts(db);
+    if (version < 19) {
+      // Older workers marked preparation failures completed, even without an echo.
+      // Keep their payload recoverable instead of compacting an unexecuted message.
+      db.exec(`UPDATE prompt_queue SET state='interrupted'
+        WHERE state='completed' AND NOT EXISTS (
+          SELECT 1 FROM transcript_entries t
+          WHERE t.agent_id=prompt_queue.agent_id AND t.conversation_id=prompt_queue.conversation_id
+            AND t.kind='message' AND json_extract(t.payload_json,'$.role')='user'
+            AND json_extract(t.payload_json,'$.clientNonce')=prompt_queue.nonce
+        )`);
+    }
+    if (version < 18) rebuildOpenBotFts(db);
     db.pragma(`user_version = ${OPENBOT_SCHEMA_VERSION}`);
   });
   migrate();

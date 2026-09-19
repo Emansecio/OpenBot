@@ -1,5 +1,6 @@
 import { spawn,execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { createRequire } from "node:module";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { runP22TasksFixture } from "./electron-p22-fixture.mjs";
 import { tmpdir } from "node:os";
@@ -10,8 +11,9 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(process.env.OPENBOT_ROOT || fileURLToPath(new URL("..", import.meta.url)));
-const exe = process.env.ELECTRON_EXE || "C:\\Users\\User\\AppData\\Local\\hermes\\hermes-agent\\apps\\desktop\\node_modules\\electron\\dist\\electron.exe";
-const electronMain = process.env.OPENBOT_ELECTRON_MAIN || join(repoRoot, "client", "extracted", "dist", "electron-main", "main.cjs");
+const requireFromProject = createRequire(join(repoRoot, "package.json"));
+const exe = process.env.ELECTRON_EXE || requireFromProject("electron");
+const electronMain = process.env.OPENBOT_ELECTRON_MAIN || join(repoRoot, "scripts", "openbot-electron.cjs");
 const settingsOnly = process.argv.includes("--settings-only");
 const screenCloseOnly = process.argv.includes("--screen-close-only");
 const emptyOnboardingOnly = process.argv.includes("--empty-onboarding-only");
@@ -122,6 +124,9 @@ async function main() {
     ];
     if (emptyOnboardingOnly) gatewayArgs.push("--empty-agent");
     if (process.argv.includes("--transitions-only")) gatewayArgs.push("--transition-history");
+    if (process.argv.includes("--readability-only")) gatewayArgs.push("--readability-content");
+    if (process.argv.includes("--execution-status-only")) gatewayArgs.push("--second-agent");
+    if (process.argv.includes("--delete-timeout-only")) gatewayArgs.push("--delete-drain-delay");
     gatewayChild = spawn(process.execPath, gatewayArgs, {
       cwd: repoRoot,
       env: { ...process.env, E2E_GATEWAY_TOKEN: gatewayToken },
@@ -221,6 +226,513 @@ async function main() {
       const img = await send("Page.captureScreenshot", { format: "png" });
       writeFileSync(join(evidenceDir, `${name}.png`), Buffer.from(img.data, "base64"));
     };
+    if (process.argv.includes("--composer-voice-only")) {
+      await waitForEval("Boolean(document.querySelector('.sand-prompt-send'))", 10000);
+      const emptyComposer = await evalExpr(`(() => {
+        const button = document.querySelector('.sand-prompt-send');
+        const prompt = document.querySelector('[contenteditable="true"][aria-label="Prompt"], textarea[aria-label="Prompt"]');
+        const style = getComputedStyle(button);
+        return { label: button.getAttribute('aria-label'), text: (prompt?.value || prompt?.textContent || '').trim(), visibility: style.visibility, pointerEvents: style.pointerEvents };
+      })()`);
+      if (emptyComposer.text || emptyComposer.label !== "Start voice input" || emptyComposer.visibility !== "hidden" || emptyComposer.pointerEvents !== "none") {
+        throw new Error(`empty composer exposes legacy control: ${JSON.stringify(emptyComposer)}`);
+      }
+      console.log("EMPTY_COMPOSER_GREEN", JSON.stringify(emptyComposer));
+      const result = await evalExpr(`(() => {
+        const host = document.createElement("div");
+        host.className = "sand-prompt-shell";
+        host.style.cssText = "position:fixed;left:40px;top:40px;width:240px;height:60px;z-index:2147483001;background:#181818";
+        const button = document.createElement("button");
+        button.className = "sand-prompt-send";
+        button.style.cssText = "width:32px;height:32px";
+        host.append(button); document.body.append(host);
+        let clicks = 0;
+        button.addEventListener("click", () => clicks++);
+        const states = [];
+        try {
+          for (const label of ["Start voice input", "Stop dictation", "Send message"]) {
+            button.setAttribute("aria-label", label);
+            const style = getComputedStyle(button);
+            states.push({ label, visibility: style.visibility, pointerEvents: style.pointerEvents, width: button.getBoundingClientRect().width });
+            if (label !== "Send message") button.click();
+          }
+          return { states, voiceClicks: clicks };
+        } finally { host.remove(); }
+      })()`);
+      if (result.voiceClicks !== 0 || result.states.slice(0, 2).some((state) => state.visibility !== "hidden" || state.pointerEvents !== "none" || state.width <= 0 || state.width !== result.states[2].width)
+        || result.states[2].visibility !== "visible" || result.states[2].pointerEvents === "none") {
+        throw new Error(`composer voice regression: ${JSON.stringify(result)}`);
+      }
+      console.log("COMPOSER_VOICE_GREEN", JSON.stringify(result));
+      return;
+    }
+    if (process.argv.includes("--auto-review-only")) {
+      const result = await evalExpr(`(() => {
+        const surface = document.createElement('div');
+        surface.setAttribute('role', 'dialog'); surface.setAttribute('aria-label', 'OpenBot settings');
+        surface.innerHTML = '<section><div id="review-fixture"><div><span>Auto-review</span><p>OpenBot checks each action before it runs and asks you first when needed. Add rules to customize what it can do automatically.</p></div><button role="switch" aria-label="Auto-review">On</button></div><div id="rules-fixture"><div><h3>Auto-review Rules</h3><p>Instructions</p></div><input aria-label="Rule"><button>Add Rule</button></div><div id="timezone-fixture">Timezone<select><option>Auto</option></select></div></section>';
+        document.body.append(surface);
+        try {
+          window.__openbotLocalSettingsScan();
+          const visible = id => getComputedStyle(surface.querySelector('#' + id)).display !== 'none';
+          return { reviewVisible: visible('review-fixture'), rulesVisible: visible('rules-fixture'), timezoneVisible: visible('timezone-fixture') };
+        } finally { surface.remove(); }
+      })()`);
+      if (result.reviewVisible || result.rulesVisible || !result.timezoneVisible) throw new Error('auto-review visibility regression: ' + JSON.stringify(result));
+      console.log('AUTO_REVIEW_GREEN', JSON.stringify(result));
+      return;
+    }
+    if (process.argv.includes("--threads-only")) {
+      const result = await evalExpr(`(async () => {
+        const results = [];
+        for (const name of ['More message actions', 'Message actions']) {
+          const menu = document.createElement('div'); menu.setAttribute('role', 'menu'); menu.setAttribute('aria-label', name);
+          menu.innerHTML = '<button role="menuitem"><span data-icon-name="chat-bubbles"></span>Start a thread</button><button role="menuitem">Reply</button><button role="menuitem">Copy</button>';
+          let activated = false; menu.firstChild.addEventListener('click', () => activated = true);
+          document.body.append(menu);
+          try {
+            const immediate = getComputedStyle(menu.firstChild).display;
+            menu.firstChild.click();
+            await new Promise(requestAnimationFrame);
+            results.push({name, immediate, activated, replyVisible: menu.children[1].getClientRects().length > 0, copyVisible: menu.children[2].getClientRects().length > 0});
+          } finally { menu.remove(); }
+        }
+        return results;
+      })()`);
+      if (result.some(item => item.immediate !== 'none' || item.activated || !item.replyVisible || !item.copyVisible)) throw new Error('Thread removal regression: ' + JSON.stringify(result));
+      console.log('THREADS_DISABLED_GREEN', JSON.stringify(result));
+      return;
+    }
+    if (process.argv.includes("--sidebar-alignment-only")) {
+      await waitForEval("Boolean(document.querySelector('.sand-sidebar-resize-handle'))", 10000);
+      const measure = () => evalExpr(`(() => {
+        const sidebar = document.querySelector('.sand-agents-sidebar');
+        const rect = el => { const r = el.getBoundingClientRect(); return { x:r.x, width:r.width, center:r.x+r.width/2 }; };
+        const footer = [...sidebar.querySelectorAll('.sand-agents-sidebar__new')].find(el => el.getClientRects().length);
+        return { sidebar:rect(sidebar), footer:rect(footer), rows:[...sidebar.querySelectorAll('.sand-agent-item')].filter(el => el.getClientRects().length).map(el => ({layout:el.dataset.layout,row:rect(el),avatar:rect(el.querySelector('.sand-agent-item__avatar'))})) };
+      })()`);
+      const drag = async (x) => {
+        const handle = await evalExpr("(() => {const r=document.querySelector('.sand-sidebar-resize-handle').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()");
+        await send('Input.dispatchMouseEvent', {type:'mouseMoved', ...handle});
+        await send('Input.dispatchMouseEvent', {type:'mousePressed', ...handle, button:'left', clickCount:1});
+        await send('Input.dispatchMouseEvent', {type:'mouseMoved', x, y:handle.y, button:'left', buttons:1});
+        await send('Input.dispatchMouseEvent', {type:'mouseReleased', x, y:handle.y, button:'left', clickCount:1});
+        await sleep(900);
+      };
+      const before = await measure();
+      await drag(70);
+      const collapsed = await measure();
+      if (!collapsed.rows.length || collapsed.rows.some(item => item.layout !== 'collapsed' || Math.abs(item.avatar.center-collapsed.footer.center)>1 || Math.abs(item.row.center-collapsed.footer.center)>1)) throw new Error('Collapsed sidebar misaligned: '+JSON.stringify(collapsed));
+      await shot('sidebar-collapsed-centered');
+      await drag(before.sidebar.width);
+      const expanded = await measure();
+      if (expanded.rows.length !== before.rows.length || expanded.rows.some((item,index) => item.layout !== 'expanded' || Math.abs(item.avatar.center-before.rows[index].avatar.center)>1 || Math.abs(item.row.width-before.rows[index].row.width)>1)) throw new Error('Expanded sidebar changed: '+JSON.stringify({before,expanded}));
+      console.log('SIDEBAR_ALIGNMENT_GREEN', JSON.stringify({before,collapsed,expanded}));
+      return;
+    }
+    if (process.argv.includes("--cancel-collapsed-only")) {
+      await waitForEval("Boolean(document.querySelector('.sand-agent-item[data-agent-id]'))", 10000);
+      const handle = await evalExpr("(() => {const r=document.querySelector('.sand-sidebar-resize-handle').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()");
+      await send('Input.dispatchMouseEvent', {type:'mousePressed', ...handle, button:'left', clickCount:1});
+      await send('Input.dispatchMouseEvent', {type:'mouseMoved', x:70, y:handle.y, button:'left', buttons:1});
+      await send('Input.dispatchMouseEvent', {type:'mouseReleased', x:70, y:handle.y, button:'left', clickCount:1});
+      await waitForEval("Boolean(document.querySelector('.sand-agent-item[data-layout=collapsed]'))");
+      await evalExpr("document.querySelector('[contenteditable=true][aria-label=Prompt],textarea[aria-label=Prompt]').focus()");
+      await send('Input.insertText', {text:'Teste'});
+      await send('Input.dispatchKeyEvent', {type:'keyDown',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,nativeVirtualKeyCode:13});
+      await send('Input.dispatchKeyEvent', {type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,nativeVirtualKeyCode:13});
+      await waitForEval("(() => {const b=document.getElementById('openbot-stop-turn');return b&&!b.hidden&&!b.disabled&&b.dataset.openbotActiveAgent==='openbot-default';})()", 12000);
+      await waitGatewayStatus(status => status.cancelReady === true && status.activeStreams > 0);
+      await evalExpr("document.getElementById('openbot-stop-turn').click()");
+      await waitGatewayStatus(status => status.abortObserved === true && status.activeStreams === 0);
+      await waitForEval("document.getElementById('openbot-stop-turn').hidden", 10000);
+      console.log('CANCEL_COLLAPSED_GREEN');
+      return;
+    }
+    if (process.argv.includes("--prompt-queue-only")) {
+      await waitForEval("Boolean(document.querySelector('[contenteditable=true][aria-label=Prompt]'))", 10000);
+      const typeAndSend = async (text) => {
+        await evalExpr("document.querySelector('[contenteditable=true][aria-label=Prompt]').focus()");
+        await send('Input.insertText', {text});
+        await send('Input.dispatchKeyEvent', {type:'keyDown',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,nativeVirtualKeyCode:13});
+        await send('Input.dispatchKeyEvent', {type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,nativeVirtualKeyCode:13});
+      };
+      await typeAndSend('Teste');
+      try { await waitGatewayStatus(status => status.cancelReady === true && status.activeStreams > 0); }
+      catch (error) {
+        console.log('QUEUE_START_DIAGNOSTIC', JSON.stringify(await evalExpr(`(async () => ({
+          state:await window.desktop.agent.getPromptStatus({agentIds:['openbot-default']}),
+          notices:[...document.querySelectorAll('.sand-notice,[role=alert],.sand-failed-send-actions')].map(node=>node.textContent).slice(-5),
+          composer:document.querySelector('[aria-label=Prompt]')?.textContent,
+          rows:[...document.querySelectorAll('.sand-transcript-row')].map(row=>({role:row.getAttribute('data-role'),text:row.innerText.slice(0,500)})).slice(-4)
+        }))()`)));
+        await shot('queue-start-failure');
+        throw error;
+      }
+      await waitForEval("!document.getElementById('openbot-stop-turn')?.hidden", 10000);
+      await evalExpr("document.querySelector('[contenteditable=true][aria-label=Prompt]').focus()");
+      await send('Input.insertText', {text:'second queued fixture'});
+      const geometry = await evalExpr(`(() => {
+        const stop=document.getElementById('openbot-stop-turn').getBoundingClientRect();
+        const send=document.querySelector('.sand-prompt-send[aria-label="Send message"]').getBoundingClientRect();
+        return {stopRight:stop.right,sendLeft:send.left};
+      })()`);
+      if (geometry.stopRight > geometry.sendLeft) throw new Error('Stop overlaps send: '+JSON.stringify(geometry));
+      const sendPoint = await evalExpr("(() => {const r=document.querySelector('.sand-prompt-send[aria-label=\"Send message\"]').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()");
+      await send('Input.dispatchMouseEvent', {type:'mousePressed',...sendPoint,button:'left',clickCount:1});
+      await send('Input.dispatchMouseEvent', {type:'mouseReleased',...sendPoint,button:'left',clickCount:1});
+      await waitForEval("document.getElementById('openbot-prompt-queue')?.textContent.includes('second queued fixture')", 10000);
+      await waitGatewayStatus(status => status.abortObserved === false && status.activeStreams > 0);
+      await shot('prompt-queue-controls');
+      await evalExpr("document.querySelector('#openbot-prompt-queue button').click()");
+      await waitForEval("!document.querySelector('#openbot-prompt-queue .ob-queued-row')", 10000);
+      await waitGatewayStatus(status => status.abortObserved === false && status.activeStreams > 0);
+      await evalExpr(`(async () => {
+        const api = window.desktop.agent;
+        const cfg = await api.getProviderConfig();
+        const conversation = await api.getActiveConversation({agentId: cfg.agentId});
+        window.__queueRecoveryFixture = {agentId: cfg.agentId, conversationId: conversation.id, clientNonce: 'queue-recovery-e2e'};
+        return window.desktop.p23.sendPrompt(cfg.agentId, 'desktop e2e instant response recovered draft', {
+          ...window.__queueRecoveryFixture, attachments: [{name:'missing-queue-fixture.txt',path:'missing-queue-fixture.txt'}]
+        });
+      })()`);
+      await waitForEval("document.getElementById('openbot-prompt-queue')?.textContent.includes('recovered draft')", 10000);
+      const queueOrigin = await evalExpr("document.querySelector('#openbot-prompt-queue .ob-queued-origin')?.textContent");
+      if (!queueOrigin) throw new Error('Queue conversation label is missing');
+      await evalExpr("document.getElementById('openbot-stop-turn').click()");
+      await waitGatewayStatus(status => status.abortObserved === true && status.activeStreams === 0);
+      await waitForEval("[...document.querySelectorAll('#openbot-prompt-queue button')].some(button => button.textContent === 'Revisar')", 10000);
+      await evalExpr("[...document.querySelectorAll('#openbot-prompt-queue button')].find(button => button.textContent === 'Revisar').click()");
+      await waitForEval("document.getElementById('openbot-queue-recovery')?.open", 10000);
+      const recovery = await evalExpr(`(() => {
+        const dialog=document.getElementById('openbot-queue-recovery'); const r=dialog.getBoundingClientRect();
+        return {text:dialog.querySelector('textarea').value, focused:document.activeElement===dialog.querySelector('textarea'),
+          labelled:dialog.getAttribute('aria-labelledby'), attachments:dialog.querySelectorAll('.ob-recovery-file').length,
+          fits:r.left>=0 && r.top>=0 && r.right<=innerWidth && r.bottom<=innerHeight};
+      })()`);
+      if (!recovery.text.includes('recovered draft') || !recovery.focused || !recovery.labelled || recovery.attachments!==1 || !recovery.fits)
+        throw new Error('Recovery editor contract: '+JSON.stringify(recovery));
+      await shot('queue-recovery-editor');
+      await evalExpr(`(() => {
+        const dialog=document.getElementById('openbot-queue-recovery'); dialog.querySelector('.ob-recovery-file button').click();
+        const editor=dialog.querySelector('textarea'); editor.value='desktop e2e instant response revised draft'; editor.dispatchEvent(new Event('input',{bubbles:true}));
+        const input=dialog.querySelector('input[type=file]'); const data=new DataTransfer();
+        data.items.add(new File(['replacement fixture'], 'replacement.txt', {type:'text/plain'}));
+        input.files=data.files; input.dispatchEvent(new Event('change',{bubbles:true}));
+      })()`);
+      await waitForEval("document.querySelector('#openbot-queue-recovery .ob-recovery-files')?.textContent.includes('replacement.txt') && document.getElementById('openbot-queue-recovery')?.getAttribute('aria-busy')==='false'",10000);
+      await evalExpr("document.querySelector('#openbot-queue-recovery [data-recovery=send]').click()");
+      await waitForEval("!document.getElementById('openbot-queue-recovery')",10000);
+      await waitGatewayStatus(status => status.instantResponses === 1);
+      await waitForEval("!document.querySelector('#openbot-prompt-queue .ob-queued-row')",10000);
+      const finalStatus = await evalExpr("window.desktop.agent.getPromptStatus({agentIds:[window.__queueRecoveryFixture.agentId]})");
+      if (finalStatus.isBusy || finalStatus.agents?.length !== 1 || finalStatus.agents[0].recoverable?.length !== 0)
+        throw new Error('Recovery did not settle: '+JSON.stringify(finalStatus));
+      console.log('PROMPT_QUEUE_UI_GREEN', JSON.stringify({geometry,recovery,queueOrigin,exactlyOneRevisedResponse:true}));
+      return;
+    }
+    if (process.argv.includes("--delete-timeout-only")) {
+      await waitForEval("Boolean(document.querySelector('.sand-agent-item[data-agent-id=delete-timeout-fixture]'))", 10000);
+      const point = await evalExpr("(() => {const r=document.querySelector('.sand-agent-item[data-agent-id=delete-timeout-fixture]').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()");
+      await send('Input.dispatchMouseEvent', {type:'mousePressed', ...point, button:'right', clickCount:1});
+      await send('Input.dispatchMouseEvent', {type:'mouseReleased', ...point, button:'right', clickCount:1});
+      await waitForEval("[...document.querySelectorAll('[role=menuitem]')].some(el => /^(Delete|Excluir)$/.test(el.textContent.trim()))");
+      await sleep(400);
+      const deletePoint = await evalExpr("(() => {const el=[...document.querySelectorAll('[role=menuitem]')].find(el => /^(Delete|Excluir)$/.test(el.textContent.trim()));const r=el.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()");
+      await send('Input.dispatchMouseEvent', {type:'mouseMoved', ...deletePoint});
+      await send('Input.dispatchMouseEvent', {type:'mousePressed', ...deletePoint, button:'left', clickCount:1});
+      await send('Input.dispatchMouseEvent', {type:'mouseReleased', ...deletePoint, button:'left', clickCount:1});
+      await send('Input.dispatchKeyEvent', {type:'keyDown',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,nativeVirtualKeyCode:13});
+      await send('Input.dispatchKeyEvent', {type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,nativeVirtualKeyCode:13});
+      await waitForEval("Boolean(document.querySelector('[role=alertdialog]'))");
+      await evalExpr("[...document.querySelector('[role=alertdialog]').querySelectorAll('button')].find(el => /^(Delete|Excluir)$/.test(el.textContent.trim())).click()");
+      await waitForEval("(() => {window.__openbotLocalSettingsScan();const d=document.querySelector('[role=alertdialog]');return d?.textContent.includes('Não foi possível concluir a exclusão')&&[...d.querySelectorAll('button')].some(b=>/^(Cancel|Cancelar)$/.test(b.textContent.trim())&&!b.disabled);})()", 12000);
+      await evalExpr("[...document.querySelector('[role=alertdialog]').querySelectorAll('button')].find(el => /^(Cancel|Cancelar)$/.test(el.textContent.trim())).click()");
+      await waitForEval("!document.querySelector('[role=alertdialog]')");
+      if (!await evalExpr("Boolean(document.querySelector('.sand-agent-item[data-agent-id=delete-timeout-fixture]'))")) throw new Error('Timed-out deletion removed fixture bot');
+      console.log('DELETE_TIMEOUT_UI_GREEN');
+      return;
+    }
+    if (process.argv.includes("--execution-status-only")) {
+      // Ferramentas habilitadas e resposta pausada: o texto da rodada fica retido,
+      // mas a etapa real do provedor precisa continuar visível.
+      await send("Emulation.setDeviceMetricsOverride", { width: 704, height: 768, deviceScaleFactor: 1, mobile: false });
+      await waitForEval("Boolean(document.querySelector('[contenteditable=true][aria-label=Prompt]'))", 10000);
+      let delivered = false;
+      for (let attempt = 0; attempt < 3 && !delivered; attempt += 1) {
+        await evalExpr(`(() => { const composer = document.querySelector('[contenteditable=true][aria-label=Prompt]'); composer.focus(); composer.click(); return document.activeElement === composer; })()`);
+        await send("Input.insertText", { text: "Teste" });
+        await send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+        await send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+        try {
+          await waitForEval("document.querySelectorAll('.sand-transcript-row').length > 0", 4000);
+          delivered = true;
+        }
+        catch { await sleep(300); }
+      }
+      if (!delivered) throw new Error("composer did not deliver the prompt");
+      await waitGatewayStatus((status) => status.cancelReady === true && status.activeStreams > 0);
+      await sleep(400);
+      const execution = await evalExpr(`(() => {
+        const row = document.querySelector('[data-row-key="sand-typing-indicator"]');
+        const detail = document.querySelector('[data-openbot-activity-detail]');
+        const local = document.getElementById('openbot-turn-status');
+        return {
+          activityVisible: Boolean(row && getComputedStyle(row).display !== 'none' && row.getBoundingClientRect().height > 0),
+          detail: detail ? detail.textContent : null,
+          localStatus: local && !local.hidden ? local.textContent : '',
+          transcriptText: /E2E incremental stream/.test(document.querySelector('main.sand-chat')?.innerText || ''),
+          rows: document.querySelectorAll('.sand-transcript-row').length,
+        };
+      })()`);
+      console.log("EXECUTION_STATUS_DETAIL", JSON.stringify(execution));
+      if (!execution.activityVisible) throw new Error("native activity indicator is missing during the paused stream");
+      if (!/Recebendo resposta|Executando ferramenta/.test(String(execution.detail || ""))) throw new Error(`step is not integrated into the native activity surface: ${JSON.stringify(execution.detail)}`);
+      if (!/atividade: |sem atualização há /.test(String(execution.detail || ""))) throw new Error(`real activity age is missing: ${JSON.stringify(execution.detail)}`);
+      if (execution.transcriptText) throw new Error("this fixture must keep the round text retained while the provider is paused");
+      if (execution.localStatus !== "") throw new Error("the local status line must not duplicate the native activity surface");
+      // Reconexão do canal e troca de bot: somente leituras, nenhum reenvio.
+      const before = JSON.parse(readFileSync(statusFile, "utf8"));
+      const switched = await evalExpr(`(() => {
+        window.dispatchEvent(new Event('focus'));
+        document.dispatchEvent(new Event('visibilitychange'));
+        const row = document.querySelector('.sand-agent-item[data-agent-id="status-switch-fixture"]');
+        if (!row) return false;
+        const rect = row.getBoundingClientRect();
+        row.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2 }));
+        return true;
+      })()`);
+      if (!switched) throw new Error("second bot was not available for the switch check");
+      await sleep(1500);
+      const after = JSON.parse(readFileSync(statusFile, "utf8"));
+      const switchedState = await evalExpr(`(() => {
+        const detail = document.querySelector('[data-openbot-activity-detail]');
+        const local = document.getElementById('openbot-turn-status');
+        return { detail: detail ? detail.textContent : null, localStatus: local && !local.hidden ? local.textContent : '',
+          rows: document.querySelectorAll('.sand-transcript-row').length,
+          activeAgent: document.querySelector('.sand-agent-item[aria-current="page"]')?.getAttribute('data-agent-id') || null };
+      })()`);
+      console.log("EXECUTION_STATUS_NO_RESEND", JSON.stringify({
+        switched: switchedState.activeAgent, chunksEmitted: [before.chunksEmitted, after.chunksEmitted],
+        completedStreams: [before.completedStreams, after.completedStreams], activeStreams: after.activeStreams,
+        rows: [execution.rows, switchedState.rows], detailAfterSwitch: switchedState.detail, localStatusAfterSwitch: switchedState.localStatus,
+      }));
+      if (after.chunksEmitted !== before.chunksEmitted || after.completedStreams !== before.completedStreams) throw new Error("reconnect or bot switch started another request");
+      if (switchedState.detail !== null || switchedState.localStatus !== "") throw new Error("execution state leaked into another bot");
+      console.log("EXECUTION_STATUS_UI_GREEN");
+      ws.close();
+      return;
+    }
+    if (process.argv.includes("--readability-only")) {
+      await send("Emulation.setDeviceMetricsOverride", { width: 704, height: 768, deviceScaleFactor: 1, mobile: false });
+      // A falha de fixture interrompeu um turno que já executou uma ferramenta:
+      // repetir poderia duplicar efeitos, então o backend oferece apenas conferir
+      // os resultados. Nenhum botão de nova tentativa pode existir aqui.
+      await waitForEval("Boolean(document.querySelector('.ob-recovery-inspect'))", 10000);
+      await sleep(400);
+      const unsafeAction = await evalExpr(`(() => ({
+        retryButtons: document.querySelectorAll('.ob-retry-generation').length,
+        confirmControl: document.querySelector('.ob-recovery-inspect')?.textContent || null,
+      }))()`);
+      console.log("READABILITY_INSPECT_ONLY", JSON.stringify(unsafeAction));
+      if (unsafeAction.retryButtons !== 0) throw new Error(`Unsafe retry was offered for uncertain effects: ${JSON.stringify(unsafeAction)}`);
+      if (!String(unsafeAction.confirmControl || "").includes("Conferir resultados")) throw new Error(`Inspect control is missing: ${JSON.stringify(unsafeAction)}`);
+      const toolFeedback = await evalExpr(`([...document.querySelectorAll("main.sand-chat .sand-transcript-row")]
+        .filter((row) => /Leitura de relatório \(fixture\)|read-file/.test(row.textContent || ""))
+        .map((row) => row.textContent?.trim() || ""))`);
+      console.log("TOOL_FEEDBACK_HIDDEN", JSON.stringify({ visibleRows: toolFeedback }));
+      if (toolFeedback.length > 0) throw new Error(`Tool lifecycle feedback leaked into the visible transcript: ${JSON.stringify(toolFeedback)}`);
+      const settledCopy = await evalExpr(`(() => {
+        const rows = [...document.querySelectorAll("main.sand-chat .sand-transcript-row")];
+        const inspect = (marker) => {
+          const row = rows.find((candidate) => (candidate.textContent || "").includes(marker));
+          const rect = row?.getBoundingClientRect();
+          const visible = Boolean(row && getComputedStyle(row).display !== "none" && rect && rect.width > 0 && rect.height > 0);
+          return { visible, role: row?.getAttribute("data-role") || null, display: row ? getComputedStyle(row).display : null, text: row?.textContent?.trim() || null };
+        };
+        const liveIndicators = [...document.querySelectorAll('[data-row-key="sand-typing-indicator"]')]
+          .filter((row) => getComputedStyle(row).display !== "none" && row.getBoundingClientRect().height > 0).length;
+        return {
+          completed: inspect("Concluído · relatório final disponível."),
+          failed: inspect("Falhou · integração indisponível; confira o erro acima."),
+          liveIndicators,
+        };
+      })()`);
+      console.log("SETTLED_COPY_VISIBLE", JSON.stringify(settledCopy));
+      if (!settledCopy.completed.visible || !settledCopy.failed.visible || settledCopy.liveIndicators !== 0) {
+        throw new Error(`settled assistant copy was hidden or stale activity remained: ${JSON.stringify(settledCopy)}`);
+      }
+      const before = await evalExpr(`(() => {
+        const control = document.querySelector('.ob-recovery-inspect');
+        const notice = control.previousElementSibling;
+        const text = document.createTreeWalker(notice, NodeFilter.SHOW_TEXT).nextNode();
+        const element = text?.parentElement || notice;
+        const style = getComputedStyle(element);
+        const ancestors = []; for(let p=element;p;p=p.parentElement) { const s=getComputedStyle(p); ancestors.push({tag:p.tagName,cls:p.className,color:s.color,background:s.backgroundColor,opacity:s.opacity}); }
+        const rect = control.getBoundingClientRect();
+        return {color:style.color,fontSize:style.fontSize,ancestors,control:{x:rect.x,y:rect.y,width:rect.width,height:rect.height},
+          rows:document.querySelectorAll('.sand-transcript-row').length,
+          userRows:document.querySelectorAll('.sand-transcript-row[data-role="user"], .sand-transcript-row[data-openbot-side="user"]').length};
+      })()`);
+      const rgba = text => (text.match(/[\d.]+/g) || []).map(Number);
+      const background = rgba(before.ancestors.find(entry => rgba(entry.background)[3] !== 0)?.background || "rgb(7, 7, 7)");
+      const foreground = rgba(before.color);
+      const alpha = foreground[3] ?? 1;
+      const composite = foreground.slice(0, 3).map((value, index) => value * alpha + background[index] * (1 - alpha));
+      const luminance = rgb => rgb.slice(0, 3).map(value => value / 255).reduce((sum, value, index) => sum + [0.2126, 0.7152, 0.0722][index] * (value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4), 0);
+      const contrast = (luminance(composite) + 0.05) / (luminance(background) + 0.05);
+      console.log("READABILITY_NOTICE", JSON.stringify({ color: before.color, background, fontSize: before.fontSize, contrast, control: before.control }));
+      if (before.ancestors.some(entry => Number(entry.opacity) !== 1)) throw new Error("Notice contrast must be measured after its animation");
+      if (!Number.isFinite(contrast) || contrast < 4.5 || Math.abs(before.control.height - 30) > 1) throw new Error("Notice contrast or inspect control geometry is inadequate");
+      await shot("visual-readability-inspect");
+      // "Conferir resultados" abre o histórico relevante e nunca reenvia o pedido.
+      await evalExpr("document.querySelector('.ob-recovery-inspect').focus()");
+      await send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", text: "\r", unmodifiedText: "\r", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+      await send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+      await waitForEval("Boolean(document.querySelector('.ob-recovery-note'))", 10000);
+      await sleep(300);
+      const revealed = await evalExpr(`(() => {
+        const note = document.querySelector('.ob-recovery-note');
+        const row = document.querySelector('.ob-recovery-inspect').previousElementSibling;
+        const rect = note.getBoundingClientRect(), parent = row.getBoundingClientRect();
+        const viewport = document.querySelector('.sand-virtual-transcript');
+        const chain = []; for(let p=note;p;p=p.parentElement) { const s=getComputedStyle(p); chain.push({cls:p.className,width:p.getBoundingClientRect().width,maxWidth:s.maxWidth,minWidth:s.minWidth,whiteSpace:s.whiteSpace,display:s.display,flex:s.flex}); if(p===row) break; }
+        return {text:note.textContent,chain,note:{left:rect.left,right:rect.right,width:rect.width,height:rect.height},
+          row:{left:parent.left,right:parent.right,width:parent.width},viewport:{width:viewport.clientWidth,scrollWidth:viewport.scrollWidth},windowWidth:innerWidth,
+          highlighted:document.querySelectorAll('[data-openbot-recovery-highlight="1"]').length,
+          rows:document.querySelectorAll('.sand-transcript-row').length,
+          userRows:document.querySelectorAll('.sand-transcript-row[data-role="user"], .sand-transcript-row[data-openbot-side="user"]').length,
+          composerFocused:document.activeElement === document.querySelector('main.sand-chat [contenteditable="true"], main.sand-chat textarea')};
+      })()`);
+      console.log("READABILITY_REVEALED_CONTEXT", JSON.stringify({ ...revealed, before: { rows: before.rows, userRows: before.userRows } }));
+      await shot("visual-readability-revealed-context");
+      if (!String(revealed.text || "").includes("Confira os resultados e possíveis efeitos")) throw new Error(`Revealed guidance is missing: ${JSON.stringify(revealed.text)}`);
+      if (revealed.highlighted < 1) throw new Error("The relevant history was not highlighted");
+      if (revealed.rows !== before.rows || revealed.userRows !== before.userRows) throw new Error("Conferir resultados changed the conversation instead of only opening it");
+      if (!revealed.composerFocused) throw new Error("Conferir resultados must leave the composer ready for a new instruction");
+      // O histórico é localizado pela identidade do turno informada pelo backend,
+      // nunca pela posição das linhas visíveis.
+      const identity = await evalExpr(`(async () => {
+        const api = window.desktop.agent;
+        const cfg = await api.getProviderConfig();
+        const conversation = await api.getActiveConversation({ agentId: cfg.agentId });
+        const recovery = await api.getPromptRecovery({ agentId: cfg.agentId, conversationId: conversation.id });
+        const wanted = Array.isArray(recovery?.failure?.historyEntryIds) ? recovery.failure.historyEntryIds : [];
+        const highlighted = [...document.querySelectorAll('[data-openbot-recovery-highlight="1"]')]
+          .map((row) => row.getAttribute('data-entry-id') || row.getAttribute('data-row-key') || '');
+        return { turnId: recovery?.failure?.turnId || null, wanted, highlighted,
+          foreign: highlighted.filter((key) => !wanted.includes(key)),
+          earlierTurn: highlighted.filter((key) => key.includes('visual-readability-earlier')) };
+      })()`);
+      console.log("READABILITY_IDENTITY_HIGHLIGHT", JSON.stringify(identity));
+      if (typeof identity.turnId !== "string" || identity.wanted.length === 0) throw new Error(`backend did not report the turn history identity: ${JSON.stringify(identity)}`);
+      if (identity.highlighted.length === 0) throw new Error("no transcript row was highlighted by identity");
+      if (identity.foreign.length > 0) throw new Error(`highlighted rows outside the failed turn: ${JSON.stringify(identity.foreign)}`);
+      if (identity.earlierTurn.length > 0) throw new Error(`an earlier turn was highlighted: ${JSON.stringify(identity.earlierTurn)}`);
+      if (!identity.wanted.some((key) => identity.highlighted.includes(key))) throw new Error(`highlight did not match the reported identities: ${JSON.stringify(identity)}`);
+      if (revealed.note.left < revealed.row.left - 1 || revealed.note.right > revealed.row.right + 1 || revealed.note.right > revealed.windowWidth) throw new Error("Long guidance escapes its transcript row");
+      if (!(revealed.note.width <= revealed.row.width + 1)) throw new Error(`Long guidance is wider than its row: ${JSON.stringify({ note: revealed.note, row: revealed.row })}`);
+      await waitGatewayStatus(status => status.activeStreams === 0 && status.completedStreams === 0);
+      const stability = await evalExpr(`new Promise(resolve => {
+        const control = document.querySelector('.ob-recovery-inspect'), samples = [];
+        const capture = () => { const r = control.getBoundingClientRect(); samples.push({x:r.x,y:r.y,width:r.width,height:r.height});
+          if(samples.length < 8) setTimeout(capture,40); else resolve({samples,focused:document.activeElement===document.querySelector('main.sand-chat [contenteditable="true"], main.sand-chat textarea')}); };
+        capture();
+      })`);
+      console.log("READABILITY_STABILITY", JSON.stringify(stability));
+      if (!stability.focused || stability.samples.some(rect => Object.keys(rect).some(key => Math.abs(rect[key] - stability.samples[0][key]) > 0.5))) throw new Error("Inspect control moved or lost the composer focus after settling");
+      await send("Emulation.setDeviceMetricsOverride", { width: 1024, height: 768, deviceScaleFactor: 1.25, mobile: false });
+      await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
+      await sleep(300);
+      const resized = await evalExpr(`(() => { const control=document.querySelector('.ob-recovery-inspect'),r=control.getBoundingClientRect(),p=control.previousElementSibling.getBoundingClientRect();return {width:innerWidth,dpr:devicePixelRatio,contained:r.left>=p.left-1&&r.right<=p.right+1,height:r.height,transition:getComputedStyle(control).transitionDuration}; })()`);
+      console.log("READABILITY_RESIZED", JSON.stringify({ ...resized, stableSamples: stability.samples.length }));
+      if (resized.width !== 1024 || resized.dpr !== 1.25 || !resized.contained || !(resized.height > 0) || resized.transition !== "0s") throw new Error("Resized/reduced-motion inspect feedback regressed");
+      await shot("visual-readability-wide-reduced");
+      const codeOverflow = await evalExpr(`(() => {
+        const walker=document.createTreeWalker(document.querySelector('main.sand-chat'),NodeFilter.SHOW_TEXT);let node;
+        while(node=walker.nextNode()) if(node.textContent.includes('relatorio_operacional_')) break;
+        const result=[];for(let p=node?.parentElement;p&&result.length<8;p=p.parentElement) result.push({tag:p.tagName,cls:p.className,width:p.clientWidth,scrollWidth:p.scrollWidth,overflow:getComputedStyle(p).overflowX});
+        return result;
+      })()`);
+      console.log("READABILITY_CODE_LAYOUT", JSON.stringify(codeOverflow));
+      console.log("READABILITY GREEN");
+      console.log("VISUAL_EVIDENCE_DIR", evidenceDir);
+      ws.close();
+      return;
+    }
+    if (process.argv.includes("--profile-feedback-only")) {
+      await waitForEval("Boolean(document.querySelector('.sand-agents-sidebar__account-name'))");
+      await evalExpr(`(async () => {
+        const canvas = document.createElement('canvas'); canvas.width = canvas.height = 256;
+        const context = canvas.getContext('2d'); context.fillStyle = '#7c3aed'; context.fillRect(0, 0, 256, 256);
+        window.__profileFeedbackSeed = await window.desktop.agent.updateLocalProfile({ name: 'Perfil anterior', avatarShape: 'rounded', avatarColor: '#7c3aed', avatarPngBase64: canvas.toDataURL('image/png').split(',')[1] });
+        window.__profileFeedbackReads = [];
+        window.__openbotLocalProfileAgent = {
+          getLocalProfile: () => new Promise(resolve => window.__profileFeedbackReads.push(() => resolve(window.__profileFeedbackSeed))),
+          updateLocalProfile: patch => window.desktop.agent.updateLocalProfile(patch),
+        };
+        const fixture = document.createElement('section'); fixture.id = 'profile-feedback-fixture';
+        fixture.style.cssText = 'position:fixed;inset:40px;z-index:2147483000;background:#181818;padding:24px';
+        fixture.innerHTML = '<div><span>local@openbot.invalid</span><button>Sign out</button></div>';
+        document.body.appendChild(fixture); window.__openbotLocalSettingsScan();
+        await new Promise(resolve => setTimeout(resolve, 250));
+        const input = document.getElementById('openbot-profile-name');
+        input.focus(); input.value = 'Nome recente'; input.dispatchEvent(new Event('input'));
+        window.__profileFeedbackReads.forEach(release => release());
+      })()`);
+      await sleep(100);
+      const loaded = await evalExpr(`({ name: document.getElementById('openbot-profile-name')?.value, photo: Boolean(document.querySelector('#openbot-profile-avatar img')), shape: document.getElementById('openbot-profile-avatar')?.dataset.shape, focused: document.activeElement?.id === 'openbot-profile-name' })`);
+      console.log('PROFILE_DELAYED_READ', JSON.stringify(loaded));
+      if (loaded.name !== 'Nome recente' || !loaded.photo || loaded.shape !== 'rounded' || !loaded.focused) throw new Error('Delayed profile read lost untouched persisted appearance or current input');
+      await evalExpr("document.getElementById('openbot-profile-form').requestSubmit()");
+      await waitForEval("document.getElementById('openbot-profile-status')?.textContent.includes('Perfil salvo')");
+      if (!await evalExpr("window.desktop.agent.getLocalProfile().then(p => p.name === 'Nome recente' && p.avatarPngBase64 === window.__profileFeedbackSeed.avatarPngBase64 && p.avatarShape === 'rounded')")) throw new Error('Name save overwrote untouched photo/shape');
+      const closed = await evalExpr(`(async () => {
+        window.__openbotLocalProfileAgent.updateLocalProfile = async patch => {
+          const saved = await window.desktop.agent.updateLocalProfile(patch);
+          return new Promise(resolve => { window.__releaseClosedProfile = () => resolve(saved); });
+        };
+        const input = document.getElementById('openbot-profile-name'); input.value = 'Nome fechado'; input.dispatchEvent(new Event('input'));
+        document.getElementById('openbot-profile-form').requestSubmit();
+        return true;
+      })()`);
+      if (!closed) throw new Error('Profile submission did not start');
+      await waitForEval("typeof window.__releaseClosedProfile === 'function'");
+      await evalExpr("document.getElementById('profile-feedback-fixture').remove(); window.__releaseClosedProfile(); delete window.__openbotLocalProfileAgent;");
+      await sleep(100);
+      if (!await evalExpr("document.querySelector('.sand-agents-sidebar__account-name')?.textContent.includes('Nome fechado')")) throw new Error('Confirmed save after closing settings left cached profile stale');
+      await sleep(300);
+      const mutations = await evalExpr(`new Promise(resolve => {
+        const avatar = document.querySelector('.sand-agents-sidebar__account .ob-account-avatar');
+        let count = 0; const observer = new MutationObserver(records => { count += records.length; });
+        observer.observe(avatar, {attributes:true,childList:true,subtree:true});
+        for (let index = 0; index < 5; index++) window.__openbotLocalSettingsScan();
+        setTimeout(() => { observer.disconnect(); resolve(count); }, 100);
+      })`);
+      if (mutations !== 0) throw new Error('Unchanged profile scan mutates avatar: '+mutations);
+      await evalExpr('window.__profileFeedbackReload = true');
+      await send('Page.reload', { ignoreCache: true });
+      await waitForEval("!window.__profileFeedbackReload && document.readyState === 'complete'", 10000);
+      await waitForEval("document.querySelector('.sand-agents-sidebar__account-name')?.textContent.includes('Nome fechado')", 10000);
+      const reloadedProfile = await evalExpr(`(async () => { const p = await window.desktop.agent.getLocalProfile(); return { name: p.name, photoBytes: p.avatarPngBase64?.length || 0, avatars: [...document.querySelectorAll('.sand-agents-sidebar__account .ob-account-avatar')].map(a => ({source: a._profileSource?.length, image: a.querySelector('img')?.naturalWidth, text: a.textContent})) }; })()`);
+      console.log('PROFILE_FEEDBACK_RELOADED', JSON.stringify(reloadedProfile));
+      await waitForEval("document.querySelector('.sand-agents-sidebar__account .ob-account-avatar img')?.naturalWidth === 256", 10000);
+      await shot('profile-feedback-reloaded');
+      await evalExpr(`(() => {
+        localStorage.setItem('openbot.profile.name.v1', 'Nome legado');
+        window.__openbotLocalProfileAgent = {
+          getLocalProfile: async () => ({ name: 'OpenBot Local' }),
+          updateLocalProfile: async () => { throw new Error('Migration fixture write failed'); },
+        };
+        const fixture = document.createElement('section'); fixture.id = 'profile-migration-fixture';
+        fixture.innerHTML = '<div><span>local@openbot.invalid</span><button>Sign out</button></div>';
+        document.body.appendChild(fixture); window.__openbotLocalSettingsScan();
+      })()`);
+      await waitForEval("document.getElementById('openbot-profile-status')?.textContent.includes('Migration fixture write failed')");
+      await evalExpr("document.getElementById('profile-migration-fixture').remove(); localStorage.removeItem('openbot.profile.name.v1'); delete window.__openbotLocalProfileAgent;");
+      console.log('PROFILE_FEEDBACK GREEN: delayed load merges untouched fields, pending save survives panel close, unchanged avatar is stable, persisted name/photo reload');
+      return;
+    }
     if (process.argv.includes("--profile-only")) {
       const reloadProfile = async () => {
         await evalExpr(`window.__profileTestReload = true`);
@@ -479,9 +991,10 @@ async function main() {
     if (emptyOnboardingOnly) {
       const emptyProviderConfig = await evalExpr(`window.desktop.agent.getProviderConfig().then((value) => ({ value })).catch((error) => ({ error: String(error?.message || error) }))`);
       console.log("EMPTY_PROVIDER_CONFIG", JSON.stringify(emptyProviderConfig));
+      // No active provider exists for an empty roster. Verify the visible flow, not its legacy session marker.
        await waitForEval(`(() => {
          const text = document.querySelector(".sand-onboarding__meet")?.innerText || "";
-         return text.includes("Conheça o OpenBot") && text.includes("Dê uma tarefa ao seu time de bots") && sessionStorage.getItem("openbot.welcome.completed.session.v1") === "1";
+         return text.includes("Conheça o OpenBot") && text.includes("Dê uma tarefa ao seu time de bots") && Boolean(document.querySelector('[data-openbot-onboarding-continue="1"]:not(:disabled)'));
        })()`, 10000);
        await sleep(1800);
        const onboarding = await evalExpr(`(() => {
@@ -534,19 +1047,36 @@ async function main() {
            continueOpaque: continueOpacityChain.length === 0,
            visible: Boolean(rect && rect.width > 0 && rect.height > 0),
           fits: Boolean(rect && rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight),
-          handledForSession: sessionStorage.getItem("openbot.welcome.completed.session.v1") === "1",
+          continueEnabled: Boolean(continueButton && !continueButton.disabled),
         };
       })()`);
       console.log("EMPTY_ONBOARDING", JSON.stringify(onboarding, null, 2));
-       if (onboarding.language !== "pt-BR" || onboarding.genericWelcomeVisible || !onboarding.title || !onboarding.composer || !onboarding.continueButton || !onboarding.titleBright || !onboarding.continueBright || !onboarding.titleOpaque || !onboarding.continueOpaque || !onboarding.visible || !onboarding.fits || !onboarding.handledForSession) {
+       if (onboarding.language !== "pt-BR" || onboarding.genericWelcomeVisible || !onboarding.title || !onboarding.composer || !onboarding.continueButton || !onboarding.titleBright || !onboarding.continueBright || !onboarding.titleOpaque || !onboarding.continueOpaque || !onboarding.visible || !onboarding.fits || !onboarding.continueEnabled) {
         throw new Error(`empty-agent onboarding failed visual verification: ${JSON.stringify(onboarding)}`);
       }
       await shot("visual-empty-agent-onboarding");
+      const continueTarget = await evalExpr(`(() => { const button=document.querySelector('[data-openbot-onboarding-continue="1"]'); const r=button.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2}; })()`);
+      await send("Input.dispatchMouseEvent", { type: "mousePressed", ...continueTarget, button: "left", clickCount: 1 });
+      await send("Input.dispatchMouseEvent", { type: "mouseReleased", ...continueTarget, button: "left", clickCount: 1 });
+      await waitForEval(`(() => { const meet=document.querySelector('.sand-onboarding__meet'); return (!meet || !meet.getClientRects().length) && document.body.innerText.trim().length > 0; })()`, 10000);
+      console.log("EMPTY_ONBOARDING_CONTINUED", await evalExpr("document.body.innerText.slice(0, 600)"));
+      await shot("visual-empty-agent-continued");
       console.log("VISUAL_EVIDENCE_DIR", evidenceDir);
       ws.close();
       return;
     }
     if (screenCloseOnly) {
+      const computerPrepaint = await evalExpr(`(() => {
+        const control = document.createElement('button');
+        control.className = 'sand-chat-header__computer';
+        control.setAttribute('aria-label', "OpenBot's Computer, in use");
+        document.body.append(control);
+        const result = { display: getComputedStyle(control).display, rects: control.getClientRects().length };
+        control.remove();
+        return result;
+      })()`);
+      if (computerPrepaint.display !== 'none' || computerPrepaint.rects !== 0) throw new Error('Computer control visible before observer: ' + JSON.stringify(computerPrepaint));
+      console.log('COMPUTER_PREPAINT_GREEN', JSON.stringify(computerPrepaint));
       await waitForEval(`(() => [...document.querySelectorAll('[aria-label="View agent settings"]')]
         .some((element) => element.getClientRects().length > 0 && getComputedStyle(element).visibility !== "hidden"))()`, 10000);
       const opened = await evalExpr(`(() => {
@@ -562,6 +1092,21 @@ async function main() {
         return Boolean(details?.getClientRects().length && settings?.getClientRects().length);
       })()`, 6000);
       await shot("visual-settings-before-close");
+      const closeFrames = await evalExpr(`(async () => {
+        const close = [...document.querySelectorAll('button[aria-label="Close details"], button[aria-label="Fechar detalhes"]')].find(button => button.getClientRects().length > 0);
+        if (!close) throw new Error('Close details control missing');
+        close.click();
+        const frames = [];
+        for (let i = 0; i < 24; i++) {
+          await new Promise(requestAnimationFrame);
+          frames.push([...document.querySelectorAll('.sand-chat-header__computer')].some(button => button.getClientRects().length > 0));
+        }
+        return frames;
+      })()`);
+      if (closeFrames.some(Boolean)) throw new Error('Computer control flashed during settings close');
+      console.log('COMPUTER_CLOSE_FRAMES_GREEN', JSON.stringify({ frames: closeFrames.length, visibleFrames: closeFrames.filter(Boolean).length }));
+      await evalExpr(`document.querySelector('[aria-label="View agent settings"]').click()`);
+      await waitForEval("Boolean(document.getElementById('openbot-provider-settings')?.getClientRects().length)", 6000);
       const legacyScreenInjected = await evalExpr(`(() => {
         const details = document.getElementById("sand-conversation-details");
         const settings = document.getElementById("openbot-provider-settings");
@@ -2086,6 +2631,11 @@ async function main() {
           stopHidden: stop?.hidden ?? null,
           stopDisplay: stopStyle?.display || null,
           alignedWithPromptAction: Boolean(stopRect && promptActionRect && Math.abs(stopRect.left - promptActionRect.left) <= 1 && Math.abs(stopRect.top - promptActionRect.top) <= 1 && Math.abs(stopRect.width - promptActionRect.width) <= 1 && Math.abs(stopRect.height - promptActionRect.height) <= 1),
+          activityDetail: (() => {
+            const detail = document.querySelector('[data-openbot-activity-detail]');
+            return detail ? detail.textContent : null;
+          })(),
+          promptActionCount: [...document.querySelectorAll(".sand-prompt-send")].filter((element) => element.getClientRects().length > 0 && getComputedStyle(element).visibility !== "hidden").length,
           insidePromptShell: Boolean(stopRect && promptShellRect && stopRect.left >= promptShellRect.left && stopRect.top >= promptShellRect.top && stopRect.right <= promptShellRect.right && stopRect.bottom <= promptShellRect.bottom),
           activeAgent: stop?.dataset.openbotActiveAgent || null,
           busyAgents: stop?.dataset.openbotBusyAgents || null,
@@ -2099,6 +2649,19 @@ async function main() {
       await sleep(100);
     }
     console.log("NATIVE_STREAMING_UI", JSON.stringify(streamingUi));
+    console.log("NATIVE_EXECUTION_DETAIL", JSON.stringify({
+      activityVisible: streamingUi?.activityVisible, transcriptTextVisible: streamingUi?.assistantVisible,
+      detail: streamingUi?.activityDetail, localStatusHidden: streamingUi?.floatingStatusHidden,
+      promptActionCount: streamingUi?.promptActionCount,
+    }));
+    // O texto da rodada fica retido com ferramentas habilitadas, mas a etapa real
+    // do provedor não pode ficar escondida: o detalhe entra na superfície nativa.
+    if (!streamingUi?.activityVisible) throw new Error("native activity indicator is missing during the paused stream");
+    const detail = String(streamingUi?.activityDetail || "");
+    if (!/Recebendo resposta|Executando ferramenta|Aguardando/.test(detail)) throw new Error(`execution step is not integrated into the native activity surface: ${JSON.stringify(detail)}`);
+    if (!/atividade: |sem atualização há /.test(detail)) throw new Error(`execution detail is missing the real activity age: ${JSON.stringify(detail)}`);
+    if (streamingUi?.assistantVisible) throw new Error("this fixture must keep the round text retained while the provider is paused");
+    if (!streamingUi?.floatingStatusHidden) throw new Error("the local status line must not duplicate the native activity surface");
     if (!streamingUi?.activityVisible || !streamingUi?.floatingStatusHidden) throw new Error("native activity missing or duplicated by status label");
     if (!streamingUi?.iconCentered) throw new Error("stop icon is not centered");
     if (!streamingUi?.userVisible || streamingUi.userLineCount !== 1 || streamingUi.userBubbleWidth < 44 || !streamingUi.assistantVisible || !streamingUi.stopVisible || Math.abs(streamingUi.stopWidth - 30) > 1 || Math.abs(streamingUi.stopHeight - 30) > 1 || !streamingUi.alignedWithPromptAction || !streamingUi.insidePromptShell || streamingUi.messageMotion !== null || streamingUi.messageDuration !== null || streamingUi.messageRuns !== null) {
@@ -2173,6 +2736,7 @@ async function main() {
           buttonVisible: Boolean(button),
           buttonHeight: button?.getBoundingClientRect().height || 0,
           buttonRadius: style?.borderRadius || null,
+          rows: [...document.querySelectorAll('.ob-retry-generation')].map(b => ({ text: b.previousElementSibling?.textContent, row: b.closest('[data-row-key]')?.getAttribute('data-row-key'), entry: b.closest('[data-entry-id]')?.getAttribute('data-entry-id') })),
         };
       })()`);
       if (retryUi?.errorVisible && retryUi?.buttonVisible) break;
@@ -2181,7 +2745,20 @@ async function main() {
     console.log("NATIVE_RETRY_UI", JSON.stringify(retryUi));
     if (!retryUi?.errorVisible || !retryUi.buttonVisible || Math.abs(retryUi.buttonHeight - 30) > 1 || retryUi.buttonRadius !== "6px") throw new Error(`retry/error UI failed visual verification: ${JSON.stringify(retryUi)}`);
     await shot("visual-error-retry");
-    const retryActivated = await evalExpr(`(() => { const button = [...document.querySelectorAll("button")].find((candidate) => candidate.textContent?.trim() === "Tentar novamente" && !candidate.disabled); if (!button) return false; button.focus(); if (document.activeElement !== button) return false; button.click(); return true; })()`);
+    const beforeStaleRetry = JSON.parse(readFileSync(statusFile, "utf8"));
+    // Uma falha superada não recebe ação do backend: a interface só oferece a
+    // recuperação que o servidor confirmou para a falha atual.
+    const historicalAction = await evalExpr(`(() => {
+      const button = [...document.querySelectorAll('.ob-retry-generation')].find(b => b.previousElementSibling?.textContent?.startsWith('Geração interrompida.'));
+      return { present: Boolean(button), disabled: button?.disabled ?? null,
+        notes: [...document.querySelectorAll('.sand-transcript-row[role="note"]')].map(r => (r.textContent || '').trim().slice(0, 60)) };
+    })()`);
+    console.log("NATIVE_RETRY_HISTORICAL", JSON.stringify(historicalAction));
+    if (historicalAction.present) throw new Error(`historical failure still offers a retry action: ${JSON.stringify(historicalAction)}`);
+    const afterStaleRetry = JSON.parse(readFileSync(statusFile, "utf8"));
+    if (afterStaleRetry.retrySuccessObserved || afterStaleRetry.activeStreams !== 0 || afterStaleRetry.chunksEmitted !== beforeStaleRetry.chunksEmitted) throw new Error(`historical retry started the wrong response: ${JSON.stringify(afterStaleRetry)}`);
+    console.log("NATIVE_RETRY_STALE_REJECTED", JSON.stringify({ historicalActionAbsent: true, activeStreams: afterStaleRetry.activeStreams, retrySuccessObserved: afterStaleRetry.retrySuccessObserved }));
+    const retryActivated = await evalExpr(`(() => { const button = [...document.querySelectorAll('.ob-retry-generation')].find(b => b.previousElementSibling?.textContent?.startsWith('O provedor está temporariamente indisponível') && !b.disabled); if (!button) return false; button.focus(); if (document.activeElement !== button) return false; button.click(); return true; })()`);
     if (!retryActivated) throw new Error("retry action could not be focused and activated");
     await waitGatewayStatus((status) => status.retrySuccessObserved === true && status.activeStreams === 0);
     let retryRecovered = false;
@@ -2206,17 +2783,19 @@ async function main() {
 
     await evalExpr(`(() => {
       const now = Date.now();
+      const fixtureAgentId = document.querySelector('.sand-agent-item[data-layout="expanded"][aria-current="page"]')?.getAttribute('data-agent-id');
+      if (!fixtureAgentId) throw new Error('Memory fixture requires the selected native bot');
       const state = {
         busy: false,
-        currentAgentId: "bot-visual",
+        currentAgentId: fixtureAgentId,
         activeConversationId: "conv-live",
         memoryMode: "automatic",
         createCalls: 0,
         calls: [],
         conversations: [
-          { id: "conv-live", agentId: "bot-visual", title: "Conversa ativa", titleSource: "manual", temporary: false, archivedAtMs: null, createdAtMs: now - 50_000, updatedAtMs: now - 10_000, lastMessageAtMs: now - 12_000, preview: "Prévia ativa" },
-          { id: "conv-side", agentId: "bot-visual", title: "Conversa lateral", titleSource: "auto", temporary: false, archivedAtMs: null, createdAtMs: now - 70_000, updatedAtMs: now - 20_000, lastMessageAtMs: now - 18_000, preview: "Prévia lateral" },
-          { id: "conv-arch", agentId: "bot-visual", title: "Arquivada", titleSource: "manual", temporary: false, archivedAtMs: now - 5_000, createdAtMs: now - 90_000, updatedAtMs: now - 5_000, lastMessageAtMs: now - 30_000, preview: "Prévia arquivada" },
+          { id: "conv-live", agentId: fixtureAgentId, title: "Conversa ativa", titleSource: "manual", temporary: false, archivedAtMs: null, createdAtMs: now - 50_000, updatedAtMs: now - 10_000, lastMessageAtMs: now - 12_000, preview: "Prévia ativa" },
+          { id: "conv-side", agentId: fixtureAgentId, title: "Conversa lateral", titleSource: "auto", temporary: false, archivedAtMs: null, createdAtMs: now - 70_000, updatedAtMs: now - 20_000, lastMessageAtMs: now - 18_000, preview: "Prévia lateral" },
+          { id: "conv-arch", agentId: fixtureAgentId, title: "Arquivada", titleSource: "manual", temporary: false, archivedAtMs: now - 5_000, createdAtMs: now - 90_000, updatedAtMs: now - 5_000, lastMessageAtMs: now - 30_000, preview: "Prévia arquivada" },
         ],
         memories: [
           { id: "mem-1", kind: "fact", text: "Valor inicial", trust: "verified_tool", status: "active", importance: 50, confidence: 0.7, pinned: false, sourceConversationId: "conv-live", validFromMs: now - 60_000, validToMs: null, expiresAtMs: null, createdAtMs: now - 60_000, updatedAtMs: now - 60_000 },
@@ -2233,8 +2812,8 @@ async function main() {
       const liveConversations = () => state.conversations.filter((item) => item.archivedAtMs == null);
       const page = () => ({ items: state.conversations.slice(0, 50), nextCursor: null });
       const memoryStatus = () => ({
-        agentId: "bot-visual",
-        settings: { agentId: "bot-visual", mode: state.memoryMode, updatedAtMs: Date.now() },
+        agentId: fixtureAgentId,
+        settings: { agentId: fixtureAgentId, mode: state.memoryMode, updatedAtMs: Date.now() },
         conversationId: activeConversation()?.id || null,
         summary: { conversationId: activeConversation()?.id || "conv-live", throughSequenceId: 1, revision: 1, updatedAtMs: Date.now(), renderedTextBytes: 128 },
         counts: {
@@ -2249,7 +2828,7 @@ async function main() {
       current.createConversation = async () => {
         logCall("createConversation", { title: "Nova conversa" });
         state.createCalls += 1;
-        const conversation = { id: "conv-new", agentId: "bot-visual", title: "Nova conversa", titleSource: "manual", temporary: false, archivedAtMs: null, createdAtMs: Date.now(), updatedAtMs: Date.now(), lastMessageAtMs: null };
+        const conversation = { id: "conv-new", agentId: fixtureAgentId, title: "Nova conversa", titleSource: "manual", temporary: false, archivedAtMs: null, createdAtMs: Date.now(), updatedAtMs: Date.now(), lastMessageAtMs: null };
         state.conversations = [conversation, ...state.conversations.filter((item) => item.id !== conversation.id)];
         state.activeConversationId = conversation.id;
         return { conversation, page: page() };
@@ -2285,11 +2864,11 @@ async function main() {
         if (state.activeConversationId === conversationId) state.activeConversationId = liveConversations()[0]?.id || null;
         return { conversationId, memoryPolicy: "delete-derived", conversation: activeConversation(), page: page() };
       };
-      current.getMemorySettings = async () => (logCall("getMemorySettings"), { agentId: "bot-visual", mode: state.memoryMode, updatedAtMs: Date.now(), internalOnly: "ignore" });
+      current.getMemorySettings = async () => (logCall("getMemorySettings"), { agentId: fixtureAgentId, mode: state.memoryMode, updatedAtMs: Date.now(), internalOnly: "ignore" });
       current.setMemorySettings = async ({ mode }) => {
         logCall("setMemorySettings", { mode });
         state.memoryMode = mode;
-        return { agentId: "bot-visual", mode: state.memoryMode, updatedAtMs: Date.now(), internalOnly: "ignore" };
+        return { agentId: fixtureAgentId, mode: state.memoryMode, updatedAtMs: Date.now(), internalOnly: "ignore" };
       };
       current.listMemories = async () => (logCall("listMemories"), state.memories.slice());
       current.listMemoriesPage = async ({ cursor, limit = 20, query = "" } = {}) => {
@@ -2324,7 +2903,7 @@ async function main() {
       current.getMemoryStatus = async () => (logCall("getMemoryStatus"), memoryStatus());
       current.searchMemoryHistory = async ({ query }) => (logCall("searchMemoryHistory", { query }), state.memories
         .filter((item) => item.text.toLowerCase().includes(String(query || "").toLowerCase()))
-        .map((item) => ({ kind: "memory", snippet: item.text, score: 1, agentId: "bot-visual", conversationId: item.sourceConversationId, sequenceId: 1, provenance: { source: "memory", memoryId: item.id }, memory: item })));
+        .map((item) => ({ kind: "memory", snippet: item.text, score: 1, agentId: fixtureAgentId, conversationId: item.sourceConversationId, sequenceId: 1, provenance: { source: "memory", memoryId: item.id }, memory: item })));
       window.__openbotMemoryUiAgent = current;
       document.getElementById("openbot-provider-settings")?.remove();
       document.getElementById("openbot-memory-ui-fixture")?.remove();
@@ -2356,6 +2935,7 @@ async function main() {
     if (!memoryUiState?.hasMemoryScript || !memoryUiState?.hasMemorySection || !memoryUiState?.hasManageMemory) {
       throw new Error(`conversation/memory UI did not mount: ${JSON.stringify(memoryUiState)}`);
     }
+    await waitForEval("Boolean(document.querySelector('#openbot-memory-settings input[value=explicit]:not(:disabled)'))");
     await evalExpr(`(() => {
       const explicit = document.querySelector('#openbot-memory-settings input[value="explicit"]');
       if (!explicit) return false;

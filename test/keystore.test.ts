@@ -335,17 +335,21 @@ describe("T4 keystore — chave-mestra local", () => {
     const dir = await makeDir();
     const file = path.join(dir, ".master.key");
     const winner = Buffer.alloc(32, 0x5a);
-    const originalWrite = fs.writeFileSync.bind(fs);
-    const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementation(((...args: unknown[]) => {
-      const [target, , options] = args;
-      expect(target).toBe(file);
-      expect(options).toMatchObject({ flag: "wx", mode: 0o600 });
-      originalWrite(file, winner, { flag: "wx", mode: 0o600 });
-      throw Object.assign(new Error("another process won"), { code: "EEXIST" });
+    let injected = false;
+    const originalRead = fs.readFileSync.bind(fs);
+    const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
+      const [target] = args;
+      if (target === file && !injected) {
+        injected = true;
+        fs.writeFileSync(file, winner, { flag: "wx", mode: 0o600 });
+        throw Object.assign(new Error("another process won"), { code: "ENOENT" });
+      }
+      return originalRead(...(args as Parameters<typeof fs.readFileSync>));
     }));
 
     const first = withoutMemoryFallback(() => createKeystore({ dir }));
-    writeSpy.mockRestore();
+    readSpy.mockRestore();
+    expect(injected).toBe(true);
     await first.upsert("openai", "race-safe-secret");
     const second = withoutMemoryFallback(() => createKeystore({ dir }));
     await expect(second.reveal("openai")).resolves.toBe("race-safe-secret");

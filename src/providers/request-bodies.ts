@@ -38,7 +38,11 @@ export function buildResponsesBody(req: ProviderChatRequest): Record<string, unk
     stream: true,
     store: false,
     ...(req.modelResolution?.serviceTier ? { service_tier: req.modelResolution.serviceTier } : {}),
-    ...(req.reasoningEffort ? { reasoning: { effort: req.reasoningEffort } } : {}),
+    // Fail-closed: o esforço só entra no corpo quando o catálogo declara o
+    // valor como suportado pelo modelo resolvido — nunca por inferência.
+    ...(req.reasoningEffort !== undefined
+      && req.modelResolution?.supportedReasoningEfforts?.includes(req.reasoningEffort) === true
+      ? { reasoning: { effort: req.reasoningEffort } } : {}),
     ...(req.tools?.length ? {
       tools: req.tools.map((tool) => ({
         type: "function",
@@ -77,12 +81,21 @@ export function buildCodexResponsesBody(req: ProviderChatRequest): Record<string
   };
 }
 
+/**
+ * Modelos OpenAI servidos pelo endpoint `/responses` em vez de
+ * `/chat/completions`. Fonte única do predicado — `OpenAiAdapter` importa
+ * daqui para que o gate de contexto (`providerRequestBody`) e o adapter
+ * nunca divirjam.
+ */
+export function usesResponsesApi(model: string): boolean {
+  return model === "gpt-6-astra" || model.startsWith("gpt-5.6-");
+}
+
 export function providerRequestBody(
   provider: string | undefined,
   request: ProviderChatRequest,
 ): Record<string, unknown> {
-  // This mirrors OpenAiAdapter's current Responses routing predicate.
-  return provider === "openai" && (request.model === "gpt-6-astra" || request.model.startsWith("gpt-5.6-"))
+  return provider === "openai" && usesResponsesApi(request.model)
     ? buildResponsesBody(request)
     : buildChatBody(request) as unknown as Record<string, unknown>;
 }

@@ -32,6 +32,36 @@ function request(model = "fixture-model"): ProviderChatRequest {
   return { model, messages: [{ role: "user", content: "hello" }] };
 }
 
+function openRouterResolution(
+  model: string,
+  options: { contextWindow?: number; maxOutputTokens?: number; capabilities?: Partial<NonNullable<ProviderChatRequest["modelResolution"]>["capabilities"]> } = {},
+): NonNullable<ProviderChatRequest["modelResolution"]> {
+  return {
+    entry: {
+      id: model,
+      provider: "openai-compat",
+      displayName: model,
+      contextWindow: options.contextWindow ?? 128_000,
+      maxOutputTokens: options.maxOutputTokens ?? 16_384,
+      maxRequestBytes: 512 * 1024,
+      tokenizerStrategy: "estimated",
+      safetyMargin: 0.1,
+    },
+    capabilities: {
+      streaming: true,
+      tools: true,
+      images: false,
+      cancellation: "abort-signal",
+      authentication: "keystore-api-key",
+      usage: "stream-events",
+      resume: "none",
+      reasoning: false,
+      ...options.capabilities,
+    },
+    protocol: "chat",
+  };
+}
+
 function fixturePath(name: "codex-cli-v1.mjs" | "claude-code-v1.mjs"): string {
   return new URL(`./fixtures/${name}`, import.meta.url).pathname;
 }
@@ -143,6 +173,112 @@ describe("P2.5 RED — OpenRouter and bounded CLI adapters", () => {
       .rejects.toMatchObject({ code: "context_budget_exceeded" });
     await expect(adapter.streamChat(request("model-not-in-catalog"), () => undefined))
       .rejects.toMatchObject({ code: "model_capability_unknown" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("trusts an exact OpenRouter request snapshot before any adapter fallback", async () => {
+    const module = await loadOptionalAdapters();
+    expect(module, "P2.5 RED: optional adapters module is missing").not.toBeNull();
+    if (module === null) return;
+
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response("data: [DONE]\n\n", { status: 200, headers: { "content-type": "text/event-stream" } }));
+    const adapter = new module.OpenRouterAdapter({
+      agentId: "agent-a",
+      credentialRef: "openrouter:key:fixture-v1",
+      resolveCredential: async () => "fixture-key",
+      fetchImpl,
+    });
+    const content = "x".repeat(100_000);
+    const req: ProviderChatRequest = {
+      model: "snapshot-large",
+      modelResolution: openRouterResolution("snapshot-large"),
+      messages: [{ role: "user", content }],
+    };
+
+    await expect(adapter.streamChat(req, () => undefined)).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body)) as { messages?: Array<{ content?: string }> };
+    expect(body.messages?.[0]?.content).toBe(content);
+  });
+
+  it("uses a declared adapter catalog before the shared unknown-model floor", async () => {
+    const module = await loadOptionalAdapters();
+    expect(module, "P2.5 RED: optional adapters module is missing").not.toBeNull();
+    if (module === null) return;
+
+    const fetchImpl = vi.fn(async () => new Response("data: [DONE]\n\n", { status: 200, headers: { "content-type": "text/event-stream" } }));
+    const adapter = new module.OpenRouterAdapter({
+      agentId: "agent-a",
+      credentialRef: "openrouter:key:fixture-v1",
+      resolveCredential: async () => "fixture-key",
+      modelCatalog: [{
+        id: "openrouter-small",
+        provider: "openai-compat",
+        displayName: "Catalog large",
+        contextWindow: 128_000,
+        maxOutputTokens: 16_384,
+        maxRequestBytes: 512 * 1024,
+        tokenizerStrategy: "estimated",
+        safetyMargin: 0.1,
+      }],
+      fetchImpl,
+    });
+    const content = "x".repeat(100_000);
+    await expect(adapter.streamChat({ model: "openrouter-small", messages: [{ role: "user", content }] }, () => undefined)).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not trust a mismatched snapshot and keeps unknown OpenRouter models on the shared bounded floor", async () => {
+    const module = await loadOptionalAdapters();
+    expect(module, "P2.5 RED: optional adapters module is missing").not.toBeNull();
+    if (module === null) return;
+
+    const fetchImpl = vi.fn(async () => new Response("data: [DONE]\n\n", { status: 200, headers: { "content-type": "text/event-stream" } }));
+    const adapter = new module.OpenRouterAdapter({
+      agentId: "agent-a",
+      credentialRef: "openrouter:key:fixture-v1",
+      resolveCredential: async () => "fixture-key",
+      fetchImpl,
+    });
+    const content = "x".repeat(100_000);
+    const unknown = { model: "unknown-model", messages: [{ role: "user" as const, content }] };
+    const mismatched = {
+      ...unknown,
+      modelResolution: openRouterResolution("different-model"),
+    };
+    const wrongProviderResolution = openRouterResolution("unknown-model");
+    const wrongProvider = {
+      ...unknown,
+      modelResolution: {
+        ...wrongProviderResolution,
+        entry: { ...wrongProviderResolution.entry, provider: "xai" },
+      } as never,
+    };
+
+    await expect(adapter.streamChat(unknown, () => undefined)).rejects.toMatchObject({ code: "context_budget_exceeded" });
+    await expect(adapter.streamChat(mismatched, () => undefined)).rejects.toMatchObject({ code: "context_budget_exceeded" });
+    await expect(adapter.streamChat(wrongProvider, () => undefined)).rejects.toMatchObject({ code: "context_budget_exceeded" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("uses the matching request capability snapshot for the tools gate", async () => {
+    const module = await loadOptionalAdapters();
+    expect(module, "P2.5 RED: optional adapters module is missing").not.toBeNull();
+    if (module === null) return;
+
+    const fetchImpl = vi.fn(async () => new Response("data: [DONE]\n\n", { status: 200, headers: { "content-type": "text/event-stream" } }));
+    const adapter = new module.OpenRouterAdapter({
+      agentId: "agent-a",
+      credentialRef: "openrouter:key:fixture-v1",
+      resolveCredential: async () => "fixture-key",
+      fetchImpl,
+    });
+    await expect(adapter.streamChat({
+      model: "snapshot-no-tools",
+      modelResolution: openRouterResolution("snapshot-no-tools", { capabilities: { tools: false } }),
+      messages: [{ role: "user", content: "hello" }],
+      tools: [{ type: "function", function: { name: "fixture", parameters: {} } }],
+    }, () => undefined)).rejects.toMatchObject({ code: "unsupported_feature" });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 

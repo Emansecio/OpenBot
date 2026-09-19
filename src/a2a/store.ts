@@ -429,13 +429,15 @@ export class A2AStore {
   listForRecipient(agentId: string, limit = 128): A2AMessageRecord[] {
     this.assertOpen();
     const bounded = Math.max(1, Math.min(128, Math.trunc(limit)));
-    return (this.db.prepare(`SELECT message.* FROM a2a_messages AS message
-      JOIN a2a_agent_incarnations AS incarnation
-        ON incarnation.agent_id = message.recipient_agent_id
-       AND incarnation.incarnation = message.recipient_incarnation
-       AND incarnation.status = 'active'
-      WHERE message.recipient_agent_id = ?
-      ORDER BY message.created_at_ms ASC, message.message_id ASC LIMIT ?`).all(agentId, bounded) as Row[]).map((row) => this.toRecord(row));
+    return (this.db.prepare(`SELECT recent.* FROM (
+      SELECT message.* FROM a2a_messages AS message
+        JOIN a2a_agent_incarnations AS incarnation
+          ON incarnation.agent_id = message.recipient_agent_id
+         AND incarnation.incarnation = message.recipient_incarnation
+         AND incarnation.status = 'active'
+        WHERE message.recipient_agent_id = ?
+        ORDER BY message.created_at_ms DESC, message.message_id DESC LIMIT ?
+    ) AS recent ORDER BY recent.created_at_ms ASC, recent.message_id ASC`).all(agentId, bounded) as Row[]).map((row) => this.toRecord(row));
   }
 
   listUndeliveredOutbox(): unknown[] { this.assertOpen(); return this.db.prepare("SELECT * FROM a2a_outbox WHERE delivered_at_ms IS NULL ORDER BY created_at_ms ASC, outbox_id ASC").all(); }
@@ -558,13 +560,15 @@ export class A2AStore {
       const epoch = projection?.epoch ?? randomUUID();
       const nextSequence = projection?.next_sequence ?? 1;
       if (projection === undefined) this.db.prepare("INSERT INTO a2a_projection_state(agent_id, epoch, next_sequence) VALUES (?, ?, 1)").run(agentId, epoch);
-      const rows = this.db.prepare(`SELECT message.* FROM a2a_messages AS message
-        JOIN a2a_agent_incarnations AS incarnation
-          ON incarnation.agent_id = message.recipient_agent_id
-         AND incarnation.incarnation = message.recipient_incarnation
-         AND incarnation.status = 'active'
-        WHERE message.recipient_agent_id = ?
-        ORDER BY message.created_at_ms ASC, message.message_id ASC LIMIT 128`).all(agentId) as Row[];
+      const rows = this.db.prepare(`SELECT recent.* FROM (
+        SELECT message.* FROM a2a_messages AS message
+          JOIN a2a_agent_incarnations AS incarnation
+            ON incarnation.agent_id = message.recipient_agent_id
+           AND incarnation.incarnation = message.recipient_incarnation
+           AND incarnation.status = 'active'
+          WHERE message.recipient_agent_id = ?
+          ORDER BY message.created_at_ms DESC, message.message_id DESC LIMIT 128
+      ) AS recent ORDER BY recent.created_at_ms ASC, recent.message_id ASC`).all(agentId) as Row[];
       return { agentId, epoch, sequence: Math.max(0, nextSequence - 1), items: rows.map((row) => this.toRecord(row)) };
     });
     return operation.immediate();

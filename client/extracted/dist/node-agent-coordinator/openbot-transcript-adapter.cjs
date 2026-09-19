@@ -87,15 +87,14 @@ function projectTranscriptForRenderer(payload) {
   // The immutable renderer reserves fromUser for another human and will not
   // acknowledge its nonce. Keep OpenBot's local-user provenance in the backend.
   const localUserEntry = (entry) => {
-    // The immutable chat renderer intentionally returns null for tool-call.
-    // Project its safe summary into the native notice card, retaining the id
-    // so pending/running/final updates replace one visible entry.
+    // Keep tool-call entries as non-rendered records. The immutable chat
+    // renderer intentionally does not render them, so projecting them as
+    // notices would turn every internal tool transition into transcript noise.
+    // Do not carry execution results across the renderer boundary: they can
+    // contain process output even though the entry itself is not rendered.
     if (entry?.kind === "tool-call") {
-      const labels = { pending: "Aguardando", running: "Executando", completed: "Concluído", failed: "Falhou" };
-      const status = labels[entry.status] || "Estado desconhecido";
-      const detail = entry.status === "failed" && typeof entry.result?.message === "string" ? entry.result.message : "";
-      return { kind: "notice", id: entry.id,
-        text: [status, entry.summary || "Ferramenta local", detail].filter(Boolean).join(" · ") };
+      const { result: _result, ...toolCall } = entry;
+      return toolCall;
     }
     if (entry?.kind !== "message" || entry.role !== "user" || !entry.fromUser
       || entry.fromAgent || entry.toAgent || typeof entry.clientNonce !== "string") return entry;

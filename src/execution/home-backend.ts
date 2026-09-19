@@ -473,12 +473,11 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     const summary = await inspectSafeTree(sourceAbs, signal);
     let reservation: { commit(): void; cancel(): void } | undefined;
     if (destination.kind === "home") {
-      const destinationAbs = await destExec.workspace.resolveExisting(".");
       reservation = await this.quota.reserveDelta({
         bytes: summary.bytes,
         files: summary.files,
         entries: summary.entries,
-      }, destinationAbs);
+      }, destAbs);
     }
     try {
       if (mode === "copy") {
@@ -492,6 +491,9 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
       reservation = undefined;
       this.quota.markUsageDirty();
       return { ok: true, operation: "file.move" };
+    } catch (error) {
+      if (mode === "move") this.quota.markUsageDirty();
+      throw error;
     } finally {
       reservation?.cancel();
     }

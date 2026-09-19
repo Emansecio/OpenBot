@@ -21,19 +21,14 @@ if (-not (Test-Path -LiteralPath $ShortcutPath -PathType Leaf)) {
 
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($ShortcutPath)
-$expectedTarget = Join-Path $env:SystemRoot 'System32\wscript.exe'
-if (-not [IO.Path]::GetFullPath($shortcut.TargetPath).Equals([IO.Path]::GetFullPath($expectedTarget), [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Shortcut target is not wscript.exe: $($shortcut.TargetPath)"
+$shortcutLauncher = [IO.Path]::GetFullPath([string]$shortcut.TargetPath)
+if ([IO.Path]::GetExtension($shortcutLauncher) -inotmatch '^\.(vbs|exe)$' -or -not [string]::IsNullOrWhiteSpace([string]$shortcut.Arguments)) {
+    throw 'Shortcut must target the OpenBot VBS or EXE directly, without arguments'
 }
-
-$shortcutArguments = ([string]$shortcut.Arguments).Trim()
-$quotedLauncher = [regex]::Match($shortcutArguments, '^"(?<path>[^"]+)"$')
-if ($quotedLauncher.Success) {
-    $shortcutLauncher = [IO.Path]::GetFullPath($quotedLauncher.Groups['path'].Value)
-} elseif ($shortcutArguments.Length -gt 0 -and $shortcutArguments.IndexOf('"') -lt 0) {
-    $shortcutLauncher = [IO.Path]::GetFullPath($shortcutArguments)
-} else {
-    throw "Shortcut must pass exactly one hidden launcher path: $shortcutArguments"
+$shortcutFolder = (New-Object -ComObject Shell.Application).Namespace((Split-Path -Parent $ShortcutPath))
+$shortcutItem = $shortcutFolder.ParseName((Split-Path -Leaf $ShortcutPath))
+if ([string]$shortcutItem.ExtendedProperty('System.AppUserModel.ID') -cne 'OpenBot.Desktop') {
+    throw 'Shortcut taskbar identity must be OpenBot.Desktop'
 }
 if (-not (Test-Path -LiteralPath $shortcutLauncher -PathType Leaf)) {
     throw "Shortcut hidden launcher does not exist: $shortcutLauncher"
@@ -42,9 +37,11 @@ if (-not (Test-Path -LiteralPath $shortcutLauncher -PathType Leaf)) {
 $repoLauncher = [IO.Path]::GetFullPath((Join-Path $scriptDir 'openbot-desktop.vbs'))
 $launcherRoot = [IO.Path]::GetFullPath((Split-Path -Parent $shortcutLauncher))
 $installedLauncher = [IO.Path]::GetFullPath((Join-Path $launcherRoot 'OpenBot.vbs'))
+$installedExe = [IO.Path]::GetFullPath((Join-Path $launcherRoot 'OpenBot.exe'))
 $workingDirectory = [IO.Path]::GetFullPath([string]$shortcut.WorkingDirectory)
 $isRepoShortcut = $shortcutLauncher.Equals($repoLauncher, [StringComparison]::OrdinalIgnoreCase)
-$isInstalledShortcut = $shortcutLauncher.Equals($installedLauncher, [StringComparison]::OrdinalIgnoreCase) -and
+$isInstalledShortcut = ($shortcutLauncher.Equals($installedLauncher, [StringComparison]::OrdinalIgnoreCase) -or
+    $shortcutLauncher.Equals($installedExe, [StringComparison]::OrdinalIgnoreCase)) -and
     $workingDirectory.Equals($launcherRoot, [StringComparison]::OrdinalIgnoreCase) -and
     (Test-Path -LiteralPath (Join-Path $launcherRoot 'OpenBot.cmd') -PathType Leaf) -and
     (Test-Path -LiteralPath (Join-Path $launcherRoot 'state.json') -PathType Leaf)
@@ -174,7 +171,7 @@ try {
         $listener.Stop()
     }
 
-    $primary = Start-Process -FilePath $shortcut.TargetPath -ArgumentList $shortcut.Arguments -WorkingDirectory $shortcut.WorkingDirectory -WindowStyle Hidden -PassThru
+    $primary = Start-Process -FilePath $ShortcutPath -WorkingDirectory $shortcut.WorkingDirectory -WindowStyle Hidden -PassThru
     $deadline = (Get-Date).AddSeconds(35)
     do {
         try {
@@ -195,7 +192,7 @@ try {
     do {
         $electronInfo = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
             $_.Name -ieq 'electron.exe' -and
-            ([string]$_.CommandLine).IndexOf('electron-main\main.cjs', [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+            ([string]$_.CommandLine).IndexOf('openbot-electron.cjs', [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
             ([string]$_.CommandLine).IndexOf($userData, [StringComparison]::OrdinalIgnoreCase) -ge 0
         } | Select-Object -First 1
         if ($null -ne $electronInfo) {
@@ -211,7 +208,11 @@ try {
     if (-not $windowReady) { throw 'Electron main window did not become visible' }
 
     $launcherProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -ieq 'cmd.exe' -and ([string]$_.CommandLine).IndexOf($launcherCommand, [StringComparison]::OrdinalIgnoreCase) -ge 0
+        $_.Name -ieq 'cmd.exe' -and (([string]$_.CommandLine).IndexOf($launcherCommand, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            [int]$_.ParentProcessId -eq $primary.Id)
+    }
+    if ([IO.Path]::GetExtension($shortcutLauncher) -ieq '.exe' -and @($launcherProcesses).Count -eq 0) {
+        throw 'Executable launcher child was not found for console visibility verification'
     }
     foreach ($launcherInfo in $launcherProcesses) {
         $launcherProcess = Get-Process -Id ([int]$launcherInfo.ProcessId) -ErrorAction SilentlyContinue
@@ -225,7 +226,7 @@ try {
         throw 'Gateway ownership probe failed before the second shortcut launch'
     }
 
-    $secondary = Start-Process -FilePath $shortcut.TargetPath -ArgumentList $shortcut.Arguments -WorkingDirectory $shortcut.WorkingDirectory -WindowStyle Hidden -PassThru
+    $secondary = Start-Process -FilePath $ShortcutPath -WorkingDirectory $shortcut.WorkingDirectory -WindowStyle Hidden -PassThru
     if (-not $secondary.WaitForExit(45000)) {
         $processSnapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
         $matchingElectron = @($processSnapshot | Where-Object {
@@ -234,7 +235,7 @@ try {
         $mainElectron = @($processSnapshot | Where-Object {
             $_.Name -ieq 'electron.exe' -and
             ([string]$_.CommandLine).IndexOf($userData, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
-            ([string]$_.CommandLine).IndexOf('electron-main\main.cjs', [StringComparison]::OrdinalIgnoreCase) -ge 0
+            ([string]$_.CommandLine).IndexOf('openbot-electron.cjs', [StringComparison]::OrdinalIgnoreCase) -ge 0
         }).Count
         $launcherCount = @($processSnapshot | Where-Object {
             $_.Name -ieq 'cmd.exe' -and ([string]$_.CommandLine).IndexOf($launcherCommand, [StringComparison]::OrdinalIgnoreCase) -ge 0

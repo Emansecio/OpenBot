@@ -44,18 +44,31 @@ pub fn run(lease: &LeaseRecord, payload: &RunPayload) -> Result<ProcessResponse,
     close(stdin_read);
     close(stdout_write);
     close(stderr_write);
-    if let Err(error) = cgroup.add_pid(pid) {
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
-        }
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(payload.timeout_ms);
+    // The child must be observed stopped before cgroup placement and release;
+    // otherwise SIGCONT can race with the child's SIGSTOP and strand it.
+    if let Err(error) = wait_for_child_stop(pid, deadline) {
+        terminate_and_reap(pid);
         close(stdin_write);
         close(stdout_read);
         close(stderr_read);
         return Err(error);
     }
-    unsafe {
-        libc::kill(pid, libc::SIGCONT);
+    if let Err(error) = cgroup.add_pid(pid) {
+        terminate_and_reap(pid);
+        close(stdin_write);
+        close(stdout_read);
+        close(stderr_read);
+        return Err(error);
+    }
+    if let Err(error) = continue_child(pid) {
+        let _ = cgroup.kill_all();
+        terminate_and_reap(pid);
+        close(stdin_write);
+        close(stdout_read);
+        close(stderr_read);
+        return Err(error);
     }
 
     let input = payload.stdin.clone().unwrap_or_default().into_bytes();
@@ -66,8 +79,6 @@ pub fn run(lease: &LeaseRecord, payload: &RunPayload) -> Result<ProcessResponse,
     let stdout_thread = thread::spawn(move || read_limited(stdout_read));
     let stderr_thread = thread::spawn(move || read_limited(stderr_read));
 
-    let started = Instant::now();
-    let deadline = started + Duration::from_millis(payload.timeout_ms);
     let mut status = 0;
     let mut timed_out = false;
     loop {
@@ -76,7 +87,11 @@ pub fn run(lease: &LeaseRecord, payload: &RunPayload) -> Result<ProcessResponse,
             break;
         }
         if result < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             let _ = cgroup.kill_all();
+            terminate_and_reap(pid);
             return Err(GuestError::new(
                 ErrorCode::SandboxSetupFailed,
                 "Process wait failed.",
@@ -84,10 +99,11 @@ pub fn run(lease: &LeaseRecord, payload: &RunPayload) -> Result<ProcessResponse,
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            cgroup.kill_all()?;
-            unsafe {
-                libc::waitpid(pid, &mut status, 0);
+            if let Err(error) = cgroup.kill_all() {
+                terminate_and_reap(pid);
+                return Err(error);
             }
+            wait_for_reap(pid, &mut status)?;
             break;
         }
         thread::sleep(Duration::from_millis(5));
@@ -128,6 +144,202 @@ pub fn run(lease: &LeaseRecord, payload: &RunPayload) -> Result<ProcessResponse,
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
     })
+}
+
+fn wait_for_child_stop(pid: libc::pid_t, deadline: Instant) -> Result<(), GuestError> {
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+        if result == pid {
+            if libc::WIFSTOPPED(status) {
+                return Ok(());
+            }
+            return Err(GuestError::new(
+                ErrorCode::SandboxSetupFailed,
+                "Process exited before the sandbox stop handshake.",
+            ));
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(GuestError::new(
+                ErrorCode::SandboxSetupFailed,
+                "Process stop handshake failed.",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(GuestError::new(
+                ErrorCode::SandboxSetupFailed,
+                "Process stop handshake timed out.",
+            ));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn continue_child(pid: libc::pid_t) -> Result<(), GuestError> {
+    loop {
+        if unsafe { libc::kill(pid, libc::SIGCONT) } == 0 {
+            return Ok(());
+        }
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(GuestError::new(
+            ErrorCode::SandboxSetupFailed,
+            "Process could not be released after the sandbox stop handshake.",
+        ));
+    }
+}
+
+fn terminate_and_reap(pid: libc::pid_t) {
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    loop {
+        let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        if result == pid {
+            return;
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                return;
+            }
+            return;
+        }
+    }
+}
+
+fn wait_for_reap(pid: libc::pid_t, status: &mut libc::c_int) -> Result<(), GuestError> {
+    loop {
+        let result = unsafe { libc::waitpid(pid, status, 0) };
+        if result == pid {
+            return Ok(());
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(GuestError::new(
+                ErrorCode::SandboxSetupFailed,
+                "Process reap failed.",
+            ));
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::time::Duration;
+
+    use super::{
+        close, continue_child, pipe, terminate_and_reap, wait_for_child_stop, wait_for_reap,
+    };
+
+    #[test]
+    fn stop_handshake_waits_until_a_delayed_child_stop() {
+        let (ready_read, ready_write) = pipe().expect("create readiness pipe");
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            close(ready_read);
+            close(ready_write);
+            panic!("could not fork handshake test child");
+        }
+        if pid == 0 {
+            close(ready_read);
+            let ready = [1_u8];
+            unsafe {
+                libc::write(ready_write, ready.as_ptr().cast(), ready.len());
+                close(ready_write);
+                libc::usleep(50_000);
+                libc::kill(libc::getpid(), libc::SIGSTOP);
+                libc::_exit(0);
+            }
+        }
+
+        close(ready_write);
+        let mut ready = unsafe { File::from_raw_fd(ready_read) };
+        let mut marker = [0_u8; 1];
+        ready
+            .read_exact(&mut marker)
+            .expect("child should announce before delaying SIGSTOP");
+
+        let started = std::time::Instant::now();
+        let handshake = wait_for_child_stop(pid, started + Duration::from_secs(1));
+        let elapsed = started.elapsed();
+
+        let mut status = 0;
+        let reaped = if handshake.is_ok() {
+            if continue_child(pid).is_ok() {
+                wait_for_reap(pid, &mut status).is_ok()
+            } else {
+                terminate_and_reap(pid);
+                false
+            }
+        } else {
+            terminate_and_reap(pid);
+            false
+        };
+
+        assert!(
+            handshake.is_ok(),
+            "child stop handshake failed: {handshake:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(20),
+            "handshake returned before the child reached SIGSTOP: {elapsed:?}"
+        );
+        assert!(reaped, "handshake test child should be reaped");
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn stop_handshake_fails_and_reaps_when_child_exits_first() {
+        let (ready_read, ready_write) = pipe().expect("create readiness pipe");
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            close(ready_read);
+            close(ready_write);
+            panic!("could not fork handshake exit test child");
+        }
+        if pid == 0 {
+            close(ready_read);
+            let ready = [1_u8];
+            unsafe {
+                libc::write(ready_write, ready.as_ptr().cast(), ready.len());
+                close(ready_write);
+                libc::_exit(7);
+            }
+        }
+
+        close(ready_write);
+        let mut ready = unsafe { File::from_raw_fd(ready_read) };
+        let mut marker = [0_u8; 1];
+        ready
+            .read_exact(&mut marker)
+            .expect("child should announce before exiting");
+
+        let error = wait_for_child_stop(pid, std::time::Instant::now() + Duration::from_secs(1))
+            .expect_err("an exited child cannot complete the stop handshake");
+        terminate_and_reap(pid);
+
+        assert_eq!(error.code.as_str(), "sandbox_setup_failed");
+        assert_eq!(
+            error.message,
+            "Process exited before the sandbox stop handshake."
+        );
+    }
 }
 
 fn child_entry(

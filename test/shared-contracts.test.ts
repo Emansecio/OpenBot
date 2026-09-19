@@ -150,6 +150,7 @@ describe("contrato congelado (T2) — shapes", () => {
 
   it("expõe o catálogo local e os modelos conhecidos do OpenCode Go", () => {
     expect(MODEL_CATALOG.filter(({ provider }) => provider !== "opencode-go").map(({ id, provider }) => ({ id, provider }))).toEqual([
+      { id: "gpt-6-astra", provider: "openai" },
       { id: "grok-4.6", provider: "xai" },
       { id: "gpt-5.6-luna", provider: "openai" },
       { id: "gpt-5.6-sol", provider: "openai" },
@@ -157,7 +158,8 @@ describe("contrato congelado (T2) — shapes", () => {
       { id: "openai-compatible", provider: "openai-compat" },
     ]);
     const openCode = MODEL_CATALOG.filter(({ provider }) => provider === "opencode-go");
-    expect(openCode).toHaveLength(27);
+    expect(openCode).toHaveLength(35);
+    expect(openCode.filter((entry) => entry.id.startsWith("opencode-go/zen/"))).toHaveLength(8);
     expect(openCode.every((entry) => entry.contextWindow && entry.maxOutputTokens && entry.maxRequestBytes && entry.tokenizerStrategy === "estimated")).toBe(true);
     expect(MODEL_CATALOG).toContainEqual(expect.objectContaining({ id: "opencode-go/minimax-m3", provider: "opencode-go" }));
     expect(MODEL_CATALOG).toContainEqual(expect.objectContaining({ id: "opencode-go/qwen3.8-flash", provider: "opencode-go" }));
@@ -166,6 +168,7 @@ describe("contrato congelado (T2) — shapes", () => {
 
   it("declara explicitamente quais modelos aceitam imagens", () => {
     expect(MODEL_CATALOG.filter((entry) => entry.supportsVision).map((entry) => entry.id)).toEqual([
+      "gpt-6-astra",
       "grok-4.6",
       "gpt-5.6-luna",
       "gpt-5.6-sol",
@@ -186,6 +189,9 @@ describe("contrato congelado (T2) — shapes", () => {
       "opencode-go/qwen3.7-plus",
       "opencode-go/qwen3.8-flash",
       "opencode-go/qwen3.8-max",
+      "opencode-go/zen/mimo-v2.5-free",
+      "opencode-go/zen/muse-spark-1.2-contributor-free",
+      "opencode-go/zen/muse-spark-1.3-contributor-free",
     ]);
     expect(MODEL_CATALOG.find((entry) => entry.id === "openai-compatible")?.supportsVision).not.toBe(true);
   });

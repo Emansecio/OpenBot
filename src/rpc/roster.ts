@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile, rm, stat, writeFile } from "node:fs/promises";
+import { readFile, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { MODEL_CATALOG } from "../config/models.js";
@@ -19,12 +19,13 @@ import {
 } from "../config/store.js";
 import type { AgentHomeStore } from "../execution/home.js";
 import { sanitizeAgentId } from "../execution/home.js";
+import { writeFileAtomic } from "../shared/fs-atomic.js";
 import { WorkspaceQuotaError } from "../execution/quota.js";
 import type { AgentRuntimeManager } from "../execution/runtime/contracts.js";
 import type { Keystore } from "../keystore/index.js";
 import { compatPresetEndpoints, wrapKeystoreForCompat } from "../providers/compat-presets.js";
 import { testCompatConnection } from "../providers/local-discover.js";
-import { OpenAiCompatAdapter, registerOpenAiCompatAdapter, unregisterOpenAiCompatAdapter, validateCompatBaseUrl } from "../providers/openai-compat.js";
+import { OpenAiCompatAdapter, unregisterOpenAiCompatAdapter, validateCompatBaseUrl } from "../providers/openai-compat.js";
 import { defaultRegistry, type ProviderAdapter, type ProviderRegistry } from "../providers/router.js";
 import { openCodeGoCatalogId } from "../providers/opencode-go-models.js";
 import type { Gateway } from "../server/gateway.js";
@@ -116,13 +117,16 @@ function wrapAgent(agent: LocalAgent, model: string, activeId?: string, activity
   return { agent: summarize(agent, model, activeId, activity) };
 }
 
-function toClientDefaultModel(modelId: string) {
+function toClientDefaultModel(
+  modelId: string,
+  inference?: { reasoningEffort?: ReasoningEffort; serviceTier?: LocalAgent["serviceTier"] },
+) {
   return {
     modelId,
     maxMode: true,
     parameters: [
-      { id: "effort", value: "high" },
-      { id: "fast", value: "true" },
+      { id: "effort", value: inference?.reasoningEffort ?? DEFAULT_REASONING_EFFORT },
+      { id: "fast", value: inference?.serviceTier === "priority" ? "true" : "false" },
     ],
   };
 }
@@ -192,12 +196,14 @@ function syncCompatAdapter(
   baseURL: string | null | undefined,
   keystore?: Keystore,
   registry?: ProviderRegistry,
+  sendReasoningEffort = false,
 ): void {
   if (typeof baseURL === "string" && baseURL.length > 0) {
     validateCompatBaseUrl(baseURL);
     const scoped = wrapKeystoreForCompat(baseURL, keystore);
-    if (registry) registry.register(new OpenAiCompatAdapter({ baseUrl: baseURL, keystore: scoped }));
-    else registerOpenAiCompatAdapter({ baseUrl: baseURL, keystore: scoped });
+    const adapter = new OpenAiCompatAdapter({ baseUrl: baseURL, keystore: scoped, sendReasoningEffort });
+    if (registry) registry.register(adapter);
+    else defaultRegistry.register(adapter);
     return;
   }
   if (registry) registry.unregister("openai-compat");
@@ -229,8 +235,9 @@ function ensureCompatAdapter(
   baseURL: string | null | undefined,
   keystore?: Keystore,
   registry?: ProviderRegistry,
+  sendReasoningEffort = false,
 ): void {
-  syncCompatAdapter(requireCompatBaseUrl(baseURL), keystore, registry);
+  syncCompatAdapter(requireCompatBaseUrl(baseURL), keystore, registry, sendReasoningEffort);
 }
 
 const MODEL_CATALOG_CACHE_TTL_MS = 30_000;
@@ -281,7 +288,7 @@ function modelIdOf(body: Record<string, unknown>): unknown {
 type HomeLifecycleFence = <T>(agentId: string, operation: () => Promise<T>) => Promise<T>;
 
 /**
- * Minimal browser lifecycle seam used by deleteAgents.
+ * Minimal browser lifecycle seam used by home operations and deleteAgents.
  *
  * The roster must not depend on the browser implementation: the bootstrap
  * injects the shared browser service, while tests can provide a deterministic
@@ -289,7 +296,10 @@ type HomeLifecycleFence = <T>(agentId: string, operation: () => Promise<T>) => P
  * been released (or was already absent).
  */
 export interface BrowserAgentLifecycle {
+  /** Drain browser work and preserve the persistent profile. */
   teardownAgent(agentId: string): Promise<void>;
+  /** Explicit agent deletion/reset, including persistent browser data. */
+  purgeAgent(agentId: string): Promise<void>;
 }
 
 function errorCodeOf(error: unknown): string | undefined {
@@ -399,7 +409,7 @@ export async function migrateLegacyProfileAvatar(config: ConfigStore): Promise<L
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    await writeFile(path, Buffer.from(legacyBase64, "base64"));
+    await writeFileAtomic(path, Buffer.from(legacyBase64, "base64"));
     const committed = config.mutateProfile((current) => (
       current.profile.avatarPngBase64 === legacyBase64
         ? withoutInlineProfileAvatar(current.profile, true)
@@ -408,13 +418,13 @@ export async function migrateLegacyProfileAvatar(config: ConfigStore): Promise<L
     if (committed.profile.hasCustomAvatar === true && committed.profile.avatarPngBase64 === undefined) {
       return { migrated: true };
     }
-    if (previous !== undefined) await writeFile(path, previous);
+    if (previous !== undefined) await writeFileAtomic(path, previous);
     else await rm(path, { force: true });
     return { migrated: false };
   } catch (error) {
     let rollbackError: unknown;
     try {
-      if (previous !== undefined) await writeFile(path, previous);
+      if (previous !== undefined) await writeFileAtomic(path, previous);
       else await rm(path, { force: true });
     } catch (caught) {
       rollbackError = caught;
@@ -464,7 +474,7 @@ export async function migrateLegacyAgentAvatars(
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
-      await writeFile(path, bytes);
+      await writeFileAtomic(path, bytes);
       staged.push({ agentId: agent.id, legacyBase64: agent.avatarPngBase64, path, previous });
     } catch (error) {
       failed.push({ agentId: agent.id, error: error instanceof Error ? error.message : String(error) });
@@ -474,7 +484,7 @@ export async function migrateLegacyAgentAvatars(
   if (staged.length === 0) return { migrated: [], failed };
 
   const restoreFile = async (entry: typeof staged[number]): Promise<void> => {
-    if (entry.previous !== undefined) await writeFile(entry.path, entry.previous);
+    if (entry.previous !== undefined) await writeFileAtomic(entry.path, entry.previous);
     else await rm(entry.path, { force: true });
   };
 
@@ -538,7 +548,7 @@ export function registerRosterHandlers(
   kickstartAgent?: (args: KickstartAgentArgs) => Promise<KickstartAgentResult>,
   isAgentDeletionPending?: (agentId: string) => boolean,
   assertManagedDiskBudget?: (extraBytes?: number) => Promise<void>,
-): void {
+): { activateAgent: (agentId: string) => void } {
   const modelCatalog = config.modelCatalog;
   const catalogModels = () => modelCatalog?.available() ?? MODEL_CATALOG;
   const selectedCatalogModel = (id: string) => catalogModels().find(m => m.id === id);
@@ -595,19 +605,20 @@ export function registerRosterHandlers(
       throw error;
     }
   };
-  const modelOf = (agent: LocalAgent) => {
+  const modelOf = (agent: LocalAgent, state?: OpenBotConfig) => {
     // Hot path (roster publication): resolveAgentInference reads only
     // `agent.model`/`agent.provider` plus the config-level fallbacks.
     // When agent.model is set, no config fallback is consulted, so we can
     // answer without cloning the whole config (snapshot()). Otherwise,
-    // fall back to the snapshot-based path for identical behavior.
+    // fall back to the snapshot-based path for identical behavior — callers
+    // that loop over the roster pass the same snapshot via `state`.
     if (agent.model) {
       return resolveAgentInference(
         { agents: [agent] } as unknown as Parameters<typeof resolveAgentInference>[0],
         agent.id,
       ).model;
     }
-    return resolveAgentInference(config.snapshot(), agent.id).model;
+    return resolveAgentInference(state ?? config.snapshot(), agent.id).model;
   };
   const agents = () => {
     const list = config.snapshot().agents;
@@ -638,13 +649,24 @@ export function registerRosterHandlers(
   };
   const publishRoster = (activeId?: string) => {
     if (activeId) activeAgentId = activeId;
-    const list = agents().map((entry) => summarize(entry, modelOf(entry), activeAgentId, activity));
-    gateway.publish("agents", { agents: list, activeAgentId });
+    const list = agents();
+    // One snapshot shared by every legacy agent that lacks an explicit model —
+    // avoids a full structuredClone per agent.
+    const state = list.some((entry) => entry.model === undefined) ? config.snapshot() : undefined;
+    gateway.publish("agents", {
+      agents: list.map((entry) => summarize(entry, modelOf(entry, state), activeAgentId, activity)),
+      activeAgentId,
+    });
+  };
+  const activateAgent = (agentId: string): void => {
+    publishRoster(requireAgent({ id: agentId }).id);
   };
   activity?.subscribe(() => publishRoster());
 
-  gateway.registerHandler("getLocalProfile", () => profileForClient(config));
-  gateway.registerHandler("updateLocalProfile", async (body) => {
+  // This key cannot be an agent ID. Keep profile JSON, PNG, and rollback in one queue.
+  const profileLockKey = "!local-profile";
+  gateway.registerHandler("getLocalProfile", () => withAgentLifecycleLock(profileLockKey, () => profileForClient(config)));
+  gateway.registerHandler("updateLocalProfile", (body) => withAgentLifecycleLock(profileLockKey, async () => {
     const b = record(body);
     const snapshot = config.snapshot();
     let next: LocalProfile = { ...snapshot.profile };
@@ -694,7 +716,7 @@ export function registerRosterHandlers(
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
-      if (avatarBytes !== undefined) await writeFile(path, avatarBytes);
+      if (avatarBytes !== undefined) await writeFileAtomic(path, avatarBytes);
       else await rm(path, { force: true });
     }
 
@@ -703,7 +725,7 @@ export function registerRosterHandlers(
     } catch (error) {
       if (avatarChanged) {
         try {
-          if (previousAvatar !== undefined) await writeFile(path, previousAvatar);
+          if (previousAvatar !== undefined) await writeFileAtomic(path, previousAvatar);
           else await rm(path, { force: true });
         } catch {
           // Preserve original config commit failure.
@@ -713,13 +735,17 @@ export function registerRosterHandlers(
       throw error;
     }
     return profileForClient(config);
+  }));
+  gateway.registerHandler("listAgents", () => {
+    const list = agents();
+    const state = list.some((entry) => entry.model === undefined) ? config.snapshot() : undefined;
+    return list.map((entry) => summarize(entry, modelOf(entry, state), activeAgentId, activity));
   });
-  gateway.registerHandler("listAgents", () => agents().map((entry) => summarize(entry, modelOf(entry), activeAgentId, activity)));
   gateway.registerHandler("countAgents", () => agents().length);
   gateway.registerHandler("getAgent", (body) => summarize(requireAgent(body, true), modelOf(requireAgent(body, true)), activeAgentId, activity));
   gateway.registerHandler("openAgent", (body) => {
     const current = requireAgent(body, true);
-    publishRoster(current.id);
+    activateAgent(current.id);
     return summarize(current, modelOf(current), current.id, activity);
   });
   gateway.registerHandler("kickstartAgent", async (body) => {
@@ -740,9 +766,10 @@ export function registerRosterHandlers(
   gateway.registerHandler("searchAgents", (body) => {
     const q = record(body).query;
     if (q !== undefined && typeof q !== "string") return bad("searchAgents: query deve ser string");
-    return agents()
-      .filter((entry) => !q || entry.name.toLowerCase().includes(q.toLowerCase()))
-      .map((entry) => summarize(entry, modelOf(entry), activeAgentId, activity));
+    const list = agents()
+      .filter((entry) => !q || entry.name.toLowerCase().includes(q.toLowerCase()));
+    const state = list.some((entry) => entry.model === undefined) ? config.snapshot() : undefined;
+    return list.map((entry) => summarize(entry, modelOf(entry, state), activeAgentId, activity));
   });
   gateway.registerHandler("createAgent", async (body) => {
     const b = record(body);
@@ -897,7 +924,7 @@ export function registerRosterHandlers(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    await writeFile(avatarPath, decoded);
+    await writeFileAtomic(avatarPath, decoded);
     let committed: OpenBotConfig;
     try {
       committed = config.mutate((state) => ({
@@ -907,7 +934,7 @@ export function registerRosterHandlers(
       }));
     } catch (error) {
       try {
-        if (previousAvatar !== undefined) await writeFile(avatarPath, previousAvatar);
+        if (previousAvatar !== undefined) await writeFileAtomic(avatarPath, previousAvatar);
         else await rm(avatarPath, { force: true });
       } catch {
         // Preserve original config commit failure.
@@ -998,7 +1025,9 @@ export function registerRosterHandlers(
       const extraBytes = await stat(archivePath).then((info) => info.size).catch(() => 0);
       await admitManagedDisk(method, extraBytes);
       const imported = await homes.importArchive(agentId, archivePath, options);
-      return { ...imported, inventory: await homes.inventory(agentId) };
+      const result = { ...imported, inventory: await homes.inventory(agentId) };
+      clearAgentHomeRepair(agentId);
+      return result;
     });
   });
 
@@ -1006,7 +1035,13 @@ export function registerRosterHandlers(
     if (!homes) throw new RpcError(503, "getWorkspaceInventory: workspace local indisponível");
     const method = "getWorkspaceInventory";
     const agentId = optionalHomeAgentId(body, method);
-    if (agentId !== undefined) return runHomeLifecycle(method, agentId, async () => homes.inventory(agentId));
+    if (agentId !== undefined) {
+      try {
+        return await homes.inventory(agentId);
+      } catch (error) {
+        return toHomeRpcError(method, error);
+      }
+    }
     try {
       return await homes.inventory();
     } catch (error) {
@@ -1220,6 +1255,28 @@ export function registerRosterHandlers(
     } catch (error) {
       return toHomeRpcError("duplicateAgent", error);
     }
+    // The custom avatar lives in the source home, not the config: carry the
+    // file into the new home (or the legacy inline base64) so the copy keeps
+    // the picture the user actually set.
+    if (homes && home !== undefined && source.hasCustomAvatar === true) {
+      try {
+        const bytes = await readFile(agentAvatarPath(homes, source.id));
+        await writeFileAtomic(join(home.root, ...AGENT_AVATAR_SEGMENTS), bytes);
+        copy.hasCustomAvatar = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          // Source claims a custom avatar but the file is already gone.
+        } else {
+          if (home.created) {
+            try { await homes.discardCreated(home); } catch { /* preserve the avatar staging failure */ }
+          }
+          throw error;
+        }
+      }
+    }
+    if (copy.hasCustomAvatar !== true && source.avatarPngBase64 !== undefined) {
+      copy.avatarPngBase64 = source.avatarPngBase64;
+    }
     try {
       config.mutate((current) => {
         if (current.agents.some((agent) => agent.id.toLowerCase() === id.toLowerCase())) {
@@ -1278,9 +1335,10 @@ export function registerRosterHandlers(
     return modelCatalog.peek(b.provider);
   });
   gateway.registerHandler("getAgentDefaultModel", (body) => {
+    const current = config.snapshot();
     const target = agentIdOf(body) !== undefined ? requireAgent(body) : agents().find((entry) => entry.id === activeAgentId) ?? agents()[0];
-    const id = target ? modelOf(target) : config.snapshot().globalModel;
-    return { model: id, ...toClientDefaultModel(id) };
+    const inference = resolveAgentInference(current, target?.id);
+    return { model: inference.model, ...toClientDefaultModel(inference.model, inference) };
   });
   gateway.registerHandler("setAgentDefaultModel", async (body) => {
     await modelCatalog?.initialize();
@@ -1297,10 +1355,11 @@ export function registerRosterHandlers(
     const provider = (catalogProvider ?? requestedProvider ?? (isKnownCatalogModel(nextModel) ? undefined : "openai-compat")) as ProviderKind | undefined;
     if (catalogProvider === undefined && provider !== "openai-compat") return bad(`modelo não suportado: ${nextModel}`);
     if (provider && !(["openai", "xai", "opencode-go", "openai-compat"] as string[]).includes(provider)) return bad("provider não suportado");
-    if (provider === "openai-compat") ensureCompatAdapter(config.snapshot().compatBaseUrl, keystore, registry);
+    if (provider === "openai-compat") ensureCompatAdapter(config.snapshot().compatBaseUrl, keystore, registry, config.snapshot().compatReasoningEffort === true);
     if (!target) {
       config.update({ globalModel: nextModel, activeProvider: catalogProvider! });
-      return { model: nextModel, ...toClientDefaultModel(nextModel) };
+      const inference = resolveAgentInference(config.snapshot());
+      return { model: inference.model, ...toClientDefaultModel(inference.model, inference) };
     }
     if (target) {
       config.mutate((state) => ({
@@ -1310,7 +1369,8 @@ export function registerRosterHandlers(
       }));
       publishRoster();
     }
-    return { model: nextModel, ...toClientDefaultModel(nextModel) };
+    const inference = resolveAgentInference(config.snapshot(), target.id);
+    return { model: inference.model, ...toClientDefaultModel(inference.model, inference) };
   });
   gateway.registerHandler("getActiveProvider", (body) => {
     const target = agentIdOf(body) !== undefined ? requireAgent(body) : agents().find((entry) => entry.id === activeAgentId);
@@ -1322,7 +1382,7 @@ export function registerRosterHandlers(
     const provider = b.provider;
     if (typeof provider !== "string") return bad("provider é obrigatório");
     if (!(["openai", "xai", "opencode-go", "openai-compat"] as string[]).includes(provider)) return bad("provider não suportado");
-    if (provider === "openai-compat") ensureCompatAdapter(config.snapshot().compatBaseUrl, keystore, registry);
+    if (provider === "openai-compat") ensureCompatAdapter(config.snapshot().compatBaseUrl, keystore, registry, config.snapshot().compatReasoningEffort === true);
     const catalog = defaultModelForProvider(provider, catalogModels());
     if (!catalog) return bad("provider sem modelo configurado");
     const target = agentIdOf(b) !== undefined ? requireAgent(b) : agents().find((entry) => entry.id === activeAgentId);
@@ -1348,7 +1408,7 @@ export function registerRosterHandlers(
     const target = agentIdOf(body) !== undefined ? requireAgent(body) : agents().find((entry) => entry.id === activeAgentId);
     const resolved = resolveAgentInference(current, target?.id);
     const last = target ? store?.getLatestAssistant(target.id) : undefined;
-    return { provider: resolved.provider, model: resolved.model, reasoningEffort: resolved.reasoningEffort, serviceTier: resolved.serviceTier ?? "default", lastServiceTier: last?.model === resolved.model ? last.serviceTierOutcome : undefined, baseURL: current.compatBaseUrl, agentId: target?.id };
+    return { provider: resolved.provider, model: resolved.model, reasoningEffort: resolved.reasoningEffort, serviceTier: resolved.serviceTier ?? "default", lastServiceTier: last?.model === resolved.model ? last.serviceTierOutcome : undefined, baseURL: current.compatBaseUrl, compatReasoningEffort: current.compatReasoningEffort === true, agentId: target?.id };
   });
   gateway.registerHandler("setProviderConfig", async (body) => {
     await modelCatalog?.initialize();
@@ -1367,7 +1427,11 @@ export function registerRosterHandlers(
       await modelCatalog.get("openai");
     }
     if (b.requireActive === true && target?.id !== activeAgentId) return bad("o bot ativo mudou; reabra as configurações");
-    const patch: { activeProvider?: ProviderKind; globalModel?: string; globalReasoningEffort?: ReasoningEffort; compatBaseUrl?: string | null; agents?: LocalAgent[] } = {};
+    const patch: { activeProvider?: ProviderKind; globalModel?: string; globalReasoningEffort?: ReasoningEffort; compatBaseUrl?: string | null; compatReasoningEffort?: boolean; agents?: LocalAgent[] } = {};
+    if (b.compatReasoningEffort !== undefined) {
+      if (typeof b.compatReasoningEffort !== "boolean") return bad("compatReasoningEffort inválido");
+      patch.compatReasoningEffort = b.compatReasoningEffort;
+    }
     if (b.baseURL !== undefined) {
       if (b.baseURL !== null && typeof b.baseURL !== "string") return bad("baseURL inválida");
       const trimmed = typeof b.baseURL === "string" ? b.baseURL.trim() || null : null;
@@ -1441,12 +1505,14 @@ export function registerRosterHandlers(
       });
     }
     const effectiveBaseURL = patch.compatBaseUrl !== undefined ? patch.compatBaseUrl : current.compatBaseUrl;
+    const effectiveReasoningEffort = patch.compatReasoningEffort !== undefined ? patch.compatReasoningEffort : current.compatReasoningEffort === true;
     const projected = {
       ...current,
       ...(patch.activeProvider !== undefined ? { activeProvider: patch.activeProvider } : {}),
       ...(patch.globalModel !== undefined ? { globalModel: patch.globalModel } : {}),
       ...(patch.globalReasoningEffort !== undefined ? { globalReasoningEffort: patch.globalReasoningEffort } : {}),
       ...(patch.compatBaseUrl !== undefined ? { compatBaseUrl: patch.compatBaseUrl } : {}),
+      ...(patch.compatReasoningEffort !== undefined ? { compatReasoningEffort: patch.compatReasoningEffort } : {}),
       ...(patch.agents !== undefined ? { agents: patch.agents } : {}),
     };
     const clearsCompatInUse = patch.compatBaseUrl === null && (
@@ -1459,7 +1525,7 @@ export function registerRosterHandlers(
     const previousCompatAdapter = (registry ?? defaultRegistry).get("openai-compat");
     let next = current;
     try {
-      syncCompatAdapter(effectiveBaseURL, keystore, registry);
+      syncCompatAdapter(effectiveBaseURL, keystore, registry, effectiveReasoningEffort);
       next = Object.keys(patch).length > 0
         ? config.update(patch, { expectedRevision: current.revision ?? 0 })
         : current;
@@ -1480,8 +1546,14 @@ export function registerRosterHandlers(
     if (agentPatchRequested) {
       publishRoster();
     }
+    // Endpoint compat persistido: agenda a descoberta do catálogo real em
+    // background (best-effort — falha deixa a lista em stale, nunca quebra o
+    // salvamento da configuração).
+    if (typeof next.compatBaseUrl === "string" && next.compatBaseUrl.length > 0) {
+      void modelCatalog?.get("openai-compat", true).catch(() => undefined);
+    }
     const resolved = resolveAgentInference(config.snapshot(), target?.id);
-    return { provider: resolved.provider, model: resolved.model, reasoningEffort: resolved.reasoningEffort, serviceTier: resolved.serviceTier ?? "default", baseURL: next.compatBaseUrl, agentId: target?.id };
+    return { provider: resolved.provider, model: resolved.model, reasoningEffort: resolved.reasoningEffort, serviceTier: resolved.serviceTier ?? "default", baseURL: next.compatBaseUrl, compatReasoningEffort: next.compatReasoningEffort === true, agentId: target?.id };
   });
   gateway.registerHandler("getHostSettings", () => config.snapshot().hostSettings);
   gateway.registerHandler("setHostSettings", (body) => {
@@ -1566,7 +1638,12 @@ export function registerRosterHandlers(
     const suppliedKey = typeof b.apiKey === "string" && b.apiKey.trim() ? b.apiKey.trim() : undefined;
     const apiKey = suppliedKey ?? await keystore?.reveal(provider) ?? undefined;
     if (provider !== "openai-compat" && !apiKey) return bad(`API key de ${provider} não configurada`);
-    return testCompatConnection(baseURL, { apiKey });
+    const tested = await testCompatConnection(baseURL, { apiKey });
+    // Endpoint respondeu: atualiza o catálogo compat com os limites reais.
+    if (tested.ok && provider === "openai-compat") {
+      void modelCatalog?.get("openai-compat", true).catch(() => undefined);
+    }
+    return tested;
   });
   gateway.registerHandler("getLocalRuntimeStatus", async (body) => {
     const agent = requireAgent(body, true);
@@ -1605,6 +1682,7 @@ export function registerRosterHandlers(
   gateway.registerHandler("isEgressTunnelAvailable", () => config.snapshot().flags.isEgressTunnelAvailable);
   gateway.registerHandler("getComputerCapabilities", () => ({ local: false, remoteExecution: false, audioTranscription: false }));
   gateway.registerHandler("transcribeAudio", () => ({ supported: false, text: "" }));
+  return { activateAgent };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

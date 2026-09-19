@@ -633,6 +633,27 @@ describe("RuntimeManager", () => {
     await manager.close();
   });
 
+  it("preserva null para desativar o encerramento por inatividade", async () => {
+    vi.useFakeTimers();
+    const driver = new FakeDriver();
+    const manager = new RuntimeManager({ driver, idleStopMs: null });
+    try {
+      const lease = await manager.acquire("agent-a", capability());
+      await lease.release();
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect((manager as unknown as { idleStopMs: number | null }).idleStopMs).toBeNull();
+      expect(driver.stops).toBe(0);
+    } finally {
+      await manager.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejeita duração de inatividade fracionária ou negativa", () => {
+    expect(() => new RuntimeManager({ driver: new FakeDriver(), idleStopMs: -1 })).toThrow(/idleStopMs/);
+    expect(() => new RuntimeManager({ driver: new FakeDriver(), idleStopMs: 1.5 })).toThrow(/idleStopMs/);
+  });
+
   it("mantém o runtime quente e para WSL após o idle configurado", async () => {
     vi.useFakeTimers();
     const driver = new FakeDriver();

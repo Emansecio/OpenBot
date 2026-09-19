@@ -129,6 +129,7 @@ npm run verify:bot-memory     # conversas, memória, contexto, worker e ponte El
 npm run verify:client-artifacts # artefatos de validação de cliente e contratos
 npm run verify:memory-flow-e2e # fluxo de memória real com OpenAiCompatAdapter (HTTP/SSE local)
 npm run recovery:status       # diagnóstico da instalação local
+npm run diagnostics:execution # contadores do gateway local já em execução
 ```
 
 `verify:clean-profile` usa uma `TempRoot` própria para APPDATA, dados, logs,
@@ -139,7 +140,9 @@ injetado; DPAPI/safeStorage não é afirmado por este gate e fica para a Etapa 3
 
 Scripts em `scripts/`: `openbot-desktop.cmd` é o launcher operacional; `openbot-desktop.vbs` o inicia sem terminal, usa um log exclusivo por invocação, apaga esse log no sucesso, retém falhas por até 7 dias e mostra o caminho no diálogo de erro. Os demais (`visual-*`, `audit-*`, `patch-process-metrics.cjs`) são forenses/de desenvolvimento e não fazem parte do fluxo de produto.
 
-O pacote local instala atalhos para `wscript.exe`/`OpenBot.vbs`, nunca diretamente para `.cmd`. A instalação gera `Update-OpenBot.cmd <pacote>` e `Rollback-OpenBot.cmd`: cada update quiesce a instância, cria backup de configuração, conversas SQLite, credenciais (`sand-secrets.json` + `.master.key`) e workspaces, mantém a versão anterior e permite rollback manual. Backups ficam em `%LOCALAPPDATA%\OpenBot\backups` por padrão. `OPENBOT_DATA_ROOT` controla dados roaming; `OPENBOT_LOCAL_DATA_ROOT` controla workspaces/runtime. Desinstalação preserva ambos por padrão; purge exige marcador de propriedade e `--yes`.
+O pacote local instala atalhos diretamente para `OpenBot.exe` quando esse iniciador existe na instalação; caso contrário, usa `OpenBot.vbs`. O atalho e a janela usam `AppUserModelID=OpenBot.Desktop`; o destino estável permanece na pasta do OpenBot, inclusive após update/rollback. A instalação gera `Update-OpenBot.cmd <pacote>` e `Rollback-OpenBot.cmd`: cada update quiesce a instância, cria backup de configuração, conversas SQLite, credenciais (`sand-secrets.json` + `.master.key`) e workspaces, mantém a versão anterior e permite rollback manual. Backups ficam em `%LOCALAPPDATA%\OpenBot\backups` por padrão. `OPENBOT_DATA_ROOT` controla dados roaming; `OPENBOT_LOCAL_DATA_ROOT` controla workspaces/runtime. Desinstalação preserva ambos por padrão; purge exige marcador de propriedade e `--yes`.
+
+Para gerar o iniciador na instalação existente, execute `node scripts/build-desktop-exe.mjs --root "%LOCALAPPDATA%\OpenBot\install"` no CMD (no PowerShell, use `"$env:LOCALAPPDATA\OpenBot\install"`). O build usa o compilador .NET Framework do Windows, sem downloads. O EXE inicia o `OpenBot.cmd` adjacente sem console, acompanha o encerramento e apresenta erros com o caminho do log. Os runtimes Node/Electron continuam no pacote. Esse comando gera somente o executável; a criação de atalhos pertence ao instalador. Validação específica: `npm exec --offline -- vitest run test/desktop-exe.test.ts --maxWorkers=1 --no-file-parallelism`.
 
 O Recovery Center local expõe o mesmo estado sem telemetria: `npm run recovery:status`, `recovery:backup`, `recovery:verify -- --backup <pasta>`, `recovery:restore -- --backup <pasta> --yes` e `recovery:diagnostics -- --output <arquivo>`. Restore recusa gateway ativo, valida checksums e cria um backup pré-restauração.
 
@@ -157,7 +160,7 @@ Requisitos: Node.js ≥ 20 (testado em v22), Windows (keystore DPAPI a partir de
 
 > Caminho atual de execução: [bootstrap](src/main.ts) e [driver local](src/execution/runtime/local/driver.ts). O [relatório de agosto](docs/practical-bot-environment-final.md) registra a arquitetura WSL anterior.
 
-- `src/execution/` implementa contratos estritos, workspace Windows confinado e operações `file.list`, `file.read`, `file.write`, `search.files` e `search.text`.
+- `src/execution/` implementa contratos estritos, paths confinados para ferramentas estruturadas e operações `file.list`, `file.read`, `file.write`, `search.files` e `search.text`. Processos nativos confiáveis continuam com acesso à conta Windows, fora dessa fronteira de paths.
 - `process.run` executa processos nativos no host Windows confiável (conta do usuário, ambiente herdado, rede do host, qualquer executável instalado). Pedidos passam por contrato estruturado; a bridge HTTP `/local-exec/*` reutiliza o mesmo parser e broker, sem shell arbitrário.
 - O boot aceita roster vazio. Ao criar um bot, `startServer` usa `%LOCALAPPDATA%\OpenBot\workspaces\<agentId>\` (Desktop/Documents/Downloads/Projects) e liga arquivos, busca, browser visual e o runtime local confiável.
 - `localToolPermission` é fixo em `always` e `runtimeMode` em `developer` para todos os agentes; não há modo Lite selecionável. Aprovações RPC continuam para brokers injetados.
@@ -165,6 +168,33 @@ Requisitos: Node.js ≥ 20 (testado em v22), Windows (keystore DPAPI a partir de
 - Cada bot pode descobrir Skills sozinho ou recebê-las pelo seletor `/` e chip nativo do chat. MCP é compartilhado/lazy, mas fica deny-all até configuração e allowlist explícitas por bot.
 - Create/customização usam o seletor nativo do Grok Bot (`+` → Create new Bot → View agent settings). Provider/chave ficam só nesse painel. Entries de transcript expõem `toAgent`/`fromAgent`/`fromUser` como objetos (`id`+`name`), o shape que o renderer espera.
 - Baseline local consolidado (18/08/2026): suíte serial de 103 arquivos, **1187 pass, 1 skipped, 0 failures**; typecheck, build, resiliência do chat, recuperação SQLite, smoke e desktop E2E verdes. Skills/MCP, WSL live e browser permanecem documentados nos respectivos artefatos.
+
+
+### Operação das homes e diagnóstico de execução
+
+- Manutenção de home fecha sessões do navegador sem apagar cookies, login ou armazenamento persistente. A exclusão explícita do bot usa uma operação de purge separada. A manutenção bloqueia novas execuções do bot e aguarda as operações em andamento; falha de drenagem impede a mutação da home.
+- Processos nativos usam Job Objects com recuperação por identidade versionada. O helper compilado fica no cache gerenciado do runtime; o primeiro uso compila, e os seguintes verificam e reutilizam o binário. Temporários e caches de ferramentas recebem defaults por home em `.openbot-runtime`, sem trocar o perfil/credenciais do usuário; `env` explícito prevalece. Isso controla o ciclo de vida, não isola permissões do Windows nem fornece serviços persistentes.
+- Processos sobrepostos na mesma home compartilham um observador de quota. Eventos repetidos são agrupados; a fila de paths é limitada. Há inventário inicial, reconciliação periódica enquanto há processos e reconciliação final. Isso não é quota rígida do NTFS nem desfaz arquivos já gravados.
+- Novos exports/snapshots usam arquivo binário v2, com payload transferido em blocos de 256 KiB. A importação reconhece o formato pelo conteúdo e aceita o JSON/Base64 legado; somente o v2 limita a memória do payload independentemente do tamanho total. Metadados continuam proporcionais ao número de entradas e têm limite próprio. Os limites de quota continuam valendo.
+- `npm run diagnostics:execution` lê `getExecutionDiagnostics` no gateway local autenticado, sem executar bots, iniciar processos ou varrer homes. Mostra admissão/fila de provider e runtime, contadores de quota das homes inicializadas, memória e event loop do gateway. Contadores são locais ao processo e reiniciam no bootstrap; não são medição de capacidade máxima. O comando precisa de um gateway que já contenha esta versão.
+- Concorrência e limites padrão não foram ampliados indiscriminadamente. Bots existentes e novos usam o mesmo fluxo no próximo bootstrap atualizado; não é necessário recriar os bots. Atualizar o código não reinicia uma instância já em execução.
+
+
+### Fechamento e bandeja do Windows
+
+Fechar a janela pelo **X** ou **Alt+F4** mantém o OpenBot em execução na bandeja, sem interromper os bots. Clique com o botão direito no ícone para **Reabrir OpenBot** ou **Encerrar OpenBot**. Duplo clique no ícone, ou abrir novamente pelo atalho, restaura a mesma janela. Minimizar continua usando a barra de tarefas.
+
+**Encerrar OpenBot** usa o encerramento normal: salva rascunhos pendentes e deixa o launcher limpar o gateway que iniciou. Um gateway externo/adotado continua sob responsabilidade de seu iniciador. Se a bandeja não puder ser criada, fechar a janela mantém o comportamento anterior de saída, sem deixar uma janela oculta inacessível.
+
+### Ícone e atalho do desktop
+
+No checkout, `npm run desktop:shortcut` cria ou corrige somente `OpenBot.lnk` no Desktop real do Windows (inclusive Desktop redirecionado). O destino é `scripts/openbot-desktop.vbs`, os argumentos ficam vazios e a pasta de trabalho é a raiz do checkout. O comando não inicia nem reinicia bots. No pacote instalado, os atalhos gerenciados apontam para o `OpenBot.vbs` estável da instalação. Repair/update/rollback só mantêm atalhos registrados e pertencentes àquela instalação. Instalar com `--skip-shortcuts` não registra posse dos atalhos padrão. Links de outra instalação ou malformados são preservados; uninstall só remove links com destino e argumentos próprios comprovados pelo Windows.
+
+Ao abrir pelo launcher do checkout, o OpenBot também confirma `Programs\OpenBot.lnk` no menu Iniciar, antes de iniciar o gateway. O registro usa o VBS e o ícone do checkout. A associação legada `Electron.lnk` só é removida se tiver `OpenBot.Desktop`, apontar para o runtime Electron em uso e não tiver argumentos; a substituição é criada e verificada primeiro. Um atalho de outro aplicativo não é sobrescrito. O Desktop não é alterado nessa etapa. Para executar somente essa correção: `node scripts/setup-desktop-shortcut.mjs --taskbar-only`.
+
+O ponto de entrada `scripts/openbot-electron.cjs` valida os ícones próprios e aplica PNG à janela e ICO à barra de tarefas. Ícones ausentes/inválidos causam erro, não fallback silencioso para Electron. Não edite o ícone em `node_modules`: a próxima atualização da dependência substituiria essa correção. Os verificadores de desktop usam o mesmo ponto de entrada.
+
+`npm run verify:desktop-identity` verifica o ícone real do HWND, a identidade de tarefa e um atalho/VBS real em fixture isolada. `npm run verify:release-lifecycle` cobre a recriação no ciclo de instalação. Essas verificações detectam regressões cobertas; não são uma garantia contra alterações arbitrárias futuras ou caches externos do Windows.
 
 ### Evidências históricas de memória e runtime (18/08/2026)
 

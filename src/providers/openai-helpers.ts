@@ -63,9 +63,12 @@ export interface OpenAiChatBody {
   model: string;
   messages: unknown[];
   stream: true;
+  stream_options: { include_usage: true };
   tools?: ProviderTool[];
   temperature?: number;
   max_tokens?: number;
+  /** Enviado só quando o adapter declara suporte ao parâmetro (xAI/compat opt-in). */
+  reasoning_effort?: string;
 }
 
 /**
@@ -174,15 +177,17 @@ export function parseRetryAfterMs(value: string | null, nowMs = Date.now()): num
 }
 
 /** Maps an error embedded in an otherwise successful SSE response. */
-export function openAiStreamErrorStatus(error: Record<string, unknown>): number {
+export function openAiStreamErrorStatus(error: Record<string, unknown>, fallback = 400): number {
   if (typeof error.status === "number" && Number.isInteger(error.status)) return error.status;
   const signature = [error.code, error.type, error.message]
     .filter((value): value is string => typeof value === "string")
     .join(" ");
   if (/rate[ _-]?limit|too many requests/iu.test(signature)) return 429;
   if (/auth|api[ _-]?key|unauthori[sz]ed|forbidden/iu.test(signature)) return 401;
+  if (/permission/iu.test(signature)) return 403;
+  if (/invalid|not_found|not found|context_length|content_filter|quota|billing/iu.test(signature)) return 400;
   if (/overload|server|internal|unavailable/iu.test(signature)) return 503;
-  return 400;
+  return fallback;
 }
 
 /**
@@ -255,6 +260,7 @@ export function buildChatBody(req: ProviderChatRequest): OpenAiChatBody {
     model: req.model,
     messages,
     stream: true,
+    stream_options: { include_usage: true },
   };
   if (req.tools !== undefined && req.tools.length > 0) body.tools = req.tools;
   if (req.temperature !== undefined) body.temperature = req.temperature;
@@ -372,14 +378,16 @@ export function normalizeOpenAiError(err: unknown): Error {
 
 /** Erro de API do provider (status HTTP + mensagem legível). */
 export class ApiError extends Error {
+  readonly code?: string;
   readonly status: number;
   readonly body?: unknown;
   readonly retryAfterMs?: number;
 
-  constructor(message: string, status: number, body?: unknown, opts: { retryAfterMs?: number } = {}) {
+  constructor(message: string, status: number, body?: unknown, opts: { retryAfterMs?: number; code?: string } = {}) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = opts.code;
     this.body = body;
     this.retryAfterMs = opts.retryAfterMs;
   }

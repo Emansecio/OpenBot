@@ -67,6 +67,55 @@ describe("desktop lifecycle hardening", () => {
     expect(disabledLines).toEqual([]);
   });
 
+  it("observa saída e erro do Electron antes do bookkeeping assíncrono", async () => {
+    // @ts-expect-error executable local launch helper has no declaration file.
+    const { observeChildProcess } = await import("../scripts/launch.mjs");
+    const events: string[] = [];
+    let emitExit: ((code: number | null, signal: string | null) => void) | undefined;
+    const child = {
+      exitCode: null as number | null,
+      signalCode: null as string | null,
+      once(event: string, callback: (...args: any[]) => void) {
+        events.push(event);
+        if (event === "exit") emitExit = callback;
+        return this;
+      },
+    };
+
+    const outcome = observeChildProcess(child);
+    expect(events).toEqual(["error", "exit"]);
+    emitExit?.(0, null);
+    await expect(outcome).resolves.toEqual({ code: 0, signal: null });
+  });
+
+  it("converte erro precoce do Electron em resultado tratado", async () => {
+    // @ts-expect-error executable local launch helper has no declaration file.
+    const { observeChildProcess } = await import("../scripts/launch.mjs");
+    const failure = new Error("electron spawn failed");
+    const child = {
+      exitCode: null as number | null,
+      signalCode: null as string | null,
+      once(event: string, callback: (error: Error) => void) {
+        if (event === "error") queueMicrotask(() => callback(failure));
+        return this;
+      },
+    };
+
+    await expect(observeChildProcess(child)).resolves.toEqual({ error: failure });
+  });
+
+  it("reconhece um processo que já encerrou antes da observação", async () => {
+    // @ts-expect-error executable local launch helper has no declaration file.
+    const { observeChildProcess } = await import("../scripts/launch.mjs");
+    const child = {
+      exitCode: 23,
+      signalCode: null as string | null,
+      once() { return this; },
+    };
+
+    await expect(observeChildProcess(child)).resolves.toEqual({ code: 23, signal: null });
+  });
+
   it("keeps the performance probe isolated and removes only roots it owns", () => {
     const probe = readFileSync(join(root, "scripts", "perf-probe.mjs"), "utf8");
     expect(probe).toContain('process.env.NODE_ENV = "test"');
@@ -199,7 +248,7 @@ describe("desktop lifecycle hardening", () => {
     await expect(readFile(externalShortcut, "utf8")).resolves.toBe("foreign shortcut");
   });
 
-  it("does not partially remove shortcuts when the second shortcut is invalid", async () => {
+  it("does not trust unverified shortcut paths during uninstall", async () => {
     const base = await temporaryRoot("openbot-uninstall-shortcut-atomicity-");
     const installRoot = join(base, "install");
     const dataRoot = join(base, "data");
@@ -230,10 +279,10 @@ describe("desktop lifecycle hardening", () => {
       captureProcessEvidence: async () => currentProcessEvidence,
       queryProcessEvidence: async () => null,
       isPortPresent: async () => false,
-    }))
-      .rejects.toThrow();
+    })).resolves.toMatchObject({ ok: true });
+    expect(existsSync(installRoot)).toBe(false);
     await expect(readFile(desktopShortcut, "utf8")).resolves.toBe("desktop shortcut");
-    await expect(readFile(join(installRoot, "state.json"), "utf8")).resolves.toContain('"activeVersion":"1.0.0"');
+    await expect(readdir(invalidStartShortcut)).resolves.toEqual([]);
   });
 
   it("restores the install and shortcuts when deferred uninstall cleanup cannot start", async () => {

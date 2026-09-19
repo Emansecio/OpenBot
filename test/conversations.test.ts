@@ -398,6 +398,114 @@ describe("OpenBot conversation schema", () => {
     }
   });
 
+  it("não reindexa histórico quando uma atualização não altera campos indexados", () => {
+    const database = new Database(":memory:");
+    const store = new SqliteTranscriptStore({ path: ":memory:", database });
+    try {
+      const conversationId = store.conversationStore.create("agent-a").id;
+      store.append("agent-a", [{ kind: "message", id: "entry-noop", role: "user", content: "conteúdo indexado", timestampMs: 1 }], conversationId);
+      const before = database.prepare("SELECT rowid, content FROM history_fts WHERE source_id = 'entry:1'").get() as { rowid: number; content: string };
+      database.prepare("UPDATE transcript_entries SET payload_json = payload_json WHERE sequence_id = 1").run();
+      const afterNoop = database.prepare("SELECT rowid, content FROM history_fts WHERE source_id = 'entry:1'").get() as { rowid: number; content: string };
+      expect(afterNoop).toEqual(before);
+
+      database.prepare("UPDATE transcript_entries SET payload_json = ? WHERE sequence_id = 1")
+        .run(JSON.stringify({ kind: "message", id: "entry-noop", role: "user", content: "conteúdo atualizado" }));
+      const afterContentChange = database.prepare("SELECT rowid, content FROM history_fts WHERE source_id = 'entry:1'").get() as { rowid: number; content: string };
+      expect(afterContentChange.content).toBe("conteúdo atualizado");
+    } finally {
+      store.close();
+      database.close();
+    }
+  });
+
+  it("usa o mapa de rowid para atualizar e remover entradas e resumos", () => {
+    const database = new Database(":memory:");
+    const store = new SqliteTranscriptStore({ path: ":memory:", database });
+    try {
+      const conversationId = store.conversationStore.create("agent-a").id;
+      store.append("agent-a", [{ kind: "message", id: "entry-addressed", role: "user", content: "conteúdo inicial", timestampMs: 1 }], conversationId);
+
+      const entryPlan = database.prepare(`
+        EXPLAIN QUERY PLAN
+        DELETE FROM history_fts
+        WHERE rowid = (
+          SELECT fts_rowid FROM history_fts_source_map WHERE source_id = ?
+        )
+      `).all("entry:1") as Array<{ detail: string }>;
+      expect(entryPlan.some((row) => row.detail.includes("idx_history_fts_source_map_source"))).toBe(true);
+      expect(entryPlan.some((row) => row.detail.includes("history_fts VIRTUAL TABLE INDEX 0:="))).toBe(true);
+
+      const entryBefore = database.prepare("SELECT rowid, content FROM history_fts WHERE source_id = ?").get("entry:1") as { rowid: number; content: string };
+      const mappedBefore = database.prepare("SELECT fts_rowid FROM history_fts_source_map WHERE source_id = ?").get("entry:1") as { fts_rowid: number };
+      expect(mappedBefore.fts_rowid).toBe(entryBefore.rowid);
+      database.prepare("UPDATE transcript_entries SET payload_json = ? WHERE sequence_id = 1")
+        .run(JSON.stringify({ kind: "message", id: "entry-addressed", role: "user", content: "conteúdo atualizado" }));
+      const entryAfter = database.prepare("SELECT rowid, content FROM history_fts WHERE source_id = ?").get("entry:1") as { rowid: number; content: string };
+      const mappedAfter = database.prepare("SELECT fts_rowid FROM history_fts_source_map WHERE source_id = ?").get("entry:1") as { fts_rowid: number };
+      expect(entryAfter.content).toBe("conteúdo atualizado");
+      expect(mappedAfter.fts_rowid).toBe(entryAfter.rowid);
+
+      database.prepare(`
+        INSERT INTO conversation_summaries
+          (conversation_id, agent_id, revision, through_sequence_id, summary_json, rendered_text, updated_at_ms)
+        VALUES (?, ?, 1, 1, '{}', 'resumo inicial', 2)
+      `).run(conversationId, "agent-a");
+      expect(database.prepare("SELECT COUNT(*) AS count FROM history_fts_source_map WHERE source_id = ?").get(`summary:${conversationId}`)).toEqual({ count: 1 });
+      database.prepare("UPDATE conversation_summaries SET rendered_text = ? WHERE conversation_id = ?").run("resumo atualizado", conversationId);
+      expect(database.prepare("SELECT content FROM history_fts WHERE source_id = ?").get(`summary:${conversationId}`)).toEqual({ content: "resumo atualizado" });
+
+      database.prepare("DELETE FROM transcript_entries WHERE sequence_id = 1").run();
+      database.prepare("DELETE FROM conversation_summaries WHERE conversation_id = ?").run(conversationId);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM history_fts_source_map").get()).toEqual({ count: 0 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM history_fts").get()).toEqual({ count: 0 });
+    } finally {
+      store.close();
+      database.close();
+    }
+  });
+
+  it("reconstrói o mapa de rowid de uma tabela FTS legada", () => {
+    const database = new Database(":memory:");
+    const store = new SqliteTranscriptStore({ path: ":memory:", database });
+    try {
+      const conversationId = store.conversationStore.create("agent-a").id;
+      store.append("agent-a", [{ kind: "message", id: "entry-legacy", role: "user", content: "conteúdo legado", timestampMs: 1 }], conversationId);
+      database.prepare(`
+        INSERT INTO conversation_summaries
+          (conversation_id, agent_id, revision, through_sequence_id, summary_json, rendered_text, updated_at_ms)
+        VALUES (?, ?, 1, 1, '{}', 'resumo legado', 2)
+      `).run(conversationId, "agent-a");
+      database.prepare("DELETE FROM history_fts").run();
+      database.prepare("DROP TABLE history_fts_source_map").run();
+      database.prepare(`
+        INSERT INTO history_fts(rowid, source_id, agent_id, conversation_id, source_type, content, sequence_id)
+        VALUES
+          (9001, 'entry:1', ?, ?, 'message', 'conteúdo legado', 1),
+          (9002, ?, ?, ?, 'summary', 'resumo legado', 1)
+      `).run("agent-a", conversationId, `summary:${conversationId}`, "agent-a", conversationId);
+
+      migrateOpenBotSchema(database);
+
+      expect(database.prepare("SELECT fts_rowid, source_id FROM history_fts_source_map ORDER BY fts_rowid").all()).toEqual([
+        { fts_rowid: 9001, source_id: "entry:1" },
+        { fts_rowid: 9002, source_id: `summary:${conversationId}` },
+      ]);
+      database.prepare("UPDATE transcript_entries SET payload_json = ? WHERE sequence_id = 1")
+        .run(JSON.stringify({ kind: "message", id: "entry-legacy", role: "user", content: "conteúdo legado atualizado" }));
+      expect(database.prepare("SELECT content FROM history_fts WHERE source_id = ?").get("entry:1")).toEqual({ content: "conteúdo legado atualizado" });
+      database.prepare("UPDATE conversation_summaries SET rendered_text = ? WHERE conversation_id = ?").run("resumo legado atualizado", conversationId);
+      expect(database.prepare("SELECT content FROM history_fts WHERE source_id = ?").get(`summary:${conversationId}`)).toEqual({ content: "resumo legado atualizado" });
+      database.prepare("DELETE FROM transcript_entries WHERE sequence_id = 1").run();
+      database.prepare("DELETE FROM conversation_summaries WHERE conversation_id = ?").run(conversationId);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM history_fts_source_map").get()).toEqual({ count: 0 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM history_fts").get()).toEqual({ count: 0 });
+    } finally {
+      store.close();
+      database.close();
+    }
+  });
+
   it("creates conversations and paginates with an opaque agent-scoped cursor", () => {
     let now = 100;
     const store = new SqliteConversationStore({ path: ":memory:", now: () => now++ });
@@ -804,7 +912,48 @@ describe("OpenBot conversation schema", () => {
         db.close();
       }
 
+      const resumeScope = {
+        agentId: "agent-a",
+        conversationId: active.id,
+        turnId: "turn-resume",
+        provider: "xai",
+        model: "grok-4.6",
+      } as const;
+      const checkpoint = {
+        checkpointId: "checkpoint-resume",
+        ...resumeScope,
+        cursor: "fixture-v1:resume:1",
+        safeSequenceId: 101,
+        completedEffectIds: [],
+        expiresAtMs: Date.now() + 60_000,
+        version: 1,
+        budget: {
+          maxProviderAttempts: 2,
+          providerAttemptsUsed: 0,
+          maxToolRounds: 8,
+          toolRoundsUsed: 0,
+          maxToolCalls: 16,
+          toolCallsUsed: 0,
+        },
+      } as const;
+      expect(transcript.createResumeCheckpoint(checkpoint)).toBe(true);
+      transcript.prepareResumeEffect(resumeScope, "effect-pending", "hash-pending");
+      transcript.prepareResumeEffect(resumeScope, "effect-completed", "hash-completed");
+      transcript.completeResumeEffect(resumeScope, "effect-completed", "hash-completed", null);
+
       const snapshot = transcript.snapshotAgent("agent-a");
+      expect(snapshot.resumeCheckpoints).toEqual([expect.objectContaining({
+        checkpointId: checkpoint.checkpointId,
+        agentId: "agent-a",
+        conversationId: active.id,
+        turnId: "turn-resume",
+        completedEffectIds: [],
+      })]);
+      expect(snapshot.resumeEffects).toEqual(expect.arrayContaining([
+        expect.objectContaining({ effectId: "effect-pending", status: "prepared" }),
+        expect.objectContaining({ effectId: "effect-completed", status: "completed", result: null }),
+      ]));
+      expect(snapshot.resumeEffects.find((effect) => effect.effectId === "effect-pending")?.result).toBeUndefined();
       expect(snapshot.acceptedNonceRows).toEqual([{ agentId: "agent-a", conversationId: active.id, nonce: "accepted-1", acceptedAtMs: 1020 }]);
       expect(snapshot.pendingNonceRows).toEqual([{ agentId: "agent-a", conversationId: active.id, nonce: "pending-1", acceptedAtMs: 1030 }]);
       expect(snapshot.interactionDecisionRows).toEqual([{
@@ -839,6 +988,8 @@ describe("OpenBot conversation schema", () => {
         pendingNonceRows: [],
         interactionDecisionRows: [],
         turnAttemptRows: [],
+        resumeCheckpoints: [],
+        resumeEffects: [],
       });
       transcript.restoreAgent("agent-a", snapshot);
       const restored = transcript.snapshotAgent("agent-a");
@@ -849,6 +1000,8 @@ describe("OpenBot conversation schema", () => {
       expect(restored.pendingNonceRows).toEqual(snapshot.pendingNonceRows);
       expect(restored.interactionDecisionRows).toEqual(snapshot.interactionDecisionRows);
       expect(restored.turnAttemptRows).toEqual(snapshot.turnAttemptRows);
+      expect(restored.resumeCheckpoints).toEqual(snapshot.resumeCheckpoints);
+      expect(restored.resumeEffects).toEqual(snapshot.resumeEffects);
     } finally {
       transcript.close();
       conversations.close();
@@ -888,4 +1041,5 @@ describe("OpenBot conversation schema", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
 });

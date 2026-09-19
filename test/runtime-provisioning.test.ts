@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile, rm } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +15,7 @@ import {
 import {
   classifyWslDistroTermination,
   createWslCommandRunner,
+  RuntimeInstallationError,
   WslProvisioner,
   decodeWslOutput,
   type WslCommandResult,
@@ -407,6 +408,8 @@ describe("WSL provisioning boundary", () => {
     const layout = await createManagedRuntimeLayout(root);
     const archive = join(layout.staging, "runtime-package.tar");
     await writeFile(archive, "archive");
+    await writeFile(join(layout.current, "runtime-package.tar"), "current-runtime");
+    await writeFile(join(layout.previous, "runtime-package.tar"), "previous-runtime");
     const manifest: RuntimeGuestPackageManifest = {
       schemaVersion: 1,
       runtimeVersion: "1.0.0",
@@ -435,6 +438,9 @@ describe("WSL provisioning boundary", () => {
     await expect(new WslProvisioner({ layout, runner }).installManagedGuestPackage(archive, manifest))
       .rejects.toThrow(/installation/i);
     expect(runner.calls).toContainEqual(["--import", "OpenBotRuntime", layout.distro, expect.stringContaining("previous-runtime"), "--version", "2"]);
+    const recoveryArtifacts = (await readdir(layout.staging)).filter((name) => /^\.(?:previous-runtime|current-runtime-before|previous-runtime-before)-[0-9a-f-]+\.tar$/u.test(name));
+    expect(recoveryArtifacts).toHaveLength(3);
+    for (const artifact of recoveryArtifacts) await expect(readFile(join(layout.staging, artifact), "utf8")).resolves.toBeTruthy();
   });
 
   it("restaura a versão anterior quando a ativação final falha", async () => {
@@ -443,6 +449,8 @@ describe("WSL provisioning boundary", () => {
     const layout = await createManagedRuntimeLayout(root);
     const archive = join(layout.staging, "runtime.tar");
     await writeFile(archive, "new-runtime");
+    await writeFile(join(layout.current, "runtime-package.tar"), "current-runtime");
+    await writeFile(join(layout.previous, "runtime-package.tar"), "previous-runtime");
     const oldManifest: RuntimeGuestPackageManifest = {
       schemaVersion: 1,
       runtimeVersion: "1.0.0",
@@ -489,5 +497,77 @@ describe("WSL provisioning boundary", () => {
       "OpenBotRuntime",
     ]);
     expect(runner.calls.flat()).not.toContain("Ubuntu");
+    const recoveryArtifacts = (await readdir(layout.staging)).filter((name) => /^\.(?:previous-runtime|current-runtime-before|previous-runtime-before)-[0-9a-f-]+\.tar$/u.test(name));
+    expect(recoveryArtifacts).toEqual([]);
+  });
+
+  it("preserva artefatos e journal quando promoção e rollback falham", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-provision-rollback-preserve-"));
+    roots.push(root);
+    const layout = await createManagedRuntimeLayout(root);
+    const archive = join(layout.staging, "runtime.tar");
+    await writeFile(archive, "new-runtime");
+    await writeFile(join(layout.current, "runtime-package.tar"), "current-runtime");
+    await writeFile(join(layout.previous, "runtime-package.tar"), "previous-runtime");
+    const oldManifest: RuntimeGuestPackageManifest = {
+      schemaVersion: 1,
+      runtimeVersion: "1.0.0",
+      supervisorVersion: "0.1.0",
+      supervisorDigest: `sha256:${"c".repeat(64)}`,
+      rootfsDigest: `sha256:${"d".repeat(64)}`,
+    };
+    const olderManifest: RuntimeGuestPackageManifest = { ...oldManifest, runtimeVersion: "0.9.0" };
+    await commitRuntimeActivation(layout, olderManifest, new Date("2026-08-14T00:00:00.000Z"));
+    await commitRuntimeActivation(layout, oldManifest, new Date("2026-08-15T00:00:00.000Z"));
+    const previousCurrent = await readRuntimeActivation(layout);
+    if (previousCurrent === null) throw new Error("expected an existing activation");
+    const journalPath = join(layout.state, "activation-transaction.json");
+    const journal = `${JSON.stringify({
+      schemaVersion: 1,
+      phase: "prepared",
+      transactionId: "pre-existing-rollback",
+      previousCurrent,
+      previousPrevious: null,
+      nextCurrent: previousCurrent,
+    })}\n`;
+    await writeFile(journalPath, journal);
+
+    const runner = new ExportingRunner();
+    runner.responses = [
+      { exitCode: 0, stdout: Buffer.from("OpenBotRuntime\nUbuntu\n"), stderr: Buffer.alloc(0) }, // list
+      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // export previous
+      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // import candidate
+      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ supervisorVersion: oldManifest.supervisorVersion, supervisorDigest: oldManifest.supervisorDigest })), stderr: Buffer.alloc(0) },
+      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ runtimeBootId: "candidate-boot", runtimeVersion: oldManifest.runtimeVersion, imageDigest: oldManifest.rootfsDigest })), stderr: Buffer.alloc(0) },
+      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ ok: true })), stderr: Buffer.alloc(0) },
+      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // terminate candidate
+      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // terminate old final
+      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // unregister old final
+      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // import new final
+      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ supervisorVersion: oldManifest.supervisorVersion, supervisorDigest: oldManifest.supervisorDigest })), stderr: Buffer.alloc(0) },
+      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ runtimeBootId: "new-boot", runtimeVersion: oldManifest.runtimeVersion, imageDigest: oldManifest.rootfsDigest })), stderr: Buffer.alloc(0) },
+      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ ok: false })), stderr: Buffer.alloc(0) }, // final health fails
+      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // cleanup candidate terminate
+      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // cleanup candidate unregister
+      { exitCode: 1, stdout: Buffer.alloc(0), stderr: Buffer.from("Access is denied.") }, // rollback terminate fails
+    ];
+
+    let installationError: unknown;
+    try {
+      await new WslProvisioner({ layout, runner }).installManagedGuestPackage(archive, oldManifest);
+    } catch (error) {
+      installationError = error;
+    }
+
+    expect(installationError).toBeInstanceOf(RuntimeInstallationError);
+    const recoveryArtifacts = (await readdir(layout.staging)).filter((name) => /^\.(?:previous-runtime|current-runtime-before|previous-runtime-before)-[0-9a-f-]+\.tar$/u.test(name));
+    expect(recoveryArtifacts).toHaveLength(3);
+    const recoveryPaths = recoveryArtifacts.map((name) => join(layout.staging, name));
+    const message = (installationError as RuntimeInstallationError).message;
+    for (const recoveryPath of recoveryPaths) {
+      await expect(readFile(recoveryPath, "utf8")).resolves.toBeTruthy();
+      expect(message).toContain(recoveryPath);
+    }
+    await expect(readFile(journalPath, "utf8")).resolves.toBe(journal);
   });
 });

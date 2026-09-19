@@ -44,6 +44,7 @@
  */
 
 import type { Keystore } from "../keystore/index.js";
+import { parseProviderUsage } from "./usage.js";
 import {
   defaultRegistry,
   type ProviderAdapter,
@@ -208,6 +209,12 @@ export interface OpenAiCompatAdapterOptions {
    * https remoto SEMPRE permitido).
    */
   allowNonLoopbackHttp?: boolean;
+  /**
+   * Opt-in do usuário: envia `reasoning_effort` no corpo chat.completions.
+   * Default false — endpoints estritos podem rejeitar parâmetros desconhecidos
+   * com HTTP 400 (normalizado como erro de validação na UI).
+   */
+  sendReasoningEffort?: boolean;
 }
 
 /**
@@ -220,6 +227,7 @@ export interface OpenAiCompatAdapterOptions {
  * header Authorization (endpoints custom podem não exigir chave).
  */
 export class OpenAiCompatAdapter implements ProviderAdapter {
+  readonly tracksTransport = true;
   readonly name: string;
   readonly baseUrl: string;
   readonly timeoutMs: number;
@@ -227,6 +235,7 @@ export class OpenAiCompatAdapter implements ProviderAdapter {
   readonly allowNonLoopbackHttp: boolean;
   private readonly apiKey?: string;
   private readonly keystore?: Keystore;
+  private readonly sendReasoningEffort: boolean;
   private readonly fetchImpl: typeof fetch;
 
   constructor(opts: OpenAiCompatAdapterOptions = {}) {
@@ -244,11 +253,14 @@ export class OpenAiCompatAdapter implements ProviderAdapter {
     this.allowNonLoopbackHttp = opts.allowNonLoopbackHttp ?? false;
     this.apiKey = opts.apiKey;
     this.keystore = opts.keystore;
+    this.sendReasoningEffort = opts.sendReasoningEffort ?? false;
     this.fetchImpl = opts.fetchImpl ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
   }
 
   serializeRequest(req: ProviderChatRequest): string {
-    return JSON.stringify(buildChatBody(req));
+    const body = buildChatBody(req);
+    if (this.sendReasoningEffort && req.reasoningEffort !== undefined) body.reasoning_effort = req.reasoningEffort;
+    return JSON.stringify(body);
   }
 
   /**
@@ -277,6 +289,11 @@ export class OpenAiCompatAdapter implements ProviderAdapter {
     const toolAccumulator = new OpenAiToolCallAccumulator();
     let buffer = "";
     let terminated = false;
+    let finishReason: string | undefined;
+    let finishPayload: unknown;
+
+    const isIncompleteReason = (reason: string | undefined): reason is "length" | "content_filter" | "max_tokens" =>
+      reason === "length" || reason === "content_filter" || reason === "max_tokens";
 
     const dispatchFrame = (frame: string): boolean => {
       const data = splitSseLines(frame).filter((line) => line.startsWith("data:"))
@@ -289,6 +306,8 @@ export class OpenAiCompatAdapter implements ProviderAdapter {
       }
       if (typeof parsed !== "object" || parsed === null) return false;
       const payload = parsed as Record<string, unknown>;
+      const usage = parseProviderUsage(payload.usage, "chat");
+      if (usage) emit({ type: "usage", usage });
       if (typeof payload.error === "object" && payload.error !== null) {
         const error = payload.error as Record<string, unknown>;
         throw new ApiError(
@@ -303,12 +322,20 @@ export class OpenAiCompatAdapter implements ProviderAdapter {
       }
       if (choices.length === 0) return false;
       const choice = choices[0] as Record<string, unknown> | undefined;
+      const currentFinishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : undefined;
       const delta = choice?.delta;
-      if (typeof delta !== "object" || delta === null) return false;
-      const record = delta as Record<string, unknown>;
-      if (typeof record.content === "string" && record.content.length > 0) emit({ type: "delta", delta: record.content });
-      if (Array.isArray(record.tool_calls)) for (const chunk of record.tool_calls) {
-        if (typeof chunk === "object" && chunk !== null) toolAccumulator.add(chunk as Parameters<OpenAiToolCallAccumulator["add"]>[0]);
+      // Preserve a final chunk's delta before recording its finish reason;
+      // later frames are consumed only for protocol/usage completion.
+      if (finishReason === undefined && typeof delta === "object" && delta !== null) {
+        const record = delta as Record<string, unknown>;
+        if (typeof record.content === "string" && record.content.length > 0) emit({ type: "delta", delta: record.content });
+        if (Array.isArray(record.tool_calls)) for (const chunk of record.tool_calls) {
+          if (typeof chunk === "object" && chunk !== null) toolAccumulator.add(chunk as Parameters<OpenAiToolCallAccumulator["add"]>[0]);
+        }
+      }
+      if (finishReason === undefined && currentFinishReason !== undefined) {
+        finishReason = currentFinishReason;
+        finishPayload = parsed;
       }
       return false;
     };
@@ -332,6 +359,9 @@ export class OpenAiCompatAdapter implements ProviderAdapter {
     } finally {
       await reader.cancel().catch(() => undefined);
       reader.releaseLock();
+    }
+    if (isIncompleteReason(finishReason)) {
+      throw new ApiError(`openai-compat: geração interrompida (${finishReason})`, 400, finishPayload, { code: finishReason });
     }
     if (toolAccumulator.hasAny && !toolAccumulator.complete) {
       throw new ApiError("openai-compat: tool call incompleta no fim do stream", 502);
@@ -384,10 +414,13 @@ export class OpenAiCompatAdapter implements ProviderAdapter {
       if (apiKey !== undefined) headers.authorization = `Bearer ${apiKey}`;
 
       try {
+        const body = this.serializeRequest(req);
+        controller.signal.throwIfAborted();
+        req.onTransportStart?.("chat");
         response = await raceWithAbort(this.fetchImpl(url, {
           method: "POST",
           headers,
-          body: this.serializeRequest(req),
+          body,
           signal: controller.signal,
         }), controller.signal);
         resetIdleTimer();

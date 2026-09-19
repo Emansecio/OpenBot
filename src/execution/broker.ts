@@ -43,6 +43,18 @@ interface PendingApproval {
   timeout?: NodeJS.Timeout;
 }
 
+interface AdmittedEffect {
+  controller?: AbortController;
+  done: Promise<void>;
+}
+
+export class ExecutionDrainError extends Error {
+  constructor() {
+    super("Agent execution did not drain before the deadline.");
+    this.name = "ExecutionDrainError";
+  }
+}
+
 interface ExecutionRecord {
   fingerprint: string;
   promise: Promise<ExecutionResult>;
@@ -50,7 +62,8 @@ interface ExecutionRecord {
 
 interface CompletedExecution {
   fingerprint: string;
-  result: ExecutionResult;
+  result?: ExecutionResult;
+  bytes: number;
 }
 
 interface ExpiredApproval {
@@ -80,6 +93,7 @@ const aborted = (request: ExecutionRequest): ExecutionResult => ({
 
 const pendingKey = (agentId: string, requestId: string): string => JSON.stringify([agentId, requestId]);
 const MAX_COMPLETED_EXECUTIONS = 1_024;
+const MAX_COMPLETED_EXECUTION_BYTES = 8 * 1024 * 1024;
 const EXPIRED_APPROVAL_TTL_MS = 10_000;
 
 const canonicalJson = (value: unknown): string => {
@@ -105,6 +119,22 @@ const validProcessOutput = (value: unknown): boolean => {
     finiteNonNegative(result.durationMs) && typeof result.stdoutTruncated === "boolean" &&
     typeof result.stderrTruncated === "boolean" && (result.signal === undefined || stringValue(result.signal));
 };
+
+const completedResultBytes = (result: ExecutionResult): number => {
+  try {
+    const serialized = JSON.stringify(result);
+    return serialized === undefined ? 0 : Buffer.byteLength(serialized);
+  } catch {
+    return MAX_COMPLETED_EXECUTION_BYTES + 1;
+  }
+};
+
+const completedResultUnavailable = (request: ExecutionRequest): ExecutionResult => ({
+  ok: false,
+  operation: request.operation,
+  code: "io_error",
+  message: "Execution result is no longer cached; request ID cannot be reused.",
+});
 const browserImage = (value: unknown): boolean => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const image = value as Record<string, unknown>;
@@ -184,7 +214,11 @@ export class LocalExecutionBroker {
   private readonly pending = new Map<string, PendingApproval>();
   private readonly inFlight = new Map<string, ExecutionRecord>();
   private readonly completed = new Map<string, CompletedExecution>();
+  private completedBytes = 0;
   private readonly expired = new Map<string, ExpiredApproval>();
+  private readonly agentFences = new Map<string, number>();
+  private readonly failedDrains = new Set<string>();
+  private readonly admitted = new Map<string, Set<AdmittedEffect>>();
   private approvalListener?: (approval: ExecutionApprovalRequest) => void;
   private approvalExpiryListener?: (approval: ExecutionApprovalRequest) => void;
   private readonly hooks?: LocalBrokerHooks;
@@ -202,6 +236,70 @@ export class LocalExecutionBroker {
     }
     this.approvalListener = onApprovalRequired;
     this.hooks = hooks;
+  }
+
+  /** Block new requests and revoke approvals before any lifecycle awaits. */
+  fenceAgent(agentId: string): () => void {
+    this.agentFences.set(agentId, (this.agentFences.get(agentId) ?? 0) + 1);
+    for (const item of [...this.pending.values()]) {
+      if (item.approval.agentId !== agentId) continue;
+      void this.emitAudit({ kind: "outcome", agentId, requestId: item.approval.requestId,
+        operation: item.approval.request.operation, outcome: "error", code: "permission_denied", durationMs: 0 });
+      this.finish(item, denied(item.approval.request, "Agent execution is fenced."));
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.agentFences.get(agentId) ?? 1) - 1;
+      if (remaining === 0) this.agentFences.delete(agentId);
+      else this.agentFences.set(agentId, remaining);
+    };
+  }
+
+  /** Wait for actual admitted effects, not an abort-race result. */
+  async drainAgent(agentId: string, deadlineMs = 5_000): Promise<void> {
+    if (!this.agentFences.has(agentId)) throw new Error("Agent must be fenced before draining execution.");
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1) throw new Error("Execution drain deadline must be positive.");
+    const settle = async (): Promise<void> => {
+      while (true) {
+        const effects = [...(this.admitted.get(agentId) ?? [])];
+        if (effects.length === 0) return;
+        for (const effect of effects) effect.controller?.abort();
+        await Promise.all(effects.map((effect) => effect.done));
+      }
+    };
+    let timeout!: ReturnType<typeof setTimeout>;
+    try {
+      await Promise.race([
+        settle(),
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new ExecutionDrainError()), deadlineMs);
+        }),
+      ]);
+      this.failedDrains.delete(agentId);
+    } catch (error) {
+      // Releasing the caller's fence after failure must not admit a late writer.
+      this.failedDrains.add(agentId);
+      throw error;
+    } finally { clearTimeout(timeout); }
+  }
+
+  private isFenced(agentId: string): boolean {
+    return this.agentFences.has(agentId) || this.failedDrains.has(agentId);
+  }
+
+  private trackEffect(agentId: string, controller?: AbortController): () => void {
+    let effects = this.admitted.get(agentId);
+    if (effects === undefined) { effects = new Set(); this.admitted.set(agentId, effects); }
+    let settled!: () => void;
+    const effect: AdmittedEffect = { controller, done: new Promise<void>((resolve) => { settled = resolve; }) };
+    effects.add(effect);
+    return () => {
+      if (!effects.delete(effect)) return;
+      settled();
+      if (effects.size === 0 && this.admitted.get(agentId) === effects) this.admitted.delete(agentId);
+    };
   }
 
   setApprovalListener(listener?: (approval: ExecutionApprovalRequest) => void): void {
@@ -224,25 +322,50 @@ export class LocalExecutionBroker {
     return { ok: false, operation: request.operation, code: "io_error", message: "Execution backend failed." };
   }
 
-  private run(agentId: string, request: ExecutionRequest, signal?: AbortSignal): Promise<ExecutionResult> {
-    return this.resolveBackend(agentId).then(
-      (backend) => backend.execute(request, signal),
-      () => this.failed(request),
-    ).then(
-      (result) => validResult(result, request) ? result : this.failed(request),
-      () => this.failed(request),
-    );
+  private async run(agentId: string, request: ExecutionRequest, signal?: AbortSignal): Promise<ExecutionResult> {
+    try {
+      if (this.closed || signal?.aborted) return aborted(request);
+      if (this.isFenced(agentId)) return denied(request, "Agent execution is fenced.");
+      const backend = await this.resolveBackend(agentId);
+      // Backend resolution may itself provision a home. Drain tracks that
+      // resolution, and an abort must prevent the next effect from starting.
+      if (this.closed || signal?.aborted) return aborted(request);
+      if (this.isFenced(agentId)) return denied(request, "Agent execution is fenced.");
+      const result = await backend.execute(request, signal);
+      return validResult(result, request) ? result : this.failed(request);
+    } catch { return this.failed(request); }
   }
 
   private rememberCompleted(key: string, fingerprint: string, result: ExecutionResult): void {
     if (this.closed) return;
+    const previous = this.completed.get(key);
+    if (previous !== undefined) this.completedBytes -= previous.bytes;
     this.completed.delete(key);
-    this.completed.set(key, { fingerprint, result: structuredClone(result) });
-    while (this.completed.size > MAX_COMPLETED_EXECUTIONS) {
+    const bytes = completedResultBytes(result);
+    this.completed.set(key, {
+      fingerprint,
+      bytes: bytes <= MAX_COMPLETED_EXECUTION_BYTES ? bytes : 0,
+      ...(bytes <= MAX_COMPLETED_EXECUTION_BYTES ? { result: structuredClone(result) } : {}),
+    });
+    this.completedBytes += bytes <= MAX_COMPLETED_EXECUTION_BYTES ? bytes : 0;
+    while (this.completed.size > MAX_COMPLETED_EXECUTIONS || this.completedBytes > MAX_COMPLETED_EXECUTION_BYTES) {
       const oldest = this.completed.keys().next().value;
       if (oldest === undefined) break;
+      const evicted = this.completed.get(oldest);
+      if (evicted !== undefined && this.completedBytes > MAX_COMPLETED_EXECUTION_BYTES && evicted.result !== undefined) {
+        this.completedBytes -= evicted.bytes;
+        this.completed.delete(oldest);
+        this.completed.set(oldest, { fingerprint: evicted.fingerprint, bytes: 0 });
+        continue;
+      }
+      if (evicted !== undefined) this.completedBytes -= evicted.bytes;
       this.completed.delete(oldest);
     }
+  }
+
+  private replayCompleted(cached: CompletedExecution, request: ExecutionRequest, fingerprint: string): ExecutionResult {
+    if (cached.fingerprint !== fingerprint) return denied(request, "Execution request ID was reused with different arguments.");
+    return cached.result === undefined ? completedResultUnavailable(request) : structuredClone(cached.result);
   }
 
   private runIdempotently(
@@ -255,9 +378,7 @@ export class LocalExecutionBroker {
     const fingerprint = canonicalJson(approvedRequest);
     const cached = this.completed.get(key);
     if (cached !== undefined) {
-      return Promise.resolve(cached.fingerprint === fingerprint
-        ? structuredClone(cached.result)
-        : denied(approvedRequest, "Execution request ID was reused with different arguments."));
+      return Promise.resolve(this.replayCompleted(cached, approvedRequest, fingerprint));
     }
     const active = this.inFlight.get(key);
     if (active !== undefined) {
@@ -299,11 +420,12 @@ export class LocalExecutionBroker {
 
   private async emitAudit(entry: BrokerAuditEntry): Promise<void> {
     if (this.hooks?.audit === undefined) return;
+    const settled = this.trackEffect(entry.agentId);
     try {
       await this.hooks.audit(entry);
     } catch {
       // Audit is observability: a broken sink never blocks execution.
-    }
+    } finally { settled(); }
   }
 
   /** Evaluates the hook policy layer; evaluation failures fail closed. */
@@ -324,6 +446,29 @@ export class LocalExecutionBroker {
     options?: { permission?: LocalToolPermission; conversationId?: string },
   ): Promise<ExecutionResult> {
     if (this.closed || signal?.aborted) return aborted(request);
+    if (this.isFenced(agentId)) return denied(request, "Agent execution is fenced.");
+    const controller = new AbortController();
+    const abortListener = (): void => controller.abort();
+    signal?.addEventListener("abort", abortListener, { once: true });
+    // Register before invoking policy, audit or backend factories: all can
+    // touch the home before the backend's execute() promise exists.
+    const settled = this.trackEffect(agentId, controller);
+    try {
+      return await this.executeAdmitted(agentId, requestId, request, controller.signal, options);
+    } finally {
+      signal?.removeEventListener("abort", abortListener);
+      settled();
+    }
+  }
+
+  private async executeAdmitted(
+    agentId: string,
+    requestId: string,
+    request: ExecutionRequest,
+    signal: AbortSignal,
+    options?: { permission?: LocalToolPermission; conversationId?: string },
+  ): Promise<ExecutionResult> {
+    if (this.closed || signal.aborted) return aborted(request);
     const configuredPermission = this.permission(agentId, request);
     if (configuredPermission === "never") return denied(request, "Local tools are disabled.");
     const policy = options?.permission ?? configuredPermission;
@@ -332,9 +477,7 @@ export class LocalExecutionBroker {
     const fingerprint = canonicalJson(request);
     const cached = this.completed.get(key);
     if (cached !== undefined) {
-      return cached.fingerprint === fingerprint
-        ? structuredClone(cached.result)
-        : denied(request, "Execution request ID was reused with different arguments.");
+      return this.replayCompleted(cached, request, fingerprint);
     }
     const active = this.inFlight.get(key);
     if (active !== undefined) {
@@ -378,6 +521,13 @@ export class LocalExecutionBroker {
       });
       return denied(request, "Local tool request was denied by policy.");
     }
+    const stopped = this.closed || signal.aborted ? aborted(request)
+      : this.isFenced(agentId) ? denied(request, "Agent execution is fenced.") : undefined;
+    if (stopped !== undefined) {
+      await this.emitAudit({ kind: "outcome", agentId, requestId, operation: request.operation,
+        outcome: "error", code: stopped.ok ? undefined : stopped.code, durationMs: 0 });
+      return stopped;
+    }
     if (effect === "ask") return this.beginApproval(key, agentId, requestId, request, signal, options?.conversationId);
     return this.runWithAudit(key, agentId, requestId, request, signal);
   }
@@ -390,6 +540,8 @@ export class LocalExecutionBroker {
     signal?: AbortSignal,
     conversationId?: string,
   ): Promise<ExecutionResult> {
+    if (this.closed || signal?.aborted) return Promise.resolve(aborted(request));
+    if (this.isFenced(agentId)) return Promise.resolve(denied(request, "Agent execution is fenced."));
     this.pruneExpired();
     if (this.expired.has(key)) return Promise.resolve(denied(request, "Approval request expired and cannot be reused yet."));
     if (this.pending.has(key)) return Promise.resolve(denied(request, "Approval request already exists."));
@@ -482,7 +634,9 @@ export class LocalExecutionBroker {
     const [key, item] = match;
     this.pending.delete(key);
     this.detach(item);
-    if (decision === "deny") {
+    if (this.closed || item.signal?.aborted || this.isFenced(item.approval.agentId)) {
+      item.resolve(denied(item.approval.request, "Agent execution is fenced or aborted."));
+    } else if (decision === "deny") {
       void this.emitAudit({
         kind: "outcome",
         agentId: item.approval.agentId,
@@ -506,8 +660,10 @@ export class LocalExecutionBroker {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    for (const effects of this.admitted.values()) for (const effect of effects) effect.controller?.abort();
     for (const item of [...this.pending.values()]) this.finish(item, aborted(item.approval.request));
     this.completed.clear();
+    this.completedBytes = 0;
     this.expired.clear();
   }
 

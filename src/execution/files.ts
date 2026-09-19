@@ -566,7 +566,7 @@ const mkdirFile = async (
       const parentPath = await workspace.resolveExisting(path.dirname(relative));
       const parentMetadata = await lstat(parentPath);
       if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) throw new FileExecutionError("invalid_path", MESSAGES.invalidPath);
-      const reservation = quota ? await quota.reserveDelta({ bytes: 0, files: 0, entries: 1 }) : undefined;
+      const reservation = quota ? await quota.reserveDelta({ bytes: 0, files: 0, entries: 1 }, target) : undefined;
       try {
         await options.beforePathUse?.(parentPath);
         await assertStablePath(parentPath, parentMetadata);
@@ -612,7 +612,7 @@ const copyFileRequest = async (
     }
   }
 
-  const reservation = quota ? await quota.reserveDelta({ bytes: summary.bytes, files: summary.files, entries: summary.entries }) : undefined;
+  const reservation = quota ? await quota.reserveDelta({ bytes: summary.bytes, files: summary.files, entries: summary.entries }, destination) : undefined;
   let temporary: string | undefined;
   let renamed = false;
   let committed = false;
@@ -641,6 +641,7 @@ const copyFileRequest = async (
         await assertStablePath(parent.path, parent.metadata);
         await rename(destination, temporary!);
       } catch {
+        quota?.markUsageDirty();
         throw new FileExecutionError("io_error", MESSAGES.ioError);
       }
     }
@@ -655,6 +656,7 @@ const moveFile = async (
   workspace: WorkspaceSandbox,
   request: Extract<FileRequest, { operation: "file.move" }>,
   signal: AbortSignal | undefined,
+  quota: WorkspaceQuota | undefined,
   options: FileExecutorOptions,
 ): Promise<ExecutionResult> => {
   abortIfRequested(signal);
@@ -674,17 +676,25 @@ const moveFile = async (
       throw new FileExecutionError("invalid_path", MESSAGES.invalidPath);
     }
   }
+  const summary = quota ? await inspectTree(source, signal, options) : undefined;
+  if (summary?.kind === "other") throw new FileExecutionError("invalid_path", MESSAGES.invalidPath);
   abortIfRequested(signal);
   await options.beforePathUse?.(source);
   await assertStablePath(source, sourceMetadata);
   await options.beforePathUse?.(parent.path);
   await assertStablePath(parent.path, parent.metadata);
+  const reservation = quota && summary !== undefined
+    ? await quota.reserveTransfer(source, destination, { bytes: summary.bytes, files: summary.files, entries: summary.entries })
+    : undefined;
   let moved = false;
+  let committed = false;
   try {
     await rename(source, destination);
     moved = true;
     await assertStablePath(parent.path, parent.metadata);
     await assertStablePath(destination, sourceMetadata);
+    reservation?.commit();
+    committed = true;
     return { ok: true, operation: "file.move" };
   } catch (error) {
     if (moved) {
@@ -693,10 +703,13 @@ const moveFile = async (
         await assertDestinationAbsent(source);
         await rename(destination, source);
       } catch {
+        quota?.markUsageDirty();
         throw new FileExecutionError("io_error", MESSAGES.ioError);
       }
     }
     throw error;
+  } finally {
+    if (!committed) reservation?.cancel();
   }
 };
 
@@ -783,9 +796,10 @@ const trashFile = async (
   const payload = path.join(entry, "payload");
   const marker = path.join(entry, "meta.json");
   const markerContents = JSON.stringify({ version: 1, path: path.relative(workspace.root, source) });
-  const reservation = quota ? await quota.reserveDelta({ bytes: Buffer.byteLength(markerContents), files: 1, entries: trashPlan.missingEntries + 2 }) : undefined;
+  const reservation = quota ? await quota.reserveDelta({ bytes: Buffer.byteLength(markerContents), files: 1, entries: trashPlan.missingEntries + 2 }, entry) : undefined;
   let moved = false;
   let renamed = false;
+  let preservedTrash = false;
   try {
     await ensureInternalTrashRoot(workspace, options);
     const trashRootMetadata = await lstat(trashRoot);
@@ -814,15 +828,28 @@ const trashFile = async (
         await assertDestinationAbsent(source);
         await rename(payload, source);
       } catch {
-        throw new FileExecutionError("io_error", MESSAGES.ioError);
+        // The source was already moved. If rollback is uncertain, retain the
+        // marker and payload so the caller can recover them through restore.
+        preservedTrash = true;
+        throw new FileExecutionError(
+          "io_error",
+          `${MESSAGES.ioError} Rollback was not confirmed; recover the retained trash entry with file.restore (trashId: ${trashId}).`,
+        );
       }
     }
     throw error;
   } finally {
     if (!moved) {
       reservation?.cancel();
-      await rm(entry, { recursive: true, force: true }).catch(() => undefined);
-      await rollbackInternalTrashRoot(workspace, trashPlan);
+      if (preservedTrash) {
+        // The failed rename may have left either side in place. Force a fresh
+        // inventory before the next quota admission instead of deleting data
+        // whose ownership is no longer certain.
+        quota?.markUsageDirty();
+      } else {
+        await rm(entry, { recursive: true, force: true }).catch(() => undefined);
+        await rollbackInternalTrashRoot(workspace, trashPlan);
+      }
     }
   }
 };
@@ -992,7 +1019,7 @@ export async function executeFileRequest(
       case "file.copy":
         return await copyFileRequest(workspace, request, signal, quota, options);
       case "file.move":
-        return await moveFile(workspace, request, signal, options);
+        return await moveFile(workspace, request, signal, quota, options);
       case "file.trash":
         return await trashFile(workspace, request, signal, quota, options);
       case "file.restore":

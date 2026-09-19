@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { getEventListeners } from "node:events";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_PROVIDER_MAX_ACTIVE,
   DEFAULT_PROVIDER_MAX_QUEUED,
@@ -9,6 +10,10 @@ import {
 } from "../src/providers/admission.js";
 import { createProviderRegistry, streamChat } from "../src/providers/router.js";
 import { createMemoryTranscriptStore, createTurnRunner } from "../src/rpc/send.js";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("global provider admission", () => {
   it("defaults to four active calls and a separate bounded queue", () => {
@@ -107,6 +112,80 @@ describe("global provider admission", () => {
     await expect(waiting).rejects.toMatchObject({ code: "aborted" });
     expect(scheduler.metrics()).toMatchObject({ active: 1, waiting: 0, aborted: 1 });
     active.release();
+  });
+
+  it("cleans timeout listeners and permits reusing the same abort signal", async () => {
+    vi.useFakeTimers();
+    const scheduler = new ProviderAdmissionScheduler({ maxActive: 1, maxQueued: 8 });
+    const active = await scheduler.acquire("holder");
+    const controller = new AbortController();
+    const waiting = [
+      scheduler.acquire("queued", { signal: controller.signal, maxWaitMs: 5 }),
+      scheduler.acquire("queued", { signal: controller.signal, maxWaitMs: 5 }),
+      scheduler.acquire("queued", { signal: controller.signal, maxWaitMs: 5 }),
+    ];
+    const rejections = waiting.map((promise) => expect(promise).rejects.toMatchObject({ code: "wait-timeout" }));
+
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(5);
+    await Promise.all(rejections);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(scheduler.waitingCount).toBe(0);
+
+    active.release();
+    const reused = await scheduler.acquire("reused", controller.signal);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    reused.release();
+  });
+
+  it("cleans the abort listener when a queued waiter is aborted", async () => {
+    const scheduler = new ProviderAdmissionScheduler({ maxActive: 1, maxQueued: 2 });
+    const active = await scheduler.acquire("holder");
+    const controller = new AbortController();
+    const waiting = scheduler.acquire("queued", { signal: controller.signal, maxWaitMs: 1_000 });
+    const rejection = expect(waiting).rejects.toMatchObject({ code: "aborted" });
+
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(1);
+    controller.abort();
+    await rejection;
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(scheduler.waitingCount).toBe(0);
+    active.release();
+  });
+
+  it("cleans queued listeners during shutdown", async () => {
+    const scheduler = new ProviderAdmissionScheduler({ maxActive: 1, maxQueued: 2 });
+    const active = await scheduler.acquire("holder");
+    const controller = new AbortController();
+    const waiting = [
+      scheduler.acquire("queued", { signal: controller.signal, maxWaitMs: 1_000 }),
+      scheduler.acquire("queued-two", { signal: controller.signal, maxWaitMs: 1_000 }),
+    ];
+    const rejections = waiting.map((promise) => expect(promise).rejects.toMatchObject({ code: "shutdown" }));
+
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(2);
+    scheduler.shutdown();
+    await Promise.all(rejections);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(scheduler.waitingCount).toBe(0);
+    active.release();
+    await scheduler.drain();
+  });
+
+  it("cleans timer and abort listener when a waiter is admitted", async () => {
+    vi.useFakeTimers();
+    const scheduler = new ProviderAdmissionScheduler({ maxActive: 1, maxQueued: 2 });
+    const active = await scheduler.acquire("holder");
+    const controller = new AbortController();
+    const waiting = scheduler.acquire("queued", { signal: controller.signal, maxWaitMs: 1_000 });
+
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(1);
+    active.release();
+    const lease = await waiting;
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(scheduler.activeCount).toBe(1);
+    lease.release();
   });
 
   it("rejects a full global queue and releases the slot after failures", async () => {

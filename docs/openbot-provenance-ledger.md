@@ -63,3 +63,29 @@ artifacts with a clean-room implementation.
 **A hash proves the integrity of the observed file; it does not prove
 authorship, license, or authenticity.** A dependency manifest likewise records
 inventory, not a blanket license for every package or for the assembled product.
+
+## Local queue and task polish — 2026-09-16
+
+The queue recovery IPC additions live in the declared main/preload artifacts;
+queue feedback, explicit draft review and incremental transcript decoration live
+in `openbot-local-settings.js`. Task list ordering and status presentation live
+in `openbot-memory-ui.js`. Their current hashes and local patch records are in
+the client manifest and `patches/client-artifacts.json`. Only the two permitted
+overlay hashes change in the renderer boundary; immutable renderer files and
+their aggregate baseline remain unchanged. These local changes do not grant
+redistribution rights to the surrounding extracted artifacts.
+
+## Execution status and backend-driven recovery — 2026-09-18
+
+The real execution status (`promptStatus.execution`/`lastTurn`) and the
+structured recovery contract (`getPromptRecovery`) are local OpenBot additions.
+The gateway method lives in `src/rpc/send.ts`; the IPC channel
+`sand:prompt-recovery` is declared in the main/preload artifacts, and the
+overlay feedback (status strip, recovery actions) lives in
+`openbot-local-settings.js`. Their current hashes and local patch records are in
+the client manifest and `patches/client-artifacts.json`. Only the
+`openbot-local-settings.js` overlay hash changes in the renderer boundary;
+immutable renderer files and their aggregate baseline remain unchanged. The
+overlay no longer infers recovery actions from displayed error text. These local
+changes do not grant redistribution rights to the surrounding extracted
+artifacts.

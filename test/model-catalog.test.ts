@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ModelCatalogService } from "../src/providers/model-catalog.js";
-import { connectionFingerprint, createXaiCatalogSource, createOpenCodeCatalogSource, codexCatalogPage } from "../src/providers/model-discovery.js";
+import { connectionFingerprint, createXaiCatalogSource, createOpenCodeCatalogSource, createCompatCatalogSource, codexCatalogPage } from "../src/providers/model-discovery.js";
 import { ConfigStore } from "../src/config/store.js";
 import { registerRosterHandlers } from "../src/rpc/roster.js";
 import { Gateway } from "../src/server/gateway.js";
@@ -201,7 +201,7 @@ describe("discovery protocols", () => {
     expect(models.map(m => m.serviceTiers)).toEqual([["priority"], ["priority"], []]);
   });
   it("joins xAI endpoints, keeps aliases and excludes non-text outputs", async () => {
-    const oauth = { catalogConnectionKey: async () => connection, resolveCredential: async () => ({ accessToken: "fixture-token" }), rejectCredential: vi.fn() };
+    const oauth = { catalogConnectionKey: async () => connection, resolveCredential: async () => ({ accessToken: "fixture-token" }), rejectCredential: vi.fn(), hasCredential: async () => true };
     const fetchImpl = vi.fn(async (url, init) => {
       expect(new Headers(init?.headers).get("authorization")).toBe("Bearer fixture-token");
       return Response.json(String(url).endsWith("/language-models")
@@ -209,11 +209,11 @@ describe("discovery protocols", () => {
         : { data: [{ id: "grok-4.6", context_length: 100000 }] });
     }) as unknown as typeof fetch;
     const source = createXaiCatalogSource({ oauth, fetchImpl });
-    expect(await source.discover(new AbortController().signal)).toEqual([{ id: "grok-4.6", contextWindow: 100000, aliases: ["grok-alias"], inputModalities: ["text", "image"] }]);
+    expect(await source.discover(new AbortController().signal)).toEqual([{ id: "grok-4.6", contextWindow: 100000, aliases: ["grok-alias"], inputModalities: ["text", "image"], supportedReasoningEfforts: ["low", "medium", "high", "xhigh"] }]);
   });
 
   it.each([401, 403, 500])("fails the whole xAI refresh on partial HTTP %i", async status => {
-    const oauth = { catalogConnectionKey: async () => connection, resolveCredential: async () => ({ accessToken: "fixture-token" }), rejectCredential: vi.fn() };
+    const oauth = { catalogConnectionKey: async () => connection, resolveCredential: async () => ({ accessToken: "fixture-token" }), rejectCredential: vi.fn(), hasCredential: async () => true };
     const source = createXaiCatalogSource({ oauth, fetchImpl: (async url => String(url).endsWith("/models") ? new Response("private-error", { status }) : Response.json({ models: [] })) as typeof fetch });
     await expect(source.discover(new AbortController().signal)).rejects.toThrow(`HTTP ${status}`);
     expect(oauth.rejectCredential).toHaveBeenCalledTimes(status === 401 ? 1 : 0);
@@ -229,5 +229,82 @@ describe("discovery protocols", () => {
 
   it("intersects Codex efforts without substituting an incompatible saved effort", () => {
     expect(codexCatalogPage({ data: [{ model: "gpt-5.6-sol", supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "ultra" }], inputModalities: ["text"] }], nextCursor: "next" })).toMatchObject({ models: [{ supportedReasoningEfforts: ["high"] }], nextCursor: "next" });
+  });
+
+  it("discovers openai-compat limits from the configured endpoint /models", async () => {
+    const source = createCompatCatalogSource({
+      baseUrl: () => "https://127.0.0.1:9/v1",
+      apiKey: async () => "fixture-compat-key",
+      fetchImpl: (async (url, init) => {
+        expect(String(url)).toBe("https://127.0.0.1:9/v1/models");
+        expect(new Headers(init?.headers).get("authorization")).toBe("Bearer fixture-compat-key");
+        return Response.json({ data: [
+          { id: "custom-llm", context_length: 64_000, max_output_tokens: 8_192 },
+          { id: "openrouter-style", top_provider: { context_length: 200_000 } },
+          { id: "opaque" },
+        ] });
+      }) as typeof fetch,
+    });
+    expect(await source.hasConnection?.()).toBe(true);
+    const models = await source.discover(new AbortController().signal);
+    expect(models).toEqual([
+      { id: "custom-llm", contextWindow: 64_000, maxOutputTokens: 8_192, maxRequestBytes: 1024 * 1024 },
+      { id: "openrouter-style", contextWindow: 200_000, maxOutputTokens: 16_384, maxRequestBytes: 1024 * 1024 },
+      { id: "opaque" },
+    ]);
+  });
+
+  it("marks openai-compat models selectable only after endpoint discovery", async () => {
+    let baseUrl: string | undefined;
+    const source = createCompatCatalogSource({
+      baseUrl: () => baseUrl,
+      fetchImpl: (async () => Response.json({ data: [
+        { id: "served-model", context_length: 128_000, max_completion_tokens: 4_096 },
+        { id: "my-custom-model" },
+      ] })) as typeof fetch,
+    });
+    const catalog = new ModelCatalogService({ sources: { "openai-compat": source } });
+    try {
+      await catalog.initialize();
+      // Sem endpoint configurado: a fonte reporta `connected: false` —
+      // o catálogo distingue "desconectado" de "indisponível" em vez de
+      // inventar um erro de catálogo.
+      const offline = catalog.peek("openai-compat");
+      expect(offline.connected).toBe(false);
+      expect(offline.models.find(m => m.id === "openai-compatible")).toBeDefined();
+
+      // Modelo custom antes de qualquer descoberta: fallback conservador da
+      // entrada genérica (compatibilidade com configs antigas).
+      expect(catalog.resolve("openai-compat", "my-custom-model").entry.contextWindow).toBe(128_000);
+
+      baseUrl = "https://127.0.0.1:9/v1";
+      const discovered = await catalog.get("openai-compat", true);
+      const served = discovered.models.find(m => m.id === "served-model");
+      expect(served).toMatchObject({ selectable: true, availability: "listed", contextWindow: 128_000, maxOutputTokens: 4_096 });
+      const resolution = catalog.resolve("openai-compat", "served-model");
+      expect(resolution.protocol).toBe("chat");
+      expect(resolution.entry.maxRequestBytes).toBeGreaterThan(0);
+
+      // A listing with only an id confirms existence; preserve the generic
+      // conservative limits that admitted the explicit custom model before discovery.
+      const minimal = discovered.models.find(m => m.id === "my-custom-model");
+      expect(minimal).toMatchObject({ selectable: true, availability: "listed", contextWindow: 128_000, maxOutputTokens: 16_384, maxRequestBytes: 1024 * 1024 });
+      expect(catalog.resolve("openai-compat", "my-custom-model").entry.contextWindow).toBe(128_000);
+
+      // Com catálogo descoberto, modelo que o endpoint não anuncia é rejeitado.
+      expect(() => catalog.resolve("openai-compat", "not-served")).toThrow();
+    } finally { catalog.close(); }
+  });
+
+  it("keeps explicitly incompatible openai-compat limits pending", async () => {
+    const catalog = new ModelCatalogService({ sources: { "openai-compat": {
+      connectionKey: async () => connection,
+      discover: async () => [{ id: "inconsistent-model", contextWindow: 4_096, maxOutputTokens: 8_192 }],
+    } } });
+    try {
+      const discovered = await catalog.get("openai-compat", true);
+      expect(discovered.models.find(m => m.id === "inconsistent-model")).toMatchObject({ selectable: false, availability: "listed" });
+      expect(() => catalog.resolve("openai-compat", "inconsistent-model")).toThrow(/limites/);
+    } finally { catalog.close(); }
   });
 });

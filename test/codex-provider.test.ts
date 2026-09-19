@@ -26,6 +26,7 @@ describe("OpenAI Codex OAuth transport", () => {
       messages: [{ role: "user", content: "oi" }],
       maxTokens: 16_384,
       reasoningEffort: "high",
+      modelResolution: { supportedReasoningEfforts: ["high"] } as never,
     }, (event) => {
       if (event.type === "delta") deltas.push(event.delta);
     });

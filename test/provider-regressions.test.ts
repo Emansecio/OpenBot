@@ -44,6 +44,49 @@ function chunkedResponse(chunks: string[]): Response {
 }
 
 describe("regressões do transporte OpenAI-like", () => {
+  it.each([
+    ["openai", "length"],
+    ["openai", "content_filter"],
+    ["compat", "length"],
+    ["compat", "content_filter"],
+  ] as const)("propaga finish_reason %s/%s após consumir o uso final", async (kind, reason) => {
+    const fetchImpl = vi.fn(async () => chunkedResponse([
+      `data: ${JSON.stringify({ choices: [{ delta: { content: "parcial" }, finish_reason: reason }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 } })}\n\n`,
+      "data: [DONE]\n\n",
+    ])) as unknown as typeof fetch;
+    const adapter = kind === "openai"
+      ? new OpenAiAdapter({ apiKey: "sk-test", fetchImpl })
+      : new OpenAiCompatAdapter({ baseUrl: "http://127.0.0.1:1234/v1", fetchImpl });
+    defaultRegistry.register(adapter);
+    const events: Array<{ type: string; [key: string]: unknown }> = [];
+
+    const result = await streamChat(adapter.name, { ...request, model: "chat-test" }, event => events.push(event), { maxRetries: 2 });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(result.error).toMatchObject({ kind: "validation", status: 400, code: reason, retryable: false });
+    expect(result.message).toBeUndefined();
+    expect(events).toContainEqual({ type: "delta", delta: "parcial" });
+    expect(events).toContainEqual({ type: "usage", usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 } });
+  });
+
+  it.each(["openai", "compat"] as const)("emite tool call completa no término normal do Chat %s", async kind => {
+    const fetchImpl = vi.fn(async () => chunkedResponse([
+      `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call-1", type: "function", function: { name: "clock", arguments: "{}" } }] } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
+      "data: [DONE]\n\n",
+    ])) as unknown as typeof fetch;
+    const adapter = kind === "openai"
+      ? new OpenAiAdapter({ apiKey: "sk-test", fetchImpl })
+      : new OpenAiCompatAdapter({ baseUrl: "http://127.0.0.1:1234/v1", fetchImpl });
+    defaultRegistry.register(adapter);
+
+    const result = await streamChat(adapter.name, { ...request, model: "chat-test" }, undefined, { maxRetries: 0 });
+
+    expect(result.error).toBeUndefined();
+    expect(result.message?.toolCalls).toEqual([{ id: "call-1", type: "function", function: { name: "clock", arguments: "{}" } }]);
+  });
+
   it("rejeita frame JSON sem o contrato de chat-completions", async () => {
     const fetchImpl = vi.fn(async () => chunkedResponse([
       'data: {"object":"chat.completion.chunk","unexpected":true}\n\n',

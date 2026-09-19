@@ -14,6 +14,7 @@
       "localToolPermission": "ask"
     },
     "availableModels": [
+      { "id": "gpt-6-astra", "provider": "openai", "displayName": "GPT-6 Astra" },
       { "id": "grok-4.6", "provider": "xai", "displayName": "Grok 4.6", "default": true },
       { "id": "gpt-5.6-luna", "provider": "openai", "displayName": "GPT-5.6 Luna" },
       { "id": "gpt-5.6-sol", "provider": "openai", "displayName": "GPT-5.6 Sol" },

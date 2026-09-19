@@ -29,6 +29,7 @@
  * e evento SSE `{channel,payload}` (heartbeat `:ping`, `retry:1000`).
  */
 
+import { timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import zlib from "node:zlib";
 
@@ -175,6 +176,7 @@ export const RPC_METHOD_TABLE = new Set<string>([
   "setProviderConfig",
   "getForeverBoxStatus",
   "getLocalRuntimeStatus",
+  "getExecutionDiagnostics",
   "repairLocalRuntime",
   "ensureForeverBox",
   "handBackForeverBox",
@@ -208,6 +210,9 @@ export const RPC_METHOD_TABLE = new Set<string>([
   "abortPrompt",
   "retryPrompt",
   "getPromptStatus",
+  "getPromptRecovery",
+  "getQueuedPrompt",
+  "reviseQueuedPrompt",
   "discoverLocalProviders",
   "testProviderConnection",
   "startProviderOAuth",
@@ -223,10 +228,10 @@ export const QUIESCENCE_ALLOWED_RPC_METHODS = new Set<string>([
   "listConversations", "getActiveConversation", "getAgentWorkflows", "getAvailableSkills",
   "listMcpServers", "listMcpTools", "getSubagents", "getAsyncTasks", "listAsyncTasks", "getAsyncTask", "dispatchAsyncTask", "steerAsyncTask", "abortAsyncTask", "settleAsyncTask", "getAvailableModels", "getProviderModelCatalog",
   "getAgentDefaultModel", "countAgents", "searchAgents", "getLocalProfile", "getActiveProvider",
-  "getProviderConfig", "getForeverBoxStatus", "getLocalRuntimeStatus",
+  "getProviderConfig", "getForeverBoxStatus", "getLocalRuntimeStatus", "getExecutionDiagnostics",
   "isAgentNetworkEnabled", "isGlobalSearchEnabled", "isEgressTunnelAvailable", "getComputerCapabilities",
   "getHostSettings", "getBoxSecretsStatus", "listQuarantinedAgents", "getWorkspaceInventory",
-  "getPromptStatus", "getAgentAvatar", "discoverLocalProviders", "getProviderOAuthStatus", "cancelProviderOAuth", "cancelPrompt", "abortPrompt",
+  "getPromptStatus", "getPromptRecovery", "getQueuedPrompt", "getAgentAvatar", "discoverLocalProviders", "getProviderOAuthStatus", "cancelProviderOAuth", "cancelPrompt", "abortPrompt",
 ]);
 
 export interface GatewayDeps {
@@ -760,7 +765,9 @@ export class Gateway {
     queryToken?: string | null,
   ): boolean {
     if (!this.gatewayToken) return true;
-    if (tokenFromRequest(req, queryToken) === this.gatewayToken) return true;
+    const supplied = Buffer.from(tokenFromRequest(req, queryToken), "utf8");
+    const expected = Buffer.from(this.gatewayToken, "utf8");
+    if (supplied.length === expected.length && timingSafeEqual(supplied, expected)) return true;
     sendJson(res, 401, { error: "unauthorized" });
     return false;
   }

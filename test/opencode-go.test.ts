@@ -41,6 +41,19 @@ describe("OpenCode Go", () => {
     expect(fetchImpl).toHaveBeenCalledWith("https://opencode.ai/zen/go/v1/models", expect.objectContaining({ method: "GET" }));
   });
 
+  it("merges declared free zen models into discovery without listing paid ids", async () => {
+    const fetchImpl = vi.fn(async (input) => {
+      const url = String(input);
+      if (url === "https://opencode.ai/zen/v1/models") {
+        return Response.json({ data: [{ id: "mimo-v2.5-free" }, { id: "gpt-6-astra" }] });
+      }
+      return Response.json({ data: [{ id: "glm-5.3" }] });
+    }) as unknown as typeof fetch;
+    const adapter = new OpenCodeGoAdapter({ apiKey: "oc-test", fetchImpl });
+
+    await expect(adapter.discoverModels()).resolves.toEqual(["glm-5.3", "zen/mimo-v2.5-free"]);
+  });
+
   it.each([
     ["opencode-go/gpt-5.6-luna", "/responses", 'data: {"type":"response.done","response":{"status":"completed"}}\n\n'],
     ["glm-5.3", "/chat/completions", "data: [DONE]\n\n"],
@@ -57,6 +70,27 @@ describe("OpenCode Go", () => {
     await adapter.streamChat({ ...request(model), sessionId: "conversation-fixture" }, () => undefined);
 
     expect(url).toBe(`https://opencode.ai/zen/go/v1${path}`);
+  });
+
+  it.each([
+    ["opencode-go/zen/mimo-v2.5-free", "/chat/completions", "data: [DONE]\n\n"],
+    ["opencode-go/zen/muse-spark-1.3-contributor-free", "/responses", 'data: {"type":"response.done","response":{"status":"completed"}}\n\n'],
+  ])("routes free tier %s through the zen endpoint %s", async (model, path, stream) => {
+    let url = "";
+    let wireModel = "";
+    const fetchImpl = vi.fn(async (input, init) => {
+      url = String(input);
+      wireModel = JSON.parse(String(init?.body)).model;
+      expect(new Headers(init?.headers).get("x-opencode-session")).toBe("conversation-fixture");
+      expect(new Headers(init?.headers).get("user-agent")).toBe("OpenBot/0.1.1");
+      return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof fetch;
+    const adapter = new OpenCodeGoAdapter({ apiKey: "oc-test", fetchImpl });
+
+    await adapter.streamChat({ ...request(model), sessionId: "conversation-fixture" }, () => undefined);
+
+    expect(url).toBe(`https://opencode.ai/zen/v1${path}`);
+    expect(wireModel).toBe(model.replace("opencode-go/zen/", ""));
   });
 
   it("streams Anthropic text and tool calls through /messages", async () => {

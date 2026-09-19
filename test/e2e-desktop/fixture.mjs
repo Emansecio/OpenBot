@@ -281,11 +281,53 @@ handle = await startServer(port, {
   gatewayToken,
 });
 if (!emptyAgent) await handle.homes?.ensure(DEFAULT_AGENT_ID);
+if (args.includes("--delete-drain-delay")) {
+  config.mutate(current => ({ agents: [...current.agents, { id: "delete-timeout-fixture", name: "Deletion Fixture", avatarId: "delete-timeout-fixture" }] }));
+  await handle.homes?.ensure("delete-timeout-fixture");
+  const originalFlush = handle.runner.flush.bind(handle.runner);
+  handle.runner.flush = async (agentId) => {
+    await sleep(8_000);
+    await originalFlush(agentId);
+  };
+}
 if (!emptyAgent && args.includes("--transition-history")) {
   handle.store.append(DEFAULT_AGENT_ID, Array.from({ length: 520 }, (_, index) => ({
     kind: "message", id: `transition-history:${index}`, role: index % 2 ? "assistant" : "user",
     content: `Histórico de transições ${index}`, timestampMs: Date.now() - (520 - index) * 1000,
   })));
+}
+
+if (!emptyAgent && args.includes("--readability-content")) {
+  const turnId = "turn:visual-readability";
+  // Stored fixture only: no tool or provider is executed by this scenario.
+  handle.store.append(DEFAULT_AGENT_ID, [
+    // Turno anterior completo: permanece visível na conversa, mas não pertence
+    // ao turno da falha e não pode ser destacado por "Conferir resultados".
+    { kind: "message", id: "visual-readability:earlier-user", role: "user", turnId: "turn:visual-readability-earlier", timestampMs: Date.now() - 6000,
+      content: "Resumo anterior desta conversa." },
+    { kind: "message", id: "visual-readability:earlier-assistant", role: "assistant", turnId: "turn:visual-readability-earlier", timestampMs: Date.now() - 5000,
+      content: "Resumo anterior concluído." },
+    { kind: "tool-call", id: "visual-readability:earlier-tool", name: "read-file", summary: "Leitura anterior (fixture)",
+      status: "completed", localToolCallId: "turn:visual-readability-earlier\0fixture", result: { ok: true, content: "Dados anteriores" } },
+    { kind: "message", id: "visual-readability:user", role: "user", turnId, clientNonce: "visual-readability", timestampMs: Date.now() - 3000,
+      content: "Confira o relatório de planejamento operacional e explique os resultados que precisam de acompanhamento." },
+    { kind: "message", id: "visual-readability:assistant", role: "assistant", turnId, timestampMs: Date.now() - 2000,
+      content: "## Relatório de planejamento\n\nConfira o identificador e o exemplo sem perder o restante da conversa.\n\n```js\nconst identificador = '" + "relatorio_operacional_".repeat(10) + "';\nconsole.log(identificador);\n```\n\nFim do relatório de fixture." },
+    { kind: "message", id: "visual-readability:assistant-completed-copy", role: "assistant", turnId, timestampMs: Date.now() - 1800,
+      content: "Concluído · relatório final disponível." },
+    { kind: "message", id: "visual-readability:assistant-failed-copy", role: "assistant", turnId, timestampMs: Date.now() - 1600,
+      content: "Falhou · integração indisponível; confira o erro acima." },
+    { kind: "tool-call", id: "visual-readability:tool", name: "read-file", summary: "Leitura de relatório (fixture)",
+      status: "completed", localToolCallId: `${turnId}\0fixture`, result: { ok: true, content: "Dados de teste" } },
+    { kind: "notice", id: "notice:visual-readability:aborted", turnId, clientNonce: "visual-readability",
+      level: "error", text: "Geração interrompida.", retryable: true, provider: "xai", model: "grok-4.6" },
+  ]);
+}
+
+if (!emptyAgent && args.includes("--second-agent")) {
+  // Segundo bot isolado: valida troca de bot sem reenvio e sem vazamento de estado.
+  config.mutate(current => ({ agents: [...current.agents, { id: "status-switch-fixture", name: "Status Switch Fixture", avatarId: "status-switch-fixture" }] }));
+  await handle.homes?.ensure("status-switch-fixture");
 }
 
 const ready = {

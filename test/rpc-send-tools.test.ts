@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { LocalExecutionBroker } from "../src/execution/broker.js";
-import { runToolLoop, MAX_TOOL_CALLS_PER_ROUND, MAX_TOOL_RESULT_BYTES_PER_ROUND, MAX_TOOL_ROUNDS, type ToolExecutionResult } from "../src/execution/tool-loop.js";
+import { runToolLoop, resolveToolLoopBudget, MAX_TOOL_CALLS_PER_ROUND, MAX_TOOL_RESULT_BYTES_PER_ROUND, MAX_TOOL_ROUNDS, MAX_TOOL_TOTAL_CALLS, MAX_TOOL_TOTAL_ROUNDS, maskStaleToolResults, isReadOnlyToolCall, type ToolExecutionResult } from "../src/execution/tool-loop.js";
 import { stableToolCallId } from "../src/execution/tool-card.js";
 import type { ExecutionBackend, ExecutionRequest, ExecutionResult } from "../src/execution/contracts.js";
-import { createProviderRegistry, type ProviderAdapter, type ProviderChatRequest, type ProviderStreamEvent, type StreamChatResult } from "../src/providers/router.js";
+import { createProviderRegistry, ProviderError, type ProviderAdapter, type ProviderChatMessage, type ProviderChatRequest, type ProviderStreamEvent, type StreamChatResult } from "../src/providers/router.js";
+import { MAX_LIVE_RESPONSE_BYTES } from "../src/rpc/stream-state.js";
 import { createMemoryTranscriptStore, createTurnRunner } from "../src/rpc/send.js";
 import type { TranscriptEntry } from "../src/shared/contracts.js";
 
@@ -19,6 +20,211 @@ const tool = (id: string, name = "file", args = '{"op":"list","path":"."}') => (
 const broker = (backend: Backend) => new LocalExecutionBroker(backend, () => "always", () => {});
 
 describe("runToolLoop", () => {
+  it("logs one preparation and one logical result for a deduplicated tool-enabled turn", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    const log = vi.spyOn(console, "info").mockImplementation(() => {});
+    const registry = createProviderRegistry();
+    const stream = vi.fn(async (_req: ProviderChatRequest, emit: (event: ProviderStreamEvent) => void) => emit({ type: "delta", delta: "done" }));
+    registry.register({ name: "xai", streamChat: stream });
+    try {
+      const runner = createTurnRunner({ registry, tools: [{ type: "function", function: { name: "file" } }],
+        toolExecutor: async () => ({ handled: true, ok: true, content: "ok" }) });
+      const args = { agentId: "agent-a", prompt: "private prompt", clientNonce: "nonce" };
+      runner.sendPrompt(args);
+      await runner.flush("agent-a");
+      runner.sendPrompt(args);
+      await runner.flush("agent-a");
+      expect(stream).toHaveBeenCalledTimes(1);
+      const lines = log.mock.calls.map(call => String(call[0]));
+      expect(lines.filter(line => line.startsWith("[openbot][context]"))).toHaveLength(1);
+      expect(lines.filter(line => line.startsWith("[openbot][turn-result]"))).toHaveLength(1);
+      const context = JSON.parse(lines.find(line => line.startsWith("[openbot][context]"))!.slice("[openbot][context] ".length));
+      expect(context.requestId).toBe(stream.mock.calls[0]![0].requestId);
+      expect(context.operationId).toBe(stream.mock.calls[0]![0].operationId);
+      expect(lines.join("\n")).not.toContain("private prompt");
+    } finally { log.mockRestore(); vi.unstubAllEnvs(); }
+  });
+  it("adapta o orçamento para modelos com janela grande", () => {
+    const budget = resolveToolLoopBudget({ modelResolution: {
+      entry: { id: "grok-4.6", provider: "xai", displayName: "Grok", contextWindow: 500_000, maxRequestBytes: 1_048_576 },
+    } as never });
+    expect(budget).toEqual({
+      maxRounds: 32,
+      maxCallsPerRound: 64,
+      maxResultBytes: MAX_TOOL_RESULT_BYTES_PER_ROUND,
+      maxTotalRounds: 128,
+      maxTotalCalls: 128,
+    });
+  });
+
+  it("mantém override de rounds estrito e expõe os tetos agregados", () => {
+    const budget = resolveToolLoopBudget({ modelResolution: undefined }, { maxRounds: 3 });
+    expect(budget.maxRounds).toBe(3);
+    expect(budget.maxTotalRounds).toBe(3);
+    expect(budget.maxTotalCalls).toBe(MAX_TOOL_TOTAL_CALLS);
+    expect(MAX_TOOL_TOTAL_ROUNDS).toBe(128);
+  });
+
+  it("estende a janela soft somente após observar saída bem-sucedida nova", async () => {
+    let executions = 0;
+    let providerRounds = 0;
+    const backend: ExecutionBackend = {
+      async execute(request) {
+        if (request.operation !== "file.list") throw new Error(`Unexpected fixture operation: ${request.operation}`);
+        executions += 1;
+        return { ok: true, operation: request.operation, entries: [{ name: `item-${executions}`, kind: "file" }] };
+      },
+    };
+    const result = await runToolLoop({
+      agentId: "a",
+      request: {
+        ...base,
+        modelResolution: {
+          entry: { id: "wide", provider: "fake", displayName: "wide", contextWindow: 128_000, maxRequestBytes: 1_048_576 },
+        } as never,
+      },
+      broker: new LocalExecutionBroker(backend, () => "always"),
+      stream: async (request) => {
+        if (request.tools?.length === 0) return { aborted: false, message: { role: "assistant", content: "fechado" } };
+        providerRounds += 1;
+        return providerRounds <= 25
+          ? { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool(`progress-${providerRounds}`, "file", JSON.stringify({ op: "list", path: `item-${providerRounds}` }))] } }
+          : { aborted: false, message: { role: "assistant", content: "fechado" } };
+      },
+      onEvent: () => {},
+    });
+    expect(result.message?.content).toBe("fechado");
+    expect(executions).toBe(25);
+  });
+
+  it("não renova a janela com resultados read-only vazios", async () => {
+    let providerRounds = 0;
+    let executions = 0;
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      executeTool: async () => {
+        executions += 1;
+        return { handled: true, ok: true, content: "" };
+      },
+      stream: async (request) => {
+        if (request.tools?.length === 0) return { aborted: false, message: { role: "assistant", content: "vazio encerrado" } };
+        providerRounds += 1;
+        return { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool(`empty-${providerRounds}`, "search_text", JSON.stringify({ query: `q-${providerRounds}` }))] } };
+      },
+      onEvent: () => {},
+    });
+    expect(result.message?.content).toBe("vazio encerrado");
+    expect(executions).toBe(MAX_TOOL_ROUNDS);
+  });
+
+  it("também reconhece saída nova de ação bem-sucedida como progresso", async () => {
+    let providerRounds = 0;
+    let executions = 0;
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      executeTool: async () => {
+        executions += 1;
+        return { handled: true, ok: true, content: `ação-confirmada-${executions}` };
+      },
+      stream: async (request) => {
+        if (request.tools?.length === 0) return { aborted: false, message: { role: "assistant", content: "ações encerradas" } };
+        providerRounds += 1;
+        return providerRounds <= MAX_TOOL_ROUNDS + 1
+          ? { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool(`action-${providerRounds}`, "use_skill", JSON.stringify({ id: `skill-${providerRounds}` }))] } }
+          : { aborted: false, message: { role: "assistant", content: "ações encerradas" } };
+      },
+      onEvent: () => {},
+    });
+    expect(result.message?.content).toBe("ações encerradas");
+    expect(executions).toBe(MAX_TOOL_ROUNDS + 1);
+  });
+
+  it("permite polling read-only quando a observação muda", async () => {
+    let providerRounds = 0;
+    let executions = 0;
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      executeTool: async () => {
+        executions += 1;
+        return { handled: true, ok: true, content: executions === 1 ? "status: running" : "status: done" };
+      },
+      stream: async (request) => {
+        if (request.tools?.length === 0) return { aborted: false, message: { role: "assistant", content: "poll concluído" } };
+        providerRounds += 1;
+        return providerRounds <= 2
+          ? { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool(`poll-${providerRounds}`, "search_text", '{"query":"job"}')] } }
+          : { aborted: false, message: { role: "assistant", content: "poll concluído" } };
+      },
+      onEvent: () => {},
+    });
+    expect(result.message?.content).toBe("poll concluído");
+    expect(executions).toBe(2);
+    expect(providerRounds).toBe(3);
+  });
+
+  it("fecha polling read-only após três resultados consecutivos sem mudança", async () => {
+    let providerRounds = 0;
+    let executions = 0;
+    const requests: ProviderChatRequest[] = [];
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      executeTool: async () => {
+        executions += 1;
+        return { handled: true, ok: true, content: "status: running" };
+      },
+      stream: async (request) => {
+        requests.push(request);
+        if (request.tools?.length === 0) return { aborted: false, message: { role: "assistant", content: "poll encerrado" } };
+        providerRounds += 1;
+        return { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool(`poll-${providerRounds}`, "search_text", '{"query":"job"}')] } };
+      },
+      onEvent: () => {},
+    });
+    expect(result.message?.content).toBe("poll encerrado");
+    expect(executions).toBe(3);
+    expect(requests.at(-1)?.tools).toEqual([]);
+  });
+
+  it("fecha um lote paralelo quando o teto agregado não comporta todos os reads", async () => {
+    let providerRounds = 0;
+    let executions = 0;
+    const requests: ProviderChatRequest[] = [];
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      executeTool: async ({ call }) => {
+        executions += 1;
+        return { handled: true, ok: true, content: `observation-${call.function.arguments}` };
+      },
+      stream: async (request) => {
+        requests.push(request);
+        if (request.tools?.length === 0) return { aborted: false, message: { role: "assistant", content: "lote encerrado" } };
+        providerRounds += 1;
+        if (providerRounds <= MAX_TOOL_TOTAL_CALLS - 3) {
+          return { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool(`single-${providerRounds}`, "search_text", JSON.stringify({ query: `q-${providerRounds}` }))] } };
+        }
+        return {
+          aborted: false,
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [1, 2, 3, 4].map((index) => tool(`batch-${index}`, "search_text", JSON.stringify({ query: `batch-${index}` }))),
+          },
+        };
+      },
+      onEvent: () => {},
+    });
+    expect(result.message?.content).toBe("lote encerrado");
+    expect(executions).toBe(MAX_TOOL_TOTAL_CALLS - 3);
+    const finalRequest = requests.at(-1);
+    expect(finalRequest?.tools).toEqual([]);
+    expect(finalRequest?.messages.filter((message) => message.role === "tool").slice(-4)).toHaveLength(4);
+  });
+
   it("publica running antes de aguardar um executor compartilhado conhecido", async () => {
     const states: string[] = [];
     let release!: () => void;
@@ -190,6 +396,79 @@ describe("runToolLoop", () => {
     expect(Buffer.byteLength(content, "utf8")).toBeLessThanOrEqual(MAX_TOOL_RESULT_BYTES_PER_ROUND);
   });
 
+  it("limita erro Unicode no wire mesmo quando o executor fornece mensagem maior", async () => {
+    const requests: ProviderChatRequest[] = [];
+    const hugeError = "😀".repeat(Math.ceil((MAX_TOOL_RESULT_BYTES_PER_ROUND + 1024) / 4));
+    await runToolLoop({
+      agentId: "a",
+      request: base,
+      stream: async (request) => {
+        requests.push(request);
+        return requests.length === 1
+          ? { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool("failed-error", "use_skill", '{"id":"error"}')] } }
+          : { aborted: false, message: { role: "assistant", content: "done" } };
+      },
+      onEvent: () => {},
+      executeTool: async () => ({ handled: true, ok: false, content: "short", error: hugeError }),
+    });
+
+    const content = String(requests[1]?.messages.at(-1)?.content ?? "");
+    expect(Buffer.byteLength(content, "utf8")).toBeLessThanOrEqual(MAX_TOOL_RESULT_BYTES_PER_ROUND);
+    expect(content).toContain("[output truncated by OpenBot]");
+  });
+
+  it("preserva o fallback de falha vazia quando ainda há orçamento", async () => {
+    const requests: ProviderChatRequest[] = [];
+    await runToolLoop({
+      agentId: "a",
+      request: base,
+      stream: async (request) => {
+        requests.push(request);
+        return requests.length === 1
+          ? { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool("empty-error", "use_skill", '{"id":"empty"}')] } }
+          : { aborted: false, message: { role: "assistant", content: "done" } };
+      },
+      onEvent: () => {},
+      executeTool: async () => ({ handled: true, ok: false, content: "", error: "" }),
+    });
+
+    expect(requests[1]?.messages.at(-1)).toMatchObject({ role: "tool", content: "erro desconhecido na execução" });
+  });
+
+  it("mantém o orçamento agregado para exceções e falhas múltiplas", async () => {
+    const requests: ProviderChatRequest[] = [];
+    const hugeError = "E".repeat(MAX_TOOL_RESULT_BYTES_PER_ROUND + 2048);
+    await runToolLoop({
+      agentId: "a",
+      request: base,
+      stream: async (request) => {
+        requests.push(request);
+        return requests.length === 1
+          ? {
+            aborted: false,
+            message: {
+              role: "assistant",
+              content: "",
+              toolCalls: [tool("failed-exception", "use_skill", '{"id":"exception"}'), tool("failed-second", "use_skill", '{"id":"second"}')],
+            },
+          }
+          : { aborted: false, message: { role: "assistant", content: "done" } };
+      },
+      onEvent: () => {},
+      executeTool: async ({ call }) => {
+        if (call.id === "failed-exception") throw new Error(hugeError);
+        return { handled: true, ok: false, content: "", error: "" };
+      },
+    });
+
+    const toolMessages = requests[1]?.messages.filter((message) => message.role === "tool") ?? [];
+    const totalBytes = toolMessages.reduce((total, message) => total + Buffer.byteLength(message.content, "utf8"), 0);
+    expect(totalBytes).toBeLessThanOrEqual(MAX_TOOL_RESULT_BYTES_PER_ROUND);
+    expect(toolMessages).toHaveLength(2);
+    expect(toolMessages[0]?.content).toContain("[output truncated by OpenBot]");
+    expect(toolMessages[1]?.content).toBe("");
+  });
+
   it("transporta screenshot como imagem multimodal e remove o base64 do JSON textual", async () => {
     const requests: ProviderChatRequest[] = [];
     const imageBackend: ExecutionBackend = {
@@ -346,7 +625,7 @@ describe("runToolLoop", () => {
     const stream = async (request: ProviderChatRequest): Promise<StreamChatResult> => {
       requests.push(request);
       if (requests.length <= 2) {
-        return { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool(`repeat-${requests.length}`)] } };
+        return { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool(`repeat-${requests.length}`, "file", '{"op":"write","path":"repeat.txt","content":"x"}')] } };
       }
       return { aborted: false, message: { role: "assistant", content: "feito sem repetir" } };
     };
@@ -448,17 +727,32 @@ describe("runToolLoop", () => {
     const backend = new Backend();
     const calls = Array.from({ length: MAX_TOOL_CALLS_PER_ROUND + 1 }, (_, index) => tool(`bulk-${index}`));
     const result = await runToolLoop({ agentId: "a", request: base, broker: broker(backend), stream: async () => ({ aborted: false, message: { role: "assistant", content: "", toolCalls: calls } }), onEvent: () => {} });
-    expect(result.error).toMatchObject({ kind: "validation" });
+    expect(result.message?.content).toContain("resposta é parcial");
+    expect(result.message?.content).toContain("file");
     expect(backend.calls).toHaveLength(0);
   });
 
   it("interrompe provider que ignora o aviso de chamada repetida", async () => {
     const backend = new Backend(); let calls = 0;
-    const stream = async (): Promise<StreamChatResult> => ({ aborted: false, message: { role: "assistant", content: "", toolCalls: [tool(`call-${++calls}`)] } });
+    const requests: ProviderChatRequest[] = [];
+    const stream = async (request: ProviderChatRequest): Promise<StreamChatResult> => {
+      requests.push(request);
+      if (request.tools?.length === 0) return { aborted: false, message: { role: "assistant", content: "repetição bloqueada; fechamento concluído" } };
+      return { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool(`call-${++calls}`, "file", '{"op":"write","path":"repeat.txt","content":"x"}')] } };
+    };
     const result = await runToolLoop({ agentId: "a", request: base, broker: broker(backend), stream, onEvent: (_event: ProviderStreamEvent) => {} });
-    expect(result.error).toMatchObject({ kind: "validation", code: "tool_repetition_limit", retryable: false });
+    expect(result.message?.content).toBe("repetição bloqueada; fechamento concluído");
     expect(calls).toBe(3);
     expect(backend.calls).toHaveLength(1);
+    const finalRequest = requests.at(-1);
+    expect(finalRequest?.tools).toEqual([]);
+    const finalAssistantCalls = finalRequest?.messages
+      .filter((message): message is Extract<ProviderChatMessage, { role: "assistant" }> => message.role === "assistant")
+      .flatMap((message) => message.toolCalls ?? []);
+    const finalToolIds = new Set(finalRequest?.messages
+      .filter((message): message is Extract<ProviderChatMessage, { role: "tool" }> => message.role === "tool")
+      .map((message) => message.toolCallId));
+    for (const call of finalAssistantCalls ?? []) expect(finalToolIds.has(call.id)).toBe(true);
   });
 
   it("marca as tool calls do teto de rodadas como failed", async () => {
@@ -486,11 +780,322 @@ describe("runToolLoop", () => {
         entries.push(entry);
       },
     });
-    expect(result.error).toMatchObject({ kind: "validation" });
+    expect(result.message?.content).toContain("resposta é parcial");
+    expect(result.message?.content).toContain("file");
     const last = [...entries].reverse().find(
       (entry) => entry.kind === "tool-call" && entry.status === "failed",
     );
     expect(last).toMatchObject({ status: "failed", result: { message: "tool round limit exceeded" } });
+  });
+
+  it("fecha com resposta sem tools quando o teto de rodadas é atingido", async () => {
+    const requests: ProviderChatRequest[] = [];
+    const backend = new Backend();
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      broker: broker(backend),
+      stream: async (request) => {
+        requests.push(request);
+        if (request.tools?.length === 0) {
+          return { aborted: false, message: { role: "assistant", content: "feito com o que foi possível" } };
+        }
+        const round = requests.length;
+        return {
+          aborted: false,
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [tool(`round-${round}`, "file", JSON.stringify({ op: "list", path: `round-${round}` }))],
+          },
+        };
+      },
+      onEvent: () => {},
+    });
+
+    expect(result).toMatchObject({ message: { content: "feito com o que foi possível" } });
+    expect(requests.at(-1)?.tools).toEqual([]);
+    expect(backend.calls).toHaveLength(MAX_TOOL_ROUNDS);
+  });
+
+  it("fecha com resposta sem tools quando o provider excede calls por rodada", async () => {
+    const requests: ProviderChatRequest[] = [];
+    const entries: TranscriptEntry[] = [];
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      broker: broker(new Backend()),
+      stream: async (request) => {
+        requests.push(request);
+        if (request.tools?.length === 0) {
+          return { aborted: false, message: { role: "assistant", content: "resposta final" } };
+        }
+        const calls = Array.from({ length: MAX_TOOL_CALLS_PER_ROUND + 1 }, (_, index) => tool(`bulk-${index}`));
+        return { aborted: false, message: { role: "assistant", content: "", toolCalls: calls } };
+      },
+      onEvent: () => {},
+      onProgress: ({ entry }) => entries.push(entry),
+    });
+
+    expect(result).toMatchObject({ message: { content: "resposta final" } });
+    expect(requests.at(-1)?.tools).toEqual([]);
+    expect(entries.filter((entry) => entry.kind === "tool-call" && entry.status === "failed")).toHaveLength(MAX_TOOL_CALLS_PER_ROUND + 1);
+  });
+
+  it("remove tools antes do preparo do fechamento e preserva pares de ids", async () => {
+    const requests: ProviderChatRequest[] = [];
+    const overrides: Array<ProviderChatRequest | undefined> = [];
+    const backend = new Backend();
+    const result = await runToolLoop({
+      agentId: "a",
+      request: { ...base, tools: [{ type: "function", function: { name: "file", parameters: {} } }] },
+      broker: broker(backend),
+      toolLoopBudget: { maxRounds: 1 },
+      prepareRequest: (messages, override) => {
+        overrides.push(override);
+        return { ...(override ?? base), messages: [...messages] };
+      },
+      stream: async (request) => {
+        requests.push(request);
+        return request.tools?.length === 0
+          ? { aborted: false, message: { role: "assistant", content: "fechamento preparado" } }
+          : { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool("bounded-call")] } };
+      },
+      onEvent: () => {},
+    });
+
+    expect(result.message?.content).toBe("fechamento preparado");
+    const finalRequest = requests.at(-1);
+    expect(finalRequest?.tools).toEqual([]);
+    const finalOverride = overrides.find((override) => override !== undefined);
+    expect(finalOverride?.tools).toEqual([]);
+    expect(finalOverride?.system).toContain("Não chame nenhuma ferramenta");
+    const assistantCall = finalRequest?.messages.find((message) => message.role === "assistant" && message.toolCalls?.some((call) => call.id === "bounded-call"));
+    expect(assistantCall?.role).toBe("assistant");
+    expect(finalRequest?.messages).toContainEqual(expect.objectContaining({ role: "tool", toolCallId: "bounded-call" }));
+    expect(backend.calls).toHaveLength(1);
+  });
+
+  it("emite relatório parcial bounded quando o preparo do fechamento não cabe", async () => {
+    let streams = 0;
+    const backend = new Backend();
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      broker: broker(backend),
+      toolLoopBudget: { maxRounds: 1 },
+      prepareRequest: (_messages, override) => {
+        if (override?.tools?.length === 0) throw new Error("provider context budget exhausted");
+        return { ...(override ?? base), messages: [..._messages] };
+      },
+      stream: async (request) => {
+        streams += 1;
+        if (request.tools?.length === 0) throw new Error("rescue must not run after prepare failure");
+        return { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool("prepare-failure")] } };
+      },
+      onEvent: () => {},
+    });
+
+    expect(result.aborted).toBe(false);
+    expect(result.error).toBeUndefined();
+    expect(result.message?.content).toContain("A resposta é parcial");
+    expect(result.message?.content).toContain("file");
+    expect(result.message?.content.length).toBeLessThan(1_000);
+    expect(streams).toBe(2);
+    expect(backend.calls).toHaveLength(1);
+  });
+
+  it("emite relatório parcial quando o provider falha no fechamento", async () => {
+    const requests: ProviderChatRequest[] = [];
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      broker: broker(new Backend()),
+      toolLoopBudget: { maxRounds: 1 },
+      stream: async (request) => {
+        requests.push(request);
+        return request.tools?.length === 0
+          ? { aborted: false, error: new ProviderError("rescue failed", { kind: "network" }), message: { role: "assistant", content: "o provider fechou parcialmente" } }
+          : { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool("error-call")] } };
+      },
+      onEvent: () => {},
+    });
+
+    expect(result).toMatchObject({ aborted: false, message: { content: expect.stringContaining("A resposta é parcial") } });
+    expect(result.error).toBeUndefined();
+    expect(requests.at(-1)?.tools).toEqual([]);
+  });
+
+  it("fecha graciosamente quando o preparo normal falha após uma tool concluída", async () => {
+    let prepares = 0;
+    const requests: ProviderChatRequest[] = [];
+    const backend = new Backend();
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      broker: broker(backend),
+      prepareRequest: (messages, override) => {
+        if (override?.tools?.length === 0) return { ...(override ?? base), messages: [...messages] };
+        prepares += 1;
+        if (prepares > 1) throw new Error("provider context budget exhausted");
+        return { ...base, messages: [...messages] };
+      },
+      stream: async (request) => {
+        requests.push(request);
+        return request.tools?.length === 0
+          ? { aborted: false, message: { role: "assistant", content: "fechado após erro de contexto" } }
+          : { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool("prepare-normal-failure", "file")] } };
+      },
+      onEvent: () => {},
+    });
+
+    expect(result.message?.content).toBe("fechado após erro de contexto");
+    expect(backend.calls).toHaveLength(1);
+    expect(requests.at(-1)?.tools).toEqual([]);
+  });
+
+  it("aborta durante o rescue sem publicar resposta de fechamento", async () => {
+    const controller = new AbortController();
+    const events: ProviderStreamEvent[] = [];
+    let streams = 0;
+    const result = await runToolLoop({
+      agentId: "a",
+      request: { ...base, signal: controller.signal },
+      broker: broker(new Backend()),
+      toolLoopBudget: { maxRounds: 1 },
+      stream: async (request) => {
+        streams += 1;
+        if (request.tools?.length === 0) {
+          controller.abort();
+          return { aborted: false, message: { role: "assistant", content: "não deve publicar" } };
+        }
+        return { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool("rescue-abort")] } };
+      },
+      onEvent: (event) => events.push(event),
+    });
+    expect(result).toMatchObject({ aborted: true, error: { kind: "aborted" } });
+    expect(streams).toBe(3);
+    expect(events.some((event) => event.type === "message")).toBe(false);
+  });
+
+  it("não tenta fechamento quando o turno foi cancelado", async () => {
+    const controller = new AbortController();
+    let streams = 0;
+    const result = await runToolLoop({
+      agentId: "a",
+      request: { ...base, signal: controller.signal },
+      broker: broker(new Backend()),
+      toolLoopBudget: { maxRounds: 1 },
+      stream: async () => {
+        streams += 1;
+        controller.abort();
+        return { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool("cancelled-call")] } };
+      },
+      onEvent: () => {},
+    });
+
+    expect(result).toMatchObject({ aborted: true, error: { kind: "aborted" } });
+    expect(streams).toBe(1);
+  });
+
+  it("retém narração de uma rodada com tools e libera lifecycle e done na ordem", async () => {
+    const events: ProviderStreamEvent[] = [];
+    let streams = 0;
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      broker: broker(new Backend()),
+      stream: async (_request, emit) => {
+        streams += 1;
+        if (streams === 1) {
+          emit({ type: "delta", delta: "Vou consultar o arquivo." });
+          emit({ type: "tool-call", call: tool("buffered-call") });
+          emit({ type: "resume-cursor", cursor: "cursor-tool" });
+          emit({ type: "done" });
+          return { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool("buffered-call")] } };
+        }
+        emit({ type: "delta", delta: "Resposta final." });
+        emit({ type: "message", message: { role: "assistant", content: "Resposta final." } });
+        emit({ type: "done" });
+        return { aborted: false, message: { role: "assistant", content: "Resposta final." } };
+      },
+      onEvent: (event) => events.push(event),
+    });
+
+    expect(result.message?.content).toBe("Resposta final.");
+    expect(events.map((event) => event.type)).toEqual([
+      "tool-call", "resume-cursor", "done", "delta", "message", "done",
+    ]);
+    expect(events.slice(0, 3).some((event) => event.type === "delta" || event.type === "message")).toBe(false);
+  });
+
+  it("libera texto e terminal done somente depois de uma rodada sem tools", async () => {
+    const events: ProviderStreamEvent[] = [];
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      stream: async (_request, emit) => {
+        emit({ type: "delta", delta: "Resposta final." });
+        emit({ type: "message", message: { role: "assistant", content: "Resposta final." } });
+        emit({ type: "done" });
+        return { aborted: false, message: { role: "assistant", content: "Resposta final." } };
+      },
+      onEvent: (event) => events.push(event),
+    });
+
+    expect(result.message?.content).toBe("Resposta final.");
+    expect(events.map((event) => event.type)).toEqual(["delta", "message", "done"]);
+  });
+
+  it("limita o buffer textual e publica erro de resposta sem done falso", async () => {
+    const events: ProviderStreamEvent[] = [];
+    const oversized = "x".repeat(MAX_LIVE_RESPONSE_BYTES + 1);
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      stream: async (_request, emit) => {
+        emit({ type: "delta", delta: oversized });
+        emit({ type: "message", message: { role: "assistant", content: oversized } });
+        emit({ type: "done" });
+        return { aborted: false, message: { role: "assistant", content: oversized } };
+      },
+      onEvent: (event) => events.push(event),
+    });
+
+    expect(result).toMatchObject({ aborted: false, error: { kind: "aborted", code: "response_limit" } });
+    const delta = events.find((event): event is Extract<ProviderStreamEvent, { type: "delta" }> => event.type === "delta");
+    expect(delta).toBeDefined();
+    expect(Buffer.byteLength(delta?.delta ?? "", "utf8")).toBeLessThanOrEqual(MAX_LIVE_RESPONSE_BYTES);
+    expect(events.some((event) => event.type === "error")).toBe(true);
+    expect(events.some((event) => event.type === "message" || event.type === "done")).toBe(false);
+  });
+
+  it("não executa tools se o provider exceder o buffer textual antes do resultado", async () => {
+    let executions = 0;
+    const events: ProviderStreamEvent[] = [];
+    const oversized = "x".repeat(MAX_LIVE_RESPONSE_BYTES + 1);
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      executeTool: async () => {
+        executions += 1;
+        return { handled: true, ok: true, content: "não deveria executar" };
+      },
+      stream: async (_request, emit) => {
+        try {
+          emit({ type: "delta", delta: oversized });
+        } catch {
+          // A permissive stream mock may swallow observer errors and still
+          // return a tool call; runToolLoop must keep the overflow terminal.
+        }
+        return { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool("after-overflow", "use_skill")] } };
+      },
+      onEvent: (event) => events.push(event),
+    });
+
+    expect(result).toMatchObject({ aborted: false, error: { kind: "aborted", code: "response_limit" } });
+    expect(executions).toBe(0);
+    expect(events).toContainEqual(expect.objectContaining({ type: "error", error: expect.objectContaining({ code: "response_limit" }) }));
   });
 });
 
@@ -872,7 +1477,7 @@ describe("TurnRunner tools integration", () => {
     expect(finalized?.activeAgentId).toBe(finalized?.agentId);
   });
 
-  it("mostra o erro do provider após texto intermediário e execução de ferramenta", async () => {
+  it("mostra o erro do provider sem persistir narração intermediária da ferramenta", async () => {
     let rounds = 0;
     const backend = new Backend();
     const registry = createProviderRegistry();
@@ -901,8 +1506,8 @@ describe("TurnRunner tools integration", () => {
       kind: "notice", level: "error", providerErrorKind: "validation", status: 400,
       text: "O provedor rejeitou a solicitação ou o modelo selecionado. Revise as configurações.",
     }));
-    expect(store.getEntries("a")).toContainEqual(expect.objectContaining({
-      kind: "message", role: "assistant", content: "Vou consultar o arquivo.", completionState: "interrupted", streaming: false,
+    expect(store.getEntries("a")).not.toContainEqual(expect.objectContaining({
+      kind: "message", role: "assistant", content: "Vou consultar o arquivo.",
     }));
   });
 
@@ -951,7 +1556,7 @@ describe("TurnRunner tools integration", () => {
     }));
   });
 
-  it("persiste explicação quando o modelo excede o limite seguro de tools", async () => {
+  it("persiste relatório parcial quando o modelo excede o limite seguro de tools", async () => {
     const registry = createProviderRegistry();
     registry.register({
       name: "scripted",
@@ -974,19 +1579,57 @@ describe("TurnRunner tools integration", () => {
     await runner.flush("a");
 
     expect(store.getEntries("a")).toContainEqual(expect.objectContaining({
-      kind: "notice",
-      level: "error",
-      text: "Não foi possível concluir: o modelo excedeu o limite seguro de ferramentas.",
-      retryable: true,
+      kind: "message",
+      role: "assistant",
+      content: expect.stringContaining("A resposta é parcial"),
       provider: "scripted",
       model: "fake",
-      clientNonce: "nonce:tool-limit",
       turnId: expect.any(String),
     }));
-    expect(await runner.retryPrompt("a")).toEqual({ accepted: true });
-    await runner.flush("a");
+    expect(store.getEntries("a")).not.toContainEqual(expect.objectContaining({
+      kind: "notice",
+      text: "Não foi possível concluir: o modelo excedeu o limite seguro de ferramentas.",
+    }));
     expect(store.getEntries("a").filter((entry) => entry.kind === "message" && entry.role === "user")).toHaveLength(1);
-    expect(store.getEntries("a").filter((entry) => entry.kind === "notice" && entry.text === "Não foi possível concluir: o modelo excedeu o limite seguro de ferramentas.")).toHaveLength(2);
+    expect(store.getEntries("a").filter((entry) => entry.kind === "message" && entry.role === "assistant" && entry.content.includes("A resposta é parcial"))).toHaveLength(1);
+  });
+
+  it("entrega a resposta final sem notice quando o fechamento do loop é possível", async () => {
+    const registry = createProviderRegistry();
+    registry.register({
+      name: "scripted-finalizer",
+      async streamChat(request, emit) {
+        if (request.tools?.length === 0) {
+          emit({ type: "delta", delta: "feito sem novas ferramentas" });
+          return;
+        }
+        emit({
+          type: "tool-call",
+          call: tool(`loop-${request.messages.length}`, "file", JSON.stringify({ op: "list", path: `round-${request.messages.length}` })),
+        });
+      },
+    });
+    const store = createMemoryTranscriptStore();
+    const runner = createTurnRunner({
+      registry,
+      store,
+      executionBroker: broker(new Backend()),
+      tools: [{ type: "function", function: { name: "file", parameters: { type: "object" } } }],
+      resolveProvider: () => ({ provider: "scripted-finalizer", model: "fake" }),
+    });
+
+    runner.sendPrompt({ agentId: "a", prompt: "conclua" });
+    await runner.flush("a");
+
+    expect(store.getEntries("a")).toContainEqual(expect.objectContaining({
+      kind: "message",
+      role: "assistant",
+      content: "feito sem novas ferramentas",
+    }));
+    expect(store.getEntries("a")).not.toContainEqual(expect.objectContaining({
+      kind: "notice",
+      text: "Não foi possível concluir: o modelo excedeu o limite seguro de ferramentas.",
+    }));
   });
 
   it("fallback legado sem localToolCallId substitui por id e emite snapshot com identidade", async () => {
@@ -1037,5 +1680,235 @@ describe("TurnRunner tools integration", () => {
     expect(fallbackSnapshot?.agentId).toBe("a");
     expect(fallbackSnapshot?.activeAgentId).toBe("a");
     expect(fallbackSnapshot?.activeAgentId).toBe(fallbackSnapshot?.agentId);
+  });
+});
+
+describe("in-turn tool result masking and read-only parallel", () => {
+  it("mantém resultado de ação mutável grande mesmo quando o id se repete em uma leitura", () => {
+    const actionOutput = "ACTION_EFFECT_ALREADY_APPLIED\n".repeat(2048);
+    const messages = maskStaleToolResults([
+      { role: "user", content: "go" },
+      { role: "assistant", content: "", toolCalls: [tool("shared-id", "file", '{"op":"write","path":"out.txt","content":"done"}')] },
+      { role: "tool", toolCallId: "shared-id", content: actionOutput },
+      { role: "assistant", content: "", toolCalls: [tool("shared-id", "search_files", "{}")] },
+      { role: "tool", toolCallId: "shared-id", content: "READ_OBSERVATION" },
+    ]);
+    const action = messages.find((message) => message.role === "tool" && message.toolCallId === "shared-id");
+    expect(action?.role === "tool" && action.content).toBe(actionOutput);
+  });
+
+  it("masks earlier tool rounds and keeps the latest round intact", () => {
+    const largeFirstRound = "FIRST_ROUND_SECRET_OUTPUT".repeat(1024);
+    const messages = maskStaleToolResults([
+      { role: "user", content: "go" },
+      { role: "assistant", content: "", toolCalls: [{ id: "c1", type: "function", function: { name: "search_files", arguments: "{}" } }] },
+      { role: "tool", toolCallId: "c1", content: largeFirstRound },
+      { role: "assistant", content: "", toolCalls: [{ id: "c2", type: "function", function: { name: "search_text", arguments: "{}" } }] },
+      { role: "tool", toolCallId: "c2", content: "SECOND_ROUND_FULL_OUTPUT" },
+    ]);
+    const first = messages.find((message) => message.role === "tool" && message.toolCallId === "c1");
+    const second = messages.find((message) => message.role === "tool" && message.toolCallId === "c2");
+    expect(first?.role === "tool" && first.content).toContain("openbotOmitted");
+    expect(first?.role === "tool" && first.content).toContain('"toolCallId":"c1"');
+    expect(first?.role === "tool" && first.content).not.toContain(largeFirstRound);
+    expect(second).toEqual(expect.objectContaining({ content: "SECOND_ROUND_FULL_OUTPUT" }));
+  });
+
+  it("não repete uma ação cujo resultado antigo foi mantido no contexto", async () => {
+    const actionOutput = "ACTION_EFFECT_ALREADY_APPLIED\n".repeat(2048);
+    const readOutput = "READ_OBSERVATION\n".repeat(2048);
+    const requests: ProviderChatRequest[] = [];
+    let streams = 0;
+    let actionExecutions = 0;
+    let readExecutions = 0;
+    const executeTool = Object.assign(
+      async ({ call }: { call: { function: { name: string } } }) => {
+        if (call.function.name === "save_skill") {
+          actionExecutions += 1;
+          return { handled: true, ok: true, content: actionOutput, result: { ok: true, operation: "save_skill" } } as const;
+        }
+        if (call.function.name === "search_text") {
+          readExecutions += 1;
+          return { handled: true, ok: true, content: readOutput, result: { ok: true, operation: "search.files" } } as const;
+        }
+        return { handled: false } as const;
+      },
+      { canHandle: (name: string) => name === "save_skill" || name === "search_text" },
+    );
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      stream: async (request) => {
+        requests.push(request);
+        streams += 1;
+        if (streams === 1) {
+          return {
+            aborted: false,
+            message: {
+              role: "assistant",
+              content: "",
+              toolCalls: [
+                tool("action", "save_skill", '{"id":"publish"}'),
+                tool("read-before", "search_text", '{"pattern":"before"}'),
+              ],
+            },
+          };
+        }
+        if (streams === 2) {
+          return {
+            aborted: false,
+            message: {
+              role: "assistant",
+              content: "",
+              toolCalls: [tool("read-after", "search_text", '{"pattern":"after"}')],
+            },
+          };
+        }
+        const action = request.messages.find((message) => message.role === "tool" && message.toolCallId === "action");
+        if (action?.role === "tool" && action.content.includes('"openbotOmitted":true')) {
+          return {
+            aborted: false,
+            message: { role: "assistant", content: "", toolCalls: [tool("action-retry", "save_skill", '{"id":"publish"}')] },
+          };
+        }
+        return { aborted: false, message: { role: "assistant", content: "done" } };
+      },
+      onEvent: () => {},
+      executeTool,
+    });
+
+    expect(result.message?.content).toBe("done");
+    expect(actionExecutions).toBe(1);
+    expect(readExecutions).toBe(2);
+    expect(requests[2]?.messages.find((message) => message.role === "tool" && message.toolCallId === "action")).toEqual(expect.objectContaining({ content: actionOutput }));
+  });
+
+  it("keeps small stale tool results verbatim when there is no byte pressure", () => {
+    const messages = maskStaleToolResults([
+      { role: "user", content: "go" },
+      { role: "assistant", content: "", toolCalls: [{ id: "c1", type: "function", function: { name: "search_files", arguments: "{}" } }] },
+      { role: "tool", toolCallId: "c1", content: "SMALL_FIRST_ROUND_OBSERVATION" },
+      { role: "assistant", content: "", toolCalls: [{ id: "c2", type: "function", function: { name: "search_text", arguments: "{}" } }] },
+      { role: "tool", toolCallId: "c2", content: "SECOND_ROUND_FULL_OUTPUT" },
+    ]);
+    const first = messages.find((message) => message.role === "tool" && message.toolCallId === "c1");
+    expect(first).toEqual(expect.objectContaining({ content: "SMALL_FIRST_ROUND_OBSERVATION" }));
+  });
+
+  it("keeps small stale tool results verbatim even under byte pressure", () => {
+    const messages = maskStaleToolResults([
+      { role: "user", content: "go" },
+      { role: "assistant", content: "", toolCalls: [
+        { id: "c1", type: "function", function: { name: "search_files", arguments: "{}" } },
+        { id: "c1b", type: "function", function: { name: "search_text", arguments: '{"pattern":"large"}' } },
+      ] },
+      { role: "tool", toolCallId: "c1", content: "SMALL_OBSERVATION_STAYS" },
+      { role: "tool", toolCallId: "c1b", content: "LARGE_STALE_OUTPUT".repeat(1200) },
+      { role: "assistant", content: "", toolCalls: [{ id: "c2", type: "function", function: { name: "search_text", arguments: "{}" } }] },
+      { role: "tool", toolCallId: "c2", content: "SECOND_ROUND_FULL_OUTPUT" },
+    ]);
+    const small = messages.find((message) => message.role === "tool" && message.toolCallId === "c1");
+    const large = messages.find((message) => message.role === "tool" && message.toolCallId === "c1b");
+    expect(small).toEqual(expect.objectContaining({ content: "SMALL_OBSERVATION_STAYS" }));
+    expect(large?.role === "tool" && large.content).toContain("openbotOmitted");
+  });
+
+  it("runs independent read-only tools concurrently", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const executeTool = Object.assign(
+      async ({ call }: { call: { function: { name: string } } }) => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        active -= 1;
+        return { handled: true, ok: true, content: call.function.name } as const;
+      },
+      { canHandle: (name: string) => name === "search_files" || name === "search_text" },
+    );
+    let streams = 0;
+    await runToolLoop({
+      agentId: "a",
+      request: base,
+      stream: async () => {
+        streams += 1;
+        return streams === 1
+          ? {
+            aborted: false,
+            message: {
+              role: "assistant",
+              content: "",
+              toolCalls: [tool("a", "search_files", "{}"), tool("b", "search_text", '{"pattern":"x"}')],
+            },
+          }
+          : { aborted: false, message: { role: "assistant", content: "ok" } };
+      },
+      onEvent: () => {},
+      executeTool,
+    });
+    expect(maxActive).toBe(2);
+    expect(isReadOnlyToolCall(tool("x", "file", '{"op":"read","path":"a.txt"}'))).toBe(true);
+    expect(isReadOnlyToolCall(tool("x", "file", '{"op":"write","path":"a.txt"}'))).toBe(false);
+    expect(isReadOnlyToolCall(tool("x", "process_run", "{}"))).toBe(false);
+  });
+
+  it("reexecuta leitura compartilhada após mutação incerta na mesma rodada", async () => {
+    const requests: ProviderChatRequest[] = [];
+    let streams = 0;
+    let readExecutions = 0;
+    let state = "before";
+    const observed: string[] = [];
+    const executeTool = Object.assign(
+      async ({ call }: { call: { function: { name: string } } }) => {
+        if (call.function.name === "memory_search") {
+          readExecutions += 1;
+          observed.push(state);
+          return { handled: true, ok: true, content: state, result: { ok: true, operation: "memory.search" } } as const;
+        }
+        if (call.function.name === "memory_remember") {
+          state = "after";
+          return {
+            handled: true,
+            ok: false,
+            content: "",
+            error: "memory write failed after commit",
+            result: { ok: false, code: "io_error", message: "memory write failed after commit" },
+          } as const;
+        }
+        return { handled: false } as const;
+      },
+      { canHandle: (name: string) => name === "memory_search" || name === "memory_remember" },
+    );
+    const result = await runToolLoop({
+      agentId: "a",
+      request: base,
+      stream: async (request) => {
+        requests.push(structuredClone(request));
+        streams += 1;
+        return streams === 1
+          ? {
+            aborted: false,
+            message: {
+              role: "assistant",
+              content: "",
+              toolCalls: [
+                tool("read-before", "memory_search", '{"query":"status"}'),
+                tool("remember", "memory_remember", '{"canonicalKey":"status"}'),
+                tool("read-after", "memory_search", '{"query":"status"}'),
+              ],
+            },
+          }
+          : { aborted: false, message: { role: "assistant", content: "done" } };
+      },
+      onEvent: () => {},
+      executeTool,
+    });
+
+    expect(result.message?.content).toBe("done");
+    expect(readExecutions).toBe(2);
+    expect(observed).toEqual(["before", "after"]);
+    const toolResults = requests[1]?.messages.filter((message) => message.role === "tool");
+    expect(toolResults?.find((message) => message.toolCallId === "read-before")?.content).toBe("before");
+    expect(toolResults?.find((message) => message.toolCallId === "read-after")?.content).toBe("after");
   });
 });

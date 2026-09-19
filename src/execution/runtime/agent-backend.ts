@@ -80,6 +80,11 @@ export class AgentRuntimeBackend implements ExecutionBackend {
     );
   }
 
+  /** Observational only: never scans the home or initializes a process. */
+  quotaMetrics(): ReturnType<HomeWorkspaceBackend["quota"]["metrics"]> {
+    return this.home.quota.metrics();
+  }
+
   private hostExecutors(root: string): Promise<HostExecutors> {
     const key = root.toLowerCase();
     const cached = this.hostVolumes.get(key);

@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -37,10 +38,54 @@ await keystore.upsert("commandcode", commandcode);
 await keystore.upsert("openai-compat", commandcode);
 
 const configPath = join(process.env.APPDATA || join(user, "AppData", "Roaming"), "OpenBot", "openbot-config.json");
+// This .mjs can't import ConfigStore (TS), so it re-enforces the invariants
+// its raw write used to bypass: refuse to write under a live .lock, bump the
+// CAS revision so readers notice the external change, and persist atomically
+// (exclusive tmp + fsync + rename) so a crash can't leave a torn config.
+const lockPath = `${configPath}.lock`;
+if (existsSync(lockPath)) {
+  let lockPid;
+  try {
+    const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+    if (typeof lock?.pid === "number") lockPid = lock.pid;
+  } catch {
+    // An unreadable/invalid lock file does not block.
+  }
+  let alive = false;
+  if (Number.isInteger(lockPid) && lockPid > 0) {
+    try {
+      process.kill(lockPid, 0);
+      alive = true;
+    } catch (error) {
+      alive = error?.code !== "ESRCH";
+    }
+  }
+  if (alive) {
+    console.error(`openbot-config.json is locked by a running OpenBot (pid ${lockPid}); close OpenBot before running this import.`);
+    process.exit(1);
+  }
+}
 const config = JSON.parse(readFileSync(configPath, "utf8"));
 config.compatBaseUrl = commandcodeUrl;
 if (!config.activeProvider) config.activeProvider = "xai";
-writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+config.revision = (Number.isSafeInteger(config.revision) ? config.revision : 0) + 1;
+const tmpPath = `${configPath}.${randomUUID()}.tmp`;
+try {
+  const fd = openSync(tmpPath, "wx", 0o600);
+  try {
+    writeFileSync(fd, `${JSON.stringify(config, null, 2)}\n`);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmpPath, configPath);
+} finally {
+  try {
+    unlinkSync(tmpPath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
 
 const names = await keystore.list();
 console.log(JSON.stringify({

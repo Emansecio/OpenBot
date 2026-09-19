@@ -63,10 +63,13 @@ describe("async task RPC integration", () => {
     await handle.keystore.upsert("xai-oauth", JSON.stringify({ type: "oauth", access: "fixture-access", refresh: "fixture-refresh", expires: Date.now() + 3600_000 }));
     expect(await handle.keystore.reveal("xai")).toBeNull();
     const credentials: string[] = [];
+    const reasoningEfforts: Array<string | undefined> = [];
+    await handler(handle, "setProviderConfig")({ agentId: "agent-a", reasoningEffort: "low", serviceTier: "default" }, ctx);
     handle.registry.register({
       name: "xai",
-      async streamChat(_request, emit) {
+      async streamChat(request, emit) {
         credentials.push((await oauth.resolveCredential("xai")).accessToken);
+        reasoningEfforts.push(request.reasoningEffort);
         emit({ type: "delta", delta: "Tarefa concluída" });
       },
     });
@@ -84,6 +87,7 @@ describe("async task RPC integration", () => {
     await handler(handle, "dispatchAsyncTask")(body, ctx);
     await vi.waitFor(() => expect(handle.asyncTaskStore.getTask(taskId)).toMatchObject({ status: "completed" }));
     expect(credentials).toEqual(["fixture-access"]);
+    expect(reasoningEfforts).toEqual(["low"]);
     expect(handle.asyncTaskStore.getTask(taskId)?.result).toMatchObject({ kind: "inline", text: "Tarefa concluída" });
 
     await oauth.disconnect("xai");

@@ -128,6 +128,7 @@ export class RuntimeManager implements AgentRuntimeManager {
   private readonly agents = new Map<string, AgentRecord>();
   private readonly deletedAgents = new Set<string>();
   private readonly agentRepairRequired = new Set<string>();
+  private readonly maintenanceFences = new Map<string, number>();
   private readonly leases = new Map<string, LeaseEntry>();
   private runtimeState: RuntimeState = "stopped";
   private boot: RuntimeBoot | null = null;
@@ -162,7 +163,7 @@ export class RuntimeManager implements AgentRuntimeManager {
       maxQueuedLeases: options.maxQueuedLeases,
       admissionTimeoutMs: options.admissionTimeoutMs,
     });
-    this.idleStopMs = options.idleStopMs ?? 5 * 60_000;
+    this.idleStopMs = options.idleStopMs === undefined ? 5 * 60_000 : options.idleStopMs;
     if (this.idleStopMs !== null && (!Number.isSafeInteger(this.idleStopMs) || this.idleStopMs < 0)) {
       throw new Error("idleStopMs must be null or a non-negative integer");
     }
@@ -288,7 +289,7 @@ export class RuntimeManager implements AgentRuntimeManager {
     if (this.deletedAgents.has(agentId)) throw new RuntimeManagerError("agent_fenced", "Agent runtime is fenced.");
     const normalizedCapability = this.normalizeCapability(capability);
     const record = this.recordFor(agentId);
-    if (record.fenced) throw new RuntimeManagerError("agent_fenced", "Agent runtime is fenced.");
+    if (record.fenced || this.maintenanceFences.has(agentId)) throw new RuntimeManagerError("agent_fenced", "Agent runtime is fenced.");
 
     const status = await this.ensure(agentId, "developer", signal);
     throwIfAborted(signal);
@@ -318,7 +319,7 @@ export class RuntimeManager implements AgentRuntimeManager {
       try {
         throwIfAborted(signal);
         if (this.shutdownStarted) throw new RuntimeManagerError("runtime_closed", "Runtime is closed.");
-        if (this.deletedAgents.has(agentId) || record.fenced) {
+        if (this.deletedAgents.has(agentId) || record.fenced || this.maintenanceFences.has(agentId)) {
           throw new RuntimeManagerError("agent_fenced", "Agent runtime is fenced.");
         }
         if (this.stopRequested || this.runtimeState !== "ready" && this.runtimeState !== "busy") {
@@ -346,6 +347,7 @@ export class RuntimeManager implements AgentRuntimeManager {
       };
 
       const pendingRecord: RuntimeLeaseRecord = {
+        ...(this.driver.recoveryKind ? { recoveryKind: this.driver.recoveryKind } : {}),
         leaseId,
         agentId,
         runtimeBootId: boot.runtimeBootId,
@@ -397,6 +399,7 @@ export class RuntimeManager implements AgentRuntimeManager {
       }
 
       const journalRecord: RuntimeActiveLeaseRecord = {
+        ...(this.driver.recoveryKind ? { recoveryKind: this.driver.recoveryKind } : {}),
         leaseId,
         agentId,
         runtimeBootId: boot.runtimeBootId,
@@ -477,6 +480,10 @@ export class RuntimeManager implements AgentRuntimeManager {
     }
   }
 
+  metrics(): import("./scheduler.js").RuntimeAdmissionMetrics {
+    return this.scheduler.metrics();
+  }
+
   async status(agentId: string, requestedMode?: RuntimeMode): Promise<RuntimeStatus> {
     this.assertAgentId(agentId);
     await this.expireLeases();
@@ -548,6 +555,19 @@ export class RuntimeManager implements AgentRuntimeManager {
     }
     await this.ensure(agentId, "developer");
     return this.status(agentId, "developer");
+  }
+
+  fenceAgentMaintenance(agentId: string): () => void {
+    this.assertAgentId(agentId);
+    this.maintenanceFences.set(agentId, (this.maintenanceFences.get(agentId) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.maintenanceFences.get(agentId) ?? 1) - 1;
+      if (remaining > 0) this.maintenanceFences.set(agentId, remaining);
+      else this.maintenanceFences.delete(agentId);
+    };
   }
 
   fenceAgent(agentId: string): void {
@@ -687,7 +707,7 @@ export class RuntimeManager implements AgentRuntimeManager {
       (this.runtimeState === "ready" || this.runtimeState === "busy") &&
       this.runtimeGeneration === generation &&
       this.boot?.runtimeBootId === boot.runtimeBootId &&
-      !this.deletedAgents.has(agentId) && !record.fenced;
+      !this.deletedAgents.has(agentId) && !record.fenced && !this.maintenanceFences.has(agentId);
   }
 
   private async cleanupRejectedAcquire(

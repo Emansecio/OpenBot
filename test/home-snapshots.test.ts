@@ -47,17 +47,18 @@ describe("home snapshots", () => {
     await expect(readFile(join(home.root, "Documents", "keep.txt"), "utf8")).resolves.toBe("keep");
   });
 
-  it("rolls back to the previous home when the snapshot import fails", async () => {
+  it("validates a corrupt snapshot before quarantining the previous home", async () => {
     const store = await AgentHomeStore.create(await tempDir());
     const home = await store.ensure("agent-a");
     await store.snapshot("agent-a");
-    // Corrupt the snapshot so import fails after quarantine.
+    // Corrupt the snapshot; the active home must not move.
     const snapshotPath = (await store.listSnapshots("agent-a"))[0]!.path;
     await writeFile(snapshotPath, "{corrupt");
     await writeFile(join(home.root, "Documents", "atual.txt"), "atual");
 
     await expect(store.restoreSnapshot("agent-a", 1)).rejects.toBeTruthy();
     await expect(readFile(join(home.root, "Documents", "atual.txt"), "utf8")).resolves.toBe("atual");
+    expect(await store.listQuarantineMetadata()).toEqual([]);
   });
 
   it("prunes old snapshots beyond the retention limit", async () => {

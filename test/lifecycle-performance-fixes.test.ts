@@ -18,6 +18,20 @@ import type { StateAclCommandRunner } from "../src/state-acl.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
 
 const dirs: string[] = [];
+const STATE_ACL_SDDL = "D:P(A;OICI;FA;;;CONTOSO\\alice)(A;;FA;;;CONTOSO\\alice)(A;OICI;FA;;;SY)(A;;FA;;;SY)(A;OICI;FA;;;BA)(A;;FA;;;BA)";
+
+function stateAclFixture(calls: string[], onCall?: () => void): StateAclCommandRunner {
+  return async (_file, args) => {
+    calls.push(args[1] ?? "");
+    onCall?.();
+    if (args[1] === "/save") {
+      const aclPath = args[2];
+      if (aclPath === undefined) throw new Error("ACL fixture save path is missing");
+      writeFileSync(aclPath, STATE_ACL_SDDL, "utf8");
+    }
+    return { exitCode: 0 };
+  };
+}
 
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -256,11 +270,9 @@ describe("lifecycle/performance fixes", () => {
     const calls: string[] = [];
     const tokenPath = join(root, "gateway.token");
     const storePath = join(root, "store.db");
-    const runner: StateAclCommandRunner = async (_file, args) => {
-      calls.push(args[1] ?? "");
+    const runner = stateAclFixture(calls, () => {
       if (!existsSync(tokenPath)) expect(existsSync(tokenPath)).toBe(false);
-      return { exitCode: 0 };
-    };
+    });
 
     const handle = await startServer(0, {
       stateRoot: root,
@@ -269,7 +281,7 @@ describe("lifecycle/performance fixes", () => {
       allowUnauthenticatedLocalGateway: true,
     });
     try {
-      expect(calls).toEqual(["/reset", "/grant:r", "/inheritance:r", "/verify"]);
+      expect(calls).toEqual(["/reset", "/grant:r", "/inheritance:r", "/verify", "/save"]);
       expect(existsSync(tokenPath)).toBe(false);
       expect(existsSync(storePath)).toBe(true);
     } finally {
@@ -281,10 +293,7 @@ describe("lifecycle/performance fixes", () => {
     const root = mkdtempSync(join(tmpdir(), "openbot-state-acl-recurring-"));
     dirs.push(root);
     const calls: string[] = [];
-    const runner: StateAclCommandRunner = async (_file, args) => {
-      calls.push(args[1] ?? "");
-      return { exitCode: 0 };
-    };
+    const runner = stateAclFixture(calls);
     const options = {
       stateRoot: root,
       stateAcl: { platform: "win32" as const, runner, currentUser: "CONTOSO\\alice" },
@@ -294,22 +303,19 @@ describe("lifecycle/performance fixes", () => {
 
     const first = await startServer(0, options);
     await stopServer(first);
-    expect(calls).toEqual(["/reset", "/grant:r", "/inheritance:r", "/verify"]);
+    expect(calls).toEqual(["/reset", "/grant:r", "/inheritance:r", "/verify", "/save"]);
 
     calls.length = 0;
     const second = await startServer(0, options);
     await stopServer(second);
-    expect(calls).toEqual(["/verify"]);
+    expect(calls).toEqual(["/verify", "/save"]);
   });
 
   it("reapplies the ACL and replaces a corrupted recurring-boot stamp", async () => {
     const root = mkdtempSync(join(tmpdir(), "openbot-state-acl-corrupt-stamp-"));
     dirs.push(root);
     const calls: string[] = [];
-    const runner: StateAclCommandRunner = async (_file, args) => {
-      calls.push(args[1] ?? "");
-      return { exitCode: 0 };
-    };
+    const runner = stateAclFixture(calls);
     const options = {
       stateRoot: root,
       stateAcl: { platform: "win32" as const, runner, currentUser: "CONTOSO\\alice" },
@@ -323,7 +329,7 @@ describe("lifecycle/performance fixes", () => {
     calls.length = 0;
     const second = await startServer(0, options);
     await stopServer(second);
-    expect(calls).toEqual(["/reset", "/grant:r", "/inheritance:r", "/verify"]);
+    expect(calls).toEqual(["/reset", "/grant:r", "/inheritance:r", "/verify", "/save"]);
   });
 
   it("fails closed before opening config/store when state ACL setup fails", async () => {

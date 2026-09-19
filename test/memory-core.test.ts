@@ -29,6 +29,57 @@ async function waitFor<T>(read: () => T, predicate: (value: T) => boolean, timeo
 }
 
 describe("memory core", () => {
+  it.each(["queued", "loading", "stream"])("cancels archived reflection at %s without cancelling another conversation", async phase => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    const conversationId = chat(transcript, "agent-a");
+    chat(transcript, "agent-a");
+    const otherConversationId = chat(transcript, "agent-b");
+    let canRun = phase !== "queued";
+    let reached = false;
+    let signal: AbortSignal | undefined;
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const reflected: string[] = [];
+    const worker = new MemoryReflectionWorker({ store: transcript.memoryStore, canRunAgent: () => canRun,
+      loadInput: async (job, abort) => {
+        if (job.conversationId === conversationId && phase === "loading") {
+          signal = abort;
+          reached = true;
+          await pending;
+        }
+        return { ...job, entries: [] };
+      },
+      reflect: async (input, abort) => {
+        reflected.push(input.conversationId);
+        if (input.conversationId === conversationId) {
+          signal = abort;
+          reached = true;
+          await pending;
+        } else expect(abort.aborted).toBe(false);
+        return { operations: [] };
+      },
+    });
+    try {
+      const job = transcript.memoryStore.enqueueJob({ agentId: "agent-a", conversationId, provider: "xai", model: "grok-4.6", fromSequenceId: 0, throughSequenceId: 1 });
+      const other = transcript.memoryStore.enqueueJob({ agentId: "agent-b", conversationId: otherConversationId, provider: "xai", model: "grok-4.6", fromSequenceId: 0, throughSequenceId: 1 });
+      worker.start();
+      if (phase !== "queued") await waitFor(() => reached, Boolean);
+      transcript.conversationStore.archive("agent-a", conversationId);
+      worker.cancelConversation("agent-a", conversationId);
+      if (signal) expect(signal.aborted).toBe(true);
+      canRun = true;
+      worker.start();
+      release();
+      await worker.waitForIdle();
+      expect(transcript.memoryStore.getJob("agent-a", job.id)).toMatchObject({ status: "dead", lastErrorCode: "conversation_archived" });
+      expect(transcript.memoryStore.getJob("agent-b", other.id)?.status).toBe("complete");
+      expect(reflected.filter(id => id === conversationId)).toHaveLength(phase === "stream" ? 1 : 0);
+    } finally {
+      release();
+      await worker.close();
+      transcript.close();
+    }
+  });
   it("creates the current schema and borrows the transcript connection", () => {
     const db = new Database(":memory:");
     const transcript = new SqliteTranscriptStore({ path: ":memory:", database: db });
@@ -64,6 +115,235 @@ describe("memory core", () => {
     expect(transcript.memoryStore.forgetMemory("agent-a", second.id, { kind: "admin" }).status).toBe("forgotten");
     expect(transcript.memoryStore.getMemory("agent-a", second.id)?.status).toBe("forgotten");
     transcript.close();
+  });
+
+  it("rejeita reuso de tombstone quando a canonicalKey já tem identidade ativa", () => {
+    const memory = new SqliteMemoryStore({ path: ":memory:", now: () => 100 });
+    const old = memory.upsertMemory("agent-a", {
+      id: "memory-old",
+      kind: "fact",
+      canonicalKey: "same-key",
+      text: "valor antigo",
+      trust: "verified_tool",
+    }, { kind: "admin" });
+    expect(memory.forgetMemory("agent-a", old.id, { kind: "admin" }).status).toBe("forgotten");
+
+    const recreated = memory.upsertMemory("agent-a", {
+      id: old.id,
+      kind: "fact",
+      canonicalKey: "same-key",
+      text: "valor novo",
+      trust: "verified_tool",
+    }, { kind: "admin" });
+    expect(recreated.id).not.toBe(old.id);
+    expect(recreated.status).toBe("active");
+
+    expect(() => memory.upsertMemory("agent-a", {
+      id: old.id,
+      kind: "fact",
+      canonicalKey: "same-key",
+      text: "valor repetido",
+      trust: "verified_tool",
+    }, { kind: "admin" })).toThrow(/memoryId retirado/iu);
+    expect(memory.getMemory("agent-a", old.id)?.status).toBe("forgotten");
+    expect(memory.getMemory("agent-a", recreated.id)?.status).toBe("active");
+
+    const different = memory.upsertMemory("agent-a", {
+      id: old.id,
+      kind: "fact",
+      canonicalKey: "different-key",
+      text: "outra identidade",
+      trust: "verified_tool",
+    }, { kind: "admin" });
+    expect(different.id).not.toBe(old.id);
+    expect(different.canonicalKey).toBe("different-key");
+    memory.close();
+  });
+
+  it("rejects keystore-known opaque secrets at the memory write boundary", () => {
+    const secrets = ["opaque-known-credential-9f8e2d"];
+    const transcript = new SqliteTranscriptStore({ path: ":memory:", secretValues: () => secrets });
+    const remember = (text: string) => transcript.memoryStore.upsertMemory("agent-a", {
+      kind: "fact",
+      canonicalKey: "known-credential",
+      text,
+      trust: "external_observation",
+    }, { kind: "admin" });
+
+    // Opaque value with no recognizable pattern: only the keystore-provided
+    // secret list can catch it.
+    expect(() => remember("valor anotado: opaque-known-credential-9f8e2d")).toThrow(/segredo|credencial/i);
+    expect(transcript.memoryStore.listMemories("agent-a")).toEqual([]);
+
+    // Values registered after construction are covered too: the callback is
+    // re-evaluated on each write instead of being captured once.
+    secrets.push("opaque-known-credential-77aa1b");
+    expect(() => remember("outro valor: opaque-known-credential-77aa1b")).toThrow(/segredo|credencial/i);
+    expect(transcript.memoryStore.listMemories("agent-a")).toEqual([]);
+    transcript.close();
+  });
+
+  it("separa metadados de autorização da validação da sobrecarga por objeto", () => {
+    const memory = new SqliteMemoryStore({ path: ":memory:" });
+    const objectResult = memory.upsertMemory({
+      id: "object-id",
+      agentId: "agent-a",
+      authority: { kind: "admin" },
+      kind: "fact",
+      canonicalKey: "object-authority",
+      text: "entrada por objeto",
+      trust: "verified_tool",
+    });
+    const positionalResult = memory.upsertMemory("agent-a", {
+      id: "positional-id",
+      kind: "fact",
+      canonicalKey: "positional-authority",
+      text: "entrada posicional",
+      trust: "verified_tool",
+    }, { kind: "admin" });
+    const aliasResult = memory.upsert({
+      id: "alias-id",
+      agentId: "agent-a",
+      authority: { kind: "admin" },
+      kind: "fact",
+      canonicalKey: "alias-authority",
+      text: "entrada pelo alias",
+      trust: "verified_tool",
+    });
+    expect(objectResult).toMatchObject({ agentId: "agent-a", kind: "fact", text: "entrada por objeto" });
+    expect(positionalResult).toMatchObject({ agentId: "agent-a", kind: "fact", text: "entrada posicional" });
+    expect(aliasResult).toMatchObject({ agentId: "agent-a", kind: "fact", text: "entrada pelo alias" });
+
+    const automaticAuthority = { kind: "automatic", conversationId: "conversation-a", evidenceIds: [] } as const;
+    expect(() => memory.upsertMemory({
+      agentId: "agent-a",
+      authority: automaticAuthority,
+      kind: "fact",
+      canonicalKey: "automatic-object",
+      text: "sem proveniência",
+      trust: "verified_tool",
+    })).toThrow(/mutação automática/iu);
+    expect(() => memory.upsertMemory("agent-a", {
+      kind: "fact",
+      canonicalKey: "automatic-positional",
+      text: "sem proveniência",
+      trust: "verified_tool",
+    }, automaticAuthority)).toThrow(/mutação automática/iu);
+
+    expect(() => memory.upsertMemory({
+      agentId: "agent-a",
+      authority: { kind: "admin" },
+      kind: "fact",
+      canonicalKey: "unsupported",
+      text: "campo extra",
+      trust: "verified_tool",
+      unsupported: true,
+    } as never)).toThrow(/campo não suportado/iu);
+    memory.close();
+  });
+
+  it("mantém cache de proveniência em escritas irrelevantes e o invalida em entradas", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    const conversationId = chat(transcript, "agent-a");
+    const internals = transcript.memoryStore as unknown as { forgottenSourceCache?: object };
+    const db = transcript.databaseForSharedStores();
+
+    transcript.memoryStore.getForgottenSourceIds("agent-a", conversationId);
+    const cachedBefore = internals.forgottenSourceCache;
+    expect(cachedBefore).toBeDefined();
+    const markerBefore = db.prepare<[], { version: number }>("SELECT version FROM memory_provenance_state WHERE id = 1").get()!;
+
+    transcript.memoryStore.setSettings("agent-a", "explicit");
+    const markerAfterSettings = db.prepare<[], { version: number }>("SELECT version FROM memory_provenance_state WHERE id = 1").get()!;
+    expect(markerAfterSettings.version).toBe(markerBefore.version);
+    transcript.memoryStore.getForgottenSourceIds("agent-a", conversationId);
+    expect(internals.forgottenSourceCache).toBe(cachedBefore);
+
+    transcript.append("agent-a", [{ kind: "message", id: "provenance-entry", role: "user", content: "texto", timestampMs: 1 }], conversationId);
+    const markerAfterEntry = db.prepare<[], { version: number }>("SELECT version FROM memory_provenance_state WHERE id = 1").get()!;
+    expect(markerAfterEntry.version).toBeGreaterThan(markerAfterSettings.version);
+    transcript.memoryStore.getForgottenSourceIds("agent-a", conversationId);
+    expect(internals.forgottenSourceCache).not.toBe(cachedBefore);
+    transcript.close();
+  });
+
+  it("invalida o cache quando outra conexão altera uma entrada de proveniência", () => {
+    const dir = mkdtempSync(join(tmpdir(), "openbot-memory-provenance-"));
+    const path = join(dir, "store.sqlite");
+    const transcript = new SqliteTranscriptStore({ path });
+    const conversationId = chat(transcript, "agent-a");
+    transcript.append("agent-a", [{ kind: "message", id: "external-entry", role: "user", content: "antes", timestampMs: 1 }], conversationId);
+    const internals = transcript.memoryStore as unknown as { forgottenSourceCache?: object };
+    transcript.memoryStore.getForgottenSourceIds("agent-a", conversationId);
+    const cachedBefore = internals.forgottenSourceCache;
+    expect(cachedBefore).toBeDefined();
+
+    const external = new Database(path);
+    const row = external.prepare<[string], { payload_json: string }>("SELECT payload_json FROM transcript_entries WHERE entry_id = ?").get("external-entry")!;
+    const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+    payload.role = "assistant";
+    external.prepare("UPDATE transcript_entries SET payload_json = ? WHERE entry_id = ?").run(JSON.stringify(payload), "external-entry");
+    external.close();
+
+    transcript.memoryStore.getForgottenSourceIds("agent-a", conversationId);
+    expect(internals.forgottenSourceCache).not.toBe(cachedBefore);
+    transcript.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("não cria revisão para upsert semanticamente idêntico", () => {
+    let now = 100;
+    const memory = new SqliteMemoryStore({ path: ":memory:", now: () => now });
+    const first = memory.upsertMemory("agent-a", {
+      kind: "fact",
+      canonicalKey: "stable-upsert",
+      text: "valor estável",
+      trust: "verified_tool",
+      importance: 40,
+      confidence: 0.8,
+      pinned: true,
+      sourceEntryIds: [],
+      validFromMs: 100,
+      validToMs: 400,
+      expiresAtMs: 500,
+    }, { kind: "admin" });
+    const revisionsBefore = memory.snapshotAgent("agent-a").revisions.filter((revision) => revision.memoryId === first.id);
+
+    now = 200;
+    const same = memory.upsertMemory("agent-a", {
+      id: first.id,
+      kind: first.kind,
+      canonicalKey: first.canonicalKey,
+      text: first.text,
+      trust: first.trust,
+      importance: first.importance,
+      confidence: first.confidence,
+      pinned: first.pinned,
+      sourceEntryIds: first.sourceEntryIds,
+      validFromMs: first.validFromMs,
+      validToMs: first.validToMs,
+      expiresAtMs: first.expiresAtMs,
+    }, { kind: "admin" });
+    expect(same).toEqual(first);
+    expect(memory.snapshotAgent("agent-a").revisions.filter((revision) => revision.memoryId === first.id)).toHaveLength(revisionsBefore.length);
+
+    const changed = memory.upsertMemory("agent-a", {
+      id: first.id,
+      kind: first.kind,
+      canonicalKey: first.canonicalKey,
+      text: "valor alterado",
+      trust: first.trust,
+      importance: first.importance,
+      confidence: first.confidence,
+      pinned: first.pinned,
+      sourceEntryIds: first.sourceEntryIds,
+      validFromMs: first.validFromMs,
+      validToMs: first.validToMs,
+      expiresAtMs: first.expiresAtMs,
+    }, { kind: "admin" });
+    expect(changed.revision).toBe(first.revision + 1);
+    expect(memory.snapshotAgent("agent-a").revisions.filter((revision) => revision.memoryId === first.id)).toHaveLength(revisionsBefore.length + 1);
+    memory.close();
   });
 
   it("records revisions for updates and expiration", () => {
@@ -160,6 +440,34 @@ describe("memory core", () => {
     transcript.close();
   });
 
+  it("filters legacy and structured source references without reparsing plain text", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    const conversationId = chat(transcript, "agent-a");
+    const otherConversationId = chat(transcript, "agent-a");
+    const insert = (canonicalKey: string, sourceEntryIds: readonly (string | { conversationId: string; entryId: string })[]) => {
+      transcript.memoryStore.upsertMemory("agent-a", {
+        kind: "fact",
+        canonicalKey,
+        text: `evidence ${canonicalKey}`,
+        trust: "verified_tool",
+        sourceEntryIds,
+      }, { kind: "admin" });
+    };
+
+    insert("legacy", [`${conversationId}:legacy-entry`]);
+    insert("plain", ["legacy-entry"]);
+    insert("structured", [{ conversationId, entryId: "structured-entry" }]);
+    insert("mixed", [`${conversationId}:mixed-entry`, { conversationId, entryId: "mixed-object" }]);
+    insert("other", [{ conversationId: otherConversationId, entryId: "other-entry" }]);
+    insert("empty", []);
+
+    const expected = new Set(["legacy", "structured", "mixed"]);
+    expect(new Set(transcript.memoryStore.listMemories("agent-a", { conversationId }).map((memory) => memory.canonicalKey))).toEqual(expected);
+    expect(new Set(transcript.memoryStore.listMemoriesPage("agent-a", { conversationId }).items.map((memory) => memory.canonicalKey))).toEqual(expected);
+    expect(new Set(transcript.memoryStore.searchMemories("agent-a", "evidence", { conversationId }).map((result) => result.memory.canonicalKey))).toEqual(expected);
+    transcript.close();
+  });
+
   it("pages every memory with a stable agent-bound cursor", () => {
     const memory = new SqliteMemoryStore({ path: ":memory:", now: () => 100 });
     for (let index = 0; index < 7; index += 1) {
@@ -207,11 +515,11 @@ describe("memory core", () => {
       model: "grok-4.6",
       fromSequenceId: 0,
       throughSequenceId: 1,
-      entries: [],
+      entries: [{ kind: "message", id: "e1", role: "user", content: "contexto" }],
     }, { operations: [
-      { op: "upsert", memory: { kind: "identity", canonicalKey: "role", text: "sou dev", trust: "verified_tool" } },
-      { op: "upsert", memory: { kind: "fact", canonicalKey: "key", text: "apiKey=sk-123456789012345", trust: "verified_tool" } },
-      { op: "upsert", memory: { kind: "fact", canonicalKey: "safe", text: "resultado verificado", trust: "verified_tool" } },
+      { op: "upsert", memory: { kind: "identity", canonicalKey: "role", text: "sou dev", trust: "verified_tool", sourceEntryIds: ["e1"] } },
+      { op: "upsert", memory: { kind: "fact", canonicalKey: "key", text: "apiKey=sk-123456789012345", trust: "verified_tool", sourceEntryIds: ["e1"] } },
+      { op: "upsert", memory: { kind: "fact", canonicalKey: "safe", text: "resultado verificado", trust: "verified_tool", sourceEntryIds: ["e1"] } },
     ] });
     expect(result.memories).toHaveLength(2);
     expect(result.rejected.map((item) => item.code)).toEqual(["secret"]);
@@ -234,7 +542,7 @@ describe("memory core", () => {
       model: "grok-4.6",
       fromSequenceId: 0,
       throughSequenceId: 1,
-      entries: [],
+      entries: [{ kind: "message", id: "e1", role: "user", content: "contexto" }],
     }, {
       operations: [{
         op: "upsert",
@@ -244,6 +552,7 @@ describe("memory core", () => {
           canonicalKey: "timezone",
           text: "PROFILE_TZ_UTC_MINUS_3",
           trust: "verified_tool",
+          sourceEntryIds: ["e1"],
         },
       }],
     });
@@ -254,6 +563,67 @@ describe("memory core", () => {
       expect.objectContaining({ canonicalKey: "timezone", text: "PROFILE_TZ_UTC_MINUS_3" }),
     ]);
     expect(transcript.memoryStore.listMemories("agent-a")).toEqual([]);
+    transcript.close();
+  });
+
+  it("validates upsert and replacement sources against the covered prefix, not the whole loaded batch", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    const conversationId = chat(transcript, "agent-a");
+    const targetA = transcript.memoryStore.upsertMemory("agent-a", {
+      kind: "fact",
+      canonicalKey: "target-a",
+      text: "antigo a",
+      trust: "verified_tool",
+      sourceConversationId: conversationId,
+    }, { kind: "admin" });
+    const targetB = transcript.memoryStore.upsertMemory("agent-a", {
+      kind: "fact",
+      canonicalKey: "target-b",
+      text: "antigo b",
+      trust: "verified_tool",
+      sourceConversationId: conversationId,
+    }, { kind: "admin" });
+    const entries = [1, 2, 3, 4].map((index) => ({
+      kind: "message",
+      id: `e${index}`,
+      role: "user",
+      content: `entrada ${index}`,
+    }));
+    const applied = applyReflectionResult(transcript.memoryStore, {
+      agentId: "agent-a",
+      conversationId,
+      provider: "xai",
+      model: "grok-4.6",
+      fromSequenceId: 0,
+      throughSequenceId: 40,
+      coveredThroughSequenceId: 8,
+      coveredEntryIds: ["e1", "e2"],
+      entries,
+    }, {
+      operations: [
+        {
+          op: "upsert",
+          memory: { kind: "fact", canonicalKey: "covered", text: "fonte enviada", trust: "verified_tool", sourceEntryIds: ["e1"] },
+        },
+        {
+          op: "upsert",
+          memory: { kind: "fact", canonicalKey: "deferred", text: "fonte adiada", trust: "verified_tool", sourceEntryIds: ["e4"] },
+        },
+        {
+          op: "supersede",
+          memoryId: targetA.id,
+          replacement: { kind: "fact", canonicalKey: "target-a", text: "novo a", trust: "verified_tool", sourceEntryIds: ["e2"] },
+        },
+        {
+          op: "supersede",
+          memoryId: targetB.id,
+          replacement: { kind: "fact", canonicalKey: "target-b", text: "novo b", trust: "verified_tool", sourceEntryIds: ["e4"] },
+        },
+      ],
+    });
+    expect(applied.memories.map((memory) => memory.canonicalKey)).toEqual(["covered", "target-a"]);
+    expect(applied.rejected.map((rejection) => rejection.code)).toEqual(["source_invalid", "source_invalid"]);
+    expect(transcript.memoryStore.getMemory("agent-a", targetB.id)?.status).toBe("active");
     transcript.close();
   });
 
@@ -341,11 +711,11 @@ describe("memory core", () => {
     const transcript = new SqliteTranscriptStore({ path: ":memory:" });
     const conversationId = chat(transcript, "agent-a");
     const applied = applyReflectionResult(transcript.memoryStore, {
-      agentId: "agent-a", conversationId, provider: "xai", model: "grok-4.6", fromSequenceId: 0, throughSequenceId: 2, entries: [],
+      agentId: "agent-a", conversationId, provider: "xai", model: "grok-4.6", fromSequenceId: 0, throughSequenceId: 2, entries: [{ kind: "message", id: "e1", role: "user", content: "contexto" }],
     }, {
       operations: [
-        { op: "upsert", memory: { kind: "fact", canonicalKey: "safe", text: "resultado verificado", trust: "verified_tool" } },
-        { op: "upsert", memory: { kind: "fact", canonicalKey: "secret", text: "apiKey=sk-123456789012345", trust: "verified_tool" } },
+        { op: "upsert", memory: { kind: "fact", canonicalKey: "safe", text: "resultado verificado", trust: "verified_tool", sourceEntryIds: ["e1"] } },
+        { op: "upsert", memory: { kind: "fact", canonicalKey: "secret", text: "apiKey=sk-123456789012345", trust: "verified_tool", sourceEntryIds: ["e1"] } },
       ],
     });
     expect(applied.memories.map((memory) => memory.canonicalKey)).toEqual(["safe"]);
@@ -395,16 +765,16 @@ describe("memory core", () => {
       model: "grok-4.6",
       fromSequenceId: 0,
       throughSequenceId: 4,
-      entries: [],
+      entries: [{ kind: "message", id: "e1", role: "user", content: "contexto" }],
     }, {
       operations: [
         {
           op: "upsert",
-          memory: { kind: "fact", canonicalKey: "pinned", text: "bypass automático", trust: "verified_tool" },
+          memory: { kind: "fact", canonicalKey: "pinned", text: "bypass automático", trust: "verified_tool", sourceEntryIds: ["e1"] },
         },
         {
           op: "upsert",
-          memory: { kind: "fact", canonicalKey: "user-pref", text: "bypass automático", trust: "verified_tool" },
+          memory: { kind: "fact", canonicalKey: "user-pref", text: "bypass automático", trust: "verified_tool", sourceEntryIds: ["e1"] },
         },
         { op: "forget", memoryId: pinned.id },
         { op: "supersede", memoryId: trustedUser.id },
@@ -416,6 +786,7 @@ describe("memory core", () => {
             canonicalKey: "same-conversation",
             text: "substituição segura",
             trust: "verified_tool",
+            sourceEntryIds: ["e1"],
           },
         },
         { op: "forget", memoryId: foreignConversation.id },
@@ -543,6 +914,7 @@ describe("memory core", () => {
             text: "não pode pinar",
             trust: "verified_tool",
             pinned: true,
+            sourceEntryIds: ["assistant-1"],
           },
         },
         {
@@ -806,11 +1178,22 @@ describe("memory core", () => {
           op: "upsert",
           memory: {
             kind: "fact",
+            canonicalKey: "foreign-provenance",
+            text: "fonte estrangeira rejeitada",
+            trust: "verified_tool",
+            sourceConversationId: foreignConversation,
+            sourceEntryIds: [{ conversationId: foreignConversation, entryId: "foreign-entry" }],
+          },
+        },
+        {
+          op: "upsert",
+          memory: {
+            kind: "fact",
             canonicalKey: "fresh-provenance",
             text: "nova memoria",
             trust: "verified_tool",
             sourceConversationId: foreignConversation,
-            sourceEntryIds: [{ conversationId: foreignConversation, entryId: "foreign-entry" }],
+            sourceEntryIds: ["entry-1", "tool-1"],
           },
         },
         {
@@ -822,7 +1205,7 @@ describe("memory core", () => {
             text: "valor novo",
             trust: "verified_tool",
             sourceConversationId: foreignConversation,
-            sourceEntryIds: [{ conversationId: foreignConversation, entryId: "foreign-entry-2" }],
+            sourceEntryIds: ["entry-1"],
           },
         },
       ],
@@ -830,6 +1213,7 @@ describe("memory core", () => {
 
     const fresh = transcript.memoryStore.listMemories("agent-a").find((memory) => memory.canonicalKey === "fresh-provenance");
     const replaced = transcript.memoryStore.listMemories("agent-a").find((memory) => memory.canonicalKey === "force-provenance");
+    expect(transcript.memoryStore.listMemories("agent-a").find((memory) => memory.canonicalKey === "foreign-provenance")).toBeUndefined();
     expect(fresh).toMatchObject({
       sourceConversationId: currentConversation,
       sourceEntryIds: [
@@ -841,7 +1225,6 @@ describe("memory core", () => {
       sourceConversationId: currentConversation,
       sourceEntryIds: [
         { conversationId: currentConversation, entryId: "entry-1" },
-        { conversationId: currentConversation, entryId: "tool-1" },
       ],
     });
     transcript.close();
@@ -883,6 +1266,78 @@ describe("memory core", () => {
     }, { kind: "admin" });
     transcript.conversationStore.delete("agent-a", source, { memoryPolicy: "delete-derived" });
     expect(transcript.memoryStore.getMemory("agent-a", memory.id)?.status).toBe("forgotten");
+    transcript.close();
+  });
+
+  it("aplica delete-derived à memória de perfil pela proveniência e preserva fontes válidas", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    const source = chat(transcript, "agent-a");
+    const survivor = chat(transcript, "agent-a");
+    const exclusive = transcript.memoryStore.upsertMemory(USER_PROFILE_AGENT_ID, {
+      kind: "preference",
+      canonicalKey: "profile-exclusive",
+      text: "derivada somente da conversa apagada",
+      trust: "verified_tool",
+      sourceConversationId: source,
+      sourceEntryIds: [{ conversationId: source, entryId: "source-entry" }],
+    }, { kind: "admin" });
+    const multiSource = transcript.memoryStore.upsertMemory(USER_PROFILE_AGENT_ID, {
+      kind: "preference",
+      canonicalKey: "profile-multi-source",
+      text: "também sustentada pela conversa sobrevivente",
+      trust: "verified_tool",
+      sourceConversationId: source,
+      sourceEntryIds: [
+        { conversationId: source, entryId: "source-entry" },
+        { conversationId: survivor, entryId: "survivor-entry" },
+      ],
+    }, { kind: "admin" });
+    const independent = transcript.memoryStore.upsertMemory(USER_PROFILE_AGENT_ID, {
+      kind: "preference",
+      canonicalKey: "profile-independent",
+      text: "preferência sem conversa de origem",
+      trust: "user",
+    }, { kind: "admin" });
+
+    transcript.conversationStore.delete("agent-a", source, { memoryPolicy: "delete-derived" });
+
+    expect(transcript.memoryStore.getMemory(USER_PROFILE_AGENT_ID, exclusive.id)?.status).toBe("forgotten");
+    expect(transcript.memoryStore.getMemory(USER_PROFILE_AGENT_ID, multiSource.id)).toMatchObject({
+      status: "active",
+      sourceConversationId: survivor,
+      sourceEntryIds: [{ conversationId: survivor, entryId: "survivor-entry" }],
+    });
+    expect(transcript.memoryStore.getMemory(USER_PROFILE_AGENT_ID, independent.id)?.status).toBe("active");
+
+    const retainSource = chat(transcript, "agent-a");
+    chat(transcript, "agent-a");
+    const retained = transcript.memoryStore.upsertMemory(USER_PROFILE_AGENT_ID, {
+      kind: "preference",
+      canonicalKey: "profile-retained",
+      text: "preferência mantida explicitamente",
+      trust: "user",
+      sourceConversationId: retainSource,
+      sourceEntryIds: [{ conversationId: retainSource, entryId: "retain-entry" }],
+    }, { kind: "admin" });
+    transcript.conversationStore.delete("agent-a", retainSource, { memoryPolicy: "retain" });
+    expect(transcript.memoryStore.getMemory(USER_PROFILE_AGENT_ID, retained.id)).toMatchObject({
+      status: "active",
+      sourceConversationId: retainSource,
+    });
+    transcript.close();
+  });
+
+  it("rejeita memória de perfil derivada de conversa temporária", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    const temporary = chat(transcript, "agent-a", true);
+    expect(() => transcript.memoryStore.upsertMemory(USER_PROFILE_AGENT_ID, {
+      kind: "preference",
+      canonicalKey: "profile-temporary",
+      text: "não persistir de conversa temporária",
+      trust: "verified_tool",
+      sourceConversationId: temporary,
+      sourceEntryIds: [{ conversationId: temporary, entryId: "temporary-entry" }],
+    }, { kind: "admin" })).toThrow(/temporária/);
     transcript.close();
   });
 
@@ -1090,11 +1545,11 @@ describe("memory core", () => {
         model: storedJob.model,
         fromSequenceId: storedJob.fromSequenceId,
         throughSequenceId: storedJob.throughSequenceId,
-        entries: [],
+        entries: [{ kind: "message", id: "e1", role: "user", content: "contexto" }],
       }),
       reflect: async () => {
         calls += 1;
-        return { operations: [{ op: "upsert", memory: { kind: "fact", canonicalKey: "job", text: "ok", trust: "verified_tool" } }] };
+        return { operations: [{ op: "upsert", memory: { kind: "fact", canonicalKey: "job", text: "ok", trust: "verified_tool", sourceEntryIds: ["e1"] } }] };
       },
     });
     expect(worker.recoverAbandonedJobs()).toBe(1);
@@ -1104,6 +1559,50 @@ describe("memory core", () => {
     expect(calls).toBe(1);
     expect(transcript.memoryStore.listJobs("agent-a", { status: "complete" })).toHaveLength(1);
     expect(transcript.memoryStore.listMemories("agent-a")[0]?.canonicalKey).toBe("job");
+    await worker.close();
+    transcript.close();
+  });
+
+  it("fires onJobDead exactly once when the job exhausts attempts", async () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    const conversationId = chat(transcript, "agent-a");
+    transcript.memoryStore.enqueueJob({
+      agentId: "agent-a",
+      conversationId,
+      provider: "xai",
+      model: "grok-4.6",
+      fromSequenceId: 0,
+      throughSequenceId: 1,
+    });
+    const dead: Array<{ agentId: string; conversationId?: string; jobId: string; provider: string; model: string; error: { code: string; text: string } }> = [];
+    let calls = 0;
+    const worker = new MemoryReflectionWorker({
+      store: transcript.memoryStore,
+      maxAttempts: 1,
+      backoffMs: [0],
+      loadInput: (job) => ({
+        agentId: job.agentId,
+        conversationId: job.conversationId,
+        provider: job.provider,
+        model: job.model,
+        fromSequenceId: job.fromSequenceId,
+        throughSequenceId: job.throughSequenceId,
+        entries: [],
+      }),
+      reflect: async () => {
+        calls += 1;
+        throw new Error("401 provider credentials rejected");
+      },
+      onJobDead: (notice) => { dead.push(notice); },
+    });
+    worker.start();
+    await waitFor(
+      () => transcript.memoryStore.listJobs("agent-a", { status: "dead" }).length,
+      (count) => count === 1,
+    );
+    expect(calls).toBe(1);
+    expect(dead).toHaveLength(1);
+    expect(dead[0]).toMatchObject({ agentId: "agent-a", conversationId, provider: "xai", model: "grok-4.6", error: { code: "reflection_failed" } });
     await worker.close();
     transcript.close();
   });
@@ -1183,7 +1682,7 @@ describe("memory core", () => {
         renderedText: "resumo parcial",
       },
       operations: [],
-    })).toThrow(/limite exato do job/);
+    })).toThrow(/limite coberto do job/);
 
     expect(transcript.memoryStore.getSummary("agent-a", conversationId)).toBeNull();
     transcript.close();
@@ -1211,7 +1710,7 @@ describe("memory core", () => {
       },
       operations: [{
         op: "upsert",
-        memory: { kind: "fact", canonicalKey: "response-length", text: "prefere respostas curtas", trust: "verified_tool" },
+        memory: { kind: "fact", canonicalKey: "response-length", text: "prefere respostas curtas", trust: "verified_tool", sourceEntryIds: ["entry-1"] },
       }],
     });
 
@@ -1468,21 +1967,112 @@ describe("memory core", () => {
     transcript.close();
   });
 
+  it("preserves the earliest requested boundary behind a running memory-only job", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    const conversationId = chat(transcript, "agent-a");
+    const running = transcript.memoryStore.enqueueJob({
+      id: "running-memory-only",
+      agentId: "agent-a",
+      conversationId,
+      provider: "xai",
+      model: "grok-4.6",
+      fromSequenceId: 0,
+      throughSequenceId: 39,
+      summaryRequested: false,
+      memoryRequested: true,
+    });
+    expect(transcript.memoryStore.claimJob("agent-a", running.id)?.status).toBe("running");
+
+    const successor = transcript.memoryStore.enqueueJob({
+      id: "summary-successor",
+      agentId: "agent-a",
+      conversationId,
+      provider: "xai",
+      model: "grok-4.6",
+      fromSequenceId: 0,
+      throughSequenceId: 41,
+      summaryRequested: true,
+      memoryRequested: true,
+    });
+    expect(successor).toMatchObject({
+      id: "summary-successor",
+      fromSequenceId: 0,
+      throughSequenceId: 41,
+      summaryRequested: true,
+      memoryRequested: true,
+      status: "pending",
+    });
+
+    const pendingConversationId = chat(transcript, "agent-a");
+    const pendingRunning = transcript.memoryStore.enqueueJob({
+      id: "pending-running-memory-only",
+      agentId: "agent-a",
+      conversationId: pendingConversationId,
+      provider: "xai",
+      model: "grok-4.6",
+      fromSequenceId: 0,
+      throughSequenceId: 39,
+      summaryRequested: false,
+      memoryRequested: true,
+    });
+    expect(transcript.memoryStore.claimJob("agent-a", pendingRunning.id)?.status).toBe("running");
+    const pending = transcript.memoryStore.enqueueJob({
+      id: "pending-successor",
+      agentId: "agent-a",
+      conversationId: pendingConversationId,
+      provider: "xai",
+      model: "grok-4.6",
+      fromSequenceId: 35,
+      throughSequenceId: 40,
+      summaryRequested: false,
+      memoryRequested: true,
+    });
+    expect(pending).toMatchObject({ id: "pending-successor", fromSequenceId: 35, throughSequenceId: 40 });
+
+    const expanded = transcript.memoryStore.enqueueJob({
+      agentId: "agent-a",
+      conversationId: pendingConversationId,
+      provider: "xai",
+      model: "grok-4.6",
+      fromSequenceId: 0,
+      throughSequenceId: 41,
+      summaryRequested: true,
+      memoryRequested: true,
+    });
+    expect(expanded).toMatchObject({
+      id: pending.id,
+      fromSequenceId: 0,
+      throughSequenceId: 41,
+      summaryRequested: true,
+      memoryRequested: true,
+      status: "pending",
+    });
+    transcript.close();
+  });
+
   it("prunes old terminal reflection jobs while enqueueing new work", () => {
     const transcript = new SqliteTranscriptStore({ path: ":memory:" });
     const conversationId = chat(transcript, "agent-a");
-    const old = transcript.memoryStore.enqueueJob({
+    const obsolete = transcript.memoryStore.enqueueJob({
       agentId: "agent-a", conversationId, provider: "xai", model: "grok-4.6",
       fromSequenceId: 0, throughSequenceId: 1, nowMs: 1,
     });
-    transcript.memoryStore.claimJob("agent-a", old.id, 1);
-    transcript.memoryStore.completeJob("agent-a", old.id, 1);
+    transcript.memoryStore.claimJob("agent-a", obsolete.id, 1);
+    transcript.memoryStore.completeJob("agent-a", obsolete.id, 1);
+
+    const keeper = transcript.memoryStore.enqueueJob({
+      agentId: "agent-a", conversationId, provider: "xai", model: "grok-4.6",
+      fromSequenceId: 2, throughSequenceId: 2, nowMs: 1,
+    });
+    transcript.memoryStore.claimJob("agent-a", keeper.id, 1);
+    transcript.memoryStore.completeJob("agent-a", keeper.id, 1);
 
     transcript.memoryStore.enqueueJob({
       agentId: "agent-a", conversationId, provider: "xai", model: "grok-4.6",
-      fromSequenceId: 2, throughSequenceId: 2, nowMs: 8 * 24 * 60 * 60_000,
+      fromSequenceId: 3, throughSequenceId: 3, nowMs: 8 * 24 * 60 * 60_000,
     });
-    expect(transcript.memoryStore.getJob("agent-a", old.id)).toBeNull();
+    expect(transcript.memoryStore.getJob("agent-a", obsolete.id)).toBeNull();
+    expect(transcript.memoryStore.getJob("agent-a", keeper.id)).toMatchObject({ status: "complete", throughSequenceId: 2 });
     transcript.close();
   });
 
@@ -1993,8 +2583,8 @@ describe("memory core", () => {
   it("parses fenced strict reflection JSON and applies summary plus operations", () => {
     const transcript = new SqliteTranscriptStore({ path: ":memory:" });
     const conversationId = chat(transcript, "agent-a");
-    const result = parseReflectionResult("```json\n{\"summary\":{\"throughSequenceId\":2,\"summaryJson\":{},\"renderedText\":\"resumo\"},\"ops\":[{\"op\":\"upsert\",\"memory\":{\"kind\":\"fact\",\"canonicalKey\":\"k\",\"text\":\"v\",\"trust\":\"verified_tool\"}}]}\n```");
-    applyReflectionResult(transcript.memoryStore, { agentId: "agent-a", conversationId, provider: "xai", model: "grok-4.6", fromSequenceId: 0, throughSequenceId: 2, entries: [] }, result);
+    const result = parseReflectionResult("```json\n{\"summary\":{\"throughSequenceId\":2,\"summaryJson\":{},\"renderedText\":\"resumo\"},\"ops\":[{\"op\":\"upsert\",\"memory\":{\"kind\":\"fact\",\"canonicalKey\":\"k\",\"text\":\"v\",\"trust\":\"verified_tool\",\"sourceEntryIds\":[\"e1\"]}}]}\n```");
+    applyReflectionResult(transcript.memoryStore, { agentId: "agent-a", conversationId, provider: "xai", model: "grok-4.6", fromSequenceId: 0, throughSequenceId: 2, entries: [{ kind: "message", id: "e1", role: "user", content: "contexto" }] }, result);
     expect(transcript.memoryStore.getSummary("agent-a", conversationId)?.renderedText).toBe("resumo");
     expect(transcript.memoryStore.listMemories("agent-a")).toEqual([
       expect.objectContaining({ canonicalKey: "k", text: "v", sourceConversationId: conversationId }),
@@ -2159,6 +2749,7 @@ describe("memory core", () => {
               canonicalKey: `memory-${input.conversationId}`,
               text: `memory ${input.conversationId}`,
               trust: "verified_tool" as const,
+              sourceEntryIds: ["e1"],
             },
           }],
         };
@@ -2174,7 +2765,7 @@ describe("memory core", () => {
       throughSequenceId: 1,
       summaryRequested: true,
       memoryRequested: true,
-      entries: [],
+      entries: [{ kind: "message", id: "e1", role: "user", content: "contexto" }],
     });
     const liveJob = worker.enqueue({
       agentId: "agent-a",
@@ -2185,7 +2776,7 @@ describe("memory core", () => {
       throughSequenceId: 3,
       summaryRequested: true,
       memoryRequested: true,
-      entries: [],
+      entries: [{ kind: "message", id: "e1", role: "user", content: "contexto" }],
     });
 
     await waitFor(() => started.includes(archivedConversation), Boolean);

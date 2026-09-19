@@ -91,6 +91,27 @@ describe("P2.1 durable A2A store", () => {
     expect(() => store.send(message({ messageId: "conflicting-id", payload: { version: 1, kind: "text", text: "different" } }))).toThrow(/nonce|conflict/i);
   });
 
+  it("retorna o tail recente na listagem e no snapshot sem inverter a ordem de exibição", () => {
+    const h = harness();
+    const store = open({ options: { ...h.options, limits: { maxMessagesPerTurn: 200, maxPendingPerRecipient: 200 } } });
+    for (let index = 0; index < 130; index += 1) {
+      store.send(message({
+        messageId: `message-${index}`,
+        nonce: `nonce-${index}`,
+        createdAtMs: 1_000 + index,
+        availableAtMs: 1_000 + index,
+      }));
+    }
+
+    const listed = store.listForRecipient("agent-b");
+    const snapshot = store.getSnapshot("agent-b").items;
+    expect(listed).toHaveLength(128);
+    expect(listed[0]?.messageId).toBe("message-2");
+    expect(listed.at(-1)?.messageId).toBe("message-129");
+    expect(snapshot.map((item) => item.messageId)).toEqual(listed.map((item) => item.messageId));
+    expect(snapshot.some((item) => item.messageId === "message-0")).toBe(false);
+  });
+
   it.each([
     ["unknown recipient", /not active/i],
     ["sender fence", /fenced/i],

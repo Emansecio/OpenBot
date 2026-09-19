@@ -13,5 +13,5 @@ if not exist "%ELECTRON_EXE%" (
   exit /b 1
 )
 echo OpenBot Electron launcher started > logs\visual-electron.log
-"%ELECTRON_EXE%" --user-data-dir="%USER_DATA_DIR%" --no-sandbox --disable-gpu --enable-logging --log-file="%CD%\logs\visual-electron-chromium.log" "%CD%\client\extracted\dist\electron-main\main.cjs" >> logs\visual-electron.log 2>&1
+"%ELECTRON_EXE%" --user-data-dir="%USER_DATA_DIR%" --no-sandbox --disable-gpu --enable-logging --log-file="%CD%\logs\visual-electron-chromium.log" "%CD%\scripts\openbot-electron.cjs" >> logs\visual-electron.log 2>&1
 if errorlevel 1 pause

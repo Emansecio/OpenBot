@@ -197,7 +197,12 @@ const record = (value: unknown): Record<string, unknown> => {
 
 const exact = (value: Record<string, unknown>, keys: readonly string[]): void => {
   const allowed = new Set(keys);
-  if (Object.keys(value).some((key) => !allowed.has(key))) throw new ExecutionRequestError("request contains unsupported fields");
+  const extras = Object.keys(value).filter((key) => !allowed.has(key));
+  if (extras.length === 0) return;
+  const preview = extras.slice(0, 8).join(", ");
+  throw new ExecutionRequestError(
+    `request contains unsupported fields; remove ${preview}${extras.length > 8 ? ", ..." : ""}`,
+  );
 };
 
 const pathValue = (value: unknown, name = "path"): string => {

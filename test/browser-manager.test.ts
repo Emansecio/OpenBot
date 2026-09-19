@@ -407,7 +407,7 @@ describe("BrowserSessionManager", () => {
     const second = await manager.acquire("agent-b");
     await manager.handoff(first);
     await manager.handoff(second);
-    await manager.teardownAgent("agent-a");
+    await manager.purgeAgent("agent-a");
     expect(manager.activeLeaseCount).toBe(1);
     expect(host?.requests.filter((request) => (request.command as Record<string, unknown>).command === "close")).toHaveLength(1);
     expect(host?.requests.filter((request) => (request.command as Record<string, unknown>).command === "reset")).toHaveLength(1);
@@ -496,7 +496,7 @@ describe("BrowserSessionManager", () => {
     expect(manager.hostRunning).toBe(true);
   });
 
-  it("faz reset da partição quando o close expira mas outro agente ainda usa o host", async () => {
+  it("preserva o perfil e reporta falha quando close expira no host compartilhado", async () => {
     let host: TimeoutCloseHost | undefined;
     const manager = new BrowserSessionManager({
       downloadsRoot: "C:\\Temp\\OpenBot\\downloads",
@@ -512,17 +512,19 @@ describe("BrowserSessionManager", () => {
     await manager.open(first, "https://example.com/a");
     await manager.open(second, "https://example.com/b");
 
-    await expect(manager.release(first)).resolves.toBeUndefined();
+    await expect(manager.release(first)).rejects.toMatchObject({ code: "BROWSER_COMMAND_TIMEOUT" });
     await expect(manager.snapshot(second)).resolves.toMatchObject({ command: "snapshot" });
     expect(host?.requests.map((request) => (request.command as Record<string, unknown>).command)).toEqual([
       "open",
       "open",
       "close",
       "cancel",
-      "reset",
       "snapshot",
     ]);
-    expect(manager.activeLeaseCount).toBe(1);
+    // Retain failed ownership for retry; the surviving agent stays usable.
+    expect(manager.activeLeaseCount).toBe(2);
+    await expect(manager.teardownAgent("agent-a")).rejects.toMatchObject({ code: "BROWSER_COMMAND_TIMEOUT" });
+    expect(host?.requests.some((request) => (request.command as Record<string, unknown>).command === "reset")).toBe(false);
     expect(manager.hostRunning).toBe(true);
   });
 
@@ -563,6 +565,8 @@ describe("BrowserSessionManager", () => {
     });
     managers.push(manager);
     await manager.teardownAgent("agent-a");
+    expect(existsSync(partitionRoot)).toBe(true);
+    await manager.purgeAgent("agent-a");
     expect(existsSync(partitionRoot)).toBe(false);
     rmSync(root, { recursive: true, force: true });
   });
@@ -574,6 +578,8 @@ describe("BrowserSessionManager", () => {
     mkdirSync(join(partitionRoot, "Cache"), { recursive: true });
     writeFileSync(join(partitionRoot, "Cache", "data"), "cached");
     writeFileSync(join(partitionRoot, "Cookies"), "keep");
+    mkdirSync(join(partitionRoot, "Service Worker", "CacheStorage"), { recursive: true });
+    writeFileSync(join(partitionRoot, "Service Worker", "CacheStorage", "offline-data"), "keep");
     const manager = new BrowserSessionManager({
       downloadsRoot: join(root, "workspaces"),
       userDataRoot: join(root, "profiles"),
@@ -585,8 +591,9 @@ describe("BrowserSessionManager", () => {
     await manager.open(lease, "https://example.com/a");
     await manager.release(lease);
     expect(manager.hostRunning).toBe(false);
-    await vi.waitFor(() => expect(existsSync(join(partitionRoot, "Cache"))).toBe(false));
+    expect(existsSync(join(partitionRoot, "Cache"))).toBe(false);
     expect(existsSync(join(partitionRoot, "Cookies"))).toBe(true);
+    expect(existsSync(join(partitionRoot, "Service Worker", "CacheStorage", "offline-data"))).toBe(true);
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -691,9 +698,12 @@ describe("BrowserSessionManager", () => {
     expect(oldHost.killed).toBe(true);
     vi.useRealTimers();
 
+    await expect(manager.acquire("agent-b")).rejects.toMatchObject({ code: "BROWSER_HOST_TEARDOWN_TIMEOUT" });
+    expect(launches).toBe(1);
+    oldHost.exit();
     const second = await manager.acquire("agent-b");
     await manager.open(second, "https://example.com/second");
-    oldHost.exit();
+    await manager.release(first);
 
     expect(manager.activeLeaseCount).toBe(1);
     await expect(manager.snapshot(second)).resolves.toMatchObject({ command: "snapshot" });
@@ -752,7 +762,7 @@ describe("BrowserSessionManager", () => {
     await manager.open(oldLease, "https://example.com/old");
     await manager.open(survivor, "https://example.com/survivor");
 
-    const teardown = manager.teardownAgent("agent-a");
+    const teardown = manager.purgeAgent("agent-a");
     await vi.waitFor(() => expect(host.requests.some((request) =>
       (request.command as Record<string, unknown>).command === "close")).toBe(true));
 
@@ -913,6 +923,58 @@ describe("BrowserSessionManager", () => {
     backpressured = false;
     await expect(harness.writeFrame(host, "second")).resolves.toBeUndefined();
     await manager.close();
+  });
+
+  it("drains an in-flight launch without publishing a late command or retaining the host", async () => {
+    let launchStarted!: () => void;
+    const started = new Promise<void>((resolve) => { launchStarted = resolve; });
+    let finishLaunch!: (host: BrowserHostProcess) => void;
+    const launching = new Promise<BrowserHostProcess>((resolve) => { finishLaunch = resolve; });
+    const manager = new BrowserSessionManager({
+      downloadsRoot: "C:\\Temp\\OpenBot\\downloads",
+      launchHost: () => { launchStarted(); return launching; },
+    });
+    managers.push(manager);
+    const lease = await manager.acquire("agent-a");
+    const opening = manager.open(lease);
+    const failedOpen = expect(opening).rejects.toMatchObject({ code: "BROWSER_LEASE_NOT_FOUND" });
+    await started;
+    let drained = false;
+    const draining = manager.teardownAgent("agent-a").then(() => { drained = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(drained).toBe(false);
+    const host = new FakeBrowserHost();
+    finishLaunch(host);
+    await failedOpen;
+    await draining;
+    expect(host.requests.map((request) => (request.command as { command: string }).command)).toEqual(["close"]);
+    expect(manager.activeLeaseCount).toBe(0);
+    expect(manager.hostRunning).toBe(false);
+  });
+
+  it("waits for download observers before returning the agent home drain", async () => {
+    let finishObserver!: () => void;
+    const observed = new Promise<void>((resolve) => { finishObserver = resolve; });
+    const host = new FakeBrowserHost();
+    const manager = new BrowserSessionManager({
+      downloadsRoot: "C:\\Temp\\OpenBot\\downloads",
+      launchHost: () => host,
+      onDownload: () => observed,
+    });
+    managers.push(manager);
+    const lease = await manager.acquire("agent-a");
+    const survivor = await manager.acquire("agent-b");
+    await manager.open(lease);
+    host.stdout.write(encodeBrowserFrame({ protocolVersion: 1, kind: "event", event: "download",
+      tabId: lease.tabId, path: join(lease.downloadRoot, "report.txt"), state: "completed", bytes: 1 }));
+    let drained = false;
+    const draining = manager.teardownAgent("agent-a").then(() => { drained = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(drained).toBe(false);
+    expect(manager.hasLease(survivor)).toBe(true);
+    finishObserver();
+    await draining;
+    expect(host.requests.some((request) => (request.command as { command: string }).command === "reset")).toBe(false);
   });
 
   it("releases a reserved pending slot when host startup fails", async () => {

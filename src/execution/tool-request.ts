@@ -67,9 +67,19 @@ const normalizeSearch = (name: string, args: Record<string, unknown>): unknown =
 
 const normalizeWhatsapp = (args: Record<string, unknown>): unknown => {
   exactArgs(args, ["op", "chat", "limit", "text", "etapa", "mediaId"]);
+  const op = args.op;
+  if (op === "doctor" || op === "sweep") {
+    const extras = ["chat", "limit", "text", "etapa", "mediaId"]
+      .filter((key) => args[key] !== undefined);
+    if (extras.length > 0) {
+      throw new ExecutionRequestError(
+        `request contains unsupported fields; whatsapp ${op} accepts only the op field; remove ${extras.join(", ")}`,
+      );
+    }
+  }
   return {
     operation: "whatsapp",
-    op: args.op,
+    op,
     chat: args.chat,
     limit: args.limit,
     text: args.text,
@@ -80,7 +90,7 @@ const normalizeWhatsapp = (args: Record<string, unknown>): unknown => {
 
 const normalizeProcess = (args: Record<string, unknown>): unknown => {
   const allowed = new Set(["executable", "argv", "cwd", "env", "stdin", "timeoutMs", "networkProfile"]);
-  if (Object.keys(args).some((key) => !allowed.has(key))) throw new ExecutionRequestError("request contains unsupported fields");
+  rejectUnsupportedFields(args, allowed);
   return {
     operation: "process.run",
     executable: args.executable,
@@ -94,9 +104,17 @@ const normalizeProcess = (args: Record<string, unknown>): unknown => {
 };
 
 const exactArgs = (args: Record<string, unknown>, keys: readonly string[]): void => {
-  const allowed = new Set(keys);
-  if (Object.keys(args).some((key) => !allowed.has(key))) throw new ExecutionRequestError("request contains unsupported fields");
+  rejectUnsupportedFields(args, new Set(keys));
 };
+
+function rejectUnsupportedFields(args: Record<string, unknown>, allowed: ReadonlySet<string>): void {
+  const extras = Object.keys(args).filter((key) => !allowed.has(key));
+  if (extras.length === 0) return;
+  const preview = extras.slice(0, 8).join(", ");
+  throw new ExecutionRequestError(
+    `request contains unsupported fields; remove ${preview}${extras.length > 8 ? ", ..." : ""}`,
+  );
+}
 
 const normalizeBrowser = (name: string, args: Record<string, unknown>): unknown => {
   switch (name) {

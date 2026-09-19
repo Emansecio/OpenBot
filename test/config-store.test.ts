@@ -148,6 +148,17 @@ describe("ConfigStore", () => {
     });
   });
 
+  it("persists the OpenAI-compatible reasoning-effort opt-in as a strict boolean", () => {
+    const path = configPath();
+    const first = new ConfigStore({ configPath: path });
+    expect(first.snapshot().compatReasoningEffort).toBeUndefined();
+
+    first.update({ compatReasoningEffort: true });
+    expect(new ConfigStore({ configPath: path }).snapshot().compatReasoningEffort).toBe(true);
+
+    expect(() => first.update({ compatReasoningEffort: "yes" as never })).toThrow(/compatReasoningEffort/);
+  });
+
   it("merges profile and host settings updates without dropping existing fields", () => {
     const path = configPath();
     const first = new ConfigStore({ configPath: path });
@@ -165,6 +176,33 @@ describe("ConfigStore", () => {
       autoReviewEnabled: true,
       localToolPermission: "always",
     });
+  });
+
+  it("recusa mutateProfile sem machineId em vez de gravar config que o boot rejeita", () => {
+    const path = configPath();
+    const store = new ConfigStore({ configPath: path });
+    const { machineId: _dropped, ...noMachine } = store.snapshot().profile;
+
+    expect(() => store.mutateProfile(() => noMachine as never)).toThrow("machineId");
+    // A config no disco continua carregável.
+    expect(new ConfigStore({ configPath: path }).snapshot().profile.machineId).toBeTruthy();
+  });
+
+  it("aceita serviceTier priority em agente que herda um modelo OpenAI global", () => {
+    const path = configPath();
+    const store = new ConfigStore({ configPath: path });
+    store.update({ globalModel: "gpt-5.6-sol", activeProvider: "openai" });
+
+    store.mutate((current) => ({
+      agents: [{ id: "agent-prio", name: "Prio", avatarId: "a", serviceTier: "priority" }],
+    }));
+
+    const reopened = new ConfigStore({ configPath: path }).snapshot();
+    expect(reopened.agents[0]).toMatchObject({ id: "agent-prio", serviceTier: "priority" });
+    // Trocar o global para não-OpenAI enquanto um agente herda o modelo e pede
+    // priority falha fechado — o estado resultante seria rejeitado no load.
+    expect(() => store.update({ globalModel: "grok-4.6", activeProvider: "xai" })).toThrow("Fast requer");
+    expect(store.snapshot().globalModel).toBe("gpt-5.6-sol");
   });
 
   it("preserva patches feitos por instâncias diferentes", () => {

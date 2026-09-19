@@ -100,6 +100,14 @@ export interface ReflectionRequestProjectionInput {
   existingMemories?: readonly ReflectionExistingMemory[];
   userProfile?: readonly { canonicalKey: string; kind: MemoryKind; text: string }[];
   entries: readonly unknown[];
+  /**
+   * Transcript sequenceIds parallel to `entries`. When present, the projection
+   * selects a contiguous prefix and the payload's `throughSequenceId` becomes
+   * the last covered sequence — never beyond what was actually examined.
+   */
+  entrySequenceIds?: readonly number[];
+  /** Present in projected payloads when part of the job range was deferred. */
+  deferredThroughSequenceId?: number;
 }
 
 export interface ContextRecentEntriesOptions {
@@ -121,6 +129,8 @@ export interface ContextAssemblyInput {
   conversationId?: string;
   prompt: string;
   currentAttachmentContext?: string;
+  /** Ephemeral per-turn context (e.g. Skill instructions). Provider-only — never persisted, never deduplicated against attachment markers. */
+  currentTurnContext?: string;
   currentPromptOverride?: { original: string; normalized: string };
   omittedAssistantTurnId?: string;
   recentStore: ContextTranscriptView;
@@ -163,6 +173,22 @@ export function shouldCompactConversationContext(
   return budget.availableContentTokens > 0 && contentUsed >= Math.floor(budget.availableContentTokens * pressureRatio);
 }
 
+/**
+ * Conservative exclusion for automatic memory reflection: only pure
+ * acknowledgements (nothing to learn) are skipped. Anything longer, ambiguous
+ * or carrying explicit intent still qualifies.
+ */
+export function isLowSignalReflectionPrompt(prompt: string): boolean {
+  const normalized = normalizeForIntent(prompt);
+  if (normalized.length === 0 || normalized.length > 48) return false;
+  const acknowledgements = [
+    /^(ok|okay|okey|kk+|yes|yeah|yep|yup|sure|done|noted|got it|thanks|thank you|thx|ty|perfect|great|nice|cool|good|fine|right|correct|exactly|agreed|sounds good|makes sense|all good|will do)[\s!?.]*$/u,
+    /^(sim|isso|certo|beleza|blz|valeu+|obrigad[oa]s?|brigad[oa]s?|muito obrigad[oa]|entendi|entendido|compreendi|perfeit[oa]|otim[oa]|legal|show|massa|top|combinado|fechado|anotado|pode ser|ta bom|tudo certo|de acordo|exat[oa]|corret[oa]|verdade|faz sentido|boa|maravilha)[\s!?.]*$/u,
+    /^(si|gracias|muchas gracias|vale|entendido|perfect[oa]|bien|buen[oa]|genial|de acuerdo|listo|hecho|exact[oa]|correct[oa])[\s!?.]*$/u,
+  ];
+  return matchesAnyPattern(normalized, acknowledgements);
+}
+
 export function planReflectionJob(
   mode: MemoryMode,
   conversation: ConversationContextInfo,
@@ -170,7 +196,9 @@ export function planReflectionJob(
   summaryRequested: boolean,
 ): ReflectionJobPlan | null {
   if (conversation.temporary) return null;
-  const memoryRequested = mode === "automatic" || (mode === "explicit" && isExplicitMemoryIntent(prompt));
+  const explicitIntent = isExplicitMemoryIntent(prompt) || isExplicitMemoryForgetIntent(prompt);
+  const memoryRequested = (mode === "automatic" && !isLowSignalReflectionPrompt(prompt))
+    || (mode === "explicit" && explicitIntent);
   if (!summaryRequested && !memoryRequested) return null;
   return { summaryRequested, memoryRequested };
 }
@@ -188,6 +216,8 @@ export interface MemoryRememberToolOptions extends MemoryToolOptions {
   conversationId?: string;
   sourceEntryId?: string;
   explicitIntent: boolean;
+  /** Explicit forget/delete intent — enables memory_forget without implying memory_remember. */
+  explicitForgetIntent?: boolean;
 }
 
 function byteLength(value: string): number {
@@ -214,6 +244,55 @@ function truncateText(text: string, maxBytes: number): string {
   const markerBytes = byteLength(marker);
   if (maxBytes <= markerBytes) return utf8Prefix(marker, maxBytes);
   return `${utf8Prefix(text, maxBytes - markerBytes)}${marker}`;
+}
+
+// Structured summaries carry recent decisions near the end; under pressure the
+// middle is elided so both the goal (head) and latest state (tail) survive.
+function selectSummaryText(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (byteLength(text) <= maxBytes) return text;
+  const marker = `\n${CONTEXT_TRUNCATION_MARKER}\n`;
+  const markerBytes = byteLength(marker);
+  if (maxBytes <= markerBytes) return truncateText(text, maxBytes);
+  const tailBudget = Math.floor((maxBytes - markerBytes) / 3);
+  let tailBytes = 0;
+  let tail = "";
+  for (const character of [...text].reverse()) {
+    const size = Buffer.byteLength(character, "utf8");
+    if (tailBytes + size > tailBudget) break;
+    tailBytes += size;
+    tail = character + tail;
+  }
+  return `${utf8Prefix(text, maxBytes - markerBytes - tailBytes)}${marker}${tail}`;
+}
+
+// Conventional work-state fields: current decisions and pending items rank
+// before secondary detail. Selection drops whole low-priority fields — never
+// slices inside one.
+const SUMMARY_FIELD_PRIORITY = ["goal", "objective", "decisions", "decision", "pending", "openLoops", "next", "nextStep", "state", "status"] as const;
+
+function summaryFieldItems(summaryJson: unknown): string[] {
+  if (typeof summaryJson !== "object" || summaryJson === null || Array.isArray(summaryJson)) return [];
+  const record = summaryJson as Record<string, unknown>;
+  const prioritized = SUMMARY_FIELD_PRIORITY.filter((key) => record[key] !== undefined);
+  const rest = Object.keys(record).filter((key) => !SUMMARY_FIELD_PRIORITY.includes(key as never));
+  return [...prioritized, ...rest].map((key) => `${key}: ${jsonText(record[key])}`);
+}
+
+// Structured fields win the budget first (complete items, priority order);
+// renderedText fills what remains via head+tail selection.
+function selectSummaryContent(summary: { summaryJson: unknown; renderedText: string }, maxBytes: number): string[] {
+  const items: string[] = [];
+  let used = 0;
+  for (const field of summaryFieldItems(summary.summaryJson)) {
+    const size = byteLength(field);
+    if (used + size > maxBytes) continue;
+    items.push(field);
+    used += size;
+  }
+  const text = selectSummaryText(summary.renderedText, Math.max(0, maxBytes - used));
+  if (text.length > 0) items.push(text);
+  return items;
 }
 
 function jsonText(value: unknown): string {
@@ -439,6 +518,41 @@ export function buildReflectionRequestPayload(
       Math.floor((targetBytes - reflectionPayloadBytes({ ...base, entries: [] })) / Math.max(1, anchorIndexes.length + 4)),
     ),
   );
+  const entryCap = (raw: unknown): number => (
+    typeof raw === "object" && raw !== null && (raw as { kind?: unknown }).kind === "message"
+      ? perEntryBytes
+      : Math.max(REFLECTION_MIN_ENTRY_BYTES, Math.min(REFLECTION_UNTRUSTED_ENTRY_BYTES, perEntryBytes))
+  );
+  // Coverage-tracked path: with sequenceIds the batch must stay contiguous
+  // from the interval start, and the declared boundary is the last covered
+  // sequence. The deferred tail is picked up by a follow-up job.
+  if (input.entrySequenceIds !== undefined && input.entrySequenceIds.length === input.entries.length && input.entries.length > 0) {
+    const covered: unknown[] = [];
+    let coveredIndex = -1;
+    for (let index = 0; index < input.entries.length; index += 1) {
+      const projected = projectReflectionEntry(input.entries[index], entryCap(input.entries[index]));
+      if (reflectionPayloadBytes({ ...base, entries: [...covered, projected] }) > targetBytes) {
+        if (covered.length === 0) {
+          // Even an oversized first entry advances the boundary by one.
+          covered.push(projectReflectionEntry(input.entries[index], REFLECTION_MIN_ENTRY_BYTES));
+          coveredIndex = 0;
+        }
+        break;
+      }
+      covered.push(projected);
+      coveredIndex = index;
+    }
+    const coveredThrough = input.entrySequenceIds[coveredIndex]!;
+    const omitted = input.entries.length - covered.length;
+    return {
+      ...base,
+      throughSequenceId: coveredThrough,
+      ...(coveredThrough < input.throughSequenceId ? { deferredThroughSequenceId: input.throughSequenceId } : {}),
+      entries: omitted > 0
+        ? [{ kind: "notice", untrusted: true, text: `${omitted} later transcript entries deferred to the next OpenBot reflection job` }, ...covered]
+        : covered,
+    };
+  }
   const selected = new Map<number, unknown>();
   for (const index of anchorIndexes) {
     const raw = input.entries[index];
@@ -630,6 +744,23 @@ function buildContextSearchQueries(prompt: string, currentAttachmentContext: str
   return queries;
 }
 
+/**
+ * Round-robin merge of ranked lists: depth-first across queries so no single
+ * query can fill the selection before other lists contribute candidates.
+ * Scores are never compared across different queries.
+ */
+function mergeRankedLists<T>(lists: readonly (readonly T[])[]): T[] {
+  const merged: T[] = [];
+  const maxDepth = Math.max(0, ...lists.map((list) => list.length));
+  for (let depth = 0; depth < maxDepth; depth += 1) {
+    for (const list of lists) {
+      const item = list[depth];
+      if (item !== undefined) merged.push(item);
+    }
+  }
+  return merged;
+}
+
 function dedupeMemories(results: readonly MemorySearchResult[]): Memory[] {
   const seen = new Set<string>();
   const deduped: Memory[] = [];
@@ -694,6 +825,13 @@ function isGenericPrompt(text: string): boolean {
   return /^(continue|continua|segue|e ai|e agora|isso|same|same thing|what about that|aquele|aquilo)\b/u.test(normalized);
 }
 
+/** Skip expensive cross-chat search for acknowledgements, not for short questions. */
+function shouldSkipCrossChatRetrieval(text: string): boolean {
+  const normalized = normalizeLine(text).toLocaleLowerCase();
+  if (normalized.length === 0) return true;
+  return /^(ok|okay|okey|thanks|thank you|thx|obrigad[oa]|valeu|tmj|e ai|e agora|isso|same|same thing|what about that|aquele|aquilo)[!?.,]*$/u.test(normalized);
+}
+
 export function isExplicitMemoryIntent(prompt: string): boolean {
   const normalized = normalizeForIntent(prompt);
   const englishLead = /^(?:(?:please|can you|could you|will you)\s+)?(?:remember|memorize|save|store|keep)\b[\s,:-]{0,12}(?:this|that|it|my|for later|for next time|preference|setting)/u;
@@ -704,6 +842,20 @@ export function isExplicitMemoryIntent(prompt: string): boolean {
   return matchesAnyPattern(normalized, [englishLead, portugueseLead, portugueseFacts, spanishLead, forgetLead]);
 }
 
+/**
+ * Explicit forget/delete intent, anchored at the start of the current user
+ * message. Requires a memory-directed target so colloquial uses ("forget it",
+ * "apague o arquivo") do not enable the mutation; negations ("não esqueça",
+ * "don't forget") and quoted forms cannot match the leading-verb anchors.
+ */
+export function isExplicitMemoryForgetIntent(prompt: string): boolean {
+  const normalized = normalizeForIntent(prompt);
+  const englishForget = /^(?:(?:please|can you|could you|will you)\s+)?(?:forget|erase|delete|remove|drop)\b[\s,:-]{0,12}(?:[\p{L}\p{N}_]+[\s,:-]+){0,4}(?:memor(?:y|ies)|preferences?|settings?|facts?|notes?|instructions?|records?|details?|what you (?:learned|know)(?: about me)?)/u;
+  const portugueseForget = /^(?:por favor[\s,]+)?(?:(?:voce (?:pode|poderia)\s+)?(?:esquecer|apagar|deletar|remover|excluir|descartar)|(?:esqueca|apague|delete|remova|exclua|descarte))\b[\s,:-]{0,12}(?:[\p{L}\p{N}_]+[\s,:-]+){0,4}(?:memorias?|preferencias?|configurac(?:ao|oes)|fatos?|notas?|dados?|informac(?:ao|oes)|instruc(?:ao|oes)|registros?|detalhes?|o que (?:voce )?(?:aprendeu|sabe)(?: sobre mim)?)/u;
+  const spanishForget = /^[¿¡]?\s*(?:por favor[\s,]+)?(?:(?:puedes|podrias)\s+)?(?:olvida(?:r)?|borra(?:r)?|elimina(?:r)?)\b[\s,:-]{0,12}(?:[\p{L}\p{N}_]+[\s,:-]+){0,4}(?:memorias?|preferencias?|configuracion(?:es)?|datos?|notas?|informacion|instruccion(?:es)?|registros?|lo que (?:aprendiste|sabes)(?: de mi)?)/u;
+  return matchesAnyPattern(normalized, [englishForget, portugueseForget, spanishForget]);
+}
+
 export function isContextOverflowError(error: unknown): boolean {
   const text = error instanceof Error ? `${error.message} ${String((error as { code?: unknown }).code ?? "")}` : String(error ?? "");
   return /context window|context overflow|context[_ -]?length[_ -]?exceeded|input exceeds|prompt too long|max context|too many tokens/iu.test(text);
@@ -711,13 +863,6 @@ export function isContextOverflowError(error: unknown): boolean {
 
 export function shouldEnableCrossChatMemory(mode: MemoryMode, conversation: ConversationContextInfo): boolean {
   return mode !== "off" && !conversation.temporary;
-}
-
-export function shouldCreateReflectionJob(mode: MemoryMode, conversation: ConversationContextInfo, prompt: string): boolean {
-  if (conversation.temporary) return false;
-  if (mode === "off") return false;
-  if (mode === "automatic") return true;
-  return isExplicitMemoryIntent(prompt);
 }
 
 const MEMORY_SAFETY_GUIDANCE = [
@@ -733,23 +878,30 @@ export function buildMemorySystemGuidance(
   explicitIntent: boolean,
 ): string {
   if (mode === "off" || conversation.temporary) return "";
-  if (mode === "automatic") {
-    return [
-      "OpenBot memory is persistent and isolated to this agent. Use memory_search when prior context may help.",
-      "After significant work and before the final answer, decide once whether a durable fact, preference, correction, decision, constraint, open loop, or reusable procedure would prevent future rework. Call memory_remember to save or update by reusing canonicalKey, and memory_forget to remove outdated memories; when the user corrects something previously remembered, update or forget instead of adding a duplicate.",
-      PROFILE_GUIDANCE,
-      MEMORY_SAFETY_GUIDANCE,
-    ].join(" ");
-  }
   if (explicitIntent) {
     return [
       "OpenBot memory is persistent and isolated to this agent. Use memory_search when prior context may help.",
-      "The current user message explicitly requests persistent memory, so memory_remember and memory_forget are available for that request; reuse canonicalKey to update an existing memory instead of creating a duplicate.",
+      "The current user message explicitly requests persistent memory changes, so the memory mutation tools authorized for that request (memory_remember and/or memory_forget) are available; reuse canonicalKey to update an existing memory instead of creating a duplicate.",
       PROFILE_GUIDANCE,
       MEMORY_SAFETY_GUIDANCE,
     ].join(" ");
   }
+  if (mode === "automatic") {
+    return [
+      "OpenBot memory is persistent and isolated to this agent. Use memory_search when prior context may help.",
+      "Durable memories are recorded automatically after the turn; do not try to persist or delete them during this reply.",
+      PROFILE_GUIDANCE,
+    ].join(" ");
+  }
   return "OpenBot memory is persistent and isolated to this agent, and memory_search can retrieve it. In explicit mode, persistent writes are available only when the current user message explicitly asks to remember something.";
+}
+
+function liveMemoryMutationEnabled(
+  mode: MemoryMode,
+  conversation: ConversationContextInfo,
+  explicitIntent: boolean,
+): boolean {
+  return explicitIntent && !conversation.temporary && (mode === "automatic" || mode === "explicit");
 }
 
 export function createMemorySearchTool(options: MemoryToolOptions): ProviderTool | undefined {
@@ -774,8 +926,8 @@ export function createMemorySearchTool(options: MemoryToolOptions): ProviderTool
 }
 
 export function createMemoryRememberTool(options: MemoryRememberToolOptions): ProviderTool | undefined {
-  const enabled = options.mode === "automatic" || (options.mode === "explicit" && options.explicitIntent);
-  if (!enabled || options.conversation.temporary || options.conversationId === undefined || options.sourceEntryId === undefined) return undefined;
+  if (!liveMemoryMutationEnabled(options.mode, options.conversation, options.explicitIntent)
+    || options.conversationId === undefined || options.sourceEntryId === undefined) return undefined;
   return {
     type: "function",
     function: {
@@ -855,13 +1007,13 @@ function memoryToolFailure(error: unknown, toolName: string): { code: string; me
 }
 
 export function createMemoryForgetTool(options: MemoryRememberToolOptions): ProviderTool | undefined {
-  const enabled = options.mode === "automatic" || (options.mode === "explicit" && options.explicitIntent);
-  if (!enabled || options.conversation.temporary || options.conversationId === undefined || options.sourceEntryId === undefined) return undefined;
+  if (!liveMemoryMutationEnabled(options.mode, options.conversation, options.explicitIntent || options.explicitForgetIntent === true)
+    || options.conversationId === undefined || options.sourceEntryId === undefined) return undefined;
   return {
     type: "function",
     function: {
       name: MEMORY_FORGET_TOOL_NAME,
-      description: "Removes an active durable memory by canonicalKey for this OpenBot agent.",
+      description: "Marks an active durable memory as forgotten by canonicalKey for this OpenBot agent — it is excluded from future context and recall; the record is retained as a permanent tombstone.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -907,8 +1059,8 @@ export async function executeMemoryRememberTool(
 ): Promise<ToolExecutionResult> {
   if (context.call.function.name !== MEMORY_REMEMBER_TOOL_NAME) return { handled: false };
   const currentMode = options.memoryStore.getSettings(options.agentId).mode;
-  const enabled = currentMode === "automatic" || (currentMode === "explicit" && options.explicitIntent);
-  if (!enabled || options.conversation.temporary || options.conversationId === undefined || options.sourceEntryId === undefined) {
+  const enabled = liveMemoryMutationEnabled(currentMode, options.conversation, options.explicitIntent);
+  if (!enabled || options.conversationId === undefined || options.sourceEntryId === undefined) {
     const message = "memory_remember is disabled for this conversation or prompt";
     return { handled: true, ok: false, content: "", error: message, result: { ok: false, code: "policy", message } };
   }
@@ -935,7 +1087,10 @@ export async function executeMemoryRememberTool(
       ? { kind: "user" as const }
       : { kind: "automatic" as const, conversationId: options.conversationId, evidenceIds: [options.sourceEntryId] };
     const previous = findActiveByCanonicalKey(options.memoryStore, targetAgentId, args.canonicalKey);
-    const id = `memory:${createHash("sha256").update(targetAgentId).update("\0").update(args.canonicalKey).digest("hex")}`;
+    // Reuse the active identity when one exists: after a forget+recreate cycle
+    // the active row has a fresh id, and resending the retired deterministic id
+    // is rejected by the store as a tombstone replacing the active identity.
+    const id = previous?.id ?? `memory:${createHash("sha256").update(targetAgentId).update("\0").update(args.canonicalKey).digest("hex")}`;
     const memory = options.memoryStore.upsertMemory(targetAgentId, {
       id,
       kind: args.kind,
@@ -978,8 +1133,8 @@ export async function executeMemoryForgetTool(
 ): Promise<ToolExecutionResult> {
   if (context.call.function.name !== MEMORY_FORGET_TOOL_NAME) return { handled: false };
   const currentMode = options.memoryStore.getSettings(options.agentId).mode;
-  const enabled = currentMode === "automatic" || (currentMode === "explicit" && options.explicitIntent);
-  if (!enabled || options.conversation.temporary || options.conversationId === undefined || options.sourceEntryId === undefined) {
+  const enabled = liveMemoryMutationEnabled(currentMode, options.conversation, options.explicitIntent || options.explicitForgetIntent === true);
+  if (!enabled || options.conversationId === undefined || options.sourceEntryId === undefined) {
     const message = "memory_forget is disabled for this conversation or prompt";
     return { handled: true, ok: false, content: "", error: message, result: { ok: false, code: "policy", message } };
   }
@@ -999,7 +1154,10 @@ export async function executeMemoryForgetTool(
       const message = `memory not found: ${args.canonicalKey}`;
       return { handled: true, ok: false, content: "", error: message, result: { ok: false, code: "not_found", message } };
     }
-    const authority = options.explicitIntent
+    // Forget authorization comes from the explicit FORGET request, not from a
+    // remember intent: "esqueça X" alone must be able to retire even a
+    // trust:user memory the user ordered saved, while granting no extra writes.
+    const authority = options.explicitForgetIntent === true
       ? { kind: "user" as const }
       : { kind: "automatic" as const, conversationId: options.conversationId, evidenceIds: [options.sourceEntryId] };
     options.memoryStore.forgetMemory(targetAgentId, memory.id, authority, args.reason);
@@ -1118,14 +1276,17 @@ export async function executeMemorySearchTool(
         provenance: { source: "memory", memoryId: hit.memory.id, sourceEntryIds: hit.memory.sourceEntryIds },
         memory: hit.memory,
       }));
-    const results = [
-      ...profileHits,
-      ...options.memoryStore.searchHistory(options.agentId, args.query, {
+    // Agent results interleave with shared-profile hits and keep precedence at
+    // low limits — a conversation-scoped query must not lose its only slot to
+    // the cross-bot profile.
+    const results = mergeRankedLists<HistorySearchResult>([
+      options.memoryStore.searchHistory(options.agentId, args.query, {
         automatic: true,
         limit: args.limit,
         ...(args.conversationId === undefined ? {} : { conversationId: args.conversationId }),
       }),
-    ].slice(0, args.limit);
+      profileHits,
+    ]).slice(0, args.limit);
     options.onContextSources?.(historyContextSources(results));
     return {
       handled: true,
@@ -1151,10 +1312,12 @@ function buildRecentMessages(
   conversationId: string | undefined,
   afterSequenceId: number | undefined,
   currentAttachmentContext: string,
+  currentTurnContext: string,
   currentPromptOverride: { original: string; normalized: string } | undefined,
   omittedAssistantTurnId: string | undefined,
-): ProviderChatMessage[] {
+): { messages: ProviderChatMessage[]; sourceMessages: Array<{ id: string; role: "user" | "assistant"; content: string }> } {
   const messages: ProviderChatMessage[] = [];
+  const sourceMessages: Array<{ id: string; role: "user" | "assistant"; content: string }> = [];
   let pendingUser: string | undefined;
   let pendingToolHistory: string[] = [];
   const flushUser = () => {
@@ -1173,6 +1336,10 @@ function buildRecentMessages(
     ...(afterSequenceId === undefined ? {} : { afterSequenceId }),
   }, conversationId);
   for (const entry of recent) {
+    if (entry.kind === "message" && (entry.role === "user" || entry.role === "assistant")
+        && typeof entry.id === "string" && entry.content.length > 0) {
+      sourceMessages.push({ id: entry.id, role: entry.role, content: entry.content });
+    }
     if (entry.kind === "message" && entry.role === "user") {
       flushToolHistory();
       flushUser();
@@ -1213,15 +1380,21 @@ function buildRecentMessages(
     }
   }
   const sanitizedCurrentAttachmentContext = currentAttachmentContext ? sanitizeProviderContextText(currentAttachmentContext) : "";
-  if (sanitizedCurrentAttachmentContext && messages.length > 0) {
+  const sanitizedCurrentTurnContext = currentTurnContext ? sanitizeProviderContextText(currentTurnContext) : "";
+  if ((sanitizedCurrentAttachmentContext || sanitizedCurrentTurnContext) && messages.length > 0) {
     const last = messages[messages.length - 1];
-    if (last?.role === "user" && typeof last.content === "string" && !last.content.includes("[[OPENBOT_UNTRUSTED_ATTACHMENT_BEGIN]]")) {
-      last.content = last.content.length > 0
-        ? `${last.content}\n\n${sanitizedCurrentAttachmentContext}`
-        : sanitizedCurrentAttachmentContext;
+    if (last?.role === "user" && typeof last.content === "string") {
+      const parts: string[] = [];
+      if (sanitizedCurrentAttachmentContext && !last.content.includes("[[OPENBOT_UNTRUSTED_ATTACHMENT_BEGIN]]")) parts.push(sanitizedCurrentAttachmentContext);
+      if (sanitizedCurrentTurnContext) parts.push(sanitizedCurrentTurnContext);
+      if (parts.length > 0) {
+        last.content = last.content.length > 0
+          ? `${last.content}\n\n${parts.join("\n\n")}`
+          : parts.join("\n\n");
+      }
     }
   }
-  return messages;
+  return { messages, sourceMessages };
 }
 
 function selectRecentMessages(messages: readonly ProviderChatMessage[], limit: number): ProviderChatMessage[] {
@@ -1243,6 +1416,22 @@ function buildUserContextMessage(blocks: readonly string[]): ProviderChatMessage
     role: "user",
     content: `${OPENBOT_UNTRUSTED_MEMORY_CONTEXT_BEGIN}\n${cleaned.join("\n\n")}\n${OPENBOT_UNTRUSTED_MEMORY_CONTEXT_END}`,
   };
+}
+
+function placeContextAtSuffix(
+  recent: readonly ProviderChatMessage[],
+  context: ProviderChatMessage | undefined,
+): ProviderChatMessage[] {
+  if (context === undefined) return [...recent];
+  let lastUser = -1;
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
+    if (recent[index]?.role === "user") {
+      lastUser = index;
+      break;
+    }
+  }
+  if (lastUser === -1) return [...recent, context];
+  return [...recent.slice(0, lastUser), context, ...recent.slice(lastUser)];
 }
 
 export class ContextAssembler {
@@ -1273,20 +1462,39 @@ export class ContextAssembler {
     const currentSummary = input.conversationId === undefined
       ? null
       : input.memoryStore.getSummary(input.agentId, input.conversationId, true);
-    const recentMessages = buildRecentMessages(
+    const { messages: recentMessages, sourceMessages } = buildRecentMessages(
       input.recentStore,
       input.agentId,
       input.conversationId,
       currentSummary?.throughSequenceId,
       input.currentAttachmentContext ?? "",
+      input.currentTurnContext ?? "",
       input.currentPromptOverride,
       input.omittedAssistantTurnId,
     );
+    const queryContext = [input.currentAttachmentContext ?? "", input.currentTurnContext ?? ""]
+      .filter((value) => value.trim().length > 0)
+      .join("\n\n");
     const crossChatEnabled = shouldEnableCrossChatMemory(input.mode, input.conversation);
     const genericPrompt = isGenericPrompt(input.prompt);
+    const skipCrossChatRetrieval = shouldSkipCrossChatRetrieval(input.prompt);
+    // A memory sourced from this conversation is already represented while its
+    // source entries remain in the recent window; once compaction moves the
+    // boundary past them, the memory must become visible again.
+    const recentSourceIds = new Set(sourceMessages.map((entry) => entry.id));
+    const representedInRecent = (memory: Memory): boolean => memory.sourceEntryIds.some((source) => {
+      const entryId = typeof source === "string" ? source : source.entryId;
+      const sourceConversation = typeof source === "string" ? undefined : source.conversationId;
+      return (sourceConversation === undefined || sourceConversation === input.conversationId) && recentSourceIds.has(entryId);
+    });
+    // Without source entries there is no positive evidence the memory's fact
+    // left the recent window, so the historical exclusion is kept.
+    const conversationScopedOut = (memory: Memory): boolean => input.conversationId !== undefined
+      && memoryReferencesConversation(memory, input.conversationId)
+      && (memory.sourceEntryIds.length === 0 || representedInRecent(memory));
     const pinned = crossChatEnabled
       ? input.memoryStore.listMemories(input.agentId, { limit: 64, automatic: true })
-        .filter((memory) => memory.pinned && (input.conversationId === undefined || !memoryReferencesConversation(memory, input.conversationId)))
+        .filter((memory) => memory.pinned && !conversationScopedOut(memory))
         .slice(0, 6)
       : [];
     const pinnedIds = new Set(pinned.map((memory) => memory.id));
@@ -1305,7 +1513,7 @@ export class ContextAssembler {
         kind: ["identity", "preference", "constraint"],
         limit: 64,
       })
-        .filter((memory) => input.conversationId === undefined || !memoryReferencesConversation(memory, input.conversationId))
+        .filter((memory) => !conversationScopedOut(memory))
         .sort((left, right) => (
           (right.pinned ? 1 : 0) - (left.pinned ? 1 : 0)
           || right.importance - left.importance
@@ -1315,20 +1523,20 @@ export class ContextAssembler {
         .slice(0, 8)
       : [];
     const coreIds = new Set(coreCandidates.map((memory) => memory.id));
-    const relevant = crossChatEnabled
-      ? dedupeMemories(buildContextSearchQueries(input.prompt, input.currentAttachmentContext ?? "")
-        .flatMap((query) => input.memoryStore.searchMemories(input.agentId, query, { limit: 6, automatic: true }))
-        .filter((result) => input.conversationId === undefined || !memoryReferencesConversation(result.memory, input.conversationId)))
+    const relevant = crossChatEnabled && !skipCrossChatRetrieval
+      ? dedupeMemories(mergeRankedLists(buildContextSearchQueries(input.prompt, queryContext)
+        .map((query) => input.memoryStore.searchMemories(input.agentId, query, { limit: 6, automatic: true })))
+        .filter((result) => !conversationScopedOut(result.memory)))
       : [];
     const historySummaryCache = new Map<string, ConversationSummary | null>();
-    const history = crossChatEnabled
-      ? dedupeHistory(buildContextSearchQueries(input.prompt, input.currentAttachmentContext ?? "")
-        .flatMap((query) => input.memoryStore.searchHistory(input.agentId, query, {
+    const history = crossChatEnabled && !skipCrossChatRetrieval
+      ? dedupeHistory(mergeRankedLists(buildContextSearchQueries(input.prompt, queryContext)
+        .map((query) => input.memoryStore.searchHistory(input.agentId, query, {
           automatic: true,
           limit: 6,
           includeMemories: false,
           ...(input.conversationId === undefined ? {} : { excludeConversationId: input.conversationId }),
-        })))
+        }))))
         .filter((result) => {
           if (input.conversationId !== undefined && result.conversationId === input.conversationId) return false;
           if (result.kind !== "message" || result.conversationId === null || result.sequenceId === null) return true;
@@ -1349,9 +1557,15 @@ export class ContextAssembler {
     let profileBytes = Math.max(160, Math.floor(DEFAULT_MEMORY_ITEM_BYTES * clampedScale));
     let relevantCount = relevant.length === 0 ? 0 : Math.max(1, Math.ceil(relevant.length * clampedScale));
     let relevantBytes = Math.max(160, Math.floor(DEFAULT_MEMORY_ITEM_BYTES * clampedScale));
+    // With slack the full summary is kept; the shrink loop below reduces it
+    // only under real byte/token pressure instead of a fixed positional cut.
+    const summaryTextBytes = currentSummary?.renderedText ? byteLength(currentSummary.renderedText) : 0;
     let summaryBytes = Math.max(
       MIN_SUMMARY_BYTES,
-      Math.floor((genericPrompt ? DEFAULT_SUMMARY_BYTES : Math.floor(DEFAULT_SUMMARY_BYTES * 0.75)) * clampedScale),
+      Math.max(
+        Math.min(summaryTextBytes, MEMORY_POLICY_LIMITS.renderedSummaryBytes),
+        Math.floor((genericPrompt ? DEFAULT_SUMMARY_BYTES : Math.floor(DEFAULT_SUMMARY_BYTES * 0.75)) * clampedScale),
+      ),
     );
     let recentLimit = Math.max(4, Math.floor(MAX_CONTEXT_RECENT_MESSAGES * Math.max(0.5, clampedScale)));
     const initialLimits = { historyCount, historyBytes, coreCount, coreBytes, profileCount, profileBytes, relevantCount, relevantBytes, summaryBytes, recentLimit };
@@ -1375,8 +1589,8 @@ export class ContextAssembler {
           .map((memory) => summarizeMemory(memory, relevantBytes)),
       );
       if (relevantBlock) blocks.push(relevantBlock);
-      if (currentSummary?.renderedText) {
-        const summaryBlock = buildUntrustedBlock("Current conversation summary", [truncateText(currentSummary.renderedText, summaryBytes)]);
+      if (currentSummary?.renderedText || (currentSummary !== null && currentSummary !== undefined && currentSummary.summaryJson !== undefined && currentSummary.summaryJson !== null)) {
+        const summaryBlock = buildUntrustedBlock("Current conversation summary", selectSummaryContent(currentSummary, summaryBytes));
         if (summaryBlock) blocks.push(summaryBlock);
       }
       const historyBlock = buildUntrustedBlock(
@@ -1390,12 +1604,12 @@ export class ContextAssembler {
           .flatMap(sourcesForMemory),
         ...historyContextSources(history.slice(0, historyCount)),
         ...(currentSummary ? [{ conversationId: currentSummary.conversationId, throughSequenceId: currentSummary.throughSequenceId, updatedAtMs: currentSummary.updatedAtMs }] : []),
-        ...(input.conversationId === undefined ? [] : input.recentStore.getRecentEntries(input.agentId, { limit: MAX_CONTEXT_RECENT_MESSAGES * 2, kinds: ["message"] }, input.conversationId)
-          .flatMap((entry): MemoryContextSource[] => entry.kind === "message" && entry.content.length > 0 && recent.some((message) => message.role === entry.role && typeof message.content === "string" && message.content.includes(entry.content))
-            ? [{ conversationId: input.conversationId!, entryId: entry.id }] : [])),
+        ...(input.conversationId === undefined ? [] : sourceMessages
+          .filter((entry) => recent.some((message) => message.role === entry.role && typeof message.content === "string" && message.content.includes(entry.content)))
+          .map((entry) => ({ conversationId: input.conversationId!, entryId: entry.id }))),
       ];
       const contextMessage = buildUserContextMessage(blocks);
-      const assembled = [...(contextMessage === undefined ? [] : [contextMessage]), ...recent];
+      const assembled = placeContextAtSuffix(recent, contextMessage);
       const bytes = Buffer.byteLength(JSON.stringify(assembled), "utf8");
       const modelFitted = modelBudget === undefined || modelTokenizer === undefined
         ? assembled

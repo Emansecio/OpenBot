@@ -86,6 +86,45 @@ describe("memory context integration", () => {
     expect(memory.getForgottenSourceIds("agent-a", next).has(repeated.id)).toBe(false);
     store.close();
   });
+  it("propagates a forget across bots through an active shared-profile memory", () => {
+    const store = createTranscriptStore();
+    const memory = store.memoryStore;
+    const convA = store.conversationStore.create("agent-a").id;
+    const convB = store.conversationStore.create("agent-b").id;
+    const userTurn = { kind: "message" as const, id: "a-u1", role: "user" as const, content: "fato privado de A", timestampMs: 1, streaming: false };
+    store.append("agent-a", [userTurn], convA);
+    const privateMemory = memory.upsertMemory("agent-a", {
+      kind: "fact",
+      canonicalKey: "priv-a",
+      text: "fato privado de A",
+      trust: "verified_tool",
+      sourceConversationId: convA,
+      sourceEntryIds: [{ conversationId: convA, entryId: userTurn.id }],
+    }, { kind: "admin" });
+    store.append("agent-a", [{ ...userTurn, id: "a-r1", role: "assistant", content: "resposta de A usando a memória", memoryContextSources: [{ memoryId: privateMemory.id }] }], convA);
+    const profileMemory = memory.upsertMemory(USER_PROFILE_AGENT_ID, {
+      kind: "preference",
+      canonicalKey: "lang",
+      text: "prefere português",
+      trust: "verified_tool",
+      sourceConversationId: convA,
+      sourceEntryIds: [{ conversationId: convA, entryId: "a-r1" }],
+    }, { kind: "admin" });
+    store.append("agent-b", [{
+      kind: "message",
+      id: "b-r1",
+      role: "assistant",
+      content: "resposta de B usando o perfil compartilhado",
+      timestampMs: 2,
+      streaming: false,
+      memoryContextSources: [{ memoryId: profileMemory.id }, { conversationId: convA, entryId: "a-r1" }],
+    }], convB);
+
+    memory.forgetMemory("agent-a", privateMemory.id, { kind: "user" });
+    expect(memory.getForgottenSourceIds("agent-b", convB).has("b-r1")).toBe(true);
+    expect(memory.hasForgottenContextSources("agent-b", [{ conversationId: convB, entryId: "b-r1" }])).toBe(true);
+    store.close();
+  });
   it("fails closed when fixed system/tool/note bytes consume the hard cap", () => {
     const store = createTranscriptStore();
     const conversationId = store.conversationStore.create("agent-a").id;
@@ -106,6 +145,45 @@ describe("memory context integration", () => {
     expect(assembled.availableBytes).toBe(0);
     expect(assembled.messages).toEqual([]);
     expect(assembled.truncated).toBe(true);
+    store.close();
+  });
+  it("keeps structured work-state fields whole under summary pressure and fills the rest with rendered text", () => {
+    const store = createTranscriptStore();
+    const conversationId = store.conversationStore.create("agent-a").id;
+    store.append("agent-a", [{ kind: "message", id: "turn-1", role: "user", content: "vamos continuar", timestampMs: 1, streaming: false }], conversationId);
+    store.memoryStore.upsertSummary("agent-a", {
+      conversationId,
+      throughSequenceId: 1,
+      summaryJson: {
+        notes: `NTFILL${"n".repeat(800)}`,
+        goal: "GOAL-NORTE-42",
+        pending: "PEND-RELATORIO",
+        decisions: ["DECISAO-ALPHA"],
+      },
+      renderedText: `INICIO ${"m".repeat(300)} MIDMARKER ${"m".repeat(300)} FIM`,
+      updatedAtMs: 1,
+    });
+    const assembled = new ContextAssembler().assemble({
+      agentId: "agent-a",
+      conversationId,
+      prompt: "siga",
+      recentStore: store,
+      memoryStore: store.memoryStore,
+      mode: "automatic",
+      conversation: { temporary: false },
+      systemText: "",
+      toolText: "",
+      modelCapabilities: { contextWindow: 4_000, maxOutputTokens: 100, maxRequestBytes: 1_024, tokenizerStrategy: "estimated", safetyMargin: 0.1 },
+      modelTokenizer: createContextTokenizer("bytes"),
+    });
+    const content = JSON.stringify(assembled.messages);
+    expect(content).toContain("GOAL-NORTE-42");
+    expect(content).toContain("PEND-RELATORIO");
+    expect(content).toContain("DECISAO-ALPHA");
+    expect(content).not.toContain("NTFILL");
+    expect(content).toContain("INICIO");
+    expect(content).toContain("FIM");
+    expect(content).not.toContain("MIDMARKER");
     store.close();
   });
   it("recognizes explicit memory intent in PT/ES without overmatching ordinary prompts", () => {
@@ -191,11 +269,11 @@ describe("memory context integration", () => {
     });
     const runner = createTurnRunner({ registry, store });
 
-    runner.sendPrompt({ agentId: "agent-a", prompt: "Conclua a revisão da release.", conversationId });
+    runner.sendPrompt({ agentId: "agent-a", prompt: "Lembre que na release comparamos hashes instalados com os do pacote.", conversationId });
     await runner.flush("agent-a");
 
     expect(requests).toHaveLength(3);
-    expect(requests[0]!.system).toContain("before the final answer");
+    expect(requests[0]!.system).toContain("explicitly requests persistent memory");
     expect(requests[0]!.system).toContain("Never claim that a memory was saved before memory_remember returns success");
     expect(requests[0]!.tools?.map((tool) => tool.function.name)).toEqual(expect.arrayContaining([
       MEMORY_SEARCH_TOOL_NAME,
@@ -211,7 +289,7 @@ describe("memory context integration", () => {
     expect(memory).toEqual(expect.objectContaining({
       kind: "procedure",
       canonicalKey: "release-check",
-      trust: "external_observation",
+      trust: "user",
       sourceConversationId: conversationId,
       pinned: false,
     }));
@@ -380,7 +458,7 @@ describe("memory context integration", () => {
     expect(automaticBlocked).toEqual(expect.objectContaining({
       handled: true,
       ok: false,
-      result: expect.objectContaining({ code: "protected_target" }),
+      result: expect.objectContaining({ code: "policy" }),
     }));
     expect(store.memoryStore.getMemory("agent-a", saved.id)).toEqual(expect.objectContaining({
       text: saved.text,
@@ -457,7 +535,7 @@ describe("memory context integration", () => {
       kind: "message",
       id: "original-retry-user",
       role: "user",
-      content: "Faça a tarefa.",
+      content: "Lembre que a memória do retry usa a mensagem original.",
       timestampMs: 1,
       streaming: false,
       turnId: "turn:failed-memory",
@@ -562,6 +640,100 @@ describe("memory context integration", () => {
     expect(String(request.messages[0]?.content)).toContain("MALICIOUSPAYLOAD");
     expect(String(request.messages[0]?.content)).toContain(OPENBOT_UNTRUSTED_MEMORY_CONTEXT_END);
     expect(request.messages.at(-1)).toEqual({ role: "user", content: "MALICIOUSPAYLOAD" });
+    store.close();
+  });
+
+  it("places retrieved memory immediately before the current user message", () => {
+    const store = createTranscriptStore();
+    const conversationId = store.conversationStore.create("agent-a").id;
+    store.memoryStore.setSettings("agent-a", "automatic");
+    store.append("agent-a", [{
+      kind: "message",
+      id: "older-user",
+      role: "user",
+      content: "older question about the workspace",
+      timestampMs: 1,
+      streaming: false,
+    }, {
+      kind: "message",
+      id: "older-assistant",
+      role: "assistant",
+      content: "older answer",
+      timestampMs: 2,
+      streaming: false,
+    }, {
+      kind: "message",
+      id: "current-user",
+      role: "user",
+      content: "what should I do next in this project plan",
+      timestampMs: 3,
+      streaming: false,
+    }], conversationId);
+    store.memoryStore.upsertMemory("agent-a", {
+      kind: "preference",
+      canonicalKey: "core-pref",
+      text: "prefers zzzqxp silent mode always",
+      trust: "external_observation",
+      sourceConversationId: store.conversationStore.create("agent-a").id,
+    }, { kind: "admin" });
+
+    const assembled = new ContextAssembler().assemble({
+      agentId: "agent-a",
+      conversationId,
+      prompt: "what should I do next in this project plan",
+      recentStore: store,
+      memoryStore: store.memoryStore,
+      mode: "automatic",
+      conversation: { temporary: false },
+      systemText: "",
+      toolText: "",
+    });
+    const roles = assembled.messages.map((message) => (
+      message.role === "user" && typeof message.content === "string" && message.content.includes(OPENBOT_UNTRUSTED_MEMORY_CONTEXT_BEGIN)
+        ? "memory"
+        : message.role
+    ));
+    expect(roles.at(-2)).toBe("memory");
+    expect(roles.at(-1)).toBe("user");
+    expect(roles[0]).not.toBe("memory");
+    expect(assembled.messages.at(-1)).toEqual(expect.objectContaining({ role: "user", content: expect.stringContaining("what should I do next") }));
+    store.close();
+  });
+
+  it("skips cross-chat retrieval for generic follow-ups", () => {
+    const store = createTranscriptStore();
+    const currentConversation = store.conversationStore.create("agent-a").id;
+    const otherConversation = store.conversationStore.create("agent-a").id;
+    store.memoryStore.setSettings("agent-a", "automatic");
+    store.append("agent-a", [{
+      kind: "message",
+      id: "other-history",
+      role: "user",
+      content: "sharedquery OTHER_HISTORY_NEEDLE retained",
+      timestampMs: 1,
+      streaming: false,
+    }], otherConversation);
+    store.append("agent-a", [{
+      kind: "message",
+      id: "current",
+      role: "user",
+      content: "ok",
+      timestampMs: 2,
+      streaming: false,
+    }], currentConversation);
+
+    const assembled = new ContextAssembler().assemble({
+      agentId: "agent-a",
+      conversationId: currentConversation,
+      prompt: "ok",
+      recentStore: store,
+      memoryStore: store.memoryStore,
+      mode: "automatic",
+      conversation: { temporary: false },
+      systemText: "",
+      toolText: "",
+    });
+    expect(JSON.stringify(assembled.messages)).not.toContain("OTHER_HISTORY_NEEDLE");
     store.close();
   });
 
@@ -961,6 +1133,62 @@ describe("memory context integration", () => {
     store.close();
   });
 
+  it.each([false, true])("ignores global sequence gaps with previous summary=%s and still compacts at the local threshold", async (previousSummary) => {
+    const store = createTranscriptStore();
+    try {
+      const conversationId = store.conversationStore.create("agent-a").id;
+      const entry = (id: string) => ({ kind: "message" as const, id, role: "user" as const, content: "short", timestampMs: 1 });
+      store.memoryStore.setSettings("agent-a", "off");
+      if (previousSummary) {
+        store.append("agent-a", [entry("old")], conversationId);
+        store.memoryStore.upsertSummary("agent-a", {
+          conversationId, throughSequenceId: store.getLatestSequenceId("agent-a", conversationId)!,
+          summaryJson: {}, renderedText: "previous", updatedAtMs: 1,
+        });
+      }
+      for (const otherAgent of ["agent-a", "agent-b"]) {
+        const other = store.conversationStore.create(otherAgent).id;
+        store.append(otherAgent, Array.from({ length: 80 }, (_, i) => entry(`other-${i}`)), other);
+      }
+      store.conversationStore.activate("agent-a", conversationId);
+      const registry = createProviderRegistry();
+      registry.register(createFakeAdapter("xai", { deltas: ["ok"] }));
+      const runner = createTurnRunner({ registry, store });
+      runner.sendPrompt({ agentId: "agent-a", prompt: "continue", conversationId });
+      await runner.flush("agent-a");
+      expect(store.memoryStore.listJobs("agent-a")).toEqual([]);
+      store.append("agent-a", Array.from({ length: 35 }, (_, i) => entry(`local-${i}`)), conversationId);
+      runner.sendPrompt({ agentId: "agent-a", prompt: "below threshold", conversationId });
+      await runner.flush("agent-a");
+      expect(store.memoryStore.listJobs("agent-a")).toEqual([]);
+      runner.sendPrompt({ agentId: "agent-a", prompt: "threshold", conversationId });
+      await runner.flush("agent-a");
+      expect(store.memoryStore.listJobs("agent-a")).toEqual([
+        expect.objectContaining({ summaryRequested: true, memoryRequested: false }),
+      ]);
+    } finally { store.close(); }
+  });
+
+  it("still queues summary-only work under context pressure below the entry threshold", async () => {
+    const store = createTranscriptStore();
+    try {
+      const conversationId = store.conversationStore.create("agent-a").id;
+      store.memoryStore.setSettings("agent-a", "off");
+      store.append("agent-a", [
+        { kind: "message", id: "large-user", role: "user", content: "x".repeat(100_000), timestampMs: 1 },
+        { kind: "message", id: "large-assistant", role: "assistant", content: "y".repeat(100_000), timestampMs: 2 },
+      ], conversationId);
+      const registry = createProviderRegistry();
+      registry.register(createFakeAdapter("xai", { deltas: ["ok"] }));
+      const runner = createTurnRunner({ registry, store, resolveProvider: () => ({ provider: "xai", model: "unknown" }) });
+      runner.sendPrompt({ agentId: "agent-a", prompt: "continue", conversationId });
+      await runner.flush("agent-a");
+      expect(store.memoryStore.listJobs("agent-a")).toEqual([
+        expect.objectContaining({ summaryRequested: true, memoryRequested: false }),
+      ]);
+    } finally { store.close(); }
+  });
+
   it("creates memory-synthesis jobs only on explicit intent in explicit mode and never for temporary conversations", async () => {
     const store = createTranscriptStore();
     const explicitConversation = store.conversationStore.create("agent-a").id;
@@ -1140,7 +1368,7 @@ describe("memory context integration", () => {
       conversation: { temporary: false },
       conversationId,
       sourceEntryId: "user-entry-1",
-      explicitIntent: false,
+      explicitIntent: true,
     };
     const remember = (text: string) => executeMemoryRememberTool({
       agentId: "agent-a",
@@ -1163,7 +1391,7 @@ describe("memory context integration", () => {
           arguments: JSON.stringify({ canonicalKey }),
         },
       },
-    }, rememberOptions);
+    }, { ...rememberOptions, explicitIntent: false, explicitForgetIntent: true });
 
     const first = await remember("First release note.");
     expect(first).toEqual(expect.objectContaining({ handled: true, ok: true }));
@@ -1179,7 +1407,7 @@ describe("memory context integration", () => {
         canonicalKey: "release-check",
         text: "Second release note.",
         revision: 2,
-        trust: "external_observation",
+        trust: "user",
         pinned: false,
       }),
     ]);
@@ -1197,6 +1425,136 @@ describe("memory context integration", () => {
       ok: false,
       result: expect.objectContaining({ code: "not_found" }),
     }));
+    store.close();
+  });
+
+  it("keeps a recreated memory updatable by the tool, also across a restart", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "openbot-memory-recreate-"));
+    try {
+      const dbPath = join(dir, "store.db");
+      const remember = (store: SqliteTranscriptStore, conversationId: string, text: string) => executeMemoryRememberTool({
+        agentId: "agent-a",
+        call: {
+          id: `remember-${text}`,
+          type: "function" as const,
+          function: {
+            name: MEMORY_REMEMBER_TOOL_NAME,
+            arguments: JSON.stringify({ kind: "preference", canonicalKey: "coffee-order", text }),
+          },
+        },
+      }, {
+        memoryStore: store.memoryStore,
+        mode: "automatic" as const,
+        agentId: "agent-a",
+        conversation: { temporary: false },
+        conversationId,
+        sourceEntryId: "user-entry-1",
+        explicitIntent: true,
+      });
+      const forget = (store: SqliteTranscriptStore, conversationId: string) => executeMemoryForgetTool({
+        agentId: "agent-a",
+        call: {
+          id: "forget-coffee-order",
+          type: "function" as const,
+          function: {
+            name: MEMORY_FORGET_TOOL_NAME,
+            arguments: JSON.stringify({ canonicalKey: "coffee-order" }),
+          },
+        },
+      }, {
+        memoryStore: store.memoryStore,
+        mode: "automatic" as const,
+        agentId: "agent-a",
+        conversation: { temporary: false },
+        conversationId,
+        sourceEntryId: "user-entry-1",
+        explicitIntent: false,
+        explicitForgetIntent: true,
+      });
+
+      const first = new SqliteTranscriptStore({ path: dbPath });
+      first.memoryStore.setSettings("agent-a", "automatic");
+      const conversationId = first.conversationStore.create("agent-a").id;
+
+      const saved = await remember(first, conversationId, "Prefiro café sem açúcar.");
+      expect(saved).toEqual(expect.objectContaining({ handled: true, ok: true }));
+      if (!saved.handled) throw new Error("memory_remember was not handled");
+      const savedId = JSON.parse(String(saved.content)).id as string;
+
+      expect(await forget(first, conversationId)).toEqual(expect.objectContaining({ handled: true, ok: true }));
+
+      const recreated = await remember(first, conversationId, "Prefiro café com leite.");
+      expect(recreated).toEqual(expect.objectContaining({ handled: true, ok: true }));
+      if (!recreated.handled) throw new Error("memory_remember was not handled");
+      const recreatedId = JSON.parse(String(recreated.content)).id as string;
+      expect(recreatedId).not.toBe(savedId);
+      first.close();
+
+      const second = new SqliteTranscriptStore({ path: dbPath });
+      second.memoryStore.setSettings("agent-a", "automatic");
+      const updated = await remember(second, conversationId, "Prefiro chá.");
+      expect(updated).toEqual(expect.objectContaining({ handled: true, ok: true }));
+      if (!updated.handled) throw new Error("memory_remember was not handled");
+      expect(JSON.parse(String(updated.content))).toMatchObject({ saved: true, updated: true, id: recreatedId });
+
+      expect(second.memoryStore.listMemories("agent-a")).toEqual([
+        expect.objectContaining({ id: recreatedId, canonicalKey: "coffee-order", text: "Prefiro chá.", revision: 2 }),
+      ]);
+      expect(second.memoryStore.listMemories("agent-a", { includeInactive: true })).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: savedId, status: "forgotten", text: "Prefiro café sem açúcar." }),
+      ]));
+      second.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("lets an explicit forget request retire a trust:user memory, while automatic authority stays blocked", async () => {
+    const store = createTranscriptStore();
+    const conversationId = store.conversationStore.create("agent-a").id;
+    store.memoryStore.setSettings("agent-a", "automatic");
+    const saved = store.memoryStore.upsertMemory("agent-a", {
+      kind: "preference",
+      canonicalKey: "coffee-order",
+      text: "O usuário prefere café sem açúcar.",
+      valueJson: null,
+      trust: "user",
+      sourceConversationId: conversationId,
+      sourceEntryIds: [{ conversationId, entryId: "user-entry-1" }],
+    }, { kind: "user" });
+
+    const forget = (options: { explicitIntent: boolean; explicitForgetIntent?: boolean }) => executeMemoryForgetTool({
+      agentId: "agent-a",
+      call: {
+        id: "forget-coffee",
+        type: "function" as const,
+        function: {
+          name: MEMORY_FORGET_TOOL_NAME,
+          arguments: JSON.stringify({ canonicalKey: "coffee-order" }),
+        },
+      },
+    }, {
+      memoryStore: store.memoryStore,
+      mode: "automatic",
+      agentId: "agent-a",
+      conversation: { temporary: false },
+      conversationId,
+      sourceEntryId: "user-entry-2",
+      explicitIntent: options.explicitIntent,
+      explicitForgetIntent: options.explicitForgetIntent,
+    });
+
+    const automaticBlocked = await forget({ explicitIntent: false });
+    expect(automaticBlocked).toEqual(expect.objectContaining({ handled: true, ok: false }));
+    expect(store.memoryStore.getMemory("agent-a", saved.id)).toMatchObject({ status: "active" });
+
+    const rememberIntentOnly = await forget({ explicitIntent: true });
+    expect(rememberIntentOnly).toEqual(expect.objectContaining({ handled: true, ok: false }));
+    expect(store.memoryStore.getMemory("agent-a", saved.id)).toMatchObject({ status: "active" });
+
+    const explicitForget = await forget({ explicitIntent: false, explicitForgetIntent: true });
+    expect(explicitForget).toEqual(expect.objectContaining({ handled: true, ok: true }));
+    expect(store.memoryStore.getMemory("agent-a", saved.id)).toMatchObject({ status: "forgotten" });
     store.close();
   });
 
@@ -1238,6 +1596,54 @@ describe("memory context integration", () => {
     expect(Buffer.byteLength(result.content, "utf8")).toBeLessThanOrEqual(MEMORY_TOOL_RESULT_LIMIT_BYTES);
     expect(result.content).toContain("alpha");
     expect(result.content).not.toContain("beta secret");
+    store.close();
+  });
+
+  it("keeps the agent's own memory ahead of shared profile hits under tight limits", async () => {
+    const store = createTranscriptStore();
+    const conversationId = store.conversationStore.create("agent-a").id;
+    store.memoryStore.setSettings("agent-a", "automatic");
+    store.memoryStore.upsertMemory(USER_PROFILE_AGENT_ID, {
+      kind: "preference",
+      canonicalKey: "coffee-profile",
+      text: "PROFILE coffee answer: black",
+      trust: "user",
+      sourceConversationId: conversationId,
+    }, { kind: "admin" });
+    store.memoryStore.upsertMemory("agent-a", {
+      kind: "fact",
+      canonicalKey: "coffee-agent",
+      text: "AGENT coffee budget: 500",
+      trust: "verified_tool",
+      sourceConversationId: conversationId,
+    }, { kind: "admin" });
+
+    const search = async (args: Record<string, unknown>) => {
+      const result = await executeMemorySearchTool({
+        agentId: "agent-a",
+        call: {
+          id: "call-limited",
+          type: "function",
+          function: { name: MEMORY_SEARCH_TOOL_NAME, arguments: JSON.stringify(args) },
+        },
+      }, {
+        memoryStore: store.memoryStore,
+        mode: "automatic",
+        agentId: "agent-a",
+        conversation: { temporary: false },
+      });
+      if (!result.handled) throw new Error("memory_search should have been handled");
+      return result;
+    };
+
+    const limited = await search({ query: "coffee", limit: 1 });
+    expect(limited.ok).toBe(true);
+    expect(limited.content).toContain("AGENT coffee budget");
+    expect(limited.content).not.toContain("PROFILE coffee answer");
+
+    const wider = await search({ query: "coffee", limit: 3 });
+    expect(wider.content).toContain("AGENT coffee budget");
+    expect(wider.content).toContain("PROFILE coffee answer");
     store.close();
   });
 
@@ -1305,6 +1711,17 @@ describe("memory context integration", () => {
       expect(legacyList[0]).not.toHaveProperty("valueJson");
       expect(legacyList[0]).not.toHaveProperty("sourceEntryIds");
       expect(legacyList[0]).not.toHaveProperty("revision");
+      expect(legacyList[0]).toHaveProperty("scope", "agent");
+
+      store.memoryStore.upsertMemory(USER_PROFILE_AGENT_ID, {
+        kind: "preference",
+        canonicalKey: "rpc-profile",
+        text: "idioma preferido",
+        trust: "user",
+        sourceConversationId: null,
+      }, { kind: "admin" });
+      const profileList = await callRpc(gateway, "listMemories", { agentId: "agent-a", scope: "user" }) as Array<Record<string, unknown>>;
+      expect(profileList[0]).toHaveProperty("scope", "user");
 
       const updated = await callRpc(gateway, "updateMemory", { agentId: "agent-a", memoryId: memory.id, text: "valor editado", pinned: true });
       expect((updated as { text: string; trust: string; pinned: boolean }).text).toBe("valor editado");
@@ -1517,7 +1934,7 @@ describe("memory context integration", () => {
       conversation: { temporary: false },
       conversationId,
       sourceEntryId: "entry-profile",
-      explicitIntent: false,
+      explicitIntent: true,
     };
     const identity = await executeMemoryRememberTool({
       agentId: "agent-a",

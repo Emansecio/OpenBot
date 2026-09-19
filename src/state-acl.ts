@@ -21,6 +21,8 @@ export interface OpenBotStateAclOptions {
   runner?: StateAclCommandRunner;
   /** Current Windows account name or SID; defaults to USERDOMAIN\\USERNAME. */
   currentUser?: string | (() => string | Promise<string>);
+  /** Optional SID for an account name in injected ACL fixtures. */
+  currentUserSid?: string | (() => string | Promise<string>);
 }
 
 /**
@@ -38,6 +40,7 @@ export async function applyOpenBotStateAcl(
     platform: options.platform,
     runner: options.runner,
     currentUser: options.currentUser,
+    currentUserSid: options.currentUserSid,
   });
   return adapter.apply(root, { agentId: "openbot-state", operation: "create" });
 }
@@ -51,6 +54,7 @@ export async function verifyOpenBotStateAcl(
     platform: options.platform,
     runner: options.runner,
     currentUser: options.currentUser,
+    currentUserSid: options.currentUserSid,
   });
   return adapter.verify(root);
 }

@@ -1,3 +1,14 @@
+export interface RuntimeAdmissionMetrics {
+  active: number;
+  waiting: number;
+  admitted: number;
+  rejected: number;
+  aborted: number;
+  /** Time spent waiting for admission, never process execution duration. */
+  waitMeanMs: number;
+  waitMaxMs: number;
+}
+
 export interface RuntimeSchedulerOptions {
   maxActiveLeases?: number;
   maxActiveLeasesPerOwner?: number;
@@ -20,6 +31,7 @@ interface PendingAdmission {
   resolve: () => void;
   reject: (error: unknown) => void;
   signal?: AbortSignal;
+  queuedAt: number;
   timer?: ReturnType<typeof setTimeout>;
   abortListener?: () => void;
 }
@@ -36,6 +48,21 @@ export class RuntimeScheduler {
   private readonly maxActiveLeasesPerOwner: number;
   private readonly maxQueuedLeases: number;
   private readonly admissionTimeoutMs: number;
+  private admitted = 0;
+  private rejected = 0;
+  private aborted = 0;
+  private waitMeanMs = 0;
+  private waitMaxMs = 0;
+
+  metrics(): RuntimeAdmissionMetrics {
+    return { active: this.active.size, waiting: this.pending.length, admitted: this.admitted, rejected: this.rejected, aborted: this.aborted, waitMeanMs: this.waitMeanMs, waitMaxMs: this.waitMaxMs };
+  }
+
+  private admittedAfter(waitMs: number): void {
+    this.admitted = Math.min(Number.MAX_SAFE_INTEGER, this.admitted + 1);
+    this.waitMeanMs += (waitMs - this.waitMeanMs) / this.admitted;
+    this.waitMaxMs = Math.max(this.waitMaxMs, waitMs);
+  }
 
   constructor(options: RuntimeSchedulerOptions = {}) {
     this.maxActiveLeases = options.maxActiveLeases ?? 4;
@@ -65,14 +92,15 @@ export class RuntimeScheduler {
   }
 
   async reserveOrWaitFor(leaseId: string, ownerId: string, signal?: AbortSignal): Promise<void> {
-    if (signal?.aborted) throw abortReason(signal);
-    if (this.reserveFor(leaseId, ownerId)) return;
+    if (signal?.aborted) { this.aborted = Math.min(Number.MAX_SAFE_INTEGER, this.aborted + 1); throw abortReason(signal); }
+    if (this.reserveFor(leaseId, ownerId)) { this.admittedAfter(0); return; }
     if (this.pending.length >= this.maxQueuedLeases) {
+      this.rejected = Math.min(Number.MAX_SAFE_INTEGER, this.rejected + 1);
       throw new RuntimeAdmissionError("Runtime admission queue is full.");
     }
 
     await new Promise<void>((resolve, reject) => {
-      const admission: PendingAdmission = { leaseId, ownerId, resolve, reject, signal };
+      const admission: PendingAdmission = { leaseId, ownerId, resolve, reject, signal, queuedAt: performance.now() };
       const settle = (callback: () => void): void => {
         const index = this.pending.indexOf(admission);
         if (index === -1) return;
@@ -81,10 +109,16 @@ export class RuntimeScheduler {
         callback();
         this.pump();
       };
-      const rejectForAbort = (): void => settle(() => reject(abortReason(signal!)));
+      const rejectForAbort = (): void => settle(() => {
+        this.aborted = Math.min(Number.MAX_SAFE_INTEGER, this.aborted + 1);
+        reject(abortReason(signal!));
+      });
       admission.abortListener = rejectForAbort;
       admission.timer = setTimeout(() => {
-        settle(() => reject(new RuntimeAdmissionError()));
+        settle(() => {
+          this.rejected = Math.min(Number.MAX_SAFE_INTEGER, this.rejected + 1);
+          reject(new RuntimeAdmissionError());
+        });
       }, this.admissionTimeoutMs);
       admission.timer.unref?.();
       signal?.addEventListener("abort", rejectForAbort, { once: true });
@@ -104,6 +138,7 @@ export class RuntimeScheduler {
       if (index === -1) continue;
       this.pending.splice(index, 1);
       this.detach(admission);
+      this.rejected = Math.min(Number.MAX_SAFE_INTEGER, this.rejected + 1);
       admission.reject(error);
     }
   }
@@ -162,10 +197,12 @@ export class RuntimeScheduler {
       if (admission === undefined) return;
       this.detach(admission);
       if (admission.signal?.aborted) {
+        this.aborted = Math.min(Number.MAX_SAFE_INTEGER, this.aborted + 1);
         admission.reject(abortReason(admission.signal));
         continue;
       }
       this.active.set(admission.leaseId, admission.ownerId);
+      this.admittedAfter(Math.max(0, performance.now() - admission.queuedAt));
       admission.resolve();
     }
   }

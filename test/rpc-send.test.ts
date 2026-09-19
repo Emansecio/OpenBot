@@ -335,7 +335,9 @@ describe("T10 sendPrompt — aceitação e dedupe por clientNonce", () => {
     expect(runner.promptStatus("a")).toMatchObject({ isBusy: true, canCancel: false, cancelRequested: true });
     release.resolve();
     await runner.flush("a");
-    expect(runner.promptStatus("a")).toEqual({ isBusy: false, canCancel: false, agentId: "a" });
+    expect(runner.promptStatus("a")).toEqual({ isBusy: false, canCancel: false, agentId: "a", queued: [], recoverable: [], recoverableTruncated: false,
+      // O término é confirmado pelo backend: aborted é o resultado factual do turno.
+      lastTurn: expect.objectContaining({ turnId: expect.any(String), outcome: "aborted", finishedAtMs: expect.any(Number) }) });
     expect(execute).toHaveBeenCalledTimes(1);
     expect(() => runner.retryPrompt("a")).toThrow("Este turno já executou ferramentas");
     const completed = store.getEntries("a").find((entry) => entry.kind === "tool-call" && entry.status === "completed")!;
@@ -628,7 +630,7 @@ describe("T10 fila exclusiva por agente (serialização)", () => {
     }));
   });
 
-  it("cancelamento esquece imediatamente nonces ainda enfileirados", async () => {
+  it("cancelamento abrangente remove pendências duráveis sem executar seus turnos", async () => {
     const registry = createProviderRegistry();
     registry.register(createFakeAdapter("xai", { deltas: ["slow"], deltaDelayMs: 50 }));
     const store = createMemoryTranscriptStore();
@@ -636,9 +638,12 @@ describe("T10 fila exclusiva por agente (serialização)", () => {
     runner.sendPrompt({ agentId: "a", prompt: "active" });
     runner.sendPrompt({ agentId: "a", prompt: "queued", clientNonce: "queued-cancel" });
     await Promise.resolve();
-    expect(store.hasAcceptedNonce("a", "queued-cancel")).toBe(true);
+    const queued = store.promptQueue!.list("a");
+    expect(queued.map(item => item.args.clientNonce)).toEqual(["queued-cancel"]);
     expect(runner.cancelPrompt("a").cancelled).toBe(true);
     expect(store.hasAcceptedNonce("a", "queued-cancel")).toBe(false);
+    expect(store.promptQueue!.list("a")).toEqual([]);
+    expect(store.promptQueue!.get("a", queued[0]!.args.conversationId!, "queued-cancel")?.state).toBe("cancelled");
     await runner.flush("a");
   });
 

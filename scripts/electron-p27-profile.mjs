@@ -14,12 +14,13 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createServer } from "node:net";
 import { promisify } from "node:util";
+import { connectCdp, startE2eWatchdog } from "./e2e-runtime.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(process.env.OPENBOT_ROOT || dirname(dirname(fileURLToPath(import.meta.url))));
 const requireFromProject = createRequire(join(repoRoot, "package.json"));
 const electronExecutable = process.env.ELECTRON_EXE || requireFromProject("electron");
-const electronMain = process.env.OPENBOT_ELECTRON_MAIN || join(repoRoot, "client", "extracted", "dist", "electron-main", "main.cjs");
+const electronMain = process.env.OPENBOT_ELECTRON_MAIN || join(repoRoot, "scripts", "openbot-electron.cjs");
 const backendEntry = join(repoRoot, "dist", "main.js");
 
 export const THRESHOLDS = Object.freeze({
@@ -412,33 +413,14 @@ async function portReleased(port) {
   finally { await new Promise((resolvePromise) => server.close(() => resolvePromise())); }
 }
 
-function connectCdp(url) {
-  const ws = new WebSocket(url);
-  const pending = new Map();
-  let nextId = 1;
-  const ready = new Promise((resolvePromise, reject) => { ws.addEventListener("open", resolvePromise, { once: true }); ws.addEventListener("error", reject, { once: true }); });
-  ws.addEventListener("message", (event) => {
-    const message = JSON.parse(String(event.data));
-    const item = pending.get(message.id);
-    if (!item) return;
-    pending.delete(message.id);
-    if (message.error) item.reject(new Error(JSON.stringify(message.error))); else item.resolve(message.result || {});
-  });
-  ws.addEventListener("close", () => { for (const item of pending.values()) item.reject(new Error("CDP closed")); pending.clear(); });
-  const send = (method, params = {}) => new Promise((resolvePromise, reject) => {
-    const id = nextId++;
-    pending.set(id, { resolve: resolvePromise, reject });
-    ws.send(JSON.stringify({ id, method, params }));
-  });
-  return { ws, ready, send };
-}
+
 
 async function waitForTarget(cdpPort, child, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`Electron exited with ${child.exitCode}`);
     try {
-      const targets = await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json();
+      const targets = await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`, { signal: AbortSignal.timeout(2000) })).json();
       const page = targets.find((target) => target.type === "page" && target.title === "OpenBot") || targets.find((target) => target.type === "page");
       if (page?.webSocketDebuggerUrl) return page;
     } catch {}
@@ -653,6 +635,13 @@ process.on("SIGINT", () => void stop("SIGINT"));`;
   let electron;
   let cdp;
   let report;
+  const disarmWatchdog = startE2eWatchdog(
+    Number(process.env.OPENBOT_E2E_BUDGET_MS ?? 10 * 60_000),
+    async () => {
+      await killTree(electron);
+      await killTree(backend);
+    },
+  );
   try {
     backend = spawn(process.execPath, ["--input-type=module", "-e", backendCode], { cwd: repoRoot, detached: true, windowsHide: true, env: cleanEnvironment({ NODE_ENV: "test", OPENBOT_DATA_ROOT: dataRoot, P27_RUN_ROOT: runRoot, P27_READY_PATH: readyPath, P27_STREAM_DELTAS: "200", P27_STREAM_DELAY_MS: "10" }), stdio: ["ignore", "pipe", "pipe"] });
     backend.stdout?.on("data", (chunk) => appendFileSync(join(evidenceDir, "backend.stdout.log"), chunk));
@@ -705,6 +694,7 @@ process.on("SIGINT", () => void stop("SIGINT"));`;
     writeFileSync(join(evidenceDir, "p27-report.json"), `${JSON.stringify(report, null, 2)}\n`, "utf8");
     throw error;
   } finally {
+    disarmWatchdog();
     try { cdp?.ws.close(); } catch {}
     await killTree(electron); await killTree(backend);
     rmSync(runRoot, { recursive: true, force: true });

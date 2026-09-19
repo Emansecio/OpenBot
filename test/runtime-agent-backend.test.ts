@@ -96,7 +96,7 @@ describe("AgentRuntimeBackend", () => {
     expect(runner.run).toHaveBeenCalledTimes(1);
   });
 
-  it("com shareUserFiles redireciona por bot; grant alcança o perfil real", async () => {
+  it("mantém caminho relativo privado e exige shared:// para alcançar o perfil real", async () => {
     const root = await mkdtemp(join(tmpdir(), "openbot-agent-overlay-"));
     roots.push(root);
     const profile = join(root, "profile");
@@ -119,18 +119,25 @@ describe("AgentRuntimeBackend", () => {
       userProfile: profile,
     });
 
-    // Sem grant: a escrita cai no redirect privado do bot.
+    // Caminhos relativos permanecem na home privada, mesmo com shareUserFiles.
     await expect(backend.execute({
       operation: "file.write",
       path: "Documents/note.txt",
       content: "shared",
       encoding: "utf8",
     })).resolves.toMatchObject({ ok: true });
-    await expect(readFile(join(profile, "Documents", "OpenBot", "agent-a", "Documents", "note.txt"), "utf8")).resolves.toBe("shared");
+    await expect(readFile(join(home.root, "Documents", "note.txt"), "utf8")).resolves.toBe("shared");
     await expect(readFile(join(profile, "Documents", "note.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(readFile(join(home.root, "Documents", "note.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 
-    // Com grant de escrita, a pasta real é montada.
+    // A referência compartilhada é explícita e exige um grant atual.
+    await expect(backend.execute({
+      operation: "file.write",
+      path: "shared://Documents/denied.txt",
+      content: "denied",
+      encoding: "utf8",
+    })).resolves.toMatchObject({ ok: false, code: "access_denied" });
+
+    // Com grant de escrita, somente a referência shared:// monta a pasta real.
     const { writeFile } = await import("node:fs/promises");
     await writeFile(join(home.root, ".openbot", "grants.json"), `${JSON.stringify({
       version: 1,
@@ -153,7 +160,7 @@ describe("AgentRuntimeBackend", () => {
     });
     await expect(granted.execute({
       operation: "file.write",
-      path: "Documents/granted.txt",
+      path: "shared://Documents/granted.txt",
       content: "real",
       encoding: "utf8",
     })).resolves.toMatchObject({ ok: true });

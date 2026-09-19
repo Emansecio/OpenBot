@@ -172,6 +172,26 @@ export async function stopSpawnedGatewayHandle(child, timeoutMs = 2_000) {
   });
 }
 
+/** Attach lifecycle listeners before any asynchronous launch bookkeeping. */
+export function observeChildProcess(child) {
+  let settled = false;
+  let resolveOutcome;
+  const outcome = new Promise((resolve) => {
+    resolveOutcome = resolve;
+  });
+  const finish = (value) => {
+    if (settled) return;
+    settled = true;
+    resolveOutcome(value);
+  };
+  child.once?.("error", (error) => finish({ error }));
+  child.once?.("exit", (code, signal) => finish({ code, signal }));
+  if (child.exitCode != null || child.signalCode != null) {
+    finish({ code: child.exitCode, signal: child.signalCode });
+  }
+  return outcome;
+}
+
 export async function teardownLaunchGateway(options = {}) {
   if (options.processState == null && options.gatewayChild != null) {
     const stopped = await stopSpawnedGatewayHandle(options.gatewayChild, options.childTimeoutMs);
@@ -367,6 +387,7 @@ export async function launchRelease(options = {}) {
       windowsHide: true,
       stdio: "inherit",
     });
+    const electronOutcome = observeChildProcess(electron);
     trace.mark("electron-spawned");
     if (ownsGateway) {
       const [launcherEvidence, gatewayEvidence, electronEvidence] = await Promise.all([
@@ -388,10 +409,9 @@ export async function launchRelease(options = {}) {
       await atomicWriteJson(layout.processState, gatewayOwnership);
       trace.mark("process-state-recorded");
     }
-    electronExitCode = await new Promise((resolvePromise, reject) => {
-      electron.once("error", reject);
-      electron.once("exit", (code, signal) => resolvePromise(code ?? (signal ? 1 : 0)));
-    });
+    const electronResult = await electronOutcome;
+    if (electronResult.error != null) throw electronResult.error;
+    electronExitCode = electronResult.code ?? (electronResult.signal ? 1 : 0);
     trace.mark("electron-exited", { exitCode: electronExitCode });
     if (electronExitCode === 23) return { ok: true, exitCode: 0, secondary: true, version: manifest.version };
     return { ok: electronExitCode === 0, exitCode: electronExitCode, version: manifest.version };

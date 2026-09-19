@@ -74,8 +74,9 @@ export async function inspectSafeTree(root: string, signal?: AbortSignal): Promi
 
 const copyFileContents = async (source: string, destination: string, signal?: AbortSignal): Promise<void> => {
   const sourceHandle = await open(source, "r");
-  const destinationHandle = await open(destination, "wx", 0o600);
+  let destinationHandle: Awaited<ReturnType<typeof open>> | undefined;
   try {
+    destinationHandle = await open(destination, "wx", 0o600);
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
     while (true) {
@@ -92,7 +93,7 @@ const copyFileContents = async (source: string, destination: string, signal?: Ab
     }
   } finally {
     await sourceHandle.close().catch(() => undefined);
-    await destinationHandle.close().catch(() => undefined);
+    if (destinationHandle !== undefined) await destinationHandle.close().catch(() => undefined);
   }
 };
 
@@ -167,5 +168,4 @@ export async function renameOrCopy(
     }
   }
 }
-
 

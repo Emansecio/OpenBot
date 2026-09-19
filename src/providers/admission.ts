@@ -5,9 +5,25 @@
  * Context assembly, tool execution and persistence remain outside this lease.
  */
 
-export const DEFAULT_PROVIDER_MAX_ACTIVE = 4;
+/**
+ * Process-wide backstop, not a per-provider quota. Eight slots allow
+ * independent providers to make progress while retaining a finite ceiling.
+ */
+export const DEFAULT_PROVIDER_MAX_ACTIVE = 8;
 export const DEFAULT_PROVIDER_MAX_QUEUED = 64;
 export const DEFAULT_PROVIDER_MAX_QUEUED_PER_AGENT = 8;
+/** Maintenance waiters older than this are promoted: interactive work wins under contention, but background work cannot starve. */
+export const ADMISSION_MAINTENANCE_PROMOTE_MS = 30_000;
+
+export type ProviderAdmissionPriority = "interactive" | "maintenance";
+
+export type ProviderAdmissionAcquireOptions = {
+  signal?: AbortSignal;
+  /** Interactive work is admitted first; maintenance fills spare capacity. */
+  priority?: ProviderAdmissionPriority;
+  /** Maximum queue wait before a retryable "wait-timeout" rejection. */
+  maxWaitMs?: number;
+};
 
 export type ProviderAdmissionMetrics = {
   active: number;
@@ -37,7 +53,7 @@ export type ProviderAdmissionOptions = {
 };
 
 export class ProviderAdmissionError extends Error {
-  readonly code: "queue-full" | "agent-queue-full" | "aborted" | "shutdown";
+  readonly code: "queue-full" | "agent-queue-full" | "aborted" | "shutdown" | "wait-timeout";
   readonly retryable: boolean;
 
   constructor(code: ProviderAdmissionError["code"], message: string, retryable: boolean) {
@@ -51,11 +67,13 @@ export class ProviderAdmissionError extends Error {
 type Waiter = {
   agentId: string;
   signal?: AbortSignal;
+  priority: ProviderAdmissionPriority;
   resolve: (lease: ProviderAdmissionLease) => void;
   reject: (error: ProviderAdmissionError) => void;
   enqueuedAtMs: number;
   settled: boolean;
   onAbort?: () => void;
+  waitTimer?: ReturnType<typeof setTimeout>;
 };
 
 function validBound(value: number | undefined, fallback: number, min: number, max: number, label: string): number {
@@ -96,7 +114,13 @@ export class ProviderAdmissionScheduler {
   get activeCount(): number { return this.active; }
   get waitingCount(): number { return this.waiting; }
 
-  acquire(agentId: string, signal?: AbortSignal): Promise<ProviderAdmissionLease> {
+  acquire(agentId: string, options?: AbortSignal | ProviderAdmissionAcquireOptions): Promise<ProviderAdmissionLease> {
+    const request = options !== undefined && !(options instanceof AbortSignal)
+      ? options
+      : { signal: options } satisfies ProviderAdmissionAcquireOptions;
+    const signal = request.signal;
+    const priority = request.priority ?? "interactive";
+    const maxWaitMs = request.maxWaitMs;
     if (typeof agentId !== "string" || agentId.trim().length === 0) {
       return Promise.reject(new ProviderAdmissionError("shutdown", "provider admission exige agentId", false));
     }
@@ -126,14 +150,25 @@ export class ProviderAdmissionScheduler {
       const waiter: Waiter = {
         agentId,
         signal,
+        priority,
         resolve,
         reject,
         enqueuedAtMs: this.now(),
         settled: false,
       };
+      if (maxWaitMs !== undefined) {
+        waiter.waitTimer = setTimeout(() => {
+          if (waiter.settled) return;
+          this.cleanupWaiter(waiter);
+          waiter.settled = true;
+          this.aborted += 1;
+          reject(new ProviderAdmissionError("wait-timeout", "provider admission excedeu a espera máxima na fila", true));
+        }, Math.max(0, maxWaitMs));
+        waiter.waitTimer.unref?.();
+      }
       waiter.onAbort = () => {
         if (waiter.settled) return;
-        this.removeWaiter(waiter);
+        this.cleanupWaiter(waiter);
         waiter.settled = true;
         this.aborted += 1;
         reject(new ProviderAdmissionError("aborted", "provider admission abortada durante a espera", false));
@@ -174,8 +209,8 @@ export class ProviderAdmissionScheduler {
   shutdown(): void {
     if (!this.accepting) return;
     this.accepting = false;
-    for (const queue of this.queues.values()) {
-      for (const waiter of queue) {
+    for (const queue of [...this.queues.values()]) {
+      for (const waiter of [...queue]) {
         this.settleQueued(waiter, new ProviderAdmissionError("shutdown", "provider admission encerrou durante a espera" , false));
       }
     }
@@ -217,12 +252,16 @@ export class ProviderAdmissionScheduler {
   private settleQueued(waiter: Waiter, error: ProviderAdmissionError): void {
     if (waiter.settled) return;
     waiter.settled = true;
-    waiter.signal?.removeEventListener("abort", waiter.onAbort!);
-    this.waiting -= 1;
+    this.cleanupWaiter(waiter);
     waiter.reject(error);
   }
 
-  private removeWaiter(waiter: Waiter): void {
+  private cleanupWaiter(waiter: Waiter): void {
+    waiter.signal?.removeEventListener("abort", waiter.onAbort!);
+    if (waiter.waitTimer !== undefined) {
+      clearTimeout(waiter.waitTimer);
+      waiter.waitTimer = undefined;
+    }
     const queue = this.queues.get(waiter.agentId);
     if (queue === undefined) return;
     const index = queue.indexOf(waiter);
@@ -236,26 +275,36 @@ export class ProviderAdmissionScheduler {
     }
   }
 
-  private pump(): void {
-    while (this.accepting && this.active < this.maxActive && this.waiting > 0 && this.readyAgents.length > 0) {
+  /** Round-robin over agents; `eligible` selects which waiters may be taken. */
+  private takeWaiter(eligible: (waiter: Waiter) => boolean): Waiter | undefined {
+    const rotations = this.readyAgents.length;
+    for (let index = 0; index < rotations; index += 1) {
       const agentId = this.readyAgents.shift()!;
       this.readySet.delete(agentId);
       const queue = this.queues.get(agentId);
-      const waiter = queue?.shift();
-      if (waiter === undefined) {
-        this.queues.delete(agentId);
-        continue;
-      }
-      this.waiting -= 1;
+      const waiterIndex = queue === undefined ? -1 : queue.findIndex(eligible);
+      const waiter = waiterIndex < 0 ? undefined : queue!.splice(waiterIndex, 1)[0];
+      if (waiter !== undefined) this.waiting -= 1;
       if (queue !== undefined && queue.length > 0) {
         this.readySet.add(agentId);
         this.readyAgents.push(agentId);
       } else {
         this.queues.delete(agentId);
       }
-      if (waiter.settled) continue;
+      if (waiter === undefined || waiter.settled) continue;
+      return waiter;
+    }
+    return undefined;
+  }
+
+  private pump(): void {
+    while (this.accepting && this.active < this.maxActive && this.waiting > 0 && this.readyAgents.length > 0) {
+      const promoteBeforeMs = this.now() - ADMISSION_MAINTENANCE_PROMOTE_MS;
+      const waiter = this.takeWaiter((candidate) => candidate.priority !== "maintenance" || candidate.enqueuedAtMs <= promoteBeforeMs)
+        ?? this.takeWaiter(() => true);
+      if (waiter === undefined) break;
       waiter.settled = true;
-      waiter.signal?.removeEventListener("abort", waiter.onAbort!);
+      this.cleanupWaiter(waiter);
       const waitedMs = Math.max(0, this.now() - waiter.enqueuedAtMs);
       this.waitCount += 1;
       this.waitTotalMs += waitedMs;

@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { TASKBAR_APP_ID } from "./shortcut-appid.mjs";
 import { dirname, join, resolve } from "node:path";
 import {
   assertManagedInstallRoot,
@@ -6,6 +7,7 @@ import {
   assertPreflight,
   assertDataRootOutsideInstall,
   assertNoReparsePath,
+  assertNoReparseAncestors,
   assertNoReparseTree,
   atomicWriteFile,
   canonicalizePath,
@@ -23,7 +25,9 @@ import {
   randomSuffix,
   readInstallState,
   removeTree,
+  removeOwnedElectronTaskbarAlias,
   shortcutPaths,
+  shortcutBelongsToInstall,
   validateReleaseManifest,
   writeDataRootMarker,
   writeInstallState,
@@ -52,13 +56,35 @@ async function readOptionalFile(path) {
   }
 }
 
+// A recorded path alone is not ownership: old skipped installs recorded the
+// user's default shortcuts, and another install can later replace a real link.
+export async function managedReleaseShortcuts(root, state, options = {}) {
+  const managed = {};
+  for (const name of ["desktop", "startMenu"]) {
+    const path = state?.shortcuts?.[name];
+    if (typeof path !== "string" || path.trim() === "") continue;
+    if (await shortcutBelongsToInstall(path, root)) managed[name] = path;
+    else if (options.recreateMissing === true && state.shortcutOwnershipVersion === 1) {
+      try { await fs.lstat(path); }
+      catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        await assertNoReparseAncestors(path);
+        managed[name] = path;
+      }
+    }
+  }
+  return managed;
+}
+
 export async function writeReleaseShortcuts(root, shortcuts, options = {}) {
   if (options.skipShortcuts === true) return;
-  const env = options.env ?? process.env;
-  const wscript = join(env.SystemRoot || process.env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
+  const executable = join(root, "OpenBot.exe");
+  const launcher = await pathExists(executable) ? executable : join(root, "OpenBot.vbs");
   const shortcutOptions = {
     description: "OpenBot local desktop",
-    arguments: `"${join(root, "OpenBot.vbs")}"`,
+    arguments: "",
+    appUserModelId: TASKBAR_APP_ID,
+    allowFallback: false,
     workingDirectory: root,
     windowStyle: 7,
     iconLocation: options.releaseId
@@ -66,8 +92,11 @@ export async function writeReleaseShortcuts(root, shortcuts, options = {}) {
       : join(root, "OpenBot.ico"),
     fail: options.failShortcut === true,
   };
-  for (const path of [shortcuts.desktop, shortcuts.startMenu]) {
-    await createShortcut(wscript, path, shortcutOptions);
+  for (const path of Object.values(shortcuts)) {
+    await createShortcut(launcher, path, shortcutOptions);
+  }
+  if (shortcuts.startMenu != null) {
+    await removeOwnedElectronTaskbarAlias(shortcuts.startMenu, { appUserModelId: TASKBAR_APP_ID });
   }
 }
 
@@ -112,8 +141,11 @@ async function installReleaseLocked(options = {}) {
     }
     await fs.mkdir(layout.staging, { recursive: true });
     await assertNoReparsePath(layout.staging);
-    shortcuts = shortcutPaths(options.shortcutRoot ?? state?.shortcutRoot, options.env ?? process.env);
-    if (options.skipShortcuts !== true) {
+    const skipShortcuts = options.skipShortcuts === true || process.env.OPENBOT_SKIP_SHORTCUTS === "1";
+    shortcuts = state == null
+      ? (skipShortcuts ? {} : shortcutPaths(options.shortcutRoot, options.env ?? process.env))
+      : await managedReleaseShortcuts(root, state, { recreateMissing: !skipShortcuts });
+    if (!skipShortcuts) {
       shortcutBackupRoot = join(layout.staging, `.install-shortcuts-${randomSuffix()}`);
       await fs.mkdir(shortcutBackupRoot, { recursive: true });
       for (const [name, path] of Object.entries(shortcuts)) {
@@ -127,6 +159,7 @@ async function installReleaseLocked(options = {}) {
       && state?.activeContentSha256 === manifest.contentSha256;
     if (sameIdentity && options.force !== true) {
       await writeReleaseShortcuts(root, shortcuts, { ...options, releaseId: manifest.releaseId });
+      if (!skipShortcuts) await writeInstallState(root, { ...state, shortcuts, shortcutOwnershipVersion: 1 });
       return { ok: true, alreadyInstalled: true, version: manifest.version, releaseId: manifest.releaseId, root, shortcuts };
     }
     if (state != null && !sameIdentity) {
@@ -193,7 +226,8 @@ async function installReleaseLocked(options = {}) {
       dataRoot,
       localDataRoot,
       shortcutRoot: options.shortcutRoot ? resolve(options.shortcutRoot) : state?.shortcutRoot ?? null,
-      shortcuts,
+      shortcuts: skipShortcuts && state != null ? state.shortcuts ?? {} : shortcuts,
+      shortcutOwnershipVersion: skipShortcuts && state != null ? state.shortcutOwnershipVersion ?? null : 1,
       unsignedLocal: true,
       manifestSha256: manifest.contentSha256,
     });

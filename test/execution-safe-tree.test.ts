@@ -8,6 +8,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
+    open: vi.fn(actual.open),
     rename: vi.fn(actual.rename),
     rm: vi.fn(actual.rm),
   };
@@ -21,6 +22,7 @@ afterEach(async () => {
   const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
   vi.mocked(fsp.rename).mockImplementation(actual.rename);
   vi.mocked(fsp.rm).mockImplementation(actual.rm);
+  vi.mocked(fsp.open).mockImplementation(actual.open);
   await Promise.all(roots.splice(0).map((entry) => actual.rm(entry, { recursive: true, force: true })));
 });
 
@@ -49,5 +51,28 @@ describe("renameOrCopy", () => {
     });
     await expect(readFile(destination, "utf8")).resolves.toBe("payload-bytes");
     await expect(readFile(source, "utf8")).resolves.toBe("payload-bytes");
+  });
+
+  it("fecha a origem quando a abertura do destino falha", async () => {
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    const root = await mkdtemp(join(tmpdir(), "openbot-destination-open-"));
+    roots.push(root);
+    const source = join(root, "source.txt");
+    const destination = join(root, "dest.txt");
+    await writeFile(source, "payload-bytes");
+    let opens = 0;
+    let openedSource: Awaited<ReturnType<typeof actual.open>> | undefined;
+    vi.mocked(fsp.open).mockImplementation(async (filename, flags, mode) => {
+      opens += 1;
+      if (opens === 2) throw Object.assign(new Error("destination open failed"), { code: "EACCES" });
+      openedSource = await actual.open(filename, flags, mode);
+      return openedSource;
+    });
+
+    await expect((async () => {
+      const { copySafeTree } = await import("../src/execution/safe-tree.js");
+      await copySafeTree(source, destination);
+    })()).rejects.toMatchObject({ code: "EACCES" });
+    await expect(openedSource!.stat()).rejects.toMatchObject({ code: "EBADF" });
   });
 });

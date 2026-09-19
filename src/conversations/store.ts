@@ -36,6 +36,8 @@ export interface SqliteConversationStoreOptions {
   database?: Database.Database;
   /** Optional shared memory store used to apply the explicit deletion policy atomically. */
   memoryStore?: SqliteMemoryStore;
+  /** Known sensitive values (e.g. keystore-held credentials) the default memory store must reject. */
+  secretValues?: () => readonly string[];
 }
 
 export interface CreateConversationOptions {
@@ -192,7 +194,7 @@ export class SqliteConversationStore {
         this.db.pragma("busy_timeout = 5000");
       }
       migrateOpenBotSchema(this.db);
-      const memoryStore = opts.memoryStore ?? new SqliteMemoryStore({ path: opts.path, database: this.db });
+      const memoryStore = opts.memoryStore ?? new SqliteMemoryStore({ path: opts.path, database: this.db, secretValues: opts.secretValues });
       if (!memoryStore.sharesDatabase(this.db)) {
         throw new Error("conversation store: memoryStore deve usar a mesma conexão SQLite");
       }
@@ -460,6 +462,7 @@ export class SqliteConversationStore {
       }
       this.memoryStore.deleteConversationDerived(agentId, conversationId, policy);
       for (const table of [
+        "prompt_queue",
         "transcript_entries",
         "accepted_nonces",
         "pending_nonces",

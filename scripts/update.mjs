@@ -26,14 +26,13 @@ import {
   readJson,
   removeTree,
   safeVersion,
-  shortcutPaths,
   stateReleaseId,
   treeDigest,
   validateReleaseManifest,
   writeInstallState,
   writeStableLauncher,
 } from "./release-common.mjs";
-import { writeReleaseShortcuts } from "./install.mjs";
+import { managedReleaseShortcuts, writeReleaseShortcuts } from "./install.mjs";
 
 const DATA_BACKUP_SCHEMA_VERSION = 1;
 const DATA_BACKUP_ENTRY_NAMES = new Set(["roaming", "workspaces"]);
@@ -306,11 +305,12 @@ async function updateReleaseLocked(options = {}) {
     }
     if (options.simulateFailure === true) throw new Error("Simulated update failure before commit finalization");
     await writeStableLauncher(root, manifest.releaseId, manifest.version);
-    const shortcuts = shortcutPaths(initialState.shortcutRoot, options.env ?? process.env);
+    const shortcuts = await managedReleaseShortcuts(root, initialState, { recreateMissing: true });
     await writeReleaseShortcuts(root, shortcuts, { env: options.env ?? process.env, releaseId: manifest.releaseId });
     const nextState = await writeInstallState(root, {
       ...initialState,
       shortcuts,
+      shortcutOwnershipVersion: 1,
       activeVersion: manifest.version,
       activeBuildId: manifest.buildId,
       activeReleaseId: manifest.releaseId,
@@ -438,11 +438,12 @@ async function rollbackReleaseLocked(options = {}) {
     await restoreDataBackup(state.lastBackup.path, { dataRoot, localDataRoot, env: options.env ?? process.env });
     restored = true;
     await writeStableLauncher(root, targetReleaseId, targetVersion);
-    const shortcuts = shortcutPaths(state.shortcutRoot, options.env ?? process.env);
+    const shortcuts = await managedReleaseShortcuts(root, state, { recreateMissing: true });
     await writeReleaseShortcuts(root, shortcuts, { env: options.env ?? process.env, releaseId: targetReleaseId });
     const nextState = await writeInstallState(root, {
       ...state,
       shortcuts,
+      shortcutOwnershipVersion: 1,
       activeVersion: targetManifest.version,
       activeBuildId: targetManifest.buildId,
       activeReleaseId: targetManifest.releaseId,

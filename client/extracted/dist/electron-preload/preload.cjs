@@ -1001,6 +1001,15 @@ var desktop = {
     async getPromptStatus(args) {
       return await import_electron.ipcRenderer.invoke("sand:prompt-status", args ?? {});
     },
+    async getPromptRecovery(args) {
+      return await import_electron.ipcRenderer.invoke("sand:prompt-recovery", args ?? {});
+    },
+    async getQueuedPrompt(args) {
+      return await import_electron.ipcRenderer.invoke("sand:queued-prompt-get", args ?? {});
+    },
+    async reviseQueuedPrompt(args) {
+      return await import_electron.ipcRenderer.invoke("sand:queued-prompt-revise", args ?? {});
+    },
     onPromptDelivery(listener) {
       openBotPromptDeliveryListeners.add(listener);
       return () => openBotPromptDeliveryListeners.delete(listener);

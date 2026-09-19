@@ -11,6 +11,23 @@ interface AgentFenceState {
 
 const keyOf = (agentId: string): string => agentId.trim().toLowerCase();
 
+/** Bounds the caller's wait only; the caller must retain fences until drain settles. */
+export async function waitForDeletionDrain(drain: Promise<void>, timeoutMs = 5_000): Promise<void> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new RangeError("Deletion deadline must be positive.");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      drain,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new RpcError(503,
+          "Não foi possível encerrar a execução a tempo. O bot não foi excluído. Aguarde o encerramento antes de tentar novamente.")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 /**
  * Process-wide admission fence for agent-scoped RPC work. Deletion closes
  * admission first, then drains operations that were already admitted.

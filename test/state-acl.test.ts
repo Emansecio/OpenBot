@@ -23,6 +23,8 @@ function fakeRunner(results: StateAclCommandResult[]): { runner: StateAclCommand
   return { runner, calls };
 }
 
+const POLICY_SDDL = "D:P(A;OICI;FA;;;CONTOSO\\alice)(A;;FA;;;CONTOSO\\alice)(A;OICI;FA;;;SY)(A;;FA;;;SY)(A;OICI;FA;;;BA)(A;;FA;;;BA)";
+
 describe("OpenBot state ACL", () => {
   it("applies and verifies only the current account, SYSTEM, and Administrators", async () => {
     const { runner, calls } = fakeRunner([
@@ -30,6 +32,7 @@ describe("OpenBot state ACL", () => {
       { exitCode: 0 },
       { exitCode: 0 },
       { exitCode: 0 },
+      { exitCode: 0, stdout: POLICY_SDDL },
     ]);
 
     const result = await applyOpenBotStateAcl("C:\\Temp\\OpenBot-state-test", {
@@ -39,7 +42,7 @@ describe("OpenBot state ACL", () => {
     });
 
     expect(result).toMatchObject({ status: "verified", platform: "win32" });
-    expect(calls).toHaveLength(4);
+    expect(calls).toHaveLength(5);
     expect(calls.every((call) => call.file === "icacls.exe")).toBe(true);
     expect(calls.every((call) => ! call.options.shell &&  call.options.windowsHide)).toBe(true);
     expect(calls[0]?.args).toEqual(["C:\\Temp\\OpenBot-state-test", "/reset", "/T", "/Q"]);
@@ -57,6 +60,8 @@ describe("OpenBot state ACL", () => {
     ]);
     expect(calls[2]?.args).toEqual(["C:\\Temp\\OpenBot-state-test", "/inheritance:r", "/T", "/Q"]);
     expect(calls[3]?.args).toEqual(["C:\\Temp\\OpenBot-state-test", "/verify", "/T", "/Q"]);
+    expect(calls[4]?.args[0]).toBe("C:\\Temp\\OpenBot-state-test");
+    expect(calls[4]?.args[1]).toBe("/save");
   });
 
   it("fails closed without verification when an ACL step fails", async () => {
@@ -77,7 +82,7 @@ describe("OpenBot state ACL", () => {
   });
 
   it("verifies an already protected tree without mutating its ACL", async () => {
-    const { runner, calls } = fakeRunner([{ exitCode: 0 }]);
+    const { runner, calls } = fakeRunner([{ exitCode: 0 }, { exitCode: 0, stdout: POLICY_SDDL }]);
 
     const result = await verifyOpenBotStateAcl("C:\\Temp\\OpenBot-state-test", {
       platform: "win32",
@@ -86,8 +91,9 @@ describe("OpenBot state ACL", () => {
     });
 
     expect(result).toMatchObject({ status: "verified", platform: "win32" });
-    expect(calls.map((call) => call.args)).toEqual([
-      ["C:\\Temp\\OpenBot-state-test", "/verify", "/T", "/Q"],
-    ]);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.args).toEqual(["C:\\Temp\\OpenBot-state-test", "/verify", "/T", "/Q"]);
+    expect(calls[1]?.args[0]).toBe("C:\\Temp\\OpenBot-state-test");
+    expect(calls[1]?.args[1]).toBe("/save");
   });
 });

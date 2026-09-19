@@ -205,19 +205,17 @@ export class SkillDispatcher {
   public async execute(context: ToolExecutionContext): Promise<ToolExecutionResult> {
     const name = callName(context);
     if (!this.canHandle(name)) return { handled: false };
+    const operation = name === "use_skill" ? "skills.use" : name === "save_skill" ? "skills.save" : "skills.search";
+    if (context.signal?.aborted) return failure(operation, "skill operation aborted", "aborted");
     const args = parseArguments(context.call.function.arguments);
-    if (args === undefined) {
-      const operation = name === "use_skill" ? "skills.use" : name === "save_skill" ? "skills.save" : "skills.search";
-      return failure(operation, "tool arguments must be a JSON object");
-    }
+    if (args === undefined) return failure(operation, "tool arguments must be a JSON object");
     try {
       if (name === "search_skills") return this.search(context.agentId, args);
       if (name === "save_skill") return await this.save(context.agentId, args);
       return await this.use(context.agentId, args);
     } catch {
       // Do not expose filesystem, parser, or policy internals in provider output.
-      const operation = name === "use_skill" ? "skills.use" : name === "save_skill" ? "skills.save" : "skills.search";
-      return failure(operation, "skill operation failed");
+      return failure(operation, "skill operation failed", "io_error");
     }
   }
 

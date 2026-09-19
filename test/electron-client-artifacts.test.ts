@@ -26,10 +26,14 @@ describe("Electron client artifact baseline", () => {
   it("records versioned hashes for the launcher inputs and renderer overlay", () => {
     expect(manifest.artifacts.main.version).toBe("0.16.0");
     expect(manifest.artifacts.preload.version).toBe("0.16.0");
-    expect(manifest.artifacts.rendererInjected.version).toBe("openbot-local-settings-v35-header-border");
+    expect(manifest.artifacts.rendererInjected).toMatchObject({
+      version: "openbot-local-settings-v58-execution-recovery",
+      sha256: "111a4d5c9e3bd3c4cbd180ce11327f44335013c880139dfe8b61fecca4b761e1",
+    });
     expect(manifest.artifacts.rendererMemoryUi).toMatchObject({
       path: "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
-      version: "openbot-memory-ui-v8-shared-profile",
+      version: "openbot-memory-ui-v13-ordered-task-list",
+      sha256: "dd81390ad91a07ed8b23c6bb25601fe837253d2687ad7d4f2431beca26fbc7d0",
     }); // Change only with an intentional renderer overlay baseline update.
     for (const artifact of Object.values(manifest.artifacts)) expect(artifact.sha256).toMatch(/^[a-f0-9]{64}$/u);
     for (const asset of manifest.renderer.requiredAssets) expect(asset.sha256).toMatch(/^[a-f0-9]{64}$/u);

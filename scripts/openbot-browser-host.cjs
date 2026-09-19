@@ -41,6 +41,8 @@ const PROXY = parseProxy(PROXY_URL, PROXY_TOKEN);
 const TABS = new Map();
 const DOWNLOAD_SESSIONS = new WeakSet();
 const DOWNLOAD_CONFIG = new WeakMap();
+// Downloads outlive WebContents. Keep ownership until final file cleanup ends.
+const ACTIVE_DOWNLOADS = new Map();
 const SECURED_SESSIONS = new WeakSet();
 const MAX_ACTIVE_REQUESTS = 4;
 const MAX_AGENT_QUEUE = 16;
@@ -609,9 +611,23 @@ async function closeTab(request, signal) {
   if (tab) {
     assertTabOwnership(tab, request);
     TABS.delete(request.tabId);
-    if (!tab.window.isDestroyed()) tab.window.close();
+    // Lifecycle close must not be vetoed by beforeunload handlers.
+    if (!tab.window.isDestroyed()) tab.window.destroy();
   }
+  await drainTabDownloads(request.tabId);
+  const browserSession = session.fromPartition(request.partition);
+  browserSession.flushStorageData();
+  await browserSession.cookies.flushStore();
   return { command: "close", tabId: request.tabId, visible: false };
+}
+
+async function drainTabDownloads(tabId) {
+  const downloads = ACTIVE_DOWNLOADS.get(tabId);
+  if (downloads === undefined) return;
+  for (const download of downloads) {
+    if (!download.finished) download.item.cancel();
+  }
+  await Promise.all([...downloads].map((download) => download.done));
 }
 
 async function handoffTab(request, signal) {
@@ -627,8 +643,7 @@ async function resetPartition(request, signal) {
   throwIfAborted(signal);
   for (const [tabId, tab] of TABS) {
     if (tab.partition !== request.partition) continue;
-    TABS.delete(tabId);
-    if (!tab.window.isDestroyed()) tab.window.destroy();
+    await closeTab({ ...request, tabId, sessionId: tab.sessionId }, signal);
   }
   const browserSession = session.fromPartition(request.partition);
   await browserSession.clearStorageData();
@@ -642,6 +657,7 @@ async function resetPartition(request, signal) {
 async function createTab(request, signal) {
   throwIfAborted(signal);
   const downloadRoot = await ensureDownloadRoot(request.downloadRoot);
+  throwIfAborted(signal);
   const window = new BrowserWindow({
     show: true,
     width: 1280,
@@ -686,7 +702,10 @@ async function createTab(request, signal) {
     DOWNLOAD_CONFIG.set(browserSession, downloadConfigs);
     browserSession.on("will-download", (_event, item, webContents) => {
       const config = downloadConfigs.get(webContents?.id);
-      if (!config) return;
+      if (!config) {
+        item.cancel();
+        return;
+      }
       const filename = safeFilename(item.getFilename());
       let savePath;
       try {
@@ -699,7 +718,11 @@ async function createTab(request, signal) {
       let limitExceeded = Number.isFinite(expectedBytes) && expectedBytes > MAX_DOWNLOAD_BYTES;
       let receivedBytes = 0;
       item.setSavePath(savePath);
-      if (limitExceeded) item.cancel();
+      let finishDownload;
+      const download = { item, finished: false, done: new Promise((resolve) => { finishDownload = resolve; }) };
+      const downloads = ACTIVE_DOWNLOADS.get(config.tabId) || new Set();
+      ACTIVE_DOWNLOADS.set(config.tabId, downloads);
+      downloads.add(download);
       item.on("updated", (_updatedEvent, state) => {
         receivedBytes = Math.max(receivedBytes, item.getReceivedBytes());
         if (state === "progressing" && receivedBytes > MAX_DOWNLOAD_BYTES && !limitExceeded) {
@@ -708,11 +731,12 @@ async function createTab(request, signal) {
         }
       });
       item.once("done", (_doneEvent, state) => {
+        download.finished = true;
         receivedBytes = Math.max(receivedBytes, item.getReceivedBytes());
         const lifecycle = limitExceeded ? "limit" : state === "completed" ? "completed" : state === "cancelled" ? "cancelled" : "interrupted";
         void (async () => {
           if (lifecycle !== "completed") await fsp.rm(savePath, { force: true }).catch(() => undefined);
-          send({
+          await send({
             protocolVersion: PROTOCOL_VERSION,
             kind: "event",
             event: "download",
@@ -721,8 +745,14 @@ async function createTab(request, signal) {
             state: lifecycle,
             bytes: receivedBytes,
           });
-        })().catch(() => undefined);
+        })().catch(() => undefined).finally(() => {
+          downloads.delete(download);
+          if (downloads.size === 0) ACTIVE_DOWNLOADS.delete(config.tabId);
+          finishDownload();
+        });
       });
+      // Register done ownership first: cancel may complete synchronously.
+      if (limitExceeded) item.cancel();
     });
   }
   // Electron can destroy webContents before emitting the BrowserWindow
@@ -1587,6 +1617,7 @@ async function shutdown() {
     }
   }
   TABS.clear();
+  await Promise.all([...ACTIVE_DOWNLOADS.keys()].map((tabId) => drainTabDownloads(tabId)));
   if (keepAliveWindow && !keepAliveWindow.isDestroyed()) {
     try {
       keepAliveWindow.destroy();

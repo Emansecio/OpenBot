@@ -119,6 +119,28 @@ async function request(
 }
 
 describe("T3 gateway — rotas HTTP (integração)", () => {
+  it("exposes authenticated content-free execution counters without starting agent work", async () => {
+    const handle = await boot(undefined, undefined, "diagnostics-fixture-token");
+    const denied = await request(handle, "/api/getExecutionDiagnostics", { method: "POST", body: "{}", withAuth: false });
+    await readBody(denied);
+    expect(denied.statusCode).toBe(401);
+    const response = await request(handle, "/api/getExecutionDiagnostics", { method: "POST", body: "{}" });
+    const result = JSON.parse(await readBody(response));
+    expect(response.statusCode).toBe(200);
+    expect(result).toMatchObject({ ok: true, value: {
+      version: 1,
+      provider: { active: 0, waiting: 0, admitted: 0 },
+      workspaces: [],
+      gateway: { memoryBytes: { rss: expect.any(Number) }, eventLoop: { samples: expect.any(Number) } },
+    } });
+    expect(handle.runner.getStatus().isBusy).toBe(false);
+    expect(JSON.stringify(result)).not.toContain("diagnostics-fixture-token");
+    handle.gateway.beginQuiescence();
+    const quiescent = await request(handle, "/api/getExecutionDiagnostics", { method: "POST", body: "{}" });
+    await readBody(quiescent);
+    expect(quiescent.statusCode).toBe(200);
+  });
+
   it("GET /health → 200 {ok,pid,isBusy,activeAgentId,startedAt}", async () => {
     const h = await boot();
     const res = await request(h, "/health");

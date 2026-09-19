@@ -414,6 +414,8 @@ export interface ModelCatalogEntry {
   /** Fraction reserved as a safety margin; finite and in [0, 0.5). */
   safetyMargin?: number;
   supportsVision?: boolean;
+  /** Esforços de raciocínio que o provider aceita no wire para este modelo. */
+  supportedReasoningEfforts?: ReasoningEffort[];
   default?: boolean;
 }
 

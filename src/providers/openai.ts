@@ -25,6 +25,7 @@
  */
 
 import type { Keystore } from "../keystore/index.js";
+import { parseProviderUsage } from "./usage.js";
 import {
   defaultRegistry,
   type ProviderAdapter,
@@ -44,7 +45,7 @@ import {
   raceWithAbort,
   splitSseLines,
 } from "./openai-helpers.js";
-import { buildCodexResponsesBody, buildResponsesBody } from "./request-bodies.js";
+import { buildCodexResponsesBody, buildResponsesBody, usesResponsesApi } from "./request-bodies.js";
 
 /** Nome canônico do provider no registry e no namespace da keystore. */
 export const OPENAI_PROVIDER_NAME = "openai" as const;
@@ -125,10 +126,15 @@ export interface OpenAiAdapterOptions {
   maxDurationMs?: number;
   /** `fetch` injetável (testes usam o do Node; prod usa globalThis.fetch). */
   fetchImpl?: typeof fetch;
-}
-
-function usesResponsesApi(model: string): boolean {
-  return model === "gpt-6-astra" || model.startsWith("gpt-5.6-");
+  /**
+   * Política do parâmetro `reasoning_effort` no corpo chat.completions
+   * (omítido por default — nem todo endpoint aceita o campo):
+   *  - "declared": envia só quando `modelResolution.supportedReasoningEfforts`
+   *    contém o esforço pedido (providers de catálogo — fail-closed);
+   *  - "always": envia sempre que `req.reasoningEffort` está presente
+   *    (opt-in do endpoint compat configurável pelo usuário).
+   */
+  reasoningEffortPolicy?: "declared" | "always";
 }
 
 /**
@@ -138,6 +144,7 @@ function usesResponsesApi(model: string): boolean {
  * consumidor final).
  */
 export class OpenAiAdapter implements ProviderAdapter {
+  readonly tracksTransport = true;
   readonly name: string;
   readonly baseUrl: string;
   readonly timeoutMs: number;
@@ -148,6 +155,7 @@ export class OpenAiAdapter implements ProviderAdapter {
   private readonly credentialResolver?: OpenAiAdapterOptions["credentialResolver"];
   private readonly onCredentialRejected?: OpenAiAdapterOptions["onCredentialRejected"];
   private readonly protocol: "openai" | "responses" | "codex";
+  private readonly reasoningEffortPolicy?: OpenAiAdapterOptions["reasoningEffortPolicy"];
   private readonly fetchImpl: typeof fetch;
 
   constructor(opts: OpenAiAdapterOptions = {}) {
@@ -163,6 +171,7 @@ export class OpenAiAdapter implements ProviderAdapter {
     this.credentialResolver = opts.credentialResolver;
     this.onCredentialRejected = opts.onCredentialRejected;
     this.protocol = opts.protocol ?? "openai";
+    this.reasoningEffortPolicy = opts.reasoningEffortPolicy;
     this.fetchImpl = opts.fetchImpl ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
   }
 
@@ -170,6 +179,11 @@ export class OpenAiAdapter implements ProviderAdapter {
     const codex = this.protocol === "codex";
     const responsesApi = codex || this.protocol === "responses" || usesResponsesApi(req.model);
     const body = codex ? buildCodexResponsesBody(req) : responsesApi ? buildResponsesBody(req) : buildChatBody(req);
+    if (!responsesApi && !codex && this.reasoningEffortPolicy !== undefined && req.reasoningEffort !== undefined) {
+      const allowed = this.reasoningEffortPolicy === "always"
+        || req.modelResolution?.supportedReasoningEfforts?.includes(req.reasoningEffort) === true;
+      if (allowed) body.reasoning_effort = req.reasoningEffort;
+    }
     return JSON.stringify(body);
   }
 
@@ -200,6 +214,11 @@ export class OpenAiAdapter implements ProviderAdapter {
     const toolAccumulator = new OpenAiToolCallAccumulator();
     let buffer = "";
     let terminated = false;
+    let finishReason: string | undefined;
+    let finishPayload: unknown;
+
+    const isIncompleteReason = (reason: string | undefined): reason is "length" | "content_filter" | "max_tokens" =>
+      reason === "length" || reason === "content_filter" || reason === "max_tokens";
 
     const dispatchFrame = (frame: string): boolean => {
       const data = splitSseLines(frame).filter((line) => line.startsWith("data:"))
@@ -212,6 +231,8 @@ export class OpenAiAdapter implements ProviderAdapter {
       }
       if (typeof parsed !== "object" || parsed === null) return false;
       const payload = parsed as Record<string, unknown>;
+      const usage = parseProviderUsage(payload.usage, "chat");
+      if (usage) emit({ type: "usage", usage });
       if (typeof payload.error === "object" && payload.error !== null) {
         const error = payload.error as Record<string, unknown>;
         throw new ApiError(
@@ -226,12 +247,20 @@ export class OpenAiAdapter implements ProviderAdapter {
       }
       if (choices.length === 0) return false;
       const choice = choices[0] as Record<string, unknown> | undefined;
+      const currentFinishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : undefined;
       const delta = choice?.delta;
-      if (typeof delta !== "object" || delta === null) return false;
-      const record = delta as Record<string, unknown>;
-      if (typeof record.content === "string" && record.content.length > 0) emit({ type: "delta", delta: record.content });
-      if (Array.isArray(record.tool_calls)) for (const chunk of record.tool_calls) {
-        if (typeof chunk === "object" && chunk !== null) toolAccumulator.add(chunk as Parameters<OpenAiToolCallAccumulator["add"]>[0]);
+      // A final chunk may carry both the last text/tool delta and
+      // `finish_reason`; preserve that delta before recording the reason.
+      if (finishReason === undefined && typeof delta === "object" && delta !== null) {
+        const record = delta as Record<string, unknown>;
+        if (typeof record.content === "string" && record.content.length > 0) emit({ type: "delta", delta: record.content });
+        if (Array.isArray(record.tool_calls)) for (const chunk of record.tool_calls) {
+          if (typeof chunk === "object" && chunk !== null) toolAccumulator.add(chunk as Parameters<OpenAiToolCallAccumulator["add"]>[0]);
+        }
+      }
+      if (finishReason === undefined && currentFinishReason !== undefined) {
+        finishReason = currentFinishReason;
+        finishPayload = parsed;
       }
       return false;
     };
@@ -257,6 +286,9 @@ export class OpenAiAdapter implements ProviderAdapter {
       // background depois que o adapter já falhou.
       await reader.cancel().catch(() => undefined);
       reader.releaseLock();
+    }
+    if (isIncompleteReason(finishReason)) {
+      throw new ApiError(`openai: geração interrompida (${finishReason})`, 400, finishPayload, { code: finishReason });
     }
     if (toolAccumulator.hasAny && !toolAccumulator.complete) {
       throw new ApiError("openai: tool call incompleta no fim do stream", 502);
@@ -290,6 +322,14 @@ export class OpenAiAdapter implements ProviderAdapter {
       if (typeof incomplete?.reason === "string") return incomplete.reason;
       if (typeof event.message === "string") return event.message;
       return "OpenAI Responses API falhou";
+    };
+    const responseError = (event: Record<string, unknown>): ApiError => {
+      const response = record(event.response);
+      const error = record(event.error) ?? record(response?.error);
+      const incomplete = event.type === "response.incomplete" || response?.status === "incomplete";
+      const status = incomplete ? 400 : openAiStreamErrorStatus(error ?? event, 502);
+      const code = incomplete ? record(response?.incomplete_details)?.reason : error?.code ?? error?.type ?? event.code;
+      return new ApiError(`openai: ${errorMessage(event)}`, status, event, { code: typeof code === "string" ? code : undefined });
     };
     const upsertTool = (index: number, item: Record<string, unknown>): ToolSlot => {
       const current = tools.get(index);
@@ -333,6 +373,8 @@ export class OpenAiAdapter implements ProviderAdapter {
       }
 
       const index = outputIndex(event.output_index);
+      const usage = parseProviderUsage(record(event.response)?.usage, "responses");
+      if (usage) emit({ type: "usage", usage });
       const item = record(event.item);
       switch (event.type) {
         case "response.output_text.delta":
@@ -362,7 +404,7 @@ export class OpenAiAdapter implements ProviderAdapter {
         case "response.done": {
           const response = record(event.response);
           if (response?.status !== undefined && response.status !== "completed") {
-            throw new ApiError(`openai: ${errorMessage(event)}`, 502, parsed);
+            throw responseError(event);
           }
           const output = response?.output;
           if (reportServiceTier) {
@@ -381,7 +423,7 @@ export class OpenAiAdapter implements ProviderAdapter {
         case "response.failed":
         case "response.incomplete":
         case "error":
-          throw new ApiError(`openai: ${errorMessage(event)}`, 502, parsed);
+          throw responseError(event);
         default:
           return false;
       }
@@ -461,6 +503,9 @@ export class OpenAiAdapter implements ProviderAdapter {
       const url = endpoint.toString();
 
       try {
+        const body = this.serializeRequest(req);
+        controller.signal.throwIfAborted();
+        req.onTransportStart?.(codex ? "codex" : responsesApi ? "responses" : "chat");
         response = await raceWithAbort(this.fetchImpl(url, {
           method: "POST",
           headers: {
@@ -475,7 +520,7 @@ export class OpenAiAdapter implements ProviderAdapter {
               originator: "openbot",
             } : {}),
           },
-          body: this.serializeRequest(req),
+          body,
           signal: controller.signal,
         }), controller.signal);
         resetIdleTimer();

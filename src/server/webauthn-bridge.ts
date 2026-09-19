@@ -84,11 +84,14 @@ async function runSigner(signerPath: string, input: string): Promise<unknown> {
         fail(new RpcError(502, detail || "WebAuthn signer rejected the ceremony"));
         return;
       }
+      let result: unknown;
       try {
-        finish(() => resolve(JSON.parse(Buffer.concat(stdout).toString("utf8")) as unknown));
+        result = JSON.parse(Buffer.concat(stdout).toString("utf8")) as unknown;
       } catch {
         fail(new RpcError(502, "WebAuthn signer returned invalid JSON"));
+        return;
       }
+      finish(() => resolve(result));
     });
     child.stdin.end(input);
   });

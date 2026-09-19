@@ -21,7 +21,7 @@ const execFileAsync = promisify(execFile);
 const repoRoot = resolve(process.env.OPENBOT_ROOT || fileURLToPath(new URL("..", import.meta.url)));
 const requireFromProject = createRequire(join(repoRoot, "package.json"));
 const exe = process.env.ELECTRON_EXE || requireFromProject("electron");
-const electronMain = process.env.OPENBOT_ELECTRON_MAIN || join(repoRoot, "client", "extracted", "dist", "electron-main", "main.cjs");
+const electronMain = process.env.OPENBOT_ELECTRON_MAIN || join(repoRoot, "scripts", "openbot-electron.cjs");
 const backendFixture = join(repoRoot, "scripts", "electron-p23-backend-fixture.mjs");
 let activeStageSignal;
 

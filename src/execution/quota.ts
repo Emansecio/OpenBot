@@ -2,6 +2,7 @@ import { lstat, opendir } from "node:fs/promises";
 import { join, win32 as path } from "node:path";
 
 import { isHomeTrashArchivePath } from "./user-files.js";
+import { WorkspaceQuotaObserver, type WorkspaceWatch } from "./quota-observer.js";
 import { WorkspaceSandbox } from "./workspace.js";
 
 export interface WorkspaceUsage {
@@ -15,6 +16,11 @@ export interface WorkspaceQuotaOptions {
   maxBytes: number;
   maxFiles: number;
   maxEntries?: number;
+  /**
+   * How long the shared process observer stays warm after the last consumer
+   * closes, so sequential commands reuse its inventory. 0 disables (melhoria 10).
+   */
+  observationIdleMs?: number;
   /**
    * Per-folder sub-quotas keyed by the first path segment (case-insensitive),
    * e.g. { downloads: {...}, projects: {...} }. Checked at reservation time
@@ -86,7 +92,135 @@ export type WorkspaceUsageCalculator = (root: string, maxEntries?: number) => Pr
 
 const FULL_SCAN_AFTER_COMMITS = 256;
 
+export interface WorkspaceProcessObservation {
+  drain(): Promise<void>;
+  close(): Promise<void>;
+}
+
+const OBSERVATION_IDLE_CLOSE_MS = 15_000;
+
+type WorkspaceObservationSession = {
+  observer: WorkspaceQuotaObserver;
+  ready: Promise<void>;
+  listeners: Set<(error: Error) => void>;
+};
+
 export class WorkspaceQuota {
+  private observation?: WorkspaceObservationSession;
+  private observationClosing?: Promise<void>;
+  private observationIdleTimer?: ReturnType<typeof setTimeout>;
+  private readonly observationIdleMs: number;
+  private readonly counters = { scans: 0, scanDurationMs: 0, observationStarts: 0 };
+
+  metrics(): Readonly<typeof this.counters> & { activeObservers: number; activeProcesses: number } {
+    return { ...this.counters, activeObservers: this.observation === undefined ? 0 : 1,
+      activeProcesses: this.observation?.listeners.size ?? 0 };
+  }
+
+  /** One authority per quota, shared by overlapping managed processes. */
+  async observeProcesses(onError: (error: Error) => void, watch?: WorkspaceWatch): Promise<WorkspaceProcessObservation> {
+    // The retiring observer still publishes its final inventory under the
+    // reservation lock. Do not let a new authority start until it has settled.
+    while (this.observationClosing !== undefined) await this.observationClosing.catch(() => undefined);
+    let session = this.observation;
+    if (session !== undefined && this.observationIdleTimer !== undefined) {
+      clearTimeout(this.observationIdleTimer);
+      this.observationIdleTimer = undefined;
+    }
+    if (session === undefined) {
+      const listeners = new Set<(error: Error) => void>();
+      const observer = new WorkspaceQuotaObserver({
+        root: this.workspace.root,
+        maxEntries: this.options.maxEntries,
+        watch,
+        synchronize: async (operation) => {
+          let release!: () => void;
+          const previous = this.reservationTail;
+          this.reservationTail = new Promise<void>((resolve) => { release = resolve; });
+          await previous;
+          try { await operation(); } finally { release(); }
+        },
+        onScan: (durationMs) => { this.counters.scans += 1; this.counters.scanDurationMs += durationMs; },
+        onSnapshot: (usage, scopes) => {
+          this.cachedUsage = { ...usage };
+          this.usageDirty = false;
+          this.commitsSinceRefresh = 0;
+          this.scopeUsage.clear();
+          this.scopeDirty.clear();
+          for (const name of Object.keys(this.scopes)) {
+            this.scopeUsage.set(name, { ...(scopes.get(name) ?? { bytes: 0, files: 0, entries: 0, directories: 0 }) });
+          }
+          this.assertUsage(usage);
+          for (const [name, scoped] of this.scopeUsage) this.assertScopeUsage(name, scoped);
+        },
+        onError: (error) => {
+          this.markUsageDirty();
+          for (const listener of listeners) listener(error);
+        },
+      });
+      session = { observer, listeners, ready: Promise.resolve() };
+      this.observation = session;
+      this.counters.observationStarts += 1;
+      session.ready = observer.start();
+    }
+    const listener = (error: Error): void => onError(error);
+    session.listeners.add(listener);
+    let closed = false;
+    const close = async (): Promise<void> => {
+      if (closed) return;
+      closed = true;
+      session.listeners.delete(listener);
+      if (session.listeners.size !== 0) {
+        await session.observer.drain();
+        return;
+      }
+      if (this.observationIdleMs <= 0 || this.observation !== session) {
+        // Legacy path: retire immediately with one final validating walk.
+        await this.retireObservation(session);
+        return;
+      }
+      // Last consumer: validate quota authority at this boundary (catches
+      // silent writes), then keep the warm observer for a bounded idle window.
+      try {
+        session.observer.invalidate();
+        await session.observer.drain();
+      } catch (error) {
+        await this.retireObservation(session).catch(() => undefined);
+        throw error;
+      }
+      if (this.observation !== session || session.listeners.size !== 0) return;
+      this.scheduleObservationIdleRetire(session);
+    };
+    try {
+      await session.ready;
+      await session.observer.drain();
+      return { drain: () => session.observer.drain(), close };
+    } catch (error) {
+      await close().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** Final close: publishes one last inventory walk under the reservation lock. */
+  private retireObservation(session: WorkspaceObservationSession): Promise<void> {
+    const closing = session.observer.close();
+    this.observationClosing = closing;
+    if (this.observation === session) this.observation = undefined;
+    return closing.catch((error) => { this.markUsageDirty(); throw error; })
+      .finally(() => { if (this.observationClosing === closing) this.observationClosing = undefined; });
+  }
+
+  /** Keep the validated observer warm for a bounded idle window. */
+  private scheduleObservationIdleRetire(session: WorkspaceObservationSession): void {
+    if (this.observationIdleTimer !== undefined) clearTimeout(this.observationIdleTimer);
+    this.observationIdleTimer = setTimeout(() => {
+      this.observationIdleTimer = undefined;
+      if (this.observation !== session || session.listeners.size !== 0) return;
+      void this.retireObservation(session).catch(() => undefined);
+    }, this.observationIdleMs);
+    this.observationIdleTimer.unref();
+  }
+
   private pendingBytes = 0;
   private pendingFiles = 0;
   private pendingEntries = 0;
@@ -105,6 +239,7 @@ export class WorkspaceQuota {
     private readonly options: WorkspaceQuotaOptions,
     private readonly calculateUsage: WorkspaceUsageCalculator = calculateWorkspaceUsage,
   ) {
+    this.observationIdleMs = options.observationIdleMs ?? OBSERVATION_IDLE_CLOSE_MS;
     if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0) throw new Error("maxBytes must be non-negative");
     if (!Number.isSafeInteger(options.maxFiles) || options.maxFiles < 0) throw new Error("maxFiles must be non-negative");
     if (options.maxEntries !== undefined && (!Number.isSafeInteger(options.maxEntries) || options.maxEntries < 1)) {
@@ -145,6 +280,7 @@ export class WorkspaceQuota {
   /** Force one full scan before the next structured reservation. */
   markUsageDirty(): void {
     this.usageDirty = true;
+    this.observation?.observer.invalidate();
     for (const scope of this.scopeUsage.keys()) this.scopeDirty.add(scope);
   }
 
@@ -327,8 +463,118 @@ export class WorkspaceQuota {
     }
   }
 
+  /** Reserve a move as one debit/credit across configured subtree scopes. */
+  async reserveTransfer(sourcePath: string, destinationPath: string, delta: QuotaDelta): Promise<QuotaReservation> {
+    let release!: () => void;
+    const previous = this.reservationTail;
+    this.reservationTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      if (
+        !Number.isSafeInteger(delta.bytes) || delta.bytes < 0 ||
+        !Number.isSafeInteger(delta.files) || delta.files < 0 ||
+        !Number.isSafeInteger(delta.entries) || delta.entries < 0
+      ) throw new WorkspaceQuotaError("Workspace quota delta is invalid.");
+
+      const usage = await this.currentUsageLocked();
+      this.assertUsage(usage);
+      const source = this.scopeFor(sourcePath);
+      const destination = this.scopeFor(destinationPath);
+      const differentScopes = source?.name !== destination?.name;
+      const sourceContext = source === undefined
+        ? undefined
+        : { name: source.name, usage: await this.currentScopeUsageLocked(source.name, source.directory) };
+      const destinationContext = destination === undefined || !differentScopes
+        ? undefined
+        : { name: destination.name, usage: await this.currentScopeUsageLocked(destination.name, destination.directory) };
+
+      if (sourceContext !== undefined) {
+        const remaining: WorkspaceUsage = {
+          ...sourceContext.usage,
+          bytes: sourceContext.usage.bytes - delta.bytes,
+          files: sourceContext.usage.files - delta.files,
+          entries: sourceContext.usage.entries - delta.entries,
+        };
+        if (remaining.bytes < 0 || remaining.files < 0 || remaining.entries < 0) {
+          throw new WorkspaceQuotaError("Workspace scoped quota delta is inconsistent.");
+        }
+      }
+      if (destinationContext !== undefined) {
+        this.assertScopeUsage(destinationContext.name, {
+          ...destinationContext.usage,
+          bytes: destinationContext.usage.bytes + delta.bytes,
+          files: destinationContext.usage.files + delta.files,
+          entries: destinationContext.usage.entries + delta.entries,
+        });
+      }
+
+      let active = true;
+      if (destinationContext !== undefined) {
+        const pending = this.pendingScope.get(destinationContext.name) ?? { bytes: 0, files: 0, entries: 0 };
+        this.pendingScope.set(destinationContext.name, {
+          bytes: pending.bytes + delta.bytes,
+          files: pending.files + delta.files,
+          entries: pending.entries + delta.entries,
+        });
+      }
+      const settle = (commit: boolean): void => {
+        if (!active) return;
+        active = false;
+        if (commit) {
+          if (sourceContext !== undefined && differentScopes && this.scopeUsage.has(sourceContext.name)) {
+            const cached = this.scopeUsage.get(sourceContext.name)!;
+            this.scopeUsage.set(sourceContext.name, {
+              ...cached,
+              bytes: cached.bytes - delta.bytes,
+              files: cached.files - delta.files,
+              entries: cached.entries - delta.entries,
+              directories: Math.max(0, cached.directories - Math.max(0, delta.entries - delta.files)),
+            });
+          }
+          if (destinationContext !== undefined && this.scopeUsage.has(destinationContext.name)) {
+            const cached = this.scopeUsage.get(destinationContext.name)!;
+            this.scopeUsage.set(destinationContext.name, {
+              ...cached,
+              bytes: cached.bytes + delta.bytes,
+              files: cached.files + delta.files,
+              entries: cached.entries + delta.entries,
+              directories: cached.directories + Math.max(0, delta.entries - delta.files),
+            });
+          }
+        }
+        if (destinationContext !== undefined) {
+          const pending = this.pendingScope.get(destinationContext.name);
+          if (pending !== undefined) {
+            const remaining = {
+              bytes: pending.bytes - delta.bytes,
+              files: pending.files - delta.files,
+              entries: pending.entries - delta.entries,
+            };
+            if (remaining.bytes === 0 && remaining.files === 0 && remaining.entries === 0) this.pendingScope.delete(destinationContext.name);
+            else this.pendingScope.set(destinationContext.name, remaining);
+          }
+        }
+        this.observation?.observer.invalidate();
+        release();
+      };
+      return { commit: () => settle(true), cancel: () => settle(false) };
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
   private async refreshUsageLocked(): Promise<WorkspaceUsage> {
+    if (this.observation !== undefined) {
+      this.observation.observer.invalidate();
+      await this.observation.observer.reconcileLocked();
+      return { ...this.cachedUsage! };
+    }
+    const started = performance.now();
     const usage = await this.calculateUsage(this.workspace.root, this.options.maxEntries);
+    this.counters.scans += 1;
+    this.counters.scanDurationMs += performance.now() - started;
+    for (const scope of this.scopeUsage.keys()) this.scopeDirty.add(scope);
     this.cachedUsage = { ...usage };
     this.usageDirty = false;
     this.commitsSinceRefresh = 0;
@@ -336,6 +582,7 @@ export class WorkspaceQuota {
   }
 
   private async currentUsageLocked(): Promise<WorkspaceUsage> {
+    await this.observation?.observer.reconcileLocked();
     if (this.cachedUsage === undefined || this.usageDirty) return this.refreshUsageLocked();
     return { ...this.cachedUsage };
   }
@@ -445,6 +692,9 @@ export class WorkspaceQuota {
           else this.pendingScope.set(scope.name, remaining);
         }
       }
+      // A structured write already adjusted the cache. Rebase the observer
+      // before it publishes again, rather than count the same write twice.
+      this.observation?.observer.invalidate();
       releaseLock();
     };
     return { commit: () => settle(true), cancel: () => settle(false) };

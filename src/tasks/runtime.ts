@@ -85,7 +85,11 @@ export class AsyncTaskRuntime {
   private loopPromise: Promise<void> | null = null;
   private readonly waiters = new Set<() => void>();
   private readonly controllers = new Map<string, AbortController>();
+  private readonly agentControllers = new Map<string, { taskId: string; controller: AbortController }>();
+  private readonly agentFences = new Map<string, number>();
   private readonly activeClaims = new Map<string, Promise<void>>();
+  private recoveryNextAtMs = 0;
+  private recoveryFailureCount = 0;
   private roundRobinCursor = 0;
   private projectionFailureCount = 0;
   private projectionRetryAtMs = 0;
@@ -118,7 +122,7 @@ export class AsyncTaskRuntime {
     // until the first loop has actually drained.
     if (this.loopPromise !== null) return;
     this.stopped = false;
-    this.recoverExpiredWork();
+    this.runRecovery(this.activeClaimTaskIds(), true);
     const loop = this.loop();
     this.loopPromise = loop;
     void loop.then(
@@ -127,47 +131,132 @@ export class AsyncTaskRuntime {
     );
   }
 
-  private recoverExpiredWork(): void {
+  private recoveryIntervalMs(): number {
+    return Math.max(this.pollIntervalMs, Math.floor(this.leaseDurationMs / 3));
+  }
+
+  private scheduleNextRecovery(nowMs: number, failed = false): void {
+    if (!failed) this.recoveryFailureCount = 0;
+    const backoff = failed
+      ? Math.min(5_000, this.recoveryIntervalMs() * (2 ** Math.max(0, this.recoveryFailureCount - 1)))
+      : this.recoveryIntervalMs();
+    const next = nowMs + backoff;
+    this.recoveryNextAtMs = Number.isSafeInteger(next) ? next : Number.MAX_SAFE_INTEGER;
+  }
+
+  private activeClaimTaskIds(): readonly string[] {
+    return Array.from(new Set(Array.from(this.agentControllers.values(), (entry) => entry.taskId)));
+  }
+
+  private reportRecoveryFailure(scope: string, error: unknown): void {
+    this.recoveryFailureCount = Math.min(this.recoveryFailureCount + 1, 7);
+    const detail = error instanceof Error ? error.message : String(error);
+    console.warn(`[openbot] async task lease recovery deferred (${scope}): ${detail}`);
+  }
+
+  private runRecovery(excludedTaskIds = this.activeClaimTaskIds(), reschedule = false): boolean {
+    let healthy = true;
+    try {
+      healthy = this.recoverExpiredWork(excludedTaskIds);
+    } catch (error) {
+      healthy = false;
+      this.reportRecoveryFailure("scan", error);
+    }
+    if (reschedule) {
+      this.scheduleNextRecovery(this.nowFn(), !healthy);
+    } else if (!healthy) {
+      // An immediate post-claim pass must not move a failed scan behind an
+      // already distant timer; keep the bounded retry/backoff observable.
+      this.scheduleNextRecovery(this.nowFn(), true);
+    } else {
+      this.recoveryFailureCount = 0;
+    }
+    return healthy;
+  }
+
+  private recoverExpiredWork(excludedTaskIds = this.activeClaimTaskIds()): boolean {
     const now = this.nowFn();
+    let healthy = true;
     for (const agentId of this.agentIds()) {
-      for (const recovered of this.store.recoverExpiredLeases(now, agentId)) {
+      let recoveredTasks: readonly AsyncTaskRecord[];
+      try {
+        recoveredTasks = this.store.recoverExpiredLeases(now, agentId, excludedTaskIds, true);
+      } catch (error) {
+        healthy = false;
+        this.reportRecoveryFailure(`agent ${agentId}`, error);
+        continue;
+      }
+      for (const recovered of recoveredTasks) {
         if (recovered.agentId !== agentId || recovered.status !== "abandoned") continue;
-        this.store.liquidateAbandonedBudget(recovered.taskId, now);
-        if (recovered.attempt >= this.maxAttempts) {
-          const grant = this.store.getGrant(recovered.taskId);
-          const revoked = grant?.revokedAt !== undefined && grant.revokedAt <= now;
-          try {
+        try {
+          const attempt = this.store.listAttempts(recovered.taskId).find((entry) => entry.attempt === recovered.attempt);
+          const recoveredAtMs = attempt?.finishedAtMs;
+          if (recoveredAtMs === null || recoveredAtMs === undefined) {
+            throw new Error("Recovered task attempt has no authoritative finish timestamp.");
+          }
+          // Keep policy metadata anchored to the persisted recovery timestamp;
+          // the store owns the authoritative operation time for the retry.
+          const transitionAtMs = recoveredAtMs;
+          this.store.liquidateAbandonedBudget(recovered.taskId, recoveredAtMs);
+          if (attempt?.unsafeEffectStarted) {
             this.store.transition({
               taskId: recovered.taskId, expectedVersion: recovered.version,
-              to: revoked ? "cancelled" : "failed", atMs: now,
+              to: "failed", atMs: transitionAtMs,
+              error: {
+                code: "internal_error",
+                message: "Task effect outcome is uncertain after lease recovery; automatic retry is blocked.",
+                retryable: false,
+              },
+            });
+            continue;
+          }
+          if (recovered.attempt >= this.maxAttempts) {
+            const grant = this.store.getGrant(recovered.taskId);
+            const revoked = grant?.revokedAt !== undefined && grant.revokedAt <= recoveredAtMs;
+            this.store.transition({
+              taskId: recovered.taskId, expectedVersion: recovered.version,
+              to: revoked ? "cancelled" : "failed", atMs: transitionAtMs,
               error: revoked
                 ? { code: "capability_denied", message: "Recovered task capability grant was revoked after retry exhaustion.", retryable: false }
                 : { code: "internal_error", message: "Task lease recovery exhausted the retry limit.", retryable: false },
             });
-          } catch {
-            // Another process may have won the durable recovery CAS.
+            continue;
           }
-          continue;
-        }
-        try {
-          this.store.transition({
-            taskId: recovered.taskId, expectedVersion: recovered.version, to: "retry_wait", atMs: now,
-            nextAttemptAtMs: now, error: { code: "internal_error", message: "Worker lease recovered after process restart.", retryable: true },
-          });
-        } catch {
-          // A revoked grant cannot enter retry_wait. Make that decision
-          // durable so the recovered task cannot remain permanently stuck.
           try {
             this.store.transition({
-              taskId: recovered.taskId, expectedVersion: recovered.version, to: "cancelled", atMs: now,
-              error: { code: "capability_denied", message: "Recovered task capability grant was revoked before retry.", retryable: false },
+              taskId: recovered.taskId, expectedVersion: recovered.version, to: "retry_wait", atMs: transitionAtMs,
+              retryAtOperationNow: true, error: { code: "internal_error", message: "Worker lease recovered after process restart.", retryable: true },
             });
-          } catch {
-            // Another process may have won the durable recovery CAS.
+          } catch (error) {
+            if (error instanceof AsyncTaskContractError && error.code === "capability_denied") {
+              // Only a proved capability denial may take the cancellation
+              // fallback; CAS/DB and budget failures remain recoverable.
+              this.store.transition({
+                taskId: recovered.taskId, expectedVersion: recovered.version, to: "cancelled", atMs: transitionAtMs,
+                error: { code: "capability_denied", message: "Recovered task capability grant was revoked before retry.", retryable: false },
+              });
+            } else if (error instanceof AsyncTaskContractError && error.code === "budget_exhausted") {
+              this.store.transition({
+                taskId: recovered.taskId, expectedVersion: recovered.version, to: "failed", atMs: transitionAtMs,
+                error: { code: "budget_exhausted", message: error.message, retryable: false },
+              });
+            } else {
+              throw error;
+            }
           }
+        } catch (error) {
+          healthy = false;
+          this.reportRecoveryFailure(`task ${recovered.taskId}`, error);
         }
       }
     }
+    return healthy;
+  }
+
+  private maybeRecoverExpiredWork(): void {
+    const now = this.nowFn();
+    if (now < this.recoveryNextAtMs) return;
+    this.runRecovery(this.activeClaimTaskIds(), true);
   }
 
   async stop(deadlineMs = 5_000): Promise<void> {
@@ -192,6 +281,56 @@ export class AsyncTaskRuntime {
     await this.whenIdle();
   }
 
+  /** Suspend only this agent's admissions. Nested maintenance owns its own fence. */
+  fenceAgent(agentId: string): () => void {
+    if (typeof agentId !== "string" || agentId.trim().length === 0) throw new Error("Agent id is required.");
+    this.agentFences.set(agentId, (this.agentFences.get(agentId) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.agentFences.get(agentId) ?? 1) - 1;
+      if (remaining > 0) this.agentFences.set(agentId, remaining);
+      else this.agentFences.delete(agentId);
+      this.wake();
+    };
+  }
+
+  /** Never report a completed drain while an executor can still touch its home. */
+  async drainAgent(agentId: string, deadlineMs = 5_000): Promise<void> {
+    if (!this.agentFences.has(agentId)) throw new Error("Agent must be fenced before draining tasks.");
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1) throw new Error("Task drain deadline must be positive.");
+    const execution = this.agentControllers.get(agentId);
+    if (execution !== undefined) {
+      try {
+        const task = this.store.getTask(execution.taskId);
+        if (task?.status === "running" || task?.status === "admitted") {
+          this.store.abort({
+            taskId: task.taskId, agentId, parentTurnId: task.parentTurnId,
+            intentId: `maintenance-${task.taskId}-${task.attempt}`,
+            expectedAbortVersion: task.abortVersion, requestedAtMs: this.nowFn(), reason: "parent",
+          });
+        }
+      } finally {
+        execution.controller.abort(new Error("Agent workspace maintenance."));
+      }
+    }
+    const active = this.activeClaims.get(agentId);
+    if (active === undefined) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        active,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Agent tasks did not drain before the maintenance deadline.")), deadlineMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
   /** True only after the worker loop and any in-flight claim have settled. */
   isIdle(): boolean {
     return this.loopPromise === null;
@@ -205,6 +344,7 @@ export class AsyncTaskRuntime {
 
   private async loop(): Promise<void> {
     while (!this.stopped) {
+      this.maybeRecoverExpiredWork();
       const progressed = this.scheduleClaims();
       await this.flushProjections();
       if (!progressed) await this.waitForWork();
@@ -229,7 +369,7 @@ export class AsyncTaskRuntime {
     while (!this.stopped && this.activeClaims.size < this.maxConcurrentTasks && scanned < agents.length) {
       const agentId = agents[(start + scanned) % agents.length]!;
       scanned += 1;
-      if (this.activeClaims.has(agentId)) continue;
+      if (this.agentFences.has(agentId) || this.activeClaims.has(agentId)) continue;
       let claim;
       try {
         claim = this.store.claimNext(agentId, {
@@ -249,6 +389,7 @@ export class AsyncTaskRuntime {
         })
         .finally(() => {
           if (this.activeClaims.get(agentId) === execution) this.activeClaims.delete(agentId);
+          if (!this.stopped) this.runRecovery(this.activeClaimTaskIds());
           this.notifyWaiters();
         });
       this.activeClaims.set(agentId, execution);
@@ -328,10 +469,20 @@ export class AsyncTaskRuntime {
   private async runClaim(task: AsyncTaskRecord, leaseOwnerId: string, attempt: number): Promise<void> {
     const controller = new AbortController();
     this.controllers.set(task.taskId, controller);
+    this.agentControllers.set(task.agentId, { taskId: task.taskId, controller });
     let heartbeat: ReturnType<typeof setInterval> | undefined;
     let current = task;
     let budgetVersion = 1;
     let unsafeEffectStarted = false;
+    let unsafeEffectFenceFailed = false;
+    let unsafeEffectFenceError: unknown;
+    const stopHeartbeat = (): void => {
+      if (heartbeat !== undefined) {
+        clearInterval(heartbeat);
+        heartbeat = undefined;
+      }
+    };
+    controller.signal.addEventListener("abort", stopHeartbeat, { once: true });
     try {
       current = this.store.start({ taskId: task.taskId, expectedVersion: task.version, leaseOwnerId, attempt, startedAtMs: this.nowFn() });
       budgetVersion = this.store.getBudgetState(task.taskId)?.version ?? 1;
@@ -342,15 +493,38 @@ export class AsyncTaskRuntime {
       current = latest;
       budgetVersion = this.store.getBudgetState(task.taskId)?.version ?? budgetVersion;
       heartbeat = setInterval(() => {
+        if (this.stopped || controller.signal.aborted) {
+          stopHeartbeat();
+          return;
+        }
         try {
-          const observed = this.store.getTask(task.taskId);
-          if (observed?.abortIntent?.consumedAtMs === null) {
-            current = this.store.consumeAbortIntent(task.taskId, leaseOwnerId, attempt, this.nowFn());
-            controller.abort(new Error("task abort intent"));
-            return;
+          let lastError: unknown;
+          for (let renewalAttempt = 0; renewalAttempt < 2; renewalAttempt += 1) {
+            const observed = this.store.getTask(task.taskId);
+            if (observed === null) throw new Error("Task disappeared during heartbeat.");
+            current = observed;
+            if (observed.abortIntent?.consumedAtMs === null) {
+              current = this.store.consumeAbortIntent(task.taskId, leaseOwnerId, attempt, this.nowFn());
+              stopHeartbeat();
+              controller.abort(new Error("task abort intent"));
+              return;
+            }
+            const nowMs = this.nowFn();
+            const lease = observed.lease;
+            if ((observed.status !== "admitted" && observed.status !== "running" && observed.status !== "cancelling")
+              || lease === null || lease.ownerId !== leaseOwnerId || lease.attempt !== attempt || lease.expiresAtMs <= nowMs) {
+              throw new Error("Task lease is no longer live.");
+            }
+            try {
+              current = this.store.heartbeat({ taskId: task.taskId, expectedVersion: observed.version, leaseOwnerId, attempt, nowMs, leaseDurationMs: this.leaseDurationMs });
+              return;
+            } catch (error) {
+              lastError = error;
+            }
           }
-          current = this.store.heartbeat({ taskId: task.taskId, expectedVersion: current.version, leaseOwnerId, attempt, nowMs: this.nowFn(), leaseDurationMs: this.leaseDurationMs });
+          if (lastError !== undefined) throw lastError;
         } catch {
+          stopHeartbeat();
           controller.abort();
         }
       }, Math.max(25, Math.floor(this.leaseDurationMs / 3)));
@@ -392,19 +566,44 @@ export class AsyncTaskRuntime {
         }
       };
       const runEffectImpl = async <T>(operation: DelegatedCapabilityOperation, call: () => Promise<T>, options: { readonly reserve?: Partial<BudgetCounters>; readonly usage?: (result: T) => Partial<BudgetCounters>; readonly retrySafe?: boolean } = {}): Promise<T> => {
+        if (unsafeEffectFenceFailed) {
+          throw unsafeEffectFenceError ?? new Error("Unsafe effect marker persistence failed.");
+        }
         context.authorize(operation);
         if (controller.signal.aborted) throw new Error("Task was aborted before effect admission.");
         const reservationId = `effect-${task.taskId}-${attempt}-${randomUUID()}`;
         const reserved = reserveEffect(options.reserve ?? defaultReservation(operation), reservationId);
-        let started = false;
-        if (!options.retrySafe) unsafeEffectStarted = true;
+        if (!options.retrySafe) {
+          // Fail closed if the durable fence itself cannot be persisted: the
+          // external call must never run without the in-memory guard set.
+          unsafeEffectStarted = true;
+        }
         try {
-          started = true;
+          if (!options.retrySafe) {
+            try {
+              current = this.store.markUnsafeEffectStarted({
+                taskId: task.taskId,
+                expectedVersion: current.version,
+                leaseOwnerId,
+                attempt,
+                markedAtMs: this.nowFn(),
+              });
+            } catch (error) {
+              unsafeEffectFenceFailed = true;
+              unsafeEffectFenceError = error;
+              throw error;
+            }
+          }
           const result = await call();
           reconcileEffect(reservationId, reserved.amounts, options.usage?.(result) ?? reserved.amounts);
           return result;
         } catch (error) {
-          try { reconcileEffect(reservationId, reserved.amounts, started ? reserved.amounts : ZERO_USAGE); } catch { /* lease recovery conservatively owns the reservation */ }
+          // A failed read consumed only its attempt counters; size dimensions
+          // may never have been spent. A failed mutation may have partially
+          // applied, so its reservation is conservatively kept.
+          const { inputTokens: _input, outputTokens: _output, workspaceWriteBytes: _bytes, ...attemptOnly } = reserved.amounts;
+          const actual = options.retrySafe ? attemptOnly : reserved.amounts;
+          try { reconcileEffect(reservationId, reserved.amounts, actual); } catch { /* lease recovery conservatively owns the reservation */ }
           throw error;
         }
       };
@@ -412,8 +611,11 @@ export class AsyncTaskRuntime {
         if (operation.kind === "provider") {
           throw new AsyncTaskContractError("invalid_contract", "Provider effects must use runProvider admission.");
         }
-        const minimum = defaultReservation(operation);
+        const minimum = { ...defaultReservation(operation) };
         const requested = options.reserve ?? {};
+        // A measured write reservation supersedes the unknown-size floor;
+        // usage reconciliation still charges the real bytes afterwards.
+        if (requested.workspaceWriteBytes !== undefined) delete minimum.workspaceWriteBytes;
         const reserve = Object.fromEntries(Object.keys({ ...minimum, ...requested }).map((key) => [
           key,
           Math.max((minimum as Record<string, number>)[key] ?? 0, (requested as Record<string, number>)[key] ?? 0),
@@ -484,6 +686,11 @@ export class AsyncTaskRuntime {
       }
       if (controller.signal.aborted || beforeExecute?.status === "cancelling") throw new Error("Task was aborted before executor start.");
       const execution = await this.execute(context);
+      // An executor may catch an injected runEffect rejection. A failed
+      // durable fence must still prevent a false successful terminal commit;
+      // no external effect was dispatched and the task remains explicitly
+      // failed below.
+      if (unsafeEffectFenceFailed) throw unsafeEffectFenceError ?? new Error("Unsafe effect marker persistence failed.");
       if (this.stopped) {
         this.finalizeShutdownClaim(task.taskId, leaseOwnerId, attempt);
         return;
@@ -518,13 +725,14 @@ export class AsyncTaskRuntime {
       const failure: AsyncTaskFailure = {
         code: error instanceof AsyncTaskContractError ? error.code === "budget_exhausted" ? "budget_exhausted" : error.code === "capability_denied" ? "capability_denied" : "internal_error" : "internal_error",
         message: error instanceof Error ? error.message : String(error),
-        retryable: !(error instanceof AsyncTaskContractError && (error.code === "budget_exhausted" || error.code === "capability_denied")),
+        retryable: !unsafeEffectFenceFailed
+          && !(error instanceof AsyncTaskContractError && (error.code === "budget_exhausted" || error.code === "capability_denied")),
       };
       const latest = this.store.getTask(task.taskId);
       if (latest === null || latest.status === "cancelled" || latest.status === "completed" || latest.status === "failed") return;
       current = latest;
       if (current.status !== "running" && current.status !== "cancelling") return;
-      if (failure.retryable && !unsafeEffectStarted && attempt < this.maxAttempts && current.status === "running") {
+      if (failure.retryable && !controller.signal.aborted && !unsafeEffectStarted && attempt < this.maxAttempts && current.status === "running") {
         this.store.transition({ taskId: task.taskId, expectedVersion: current.version, to: "retry_wait", atMs: this.nowFn(), leaseOwnerId, attempt, nextAttemptAtMs: this.nowFn() + this.retryDelayMs, error: failure });
       } else if (current.status === "running" || current.status === "cancelling") {
         this.store.commitTerminal({
@@ -536,8 +744,9 @@ export class AsyncTaskRuntime {
         });
       }
     } finally {
-      if (heartbeat !== undefined) clearInterval(heartbeat);
+      stopHeartbeat();
       this.controllers.delete(task.taskId);
+      if (this.agentControllers.get(task.agentId)?.controller === controller) this.agentControllers.delete(task.agentId);
     }
   }
 

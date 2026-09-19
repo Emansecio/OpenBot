@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEVELOPER_TOOLS, HOME_SYSTEM_PROMPT, SAFE_HOME_TOOLS } from "../src/execution/home-tools.js";
+import { DEVELOPER_TOOLS, HOME_SYSTEM_PROMPT, SAFE_HOME_TOOLS, selectTurnProviderTools } from "../src/execution/home-tools.js";
 
 describe("SAFE_HOME_TOOLS", () => {
   it("publishes file/search and the structured visual browser, without shell or delete", () => {
@@ -51,10 +51,28 @@ describe("SAFE_HOME_TOOLS", () => {
     expect(HOME_SYSTEM_PROMPT).toMatch(/absolute paths on any mounted drive/);
     expect(HOME_SYSTEM_PROMPT).toMatch(/PowerShell/);
     expect(HOME_SYSTEM_PROMPT).toMatch(/process_run/);
-    expect(HOME_SYSTEM_PROMPT).toMatch(/1 MB/);
+    expect(HOME_SYSTEM_PROMPT).toMatch(/Browser tools are attached/);
+    expect(HOME_SYSTEM_PROMPT).toMatch(/whatsapp tool is attached/);
     expect(HOME_SYSTEM_PROMPT).not.toMatch(/LOCALAPPDATA/i);
     const processRun = DEVELOPER_TOOLS.find((tool) => tool.function.name === "process_run");
     expect(processRun?.function.description).toMatch(/trusted host access/);
     expect(processRun?.function.description).toMatch(/absolute path on any mounted drive/);
+  });
+
+  it("omits browser and WhatsApp from the full catalog unless the turn needs them", () => {
+    const core = selectTurnProviderTools(DEVELOPER_TOOLS, { prompt: "liste Documents" }).map((tool) => tool.function.name);
+    expect(core).toEqual(["workspace_info", "file", "search_files", "search_text", "process_run"]);
+    const web = selectTurnProviderTools(DEVELOPER_TOOLS, { prompt: "abra https://example.com" }).map((tool) => tool.function.name);
+    expect(web).toEqual(expect.arrayContaining(["browser_open", "browser_snapshot", "process_run"]));
+    expect(web).not.toContain("whatsapp");
+    const sticky = selectTurnProviderTools(DEVELOPER_TOOLS, { prompt: "continue", recentToolNames: ["browser_snapshot"] }).map((tool) => tool.function.name);
+    expect(sticky).toContain("browser_click");
+    const chat = selectTurnProviderTools(DEVELOPER_TOOLS, { prompt: "leia o whatsapp" }).map((tool) => tool.function.name);
+    expect(chat).toContain("whatsapp");
+    expect(chat).not.toContain("browser_open");
+    expect(selectTurnProviderTools(
+      DEVELOPER_TOOLS.filter((tool) => tool.function.name === "file" || tool.function.name === "whatsapp"),
+      { prompt: "liste a home" },
+    ).map((tool) => tool.function.name)).toEqual(["file", "whatsapp"]);
   });
 });

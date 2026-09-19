@@ -3,6 +3,7 @@ import {
   DEFAULT_UNKNOWN_MODEL_CAPABILITIES,
   computeModelContextBudget,
   createContextTokenizer,
+  countProviderMessageTokens,
   createFakeTokenizer,
   fitProviderMessagesToByteBudget,
   canonicalProviderRequestBytes,
@@ -16,6 +17,18 @@ import {
 import { OpenAiAdapter } from "../src/providers/openai.js";
 
 describe("model-aware context", () => {
+  it("includes tool arguments in preparation estimates without counting them twice", () => {
+    const tokenizer = createContextTokenizer();
+    const prepared = prepareProviderRound({ model: "test", messages: [
+      { role: "user", content: "read" },
+      { role: "assistant", content: "", toolCalls: [{ id: "c1", type: "function", function: { name: "file", arguments: JSON.stringify({ path: "x".repeat(12_000) }) } }] },
+      { role: "tool", toolCallId: "c1", content: "ok" },
+    ] }, { capabilities: DEFAULT_UNKNOWN_MODEL_CAPABILITIES, maxBytes: 100_000 });
+    expect(prepared.telemetry.droppedTurns).toBe(0);
+    expect(prepared.telemetry.estimatedInputTokens).toBe(countProviderMessageTokens(prepared.request.messages, tokenizer) + prepared.budget.used.system + prepared.budget.used.tools);
+    expect(prepared.telemetry.estimatedInputTokens).toBeGreaterThan(4_000);
+    expect(prepared.request.requestId).toBe(prepared.telemetry.requestId);
+  });
   it("uses different finite input budgets for models with different windows", () => {
     const tokenizer = createFakeTokenizer({ tokensPerCharacter: 1 });
     const small = computeModelContextBudget({

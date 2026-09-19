@@ -256,6 +256,31 @@ describe("P2.3 staging security (direct store)", () => {
     expect(existsSync(survivor.storedPath)).toBe(true);
   });
 
+  it("retains rows for a retry when strict purge cannot remove bytes", async () => {
+    const staging = directStaging();
+    const staged = await staging.stageBytes("agent-a", { filename: "retry.txt", bytes: TEXT });
+    const realRm = fsp.rm.bind(fsp);
+    let failOnce = true;
+    const rm = vi.spyOn(fsp, "rm").mockImplementation(async (target, options) => {
+      if (String(target) === staged.storedPath && failOnce) {
+        failOnce = false;
+        throw new Error("bytes busy");
+      }
+      return realRm(target, options);
+    });
+    try {
+      await expect(staging.purgeAgent("agent-a")).rejects.toThrow("bytes busy");
+      expect(staging.get("agent-a", staged.id)).toEqual(expect.objectContaining({ id: staged.id }));
+      expect(existsSync(staged.storedPath)).toBe(true);
+
+      await expect(staging.purgeAgent("agent-a")).resolves.toBe(1);
+      expect(staging.get("agent-a", staged.id)).toBeNull();
+      expect(existsSync(staged.storedPath)).toBe(false);
+    } finally {
+      rm.mockRestore();
+    }
+  });
+
   it("restricts legacy path roots to the current agent home", () => {
     expect(defaultAttachmentRoots("C:\\OpenBot\\workspaces\\agent-a"))
       .toEqual([expect.stringMatching(/OpenBot[\\/]workspaces[\\/]agent-a$/)]);

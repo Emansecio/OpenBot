@@ -187,13 +187,14 @@ export async function buildRelease(options = {}) {
       join(stagingDirectory, "app", "scripts", "openbot-browser-host.cjs"),
     );
     await copyFile(join(sourceRoot, "scripts", "openbot-electron.cjs"), join(stagingDirectory, "app", "scripts", "openbot-electron.cjs"));
+    await copyFile(join(sourceRoot, "scripts", "execution-diagnostics.mjs"), join(stagingDirectory, "app", "scripts", "execution-diagnostics.mjs"));
     const extractedPackage = join(sourceRoot, "client", "extracted", "package.json");
     try {
       await copyFile(extractedPackage, join(stagingDirectory, "app", "client", "extracted", "package.json"));
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
     }
-    for (const scriptName of ["launch.mjs", "shutdown-gateway.mjs", "release-common.mjs", "install.mjs", "update.mjs", "uninstall.mjs", "recovery-center.mjs"]) {
+    for (const scriptName of ["launch.mjs", "shutdown-gateway.mjs", "release-common.mjs", "install.mjs", "update.mjs", "uninstall.mjs", "recovery-center.mjs", "shortcut-appid.mjs"]) {
       await copyFile(join(sourceRoot, "scripts", scriptName), join(stagingDirectory, "scripts", scriptName));
     }
     await writeVersionLauncher(stagingDirectory);
@@ -227,6 +228,7 @@ export async function buildRelease(options = {}) {
         "app/node_modules/better-sqlite3/build/Release/better_sqlite3.node",
         ...(existsSync(dpapiSource) ? [dpapiRelative] : []),
         "app/dist/main.js",
+        "app/scripts/execution-diagnostics.mjs",
         "app/client/extracted/dist/electron-main/main.cjs",
         "app/client/extracted/dist/renderer/index.html",
         `${PRODUCT_NAME}.cmd`,
@@ -243,6 +245,7 @@ export async function buildRelease(options = {}) {
         "scripts/update.mjs",
         "scripts/uninstall.mjs",
         "scripts/recovery-center.mjs",
+        "scripts/shortcut-appid.mjs",
       ],
       signed: false,
       signature: null,

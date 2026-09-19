@@ -42,6 +42,9 @@ import {
 } from "../src/providers/openai-helpers.js";
 import { defaultRegistry, streamChat } from "../src/providers/router.js";
 import type { ProviderChatRequest, ProviderStreamEvent } from "../src/providers/router.js";
+import type { ModelResolution } from "../src/providers/model-catalog.js";
+import { XaiAdapter } from "../src/providers/xai.js";
+import { OpenAiCompatAdapter } from "../src/providers/openai-compat.js";
 import { createKeystore } from "../src/keystore/index.js";
 import type { KeystoreOptions } from "../src/keystore/index.js";
 
@@ -620,5 +623,36 @@ describe("OpenAI error body bounds", () => {
     expect(Buffer.byteLength(error.body as string, "utf8")).toBeLessThanOrEqual(limit + 128);
     expect(error.body as string).toContain("corpo de erro truncado");
     expect(cancelled).toBe(true);
+  });
+});
+
+describe("reasoning_effort fail-closed (F-05)", () => {
+  const baseRequest = (extra: Partial<ProviderChatRequest> = {}): ProviderChatRequest => ({
+    model: "grok-4.6",
+    messages: [{ role: "user", content: "oi" }],
+    reasoningEffort: "low",
+    ...extra,
+  });
+  const resolution = (efforts: string[]) =>
+    ({ supportedReasoningEfforts: efforts }) as unknown as ModelResolution;
+
+  it("xai envia somente quando o modelo resolvido declara o esforço", () => {
+    const xai = new XaiAdapter({ apiKey: "x" });
+    expect(JSON.parse(xai.serializeRequest(baseRequest({ modelResolution: resolution(["low", "high"]) }))).reasoning_effort).toBe("low");
+    expect(JSON.parse(xai.serializeRequest(baseRequest({ modelResolution: resolution(["high"]) })))).not.toHaveProperty("reasoning_effort");
+    expect(JSON.parse(xai.serializeRequest(baseRequest()))).not.toHaveProperty("reasoning_effort");
+  });
+
+  it("openai nunca envia reasoning_effort no chat.completions", () => {
+    const openai = new OpenAiAdapter({ apiKey: "x" });
+    expect(JSON.parse(openai.serializeRequest(baseRequest()))).not.toHaveProperty("reasoning_effort");
+    expect(JSON.parse(openai.serializeRequest(baseRequest({ modelResolution: resolution(["low"]) })))).not.toHaveProperty("reasoning_effort");
+  });
+
+  it("openai-compat envia somente com o opt-in configurado", () => {
+    const off = new OpenAiCompatAdapter({ baseUrl: "https://127.0.0.1:9/v1", apiKey: "x" });
+    expect(JSON.parse(off.serializeRequest(baseRequest({ modelResolution: resolution(["low"]) })))).not.toHaveProperty("reasoning_effort");
+    const on = new OpenAiCompatAdapter({ baseUrl: "https://127.0.0.1:9/v1", apiKey: "x", sendReasoningEffort: true });
+    expect(JSON.parse(on.serializeRequest(baseRequest())).reasoning_effort).toBe("low");
   });
 });

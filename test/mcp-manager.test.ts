@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { ProtocolError } from "@modelcontextprotocol/client";
-import type { CallToolResult, ListToolsResult, Tool } from "@modelcontextprotocol/client";
+import type { CallToolResult, ListToolsRequest, ListToolsResult, Tool } from "@modelcontextprotocol/client";
 import { createPinnedDnsLookup, McpManager, McpPolicyError, McpResultLimitError, McpValidationError, type McpClientSession } from "../src/mcp/manager.js";
 import { fromMcpProviderToolName, toMcpProviderToolName } from "../src/mcp/contracts.js";
 import type { McpHttpServerConfig, McpServerConfig } from "../src/mcp/contracts.js";
-import { MAX_MCP_RESULT_BYTES, MAX_MCP_SERVERS, MAX_MCP_TIMEOUT_MS } from "../src/mcp/security.js";
+import { MAX_MCP_RESULT_BYTES, MAX_MCP_SERVERS, MAX_MCP_TIMEOUT_MS, MAX_MCP_TOOLS } from "../src/mcp/security.js";
 
 const tool = (name: string, description = `${name} description`): Tool => ({
   name,
@@ -183,6 +183,126 @@ describe("McpManager", () => {
       manager.callProviderTool("bot", "mcp__demo__echo", {}),
     ]);
     expect(listCalls).toBe(1);
+    await manager.close();
+  });
+
+  it("follows MCP tool-list cursors before validating call availability", async () => {
+    const cursors: Array<string | undefined> = [];
+    const manager = new McpManager({
+      servers: [server],
+      connector: async () => ({
+        ...fakeSession([]),
+        async listTools(params: ListToolsRequest["params"]) {
+          cursors.push(params?.cursor);
+          return params?.cursor === undefined
+            ? { tools: [tool("first")], nextCursor: "page-2" }
+            : { tools: [tool("second")] };
+        },
+      }),
+      policies: { bot: { enabled: true, serverAllowlist: ["demo"] } },
+    });
+
+    await expect(manager.callProviderTool("bot", "mcp__demo__second", {})).resolves.toMatchObject({ content: [{ text: "ok" }] });
+    expect(cursors).toEqual([undefined, "page-2"]);
+    await manager.close();
+  });
+
+  it("rejects a repeated MCP tool-list cursor instead of looping", async () => {
+    let calls = 0;
+    const manager = new McpManager({
+      servers: [server],
+      connector: async () => ({
+        ...fakeSession([]),
+        async listTools() {
+          calls += 1;
+          return { tools: [tool("echo")], nextCursor: "same" };
+        },
+      }),
+      policies: { bot: { enabled: true, serverAllowlist: ["demo"] } },
+    });
+
+    await expect(manager.listProviderTools("bot")).rejects.toThrow(/cursor repeated/iu);
+    expect(calls).toBe(2);
+    await manager.close();
+  });
+
+  it("treats an empty MCP cursor as opaque and follows it", async () => {
+    const cursors: Array<string | undefined> = [];
+    const manager = new McpManager({
+      servers: [server],
+      connector: async () => ({
+        ...fakeSession([]),
+        async listTools(params: ListToolsRequest["params"]) {
+          cursors.push(params?.cursor);
+          return params?.cursor === undefined
+            ? { tools: [tool("first")], nextCursor: "" }
+            : { tools: [tool("second")] };
+        },
+      }),
+      policies: { bot: { enabled: true, serverAllowlist: ["demo"] } },
+    });
+
+    await expect(manager.callProviderTool("bot", "mcp__demo__second", {})).resolves.toMatchObject({ content: [{ text: "ok" }] });
+    expect(cursors).toEqual([undefined, ""]);
+    await manager.close();
+  });
+
+  it("stops paginated listing when agent removal cancels between pages", async () => {
+    let manager!: McpManager;
+    const cursors: Array<string | undefined> = [];
+    const connector = async () => ({
+      ...fakeSession([]),
+      async listTools(params: ListToolsRequest["params"]) {
+        cursors.push(params?.cursor);
+        if (params?.cursor === undefined) {
+          queueMicrotask(() => manager.removeAgent("bot"));
+          return { tools: [tool("first")], nextCursor: "page-2" };
+        }
+        throw new Error("second page should not be requested");
+      },
+    });
+    manager = new McpManager({
+      servers: [{ ...server, sessionScope: "agent" }],
+      connector,
+      policies: { bot: { enabled: true, serverAllowlist: ["demo"] } },
+    });
+
+    await expect(manager.listProviderTools("bot")).rejects.toThrow(/aborted|listing failed/iu);
+    expect(cursors).toEqual([undefined]);
+    await manager.close();
+  });
+
+  it("rejects a paginated MCP catalog that exceeds the tool limit", async () => {
+    const manager = new McpManager({
+      servers: [server],
+      connector: async () => ({
+        ...fakeSession([]),
+        async listTools() {
+          return { tools: Array.from({ length: MAX_MCP_TOOLS + 1 }, (_, index) => tool(`tool-${index}`)) };
+        },
+      }),
+      policies: { bot: { enabled: true, serverAllowlist: ["demo"] } },
+    });
+
+    await expect(manager.listProviderTools("bot")).rejects.toThrow(/tool count exceeds/iu);
+    await manager.close();
+  });
+
+  it("applies the byte budget across paginated MCP responses", async () => {
+    const manager = new McpManager({
+      servers: [{ ...server, maxResultBytes: 500 }],
+      connector: async () => ({
+        ...fakeSession([]),
+        async listTools(params: ListToolsRequest["params"]) {
+          return params?.cursor === undefined
+            ? { tools: [tool("first")], nextCursor: "x".repeat(200) }
+            : { tools: [tool("second")], nextCursor: "y".repeat(200) };
+        },
+      }),
+      policies: { bot: { enabled: true, serverAllowlist: ["demo"] } },
+    });
+
+    await expect(manager.listProviderTools("bot")).rejects.toThrow(McpResultLimitError);
     await manager.close();
   });
 

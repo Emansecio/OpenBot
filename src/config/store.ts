@@ -3,11 +3,8 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  renameSync,
-  rmSync,
   statSync,
   unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -30,6 +27,7 @@ import {
 } from "../mcp/security.js";
 import { validateCompatBaseUrl } from "../providers/openai-compat.js";
 import { isCatalogProvider, type ModelCatalogService } from "../providers/model-catalog.js";
+import { writeFileAtomicSync, writeFileExclusiveSync } from "../shared/fs-atomic.js";
 import { MODEL_CATALOG } from "./models.js";
 
 export const MAX_AGENT_NAME_CHARS = 120;
@@ -113,37 +111,12 @@ export interface OpenBotConfig {
   /** Shared MCP definitions. Secrets are references resolved by the host keystore. */
   mcpServers?: McpServerConfig[];
   /**
-   * P2.5 — optional provider configuration (openrouter, codex-cli,
-   * claude-code). Only OPaque credential/session references are persisted
-   * here, never secret values; every provider is disabled by default.
+   * Opt-in do usuário: o adapter openai-compat envia `reasoning_effort` no
+   * corpo chat.completions. Default false — endpoints estritos podem rejeitar
+   * parâmetros desconhecidos.
    */
-  optionalProviders?: OptionalProviderConfigMap;
+  compatReasoningEffort?: boolean;
 }
-
-export interface OptionalProviderConfig {
-  enabled: boolean;
-  /** Agent scope that owns the credential/session reference. */
-  scope?: string | null;
-  /** Opaque keystore credential reference (OpenRouter). */
-  credentialRef?: string | null;
-  /** Opaque keystore session reference (CLI providers). */
-  sessionRef?: string | null;
-  /** Explicit endpoint (OpenRouter). */
-  endpoint?: string | null;
-  httpReferer?: string | null;
-  appTitle?: string | null;
-  /** Catalog model id serving this provider. */
-  model?: string | null;
-  /** CLI executable (broker allowlist applies at execution). */
-  executable?: string | null;
-  args?: string[] | null;
-  cwd?: string | null;
-  timeoutMs?: number | null;
-}
-
-export type OptionalProviderConfigMap = Partial<Record<"openrouter" | "codex-cli" | "claude-code", OptionalProviderConfig>>;
-
-export const OPTIONAL_PROVIDER_CONFIG_KEYS = ["openrouter", "codex-cli", "claude-code"] as const;
 
 export interface ConfigStoreOptions {
   configPath?: string;
@@ -160,7 +133,7 @@ export interface OpenBotConfigUpdate {
   hostSettings?: SandHostSettings;
   flags?: Partial<OpenBotFlags>;
   mcpServers?: McpServerConfig[];
-  optionalProviders?: OptionalProviderConfigMap;
+  compatReasoningEffort?: boolean;
 }
 
 export function defaultConfigPath(): string {
@@ -336,61 +309,6 @@ function normalizeMcpServer(value: unknown, index: number): McpServerConfig {
   throw configError(`mcpServers[${index}].transport`);
 }
 
-function normalizeOptionalProviders(value: unknown): OptionalProviderConfigMap | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("config inválida: optionalProviders");
-  const input = value as Record<string, unknown>;
-  const output: OptionalProviderConfigMap = {};
-  for (const key of Object.keys(input)) {
-    if (!((OPTIONAL_PROVIDER_CONFIG_KEYS as readonly string[]).includes(key))) throw new Error(`config inválida: optionalProviders.${key}`);
-    const entry = input[key];
-    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error(`config inválida: optionalProviders.${key}`);
-    const record = entry as Record<string, unknown>;
-    if (typeof record.enabled !== "boolean") throw new Error(`config inválida: optionalProviders.${key}.enabled`);
-    const nullableString = (name: string, maxBytes = 512): string | null => {
-      const raw = record[name];
-      if (raw === undefined || raw === null) return null;
-      if (typeof raw !== "string" || raw.length === 0 || raw.length > maxBytes) throw new Error(`config inválida: optionalProviders.${key}.${name}`);
-      return raw;
-    };
-    const scope = nullableString("scope", 256);
-    const ref = nullableString("credentialRef") ?? nullableString("sessionRef");
-    if (ref !== null && /\s/u.test(ref)) throw new Error(`config inválida: optionalProviders.${key} ref opaco`);
-    const endpoint = nullableString("endpoint");
-    if (endpoint !== null) {
-      let parsed: URL;
-      try { parsed = new URL(endpoint); } catch { throw new Error(`config inválida: optionalProviders.${key}.endpoint`); }
-      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error(`config inválida: optionalProviders.${key}.endpoint`);
-    }
-    const args = record.args;
-    if (args !== undefined && args !== null) {
-      if (!Array.isArray(args) || args.length === 0 || args.length > 64
-        || args.some((item) => typeof item !== "string" || item.length === 0 || Buffer.byteLength(item, "utf8") > 4096)) {
-        throw new Error(`config inválida: optionalProviders.${key}.args`);
-      }
-    }
-    const timeoutMs = record.timeoutMs;
-    if (timeoutMs !== undefined && timeoutMs !== null && (typeof timeoutMs !== "number" || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) {
-      throw new Error(`config inválida: optionalProviders.${key}.timeoutMs`);
-    }
-    output[key as "openrouter" | "codex-cli" | "claude-code"] = {
-      enabled: record.enabled,
-      ...(scope === null ? {} : { scope }),
-      ...(typeof record.credentialRef === "string" ? { credentialRef: record.credentialRef } : {}),
-      ...(typeof record.sessionRef === "string" ? { sessionRef: record.sessionRef } : {}),
-      ...(endpoint === null ? {} : { endpoint }),
-      ...(nullableString("httpReferer") === null ? {} : { httpReferer: nullableString("httpReferer", 512) ?? undefined }),
-      ...(nullableString("appTitle") === null ? {} : { appTitle: nullableString("appTitle", 512) ?? undefined }),
-      ...(nullableString("model", 256) === null ? {} : { model: nullableString("model", 256) ?? undefined }),
-      ...(nullableString("executable", 256) === null ? {} : { executable: nullableString("executable", 256) ?? undefined }),
-      ...(args === undefined || args === null ? {} : { args: args as string[] }),
-      ...(nullableString("cwd", 4096) === null ? {} : { cwd: nullableString("cwd", 4096) ?? undefined }),
-      ...(timeoutMs === undefined || timeoutMs === null ? {} : { timeoutMs }),
-    };
-  }
-  return output;
-}
-
 function normalizeMcpServers(value: unknown): McpServerConfig[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.length > MAX_MCP_SERVERS) throw configError("mcpServers");
@@ -484,6 +402,18 @@ function validateAgent(agent: LocalAgent, ids: Set<string>, globalModel: string,
     throw new Error("config inválida: agent.description");
   }
   if (agent.title !== undefined && (typeof agent.title !== "string" || !agent.title.trim())) throw new Error("config inválida: agent.title");
+  // Campos de exibição: rejeita somente lixo que nunca foi um valor válido
+  // (tipo errado, NUL, nova linha, comprimento absurdo) — nunca um valor
+  // legado que a UI já renderizava.
+  if (agent.origin !== undefined && (typeof agent.origin !== "string" || agent.origin.includes("\0") || /[\r\n]/u.test(agent.origin) || agent.origin.length > 128)) {
+    throw new Error("config inválida: agent.origin");
+  }
+  if (agent.avatarShape !== undefined && (typeof agent.avatarShape !== "string" || agent.avatarShape.includes("\0") || agent.avatarShape.length > 64)) {
+    throw new Error("config inválida: agent.avatarShape");
+  }
+  if (agent.avatarColor !== undefined && (typeof agent.avatarColor !== "string" || agent.avatarColor.includes("\0") || /[\r\n]/u.test(agent.avatarColor) || agent.avatarColor.length > 64)) {
+    throw new Error("config inválida: agent.avatarColor");
+  }
   if (typeof agent.avatarId !== "string" || !agent.avatarId) throw new Error("config inválida: agent.avatarId");
   if (agent.hasCustomAvatar !== undefined && typeof agent.hasCustomAvatar !== "boolean") {
     throw new Error("config inválida: agent.hasCustomAvatar");
@@ -503,8 +433,14 @@ function validateAgent(agent: LocalAgent, ids: Set<string>, globalModel: string,
   if (agent.serviceTier !== undefined && agent.serviceTier !== "default" && agent.serviceTier !== "priority") {
     throw new Error("config inválida: agent.serviceTier");
   }
-  if (agent.serviceTier === "priority" && agent.provider !== "openai" && MODEL_CATALOG.find(m => m.id === agent.model)?.provider !== "openai") {
-    throw new Error("Fast requer um modelo OpenAI compatível.");
+  if (agent.serviceTier === "priority") {
+    // Provider efetivo: explícito do agente, senão o catálogo do modelo
+    // efetivo (agente pode herdar o modelo global). Comparar só com
+    // `agent.model` rejeitaria `priority` num agente que herda um modelo
+    // OpenAI — falso negativo que também derrubaria o load inteiro.
+    const tierModel = agent.model ?? globalModel;
+    const tierProvider = agent.provider ?? MODEL_CATALOG.find(m => m.id === tierModel)?.provider;
+    if (tierProvider !== "openai") throw new Error("Fast requer um modelo OpenAI compatível.");
   }
   if (agent.reasoningEffort !== undefined && !(REASONING_EFFORTS as readonly unknown[]).includes(agent.reasoningEffort)) {
     throw new Error("config inválida: agent.reasoningEffort");
@@ -574,6 +510,12 @@ function validateLocalProfile(profile: LocalProfile): void {
   if (!profile.name.trim() || profile.name.length > MAX_AGENT_NAME_CHARS || profile.name.includes("\0")) {
     throw new Error("config inválida: profile.name");
   }
+  // O load exige machineId; a validação do write-path precisa do mesmo
+  // invariante ou um mutateProfile poderia persistir uma config que o boot
+  // rejeita.
+  if (typeof profile.machineId !== "string" || !profile.machineId.trim()) {
+    throw new Error("config inválida: profile.machineId");
+  }
   if (!profile.avatarId.trim() || profile.avatarId.includes("\0")) throw new Error("config inválida: profile.avatarId");
   if (profile.avatarShape !== undefined && !LOCAL_PROFILE_AVATAR_SHAPES.includes(profile.avatarShape)) {
     throw new Error("config inválida: profile.avatarShape");
@@ -630,6 +572,13 @@ function decodeConfig(raw: unknown, allowUnverified = false): OpenBotConfig {
   }
   if (raw.compatBaseUrl === undefined) raw.compatBaseUrl = null;
   if (typeof raw.compatBaseUrl === "string") validateCompatBaseUrl(raw.compatBaseUrl);
+  if (raw.compatReasoningEffort !== undefined && typeof raw.compatReasoningEffort !== "boolean") {
+    throw new Error("config inválida: compatReasoningEffort");
+  }
+  // Superfície removida (P2.5 legado): a chave era de configuração inerte —
+  // nenhum agente podia selecionar esses providers. Aceita e descarta para
+  // que configs antigas carreguem; some na próxima gravação.
+  delete raw.optionalProviders;
   if (!isRecord(raw.hostSettings)) throw new Error("config inválida: hostSettings");
   const settings = raw.hostSettings;
   validateHostSettings(settings, true);
@@ -639,8 +588,6 @@ function decodeConfig(raw: unknown, allowUnverified = false): OpenBotConfig {
       typeof raw.flags.isEgressTunnelAvailable !== "boolean") {
     throw new Error("config inválida: flags");
   }
-  const optionalProviders = normalizeOptionalProviders(raw.optionalProviders);
-  if (optionalProviders !== undefined) (raw).optionalProviders = optionalProviders;
   const config = raw as unknown as OpenBotConfig;
   const mcpServers = normalizeMcpServers(raw.mcpServers);
   if (mcpServers !== undefined) config.mcpServers = mcpServers;
@@ -723,7 +670,7 @@ function withConfigLock<T>(target: string, task: () => T): T {
 
   while (true) {
     try {
-      writeFileSync(file, JSON.stringify({ pid: process.pid, token }), { flag: "wx", mode: 0o600 });
+      writeFileExclusiveSync(file, JSON.stringify({ pid: process.pid, token }));
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -818,6 +765,13 @@ export class ConfigStore {
     }
   }
 
+  /**
+   * Returns the last committed in-memory state. External file edits only
+   * become visible after a commit re-reads the disk under the lock — the
+   * store assumes the config file is single-writer in steady state; the
+   * file lock exists for first-boot races and commit mutual exclusion, not
+   * continuous multi-process write sharing.
+   */
   snapshot(): OpenBotConfig {
     return structuredClone(this.config);
   }
@@ -883,9 +837,9 @@ export class ConfigStore {
         ...(patch.globalModel !== undefined ? { globalModel: patch.globalModel } : {}),
         ...(patch.globalReasoningEffort !== undefined ? { globalReasoningEffort: patch.globalReasoningEffort } : {}),
         ...(patch.compatBaseUrl !== undefined ? { compatBaseUrl: patch.compatBaseUrl } : {}),
+        ...(patch.compatReasoningEffort !== undefined ? { compatReasoningEffort: patch.compatReasoningEffort } : {}),
         ...(patch.agents !== undefined ? { agents: patch.agents } : {}),
         ...(patch.mcpServers !== undefined ? { mcpServers: patch.mcpServers } : {}),
-        ...(patch.optionalProviders !== undefined ? { optionalProviders: normalizeOptionalProviders(patch.optionalProviders) } : {}),
         profile: replaceProfile && patch.profile !== undefined
         ? patch.profile as LocalProfile
         : { ...current.profile, ...patch.profile },
@@ -898,6 +852,9 @@ export class ConfigStore {
       validateLocalProfile(next.profile);
       validateHostSettings(next.hostSettings, true);
       if (typeof next.compatBaseUrl === "string") validateCompatBaseUrl(next.compatBaseUrl);
+      if (next.compatReasoningEffort !== undefined && typeof next.compatReasoningEffort !== "boolean") {
+        throw new Error("config inválida: compatReasoningEffort");
+      }
       next.agents = validateAgents(next.agents, next.globalModel, new Set((mcpServers ?? []).map((server) => server.id.toLowerCase())), this.allowUnverified);
       if (this.modelCatalog) {
         const check = (provider: string, model: string, effort?: ReasoningEffort) => {
@@ -947,16 +904,6 @@ export class ConfigStore {
   }
 
   private persist(config: OpenBotConfig): void {
-    mkdirSync(dirname(this.path), { recursive: true });
-    const tempPath = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      writeFileSync(tempPath, `${JSON.stringify(config, null, 2)}\n`, {
-        encoding: "utf8",
-        mode: 0o600,
-      });
-      renameSync(tempPath, this.path);
-    } finally {
-      rmSync(tempPath, { force: true });
-    }
+    writeFileAtomicSync(this.path, `${JSON.stringify(config, null, 2)}\n`);
   }
 }

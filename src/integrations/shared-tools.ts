@@ -1,6 +1,15 @@
-import type { ToolCallExecutor, ToolExecutionContext, ToolExecutionResult } from "../execution/tool-loop.js";
+import { MAX_TOOL_RESULT_BYTES_PER_ROUND, type ToolCallExecutor, type ToolExecutionContext, type ToolExecutionResult } from "../execution/tool-loop.js";
 import type { McpAgentPolicy } from "../mcp/contracts.js";
-import { MCP_PROVIDER_TOOL_PREFIX } from "../mcp/contracts.js";
+import {
+  isMcpProviderToolName,
+  McpAbortedError,
+  McpPolicyError,
+  McpResultLimitError,
+  MCP_PROVIDER_TOOL_PREFIX,
+  McpTimeoutError,
+  McpValidationError,
+} from "../mcp/contracts.js";
+import { McpSecurityError } from "../mcp/security.js";
 import type { ProviderTool } from "../providers/router.js";
 import type { SkillCatalog } from "../skills/catalog.js";
 import { SkillDispatcher, type SkillAgentPolicy } from "../skills/dispatcher.js";
@@ -9,11 +18,50 @@ import type { TurnContextResolution } from "../rpc/send.js";
 
 export const MAX_PROVIDER_TOOL_SCHEMA_BYTES = 256 * 1024;
 export const DEFAULT_MCP_TURN_DISCOVERY_TIMEOUT_MS = 1_500;
+export const SEARCH_MCP_TOOLS_NAME = "search_mcp_tools";
+export const CALL_MCP_TOOL_NAME = "call_mcp_tool";
+const MCP_SEARCH_LIMIT = 20;
+const MCP_SEARCH_DESCRIPTION_BYTES = 240;
+
+export const MCP_GATEWAY_TOOLS: ProviderTool[] = [
+  {
+    type: "function",
+    function: {
+      name: SEARCH_MCP_TOOLS_NAME,
+      description: "Search authorized MCP tools by task keywords. Returns matching names, descriptions, and bounded input schemas; omittedByByteLimit reports schemas excluded by the response byte limit; invoke one with call_mcp_tool.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          query: { type: "string", minLength: 1, maxLength: 256 },
+          limit: { type: "integer", minimum: 1, maximum: MCP_SEARCH_LIMIT },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: CALL_MCP_TOOL_NAME,
+      description: "Call one authorized MCP tool by its mcp__server__tool name with a JSON object of arguments.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          name: { type: "string", minLength: 1, maxLength: 256 },
+          arguments: { type: "object" },
+        },
+        required: ["name"],
+      },
+    },
+  },
+];
 
 export interface SharedMcpManager {
   setAgentPolicy(agentId: string, policy: McpAgentPolicy): void;
   removeAgent?(agentId: string): void;
-  getProviderTools(agentId: string, options?: { signal?: AbortSignal }): Promise<ProviderTool[]>;
+  getProviderTools(agentId: string, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<ProviderTool[]>;
   callProviderTool(
     agentId: string,
     name: string,
@@ -48,6 +96,36 @@ const safeFailure = (operation: string, code: string, message: string): ToolExec
   result: { ok: false, operation, code, message },
 });
 
+/** Honest codes: a policy denial or timeout is not an availability failure. */
+const mcpFailure = (operation: string, error: unknown, fallback: string): ToolExecutionResult => {
+  if (error instanceof McpPolicyError || error instanceof McpSecurityError) return safeFailure(operation, "policy", fallback);
+  if (error instanceof McpValidationError) return safeFailure(operation, "validation", fallback);
+  if (error instanceof McpTimeoutError) return safeFailure(operation, "timed_out", fallback);
+  if (error instanceof McpAbortedError) return safeFailure(operation, "aborted", fallback);
+  if (error instanceof McpResultLimitError) return safeFailure(operation, "output_limit", fallback);
+  return safeFailure(operation, "unavailable", fallback);
+};
+
+const isMcpToolErrorResult = (value: unknown): boolean =>
+  typeof value === "object"
+  && value !== null
+  && !Array.isArray(value)
+  && (value as { isError?: unknown }).isError === true;
+
+function compactMcpDescription(value: string | undefined): string {
+  if (value === undefined || value.length === 0) return "";
+  if (Buffer.byteLength(value, "utf8") <= MCP_SEARCH_DESCRIPTION_BYTES) return value;
+  let text = value;
+  while (text.length > 0 && Buffer.byteLength(text, "utf8") > MCP_SEARCH_DESCRIPTION_BYTES - 1) {
+    text = text.slice(0, Math.max(0, text.length - 8));
+  }
+  return `${text}…`;
+}
+
+function isMcpSchemaToolName(name: string): boolean {
+  return name.startsWith(MCP_PROVIDER_TOOL_PREFIX) || name === SEARCH_MCP_TOOLS_NAME || name === CALL_MCP_TOOL_NAME;
+}
+
 function parseObjectArguments(raw: string): Record<string, unknown> | undefined {
   try {
     const value: unknown = JSON.parse(raw);
@@ -78,41 +156,36 @@ export class SharedTools {
   public async providerTools(
     agentId: string,
     baseTools: readonly ProviderTool[] = [],
-    options?: { signal?: AbortSignal },
+    _options?: { signal?: AbortSignal },
   ): Promise<ProviderTool[]> {
     const skillPolicy = this.options.resolveAgentSkillPolicy(agentId);
     const mcpPolicy = this.options.resolveAgentMcpPolicy(agentId);
     this.options.mcpManager.setAgentPolicy(agentId, mcpPolicy);
-    const combined: ProviderTool[] = [...baseTools];
+    const combined: ProviderTool[] = baseTools.filter((tool) => !isMcpSchemaToolName(tool.function.name));
     if (skillPolicy.enabled !== false) combined.push(...this.skillDispatcher.tools);
-    let mcpState: SharedToolsStatus["mcp"] = { enabled: mcpPolicy.enabled, state: mcpPolicy.enabled ? "ready" : "disabled" };
+    const mcpState: SharedToolsStatus["mcp"] = { enabled: mcpPolicy.enabled, state: mcpPolicy.enabled ? "ready" : "disabled" };
     if (mcpPolicy.enabled) {
-      const discovery = this.options.mcpManager.getProviderTools(agentId).then(
-        (tools) => ({ state: "ready" as const, tools }),
-        () => ({ state: "error" as const }),
+      combined.push(...MCP_GATEWAY_TOOLS);
+      void this.options.mcpManager.getProviderTools(agentId, { timeoutMs: this.mcpTurnTimeoutMs }).then(
+        (tools) => {
+          const current = this.statuses.get(agentId);
+          if (current === undefined) return;
+          this.statuses.set(agentId, {
+            ...current,
+            mcp: { enabled: true, state: "ready", toolCount: tools.length },
+          });
+        },
+        () => {
+          // Gateway search/call stays usable without a warm catalog, but the
+          // turn notice reflects that discovery actually failed.
+          const current = this.statuses.get(agentId);
+          if (current === undefined || current.mcp.enabled !== true) return;
+          this.statuses.set(agentId, {
+            ...current,
+            mcp: { enabled: true, state: "error", error: { code: "unavailable" } },
+          });
+        },
       );
-      let timeout: ReturnType<typeof setTimeout> | undefined;
-      let abortListener: (() => void) | undefined;
-      const unavailable = new Promise<{ state: "error" }>((resolve) => {
-        timeout = setTimeout(() => resolve({ state: "error" }), this.mcpTurnTimeoutMs);
-        timeout.unref();
-        if (options?.signal) {
-          abortListener = () => resolve({ state: "error" });
-          if (options.signal.aborted) abortListener();
-          else options.signal.addEventListener("abort", abortListener, { once: true });
-        }
-      });
-      const listed = await Promise.race([discovery, unavailable]);
-      if (timeout !== undefined) clearTimeout(timeout);
-      if (options?.signal && abortListener) options.signal.removeEventListener("abort", abortListener);
-      if (listed.state === "ready") {
-        combined.push(...listed.tools);
-        mcpState = { enabled: true, state: "ready", toolCount: listed.tools.length };
-      } else {
-        // Remote/process errors are untrusted. The diagnostic intentionally
-        // carries no original message, URL, path, arguments or secret data.
-        mcpState = { enabled: true, state: "error", error: { code: "unavailable" } };
-      }
     }
     const names = new Set<string>();
     const unique = combined.filter((tool) => {
@@ -126,12 +199,6 @@ export class SharedTools {
       const next = [...bounded, tool];
       if (Buffer.byteLength(JSON.stringify(next), "utf8") > MAX_PROVIDER_TOOL_SCHEMA_BYTES) continue;
       bounded.push(tool);
-    }
-    if (mcpState.state === "ready") {
-      mcpState = {
-        ...mcpState,
-        toolCount: bounded.filter((tool) => tool.function.name.startsWith(MCP_PROVIDER_TOOL_PREFIX)).length,
-      };
     }
     this.statuses.set(agentId, { skills: { enabled: skillPolicy.enabled !== false }, mcp: mcpState });
     return bounded;
@@ -197,38 +264,119 @@ export class SharedTools {
   }
 
   private async execute(context: ToolExecutionContext): Promise<ToolExecutionResult> {
+    if (context.signal?.aborted) {
+      return safeFailure("shared.tool", "aborted", "Tool execution was aborted.");
+    }
     if (this.skillDispatcher.canHandle(context.call.function.name)) {
       return this.skillDispatcher.execute(context);
     }
-    if (!context.call.function.name.startsWith(MCP_PROVIDER_TOOL_PREFIX)) return { handled: false };
     const policy = this.options.resolveAgentMcpPolicy(context.agentId);
     this.options.mcpManager.setAgentPolicy(context.agentId, policy);
+    if (context.call.function.name === SEARCH_MCP_TOOLS_NAME) {
+      if (!policy.enabled) return safeFailure("mcp.search", "policy", "MCP is disabled for this bot");
+      const args = parseObjectArguments(context.call.function.arguments);
+      const query = typeof args?.query === "string" ? args.query.trim() : "";
+      if (query.length === 0 || Buffer.byteLength(query, "utf8") > 256) {
+        return safeFailure("mcp.search", "validation", "search_mcp_tools query is invalid");
+      }
+      const limit = args?.limit === undefined ? 8 : args.limit;
+      if (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > MCP_SEARCH_LIMIT) {
+        return safeFailure("mcp.search", "validation", "search_mcp_tools limit is invalid");
+      }
+      try {
+        const listed = await this.options.mcpManager.getProviderTools(context.agentId, { signal: context.signal });
+        const needle = query.toLocaleLowerCase();
+        const compact = listed.map((tool) => ({
+          name: tool.function.name,
+          description: compactMcpDescription(tool.function.description),
+          ...(tool.function.parameters === undefined ? {} : { parameters: tool.function.parameters }),
+        }));
+        const matched = compact.filter((tool) => (
+          tool.name.toLocaleLowerCase().includes(needle) || tool.description.toLocaleLowerCase().includes(needle)
+        ));
+        const selected = (matched.length > 0 ? matched : compact).slice(0, limit as number);
+        const encode = (tools: typeof compact, omittedByByteLimit: number): string => JSON.stringify({
+          tools,
+          count: tools.length,
+          ...(omittedByByteLimit > 0 ? { omittedByByteLimit } : {}),
+        });
+        const bounded: typeof selected = [];
+        let omittedByByteLimit = 0;
+        for (const tool of selected) {
+          const candidate = [...bounded, tool];
+          const encoded = encode(candidate, 0);
+          if (Buffer.byteLength(encoded, "utf8") > MAX_TOOL_RESULT_BYTES_PER_ROUND) {
+            omittedByByteLimit += 1;
+            continue;
+          }
+          bounded.push(tool);
+        }
+        let content = encode(bounded, omittedByByteLimit);
+        while (Buffer.byteLength(content, "utf8") > MAX_TOOL_RESULT_BYTES_PER_ROUND && bounded.length > 0) {
+          bounded.pop();
+          omittedByByteLimit += 1;
+          content = encode(bounded, omittedByByteLimit);
+        }
+        return { handled: true, ok: true, content, result: { ok: true, operation: "mcp.search", bytes: Buffer.byteLength(content) } };
+      } catch (error) {
+        return mcpFailure("mcp.search", error, "MCP tool listing failed");
+      }
+    }
+    if (context.call.function.name === CALL_MCP_TOOL_NAME) {
+      if (!policy.enabled) return safeFailure("mcp.call", "policy", "MCP is disabled for this bot");
+      const args = parseObjectArguments(context.call.function.arguments);
+      const name = typeof args?.name === "string" ? args.name.trim() : "";
+      if (!isMcpProviderToolName(name)) return safeFailure("mcp.call", "validation", "call_mcp_tool name is invalid");
+      const callArgs = args?.arguments;
+      if (callArgs !== undefined && (typeof callArgs !== "object" || callArgs === null || Array.isArray(callArgs))) {
+        return safeFailure("mcp.call", "validation", "MCP tool arguments must be a JSON object");
+      }
+      return this.callMcp(context.agentId, name, (callArgs ?? {}) as Record<string, unknown>, context.signal);
+    }
+    if (!isMcpProviderToolName(context.call.function.name)) return { handled: false };
     if (!policy.enabled) return safeFailure("mcp.call", "policy", "MCP is disabled for this bot");
     const args = parseObjectArguments(context.call.function.arguments);
     if (args === undefined) return safeFailure("mcp.call", "validation", "MCP tool arguments must be a JSON object");
+    return this.callMcp(context.agentId, context.call.function.name, args, context.signal);
+  }
+
+  private async callMcp(
+    agentId: string,
+    name: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<ToolExecutionResult> {
     try {
-      const value = await this.options.mcpManager.callProviderTool(
-        context.agentId,
-        context.call.function.name,
-        args,
-        { signal: context.signal },
-      );
+      const value = await this.options.mcpManager.callProviderTool(agentId, name, args, { signal });
       const content = JSON.stringify(value);
+      if (isMcpToolErrorResult(value)) {
+        const message = "MCP tool reported an execution error";
+        return {
+          handled: true,
+          ok: false,
+          content,
+          error: content,
+          result: { ok: false, operation: "mcp.call", code: "tool_error", message },
+        };
+      }
       return {
         handled: true,
         ok: true,
         content,
         result: { ok: true, operation: "mcp.call", bytes: Buffer.byteLength(content) },
       };
-    } catch {
-      return safeFailure("mcp.call", "unavailable", "MCP tool execution failed");
+    } catch (error) {
+      return mcpFailure("mcp.call", error, "MCP tool execution failed");
     }
   }
 
   public executor(): ToolCallExecutor {
     const executor = (context: ToolExecutionContext) => this.execute(context);
     return Object.assign(executor, {
-      canHandle: (name: string) => this.skillDispatcher.canHandle(name) || name.startsWith(MCP_PROVIDER_TOOL_PREFIX),
+      canHandle: (name: string) => this.skillDispatcher.canHandle(name)
+        || isMcpProviderToolName(name)
+        || name === SEARCH_MCP_TOOLS_NAME
+        || name === CALL_MCP_TOOL_NAME,
     });
   }
 }

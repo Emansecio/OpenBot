@@ -13,7 +13,7 @@
     "main": {
       "path": "client/extracted/dist/electron-main/main.cjs",
       "version": "0.16.0",
-      "sha256": "a8260b2021ecf5f4a0ebbb8d23df3f319d68cbd575951578cc18c21abf1ebc3f",
+      "sha256": "9ebd56c8b5c323d3f0975bcd5c2d95fa0c19d97c1b629bc5809f05e95ed7c02f",
       "sourceMap": {
         "path": "client/extracted/dist/electron-main/main.cjs.map",
         "status": "removed",
@@ -23,7 +23,7 @@
     "preload": {
       "path": "client/extracted/dist/electron-preload/preload.cjs",
       "version": "0.16.0",
-      "sha256": "9e16e28682a75c15d48eb9a220711f718f62c53b423f59e88eccb206088b60fd",
+      "sha256": "409d936e7286dffc9b7427454cb52ccaf182aa9631d9153ff7eb33144eb70642",
       "sourceMap": {
         "path": "client/extracted/dist/electron-preload/preload.cjs.map",
         "status": "removed",
@@ -32,24 +32,24 @@
     },
     "coordinatorTranscriptAdapter": {
       "path": "client/extracted/dist/node-agent-coordinator/openbot-transcript-adapter.cjs",
-      "version": "openbot-transcript-adapter-v5-tool-notices",
-      "sha256": "b107184c402f7bb28dbf26b2f74a39dc9a1587d19b298e16234a55e89eefe499",
+      "version": "openbot-transcript-adapter-v6-quiet-tools",
+      "sha256": "a701fc4dd63e59895a0127cb998631f433a7b777a407a441284b6a85015f1a67",
       "sourceMap": {
         "status": "not-applicable"
       }
     },
     "rendererInjected": {
       "path": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
-      "version": "openbot-local-settings-v44-physical-home",
-      "sha256": "cd72723d206e139520b91a32bdce1acbd1ba58fdd571d7f959436bdc6d67ae7b",
+      "version": "openbot-local-settings-v58-execution-recovery",
+      "sha256": "111a4d5c9e3bd3c4cbd180ce11327f44335013c880139dfe8b61fecca4b761e1",
       "sourceMap": {
         "status": "not-applicable"
       }
     },
     "rendererMemoryUi": {
       "path": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
-      "version": "openbot-memory-ui-v11-forgetting",
-      "sha256": "4bb3cd8d94a8f0fdf5cd00d84da734e948f2b2b80d928fae02378bc377a2ff15",
+      "version": "openbot-memory-ui-v13-ordered-task-list",
+      "sha256": "dd81390ad91a07ed8b23c6bb25601fe837253d2687ad7d4f2431beca26fbc7d0",
       "sourceMap": {
         "status": "not-applicable"
       }
@@ -85,12 +85,12 @@
       },
       {
         "path": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
-        "sha256": "cd72723d206e139520b91a32bdce1acbd1ba58fdd571d7f959436bdc6d67ae7b",
+        "sha256": "111a4d5c9e3bd3c4cbd180ce11327f44335013c880139dfe8b61fecca4b761e1",
         "role": "injected"
       },
       {
         "path": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
-        "sha256": "4bb3cd8d94a8f0fdf5cd00d84da734e948f2b2b80d928fae02378bc377a2ff15",
+        "sha256": "dd81390ad91a07ed8b23c6bb25601fe837253d2687ad7d4f2431beca26fbc7d0",
         "role": "injected"
       },
       {

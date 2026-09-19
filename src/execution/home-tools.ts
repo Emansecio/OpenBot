@@ -7,9 +7,9 @@ export const HOME_SYSTEM_PROMPT =
   "When you need something outside it, use process_run: it runs Windows tools on the host and may use absolute paths on any mounted drive, including AppData, installed applications, repositories, and skill folders. " +
   "You may use PowerShell, cmd, WSL, or any installed executable to inspect, copy, create, move, or modify host files. Prefer the private workspace for normal work and access host paths only when the task needs them. " +
   "File reads are limited to 1 MB; for larger files copy an excerpt into Projects. " +
-  "Use the file, search_files, search_text, and browser tools. " +
+  "Use the file, search_files and search_text tools. Browser tools are attached when the task involves a web page or URL. " +
   "Do not ask the user to pick a folder. " +
-  "If the user asks about WhatsApp messages, sending, or the local wacli daemon, use the whatsapp tool.";
+  "If the user asks about WhatsApp messages, sending, or the local wacli daemon, the whatsapp tool is attached for that turn.";
 
 const HOME_FILE_TOOLS: ProviderTool[] = [
   {
@@ -247,14 +247,16 @@ export const WHATSAPP_TOOL: ProviderTool = {
     name: "whatsapp",
     description:
       "Use the user's local WhatsApp CLI (wacli) on the Windows host. " +
-      "op=doctor checks the daemon, sweep lists pending chats, messages_list reads one chat, send delivers text, download fetches one media item. " +
-      "Do not use process_run or browser for WhatsApp.",
+      "op=doctor checks the daemon and op=sweep lists pending chats; both accept only the op field. " +
+      "messages_list reads one chat, send delivers text, and download fetches one media item. " +
+      "If doctor reports locked_by_other_process, report the lock and do not stop or bypass it with process_run. " +
+      "Do not use browser for WhatsApp.",
     parameters: {
       type: "object",
       properties: {
-        op: { type: "string", enum: ["doctor", "sweep", "messages_list", "send", "download"] },
+        op: { type: "string", enum: ["doctor", "sweep", "messages_list", "send", "download"], description: "doctor and sweep use only this field; other operations use only their documented fields." },
         chat: { type: "string", description: "Chat JID or phone number for messages_list, send, and download." },
-        limit: { type: "integer", minimum: 1, maximum: 50 },
+        limit: { type: "integer", minimum: 1, maximum: 50, description: "Only for messages_list; never send with doctor or sweep." },
         text: { type: "string", description: "UTF-8 message body for send." },
         etapa: { type: "string", description: "Optional send.py etapa name." },
         mediaId: { type: "string", description: "Optional media message id for download." },
@@ -289,3 +291,33 @@ export const PROCESS_TOOL: ProviderTool = {
 };
 
 export const DEVELOPER_TOOLS: ProviderTool[] = [...SAFE_HOME_TOOLS, PROCESS_TOOL];
+
+export const BROWSER_TOOL_NAMES: readonly string[] = BROWSER_TOOLS.map((tool) => tool.function.name);
+export const WHATSAPP_TOOL_NAME = WHATSAPP_TOOL.function.name;
+
+const WEB_TASK_INTENT = /https?:\/\/|\bwww\.|\bnaveg[ueoa][\w]*\b|\bbrowser\b|\bwebsite\b|\bsite\b|\burl\b|\blink\b|\bdownload\b|\bportal\b|\bon-?line\b|\bpesquis\w*\b|\bacesse\b|\bacessar\b|\bbaixe\b|\bbaixar\b|\binternet\b|p[áa]gina web/iu;
+const WHATSAPP_TASK_INTENT = /\bwhatsapp\b|\bwacli\b|\bzap\b/iu;
+
+export interface TurnToolSelection {
+  prompt: string;
+  recentToolNames?: readonly string[];
+}
+
+export function selectTurnProviderTools(
+  tools: readonly ProviderTool[],
+  selection: TurnToolSelection,
+): ProviderTool[] {
+  const names = new Set(tools.map((tool) => tool.function.name));
+  const fullBrowserCatalog = BROWSER_TOOL_NAMES.every((name) => names.has(name));
+  if (!fullBrowserCatalog) return [...tools];
+  const recent = new Set(selection.recentToolNames ?? []);
+  const includeBrowser = BROWSER_TOOL_NAMES.some((name) => recent.has(name)) || WEB_TASK_INTENT.test(selection.prompt);
+  const includeWhatsapp = recent.has(WHATSAPP_TOOL_NAME) || WHATSAPP_TASK_INTENT.test(selection.prompt);
+  const browser = new Set(BROWSER_TOOL_NAMES);
+  return tools.filter((tool) => {
+    const name = tool.function.name;
+    if (browser.has(name)) return includeBrowser;
+    if (name === WHATSAPP_TOOL_NAME) return includeWhatsapp;
+    return true;
+  });
+}

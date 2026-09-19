@@ -647,6 +647,68 @@ describe("SqliteTranscriptStore", () => {
     expect(store.snapshotAgent("agent-a").turnAttemptRows).toHaveLength(1);
   });
 
+  it("rejects a foreign resume checkpoint atomically", () => {
+    const store = createStore();
+    const conversation = store.conversationStore.ensureDefault("agent-a");
+    const scope = {
+      agentId: "agent-a",
+      conversationId: conversation.id,
+      turnId: "turn-resume",
+      provider: "xai",
+      model: "grok-4.6",
+    } as const;
+    store.createResumeCheckpoint({
+      checkpointId: "checkpoint-resume",
+      ...scope,
+      cursor: "fixture-v1:resume:1",
+      safeSequenceId: 0,
+      completedEffectIds: [],
+      expiresAtMs: Date.now() + 60_000,
+      version: 1,
+      budget: { maxProviderAttempts: 2, providerAttemptsUsed: 0, maxToolRounds: 8, toolRoundsUsed: 0, maxToolCalls: 16, toolCallsUsed: 0 },
+    });
+    store.prepareResumeEffect(scope, "effect-pending", "hash-pending");
+    const snapshot = store.snapshotAgent("agent-a");
+    const forged = {
+      ...snapshot,
+      resumeCheckpoints: snapshot.resumeCheckpoints.map((checkpoint) => ({ ...checkpoint, agentId: "other-agent" })),
+    };
+
+    expect(() => store.restoreAgent("agent-a", forged)).toThrow(/checkpoint de outro agente/i);
+    expect(store.snapshotAgent("agent-a").resumeCheckpoints).toEqual(snapshot.resumeCheckpoints);
+    expect(store.getResumeEffect(scope, "effect-pending")).toMatchObject({ status: "prepared" });
+  });
+
+  it("rejects an invalid resume cursor before clearing the agent", () => {
+    const store = createStore();
+    const conversation = store.conversationStore.ensureDefault("agent-a");
+    const scope = {
+      agentId: "agent-a",
+      conversationId: conversation.id,
+      turnId: "turn-cursor",
+      provider: "xai",
+      model: "grok-4.6",
+    } as const;
+    store.createResumeCheckpoint({
+      checkpointId: "checkpoint-cursor",
+      ...scope,
+      cursor: "fixture-v1:cursor:1",
+      safeSequenceId: 0,
+      completedEffectIds: [],
+      expiresAtMs: Date.now() + 60_000,
+      version: 1,
+      budget: { maxProviderAttempts: 2, providerAttemptsUsed: 0, maxToolRounds: 8, toolRoundsUsed: 0, maxToolCalls: 16, toolCallsUsed: 0 },
+    });
+    const snapshot = store.snapshotAgent("agent-a");
+    const forged = {
+      ...snapshot,
+      resumeCheckpoints: snapshot.resumeCheckpoints.map((checkpoint) => ({ ...checkpoint, cursor: "" })),
+    };
+
+    expect(() => store.restoreAgent("agent-a", forged)).toThrow(/cursor/i);
+    expect(store.getResumeCheckpoint(scope)?.cursor).toBe("fixture-v1:cursor:1");
+  });
+
   it("prevalidates an invalid memory snapshot before clearing persisted rows", () => {
     const store = createStore();
     const conversation = store.conversationStore.ensureDefault("agent-a");

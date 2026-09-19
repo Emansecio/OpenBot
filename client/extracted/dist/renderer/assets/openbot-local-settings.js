@@ -1,5 +1,5 @@
 (() => {
-  // openbot-local-settings-v43-send-feedback
+  // openbot-local-settings-v57-queue-recovery
   window.performance?.mark?.("openbot:local-settings-evaluated");
   const ROOT_ID = "openbot-provider-settings";
   const EMPTY_ID = "openbot-empty-agent-state";
@@ -272,7 +272,7 @@
 @media (max-width:520px){#${ROOT_ID} .ob-secret-row>*{flex-basis:100%}#${ROOT_ID} .ob-secret-row button,#${ROOT_ID} .ob-workspace button{width:100%}#${ROOT_ID} .ob-field-row{grid-template-columns:1fr;gap:6px;padding:9px 0}#${ROOT_ID} .ob-field-row select{justify-self:stretch}#${ROOT_ID} .ob-auth-row{align-items:stretch;flex-direction:column}#${ROOT_ID} .ob-auth-row button{align-self:flex-start}#${ROOT_ID}[data-scope="global"] .ob-field-row{padding:11px 14px}#${ROOT_ID}[data-scope="global"] .ob-auth-row{padding:11px 14px}}
 @media (max-width:520px){#${PROFILE_ID} .ob-profile-row{align-items:stretch;flex-direction:column}#${PROFILE_ID} button{width:100%}}
 @media (max-width:520px){#${WELCOME_ID}{padding:28px 22px}#${WELCOME_ID} .ob-welcome-copy{line-height:1.5}#${WELCOME_ID} button{width:min(260px,100%)}}
-@media (prefers-reduced-motion:reduce){#${ROOT_ID} button,#${ROOT_ID} .ob-advanced summary::after,#${EMPTY_ID} button,#${PROFILE_ID} input,#${PROFILE_ID} button,#${STOP_ID},.ob-retry-generation,#${WELCOME_ID},#${WELCOME_ID} .ob-welcome-kicker,#${WELCOME_ID} h1,#${WELCOME_ID} .ob-welcome-copy,#${WELCOME_ID} .ob-welcome-note,#${WELCOME_ID} button,#${WELCOME_ID}.is-leaving .ob-welcome-content,.sand-info-pane__top :is(button,[role="button"]),.sand-agent-item[data-layout="expanded"],#${CREATE_ID} .ob-create-avatar,#${ROOT_ID}[data-scope="global"] .ob-select-trigger::after,#${ROOT_ID} select,#${ROOT_ID} input{transition:none}#${EMPTY_ID} .ob-empty-character{animation:none}}
+@media (prefers-reduced-motion:reduce){#${ROOT_ID} button,#${ROOT_ID} .ob-advanced summary::after,#${EMPTY_ID} button,#${PROFILE_ID} input,#${PROFILE_ID} button,#${STOP_ID},#${WELCOME_ID},#${WELCOME_ID} .ob-welcome-kicker,#${WELCOME_ID} h1,#${WELCOME_ID} .ob-welcome-copy,#${WELCOME_ID} .ob-welcome-note,#${WELCOME_ID} button,#${WELCOME_ID}.is-leaving .ob-welcome-content,.sand-info-pane__top :is(button,[role="button"]),.sand-agent-item[data-layout="expanded"],#${CREATE_ID} .ob-create-avatar,#${ROOT_ID}[data-scope="global"] .ob-select-trigger::after,#${ROOT_ID} select,#${ROOT_ID} input{transition:none}#${EMPTY_ID} .ob-empty-character{animation:none}}
 #${STOP_ID}{position:fixed;z-index:2147483000;display:grid;place-items:center;box-sizing:border-box;border:1px solid var(--cursor-stroke-secondary,rgba(255,255,255,.14));border-radius:8px;padding:0;background:#262626;color:var(--cursor-text-primary,#ececec);font-size:0;cursor:pointer;transition:transform var(--cursor-duration-fast,.1s) var(--cursor-easing-default,ease),background-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
 #${STOP_ID}::before{content:"";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:8px;height:8px;border-radius:2px;background:currentColor}
 #${STOP_ID}:hover{background:var(--cursor-button-secondary-background,#333)}
@@ -280,15 +280,51 @@
 #${STOP_ID}:active{transform:scale(.96)}
 #${STOP_ID}[disabled]{opacity:.5;cursor:default;transform:none}
 #${STOP_ID}[hidden]{display:none !important}
+#openbot-prompt-queue{display:flex;flex-direction:column;gap:5px;margin:0 0 8px;color:var(--cursor-text-secondary,#aaa);font:inherit;font-size:12px}
+#openbot-prompt-queue:empty{display:none}
+#openbot-prompt-queue{max-height:220px;overflow-y:auto}
+#openbot-prompt-queue .ob-queued-row{flex-wrap:wrap}
+#openbot-prompt-queue .ob-queued-info{flex:1;min-width:0}
+#openbot-prompt-queue .ob-queued-origin{font-size:11px;line-height:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#openbot-prompt-queue .ob-queued-error{flex-basis:100%;color:var(--cursor-text-primary,#eee);white-space:normal;overflow-wrap:anywhere}
+#openbot-queue-recovery{width:min(620px,calc(100vw - 40px));max-height:calc(100vh - 48px);overflow:auto;box-sizing:border-box;border:1px solid var(--cursor-stroke-secondary,#444);border-radius:14px;padding:24px;background:var(--cursor-bg-elevated,#191919);color:var(--cursor-text-primary,#eee);font:inherit}
+#openbot-queue-recovery::backdrop{background:rgba(0,0,0,.55)}
+#openbot-queue-recovery h2{font-size:17px;margin:0 0 12px}
+#openbot-queue-recovery p{font-size:13px;line-height:1.5;overflow-wrap:anywhere}
+#openbot-queue-recovery textarea{display:block;width:100%;box-sizing:border-box;resize:vertical;min-height:120px;max-height:40vh;margin-top:8px;padding:10px;border:1px solid var(--cursor-stroke-secondary,#444);border-radius:8px;background:var(--cursor-bg-secondary,#222);color:inherit;font:inherit}
+#openbot-queue-recovery .ob-recovery-file,#openbot-queue-recovery .ob-recovery-controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px}
+#openbot-queue-recovery .ob-recovery-file span{flex:1;min-width:0;overflow-wrap:anywhere}
+#openbot-queue-recovery button{padding:7px 12px;min-height:32px;border:1px solid var(--cursor-stroke-secondary,#444);border-radius:7px;background:var(--cursor-bg-secondary,#222);color:inherit;font:inherit;cursor:pointer}
+#openbot-queue-recovery button:disabled{opacity:.6;cursor:default}
+#openbot-queue-recovery :focus-visible{outline:2px solid var(--cursor-focus,currentColor);outline-offset:2px}
+#openbot-queue-recovery input[type=file]{display:block;max-width:100%;font-size:12px}
+#openbot-queue-recovery .ob-recovery-controls>label{flex:1;min-width:160px;font-size:12px}
+#openbot-queue-recovery .ob-recovery-status{min-height:20px}
+
+#openbot-prompt-queue .ob-queued-row{display:flex;align-items:center;gap:8px;min-width:0;padding:6px 8px;border:1px solid var(--cursor-stroke-secondary,#333);border-radius:8px;background:var(--cursor-bg-secondary,#222)}
+#openbot-prompt-queue .ob-queued-copy{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#openbot-prompt-queue button{flex:none;min-width:28px;min-height:28px;border:0;border-radius:6px;background:transparent;color:inherit;cursor:pointer}
+#openbot-prompt-queue button:hover{background:var(--cursor-bg-tertiary,#333)}
+#openbot-prompt-queue button:focus-visible{outline:2px solid var(--cursor-focus,currentColor);outline-offset:2px}
+.sand-prompt-send:is([aria-label="Start voice input"],[aria-label="Stop dictation"]){visibility:hidden!important;pointer-events:none!important}
 #openbot-turn-status{font-size:12px;line-height:18px;color:var(--cursor-text-secondary,#aaa);padding:0 0 6px;pointer-events:none}
 #openbot-turn-status[hidden]{display:none !important}
-.ob-retry-generation{display:flex;width:max-content;align-items:center;min-height:30px;margin:8px auto 0;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 18%,transparent));border-radius:6px;padding:4px 10px;background:var(--cursor-button-secondary-background,var(--cursor-bg-tertiary,color-mix(in srgb,currentColor 8%,transparent)));color:var(--cursor-text-primary,currentColor);font:inherit;font-size:var(--cursor-font-size-sm,12px);cursor:pointer;transition:transform 160ms cubic-bezier(.22,1,.36,1),background-color 180ms ease,border-color 180ms ease}
-.ob-retry-generation:hover{border-color:var(--cursor-stroke-primary,color-mix(in srgb,currentColor 28%,transparent))}
-.ob-retry-generation:active{transform:scale(.96)}
-.ob-retry-generation:focus-visible{outline:2px solid var(--cursor-focus,currentColor);outline-offset:2px}
+[data-openbot-recovery-signature],[data-openbot-recovery-signature] *{color:var(--cursor-text-secondary,#aaa)!important}
+[data-openbot-recovery-highlight="1"]{outline:1px solid var(--cursor-stroke-primary,color-mix(in srgb,currentColor 24%,transparent));outline-offset:2px;border-radius:8px}
+.ob-recovery-note{display:block;width:100%;box-sizing:border-box;margin:6px 0 0;color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 74%,transparent));font:inherit;font-size:var(--cursor-font-size-sm,12px);line-height:1.45;overflow-wrap:anywhere}
+.ob-activity-detail{font-variant-numeric:tabular-nums}
+#openbot-turn-status .ob-turn-detail{display:block;font-variant-numeric:tabular-nums}
+.sand-notice:has(.ob-retry-generation){min-width:0;max-width:100%;box-sizing:border-box}
+.ob-retry-generation,.ob-recovery-inspect{display:flex;width:max-content;max-width:100%;box-sizing:border-box;overflow-wrap:anywhere;align-items:center;min-height:30px;margin:8px auto 0;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 18%,transparent));border-radius:6px;padding:4px 10px;background:var(--cursor-button-secondary-background,var(--cursor-bg-tertiary,color-mix(in srgb,currentColor 8%,transparent)));color:var(--cursor-text-primary,currentColor);font:inherit;font-size:var(--cursor-font-size-sm,12px);cursor:pointer;transition:transform 160ms cubic-bezier(.22,1,.36,1),background-color 180ms ease,border-color 180ms ease}
+.ob-retry-generation:hover,.ob-recovery-inspect:hover{border-color:var(--cursor-stroke-primary,color-mix(in srgb,currentColor 28%,transparent))}
+.ob-retry-generation:active,.ob-recovery-inspect:active{transform:scale(.96)}
+.ob-retry-generation:focus-visible,.ob-recovery-inspect:focus-visible{outline:2px solid var(--cursor-focus,currentColor);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){.ob-retry-generation,.ob-recovery-inspect{transition:none}.ob-retry-generation:active,.ob-recovery-inspect:active{transform:none}}
 .ob-retry-generation[disabled]{opacity:.6;cursor:default}
 [data-openbot-hide="1"]{display:none !important}
 #sand-conversation-details:has(.sand-computer-stage__placeholder){display:none!important}
+.sand-chat-header__computer{display:none!important}
+[role="menu"][aria-label="More message actions"] [role="menuitem"]:has([data-icon-name="chat-bubbles"]),[role="menu"][aria-label="Message actions"] [role="menuitem"]:has([data-icon-name="chat-bubbles"]){display:none!important}
 [data-openbot-agent-settings-host="1"][data-openbot-simple-fields="1"]{display:grid!important;grid-template-columns:minmax(0,1fr)!important;align-content:start!important;gap:6px!important;padding:12px!important;overflow:auto!important}
 [data-openbot-agent-settings-host="1"][data-openbot-simple-fields="1"]>label{margin:4px 0 0;color:var(--cursor-text-secondary,currentColor);font-size:var(--cursor-font-size-sm,12px);line-height:1.4}
 [data-openbot-agent-settings-host="1"][data-openbot-simple-fields="1"]>input:not([type="checkbox"]),[data-openbot-agent-settings-host="1"][data-openbot-simple-fields="1"]>textarea{width:100%;min-width:0;box-sizing:border-box;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));border-radius:6px;outline:none;background:var(--cursor-bg-input,var(--cursor-bg-editor,#181818));color:var(--cursor-text-primary,currentColor);padding:6px 8px;font:inherit}
@@ -305,6 +341,9 @@
 .sand-info-pane__top :is(button,[role="button"]):active{transform:scale(.94)}
 .sand-info-pane__subpage-title{min-width:max-content!important;flex:1 1 auto;overflow:visible!important;color:var(--cursor-text-primary,currentColor);font-size:var(--cursor-font-size-base,13px);font-weight:var(--cursor-font-weight-semibold,600);line-height:20px;white-space:nowrap}
 .sand-info-pane__window-controls-divider{display:none!important}
+/* Keep the centered settings surface below native controls, including zoom/resize.
+   Without a controls overlay, the original 48px vertical margin is preserved. */
+.sand-settings-dialog .sand-settings-layout{height:min(700px,calc(100dvh - 2 * max(48px,calc(env(titlebar-area-height,0px) + 16px))))!important}
 .sand-info-pane__section-content{min-height:0;scrollbar-gutter:stable}
 .sand-agent-settings{display:flex!important;flex-direction:column!important;gap:12px!important;padding:12px!important}
 .sand-agent-settings input,.sand-agent-settings textarea{box-sizing:border-box;width:100%;min-width:0;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));border-radius:6px;background:var(--cursor-bg-input,var(--cursor-bg-editor,#181818));color:var(--cursor-text-primary,currentColor);font:inherit}
@@ -318,6 +357,8 @@
 .sand-agents-sidebar__header{box-sizing:border-box;height:50px!important;padding:0 12px 0 16px!important;border-bottom:0!important}
 .sand-agents-section[data-openbot-empty-section="1"],.sand-agents-sections[data-openbot-flat="1"] .sand-agents-section__header{display:none!important}
 .sand-agents-list__rows{gap:2px!important;padding:4px 8px 8px!important}
+.sand-agents-list__rows:has(.sand-agent-item[data-layout="collapsed"]){padding-inline:0!important}
+.sand-agent-item[data-layout="collapsed"]{margin-inline:auto!important;justify-content:center!important;padding-inline:0!important;gap:0!important;transform:none!important}
 .sand-agent-item[data-layout="expanded"]{display:grid!important;box-sizing:border-box;width:100%;min-height:58px;grid-template-columns:34px minmax(0,1fr);align-items:center;gap:9px!important;padding:8px!important;border:0;border-radius:var(--cursor-radius-lg,9px)!important;text-align:left;transition:background-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease),transform var(--cursor-duration-fast,.1s) var(--cursor-easing-default,ease)}
 .sand-agent-item[data-layout="expanded"]:hover{background:var(--cursor-bg-secondary,color-mix(in srgb,currentColor 8%,transparent))}
 .sand-agent-item[data-layout="expanded"]:is([aria-current="page"],[data-active="true"]){background:var(--cursor-bg-secondary,color-mix(in srgb,currentColor 8%,transparent))}
@@ -491,7 +532,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   };
   const SETTINGS_LABELS = /^(Name|Nome|Title|Título|Titulo|Description|Descrição|Descricao|Notifications|Notificações|Notificacoes)$/i;
   const UNAVAILABLE_NAV_LABELS = /^(Help Center|Send Feedback|Updates)$/i;
-  const UNSUPPORTED_COMMAND_LABELS = /^(Settings: Updates|Plugins|Feature Flags…?|Capture Backend RPC Trace(?: \(2 min\))?|Update OpenBot(?:'s|’s) Computer)$/i;
+  const UNSUPPORTED_COMMAND_LABELS = /^(Start a thread|Iniciar (?:uma )?thread|Settings: Updates|Plugins|Feature Flags…?|Capture Backend RPC Trace(?: \(2 min\))?|Update OpenBot(?:'s|’s) Computer)$/i;
   const UNSAFE_SECTION_ACTION = /^(Move to new section|Mover para nova seção)$/i;
   const LEGACY_SCREEN_LABELS = /^(?:Can't reach .+ screen|.+['’]s screen)$/i;
   const LEGACY_CURSOR_COMPOSER = /Sign in to Cursor in settings,\s*then ask anything\.?/i;
@@ -744,6 +785,26 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   let profileLoadPromise = null;
   let profileRetryAfter = 0;
   let profileRevision = 0;
+  let profileWriteSequence = 0;
+  let profileAppliedWrite = 0;
+
+  async function persistLocalProfile(patch) {
+    const api = profileAgent();
+    if (typeof api?.updateLocalProfile !== "function") throw new Error("Perfil local indisponível");
+    const sequence = ++profileWriteSequence;
+    profileRevision += 1;
+    const saved = normalizeProfileState(await api.updateLocalProfile(patch));
+    const expected = normalizeProfileState({ ...profileState, ...patch });
+    if (Object.keys(patch).some((key) => saved[key] !== expected[key])) throw new Error("O perfil salvo não foi confirmado");
+    if (sequence > profileAppliedWrite) {
+      profileAppliedWrite = sequence;
+      profileRevision += 1;
+      profileState = saved;
+      profileLoaded = true;
+      applyProfileName();
+    }
+    return saved;
+  }
 
   function ensureLocalProfileLoaded() {
     if (profileLoaded || profileLoadPromise || Date.now() < profileRetryAfter) return;
@@ -772,8 +833,8 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   }
 
   function renderAvatar(avatar, profile) {
-    avatar.dataset.shape = profile.avatarShape;
-    avatar.style.setProperty("--ob-profile-color", profile.avatarColor);
+    if (avatar.dataset.shape !== profile.avatarShape) avatar.dataset.shape = profile.avatarShape;
+    if (avatar.style.getPropertyValue("--ob-profile-color") !== profile.avatarColor) avatar.style.setProperty("--ob-profile-color", profile.avatarColor);
     const source = profile.avatarPngBase64 ? `data:image/png;base64,${profile.avatarPngBase64}` : "";
     if (avatar._profileSource !== source) {
       avatar._profileSource = source;
@@ -969,7 +1030,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       ["Model", "Modelo"],
       ["Timezone", "Fuso horário"],
       ["Execution on Local Computer", "Execução no computador local"],
-      ["Let the assistant open files and run tasks on your computer. Auto-review still checks everything first.", "Permita que o bot abra arquivos e execute tarefas neste computador. A revisão automática continua verificando tudo primeiro."],
+      ["Let the assistant open files and run tasks on your computer. Auto-review still checks everything first.", "Permita que o bot abra arquivos e execute tarefas neste computador."],
       ["Ask every time", "Perguntar sempre"],
       ["Auto-review", "Revisão automática"],
       ["OpenBot checks each action before it runs and asks you first when needed. Add rules to customize what it can do automatically.", "O OpenBot verifica cada ação antes de executar e pede sua confirmação quando necessário."],
@@ -1143,6 +1204,8 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       ["Hide from sidebar", "Ocultar da barra lateral"],
       ["Delete", "Excluir"],
       ["Cancel", "Cancelar"],
+      ["Deleting...", "Encerrando e excluindo..."],
+      ["Deleting failed. Check your connection and try again.", "Não foi possível concluir a exclusão. Aguarde o encerramento das tarefas e tente novamente. Se persistir, reinicie o OpenBot para recuperar o estado pendente."],
       ["This permanently deletes the agent and its chat history. This can't be undone.", "Isso exclui permanentemente o bot e o histórico da conversa. Esta ação não pode ser desfeita."],
     ]);
     for (const menu of document.querySelectorAll('[role="menu"]')) {
@@ -1237,7 +1300,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   }
 
   function trapLocalModalFocus(event) {
-    if (event.key !== "Tab") return;
+    if (event.key !== "Tab" || document.getElementById("openbot-queue-recovery")?.open) return;
     const panel = document.querySelector(".obp23-dialog .obp23-panel");
     if (!(panel instanceof HTMLElement)) return;
     const focusable = [...panel.querySelectorAll("button:not([disabled]),input:not([disabled]),textarea:not([disabled]),select:not([disabled]),[href],[tabindex]:not([tabindex='-1'])")]
@@ -1406,6 +1469,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       const removeAvatar = root.querySelector("#openbot-profile-avatar-remove");
       let draft = { ...profileState };
       let savedProfile = { ...profileState };
+      const editedFields = new Set();
       let photoRevision = 0;
       let photoPending = false;
       let saving = false;
@@ -1416,7 +1480,8 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
         saveButton.disabled = saving || photoPending || !hasChanges();
       };
       let draftRevision = 0;
-      const markDirty = () => {
+      const markDirty = (field) => {
+        if (field) editedFields.add(field);
         draftRevision += 1;
         clearLocalTimeout(profileSaveResetTimer);
         saveButton?.classList.remove("is-saved");
@@ -1430,18 +1495,18 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       };
       input?.addEventListener("input", () => {
         draft.name = normalizeProfileName(input.value) || input.value;
-        markDirty();
+        markDirty("name");
       });
       for (const button of root.querySelectorAll("[data-avatar-shape]")) {
         button.addEventListener("click", () => {
           draft.avatarShape = button.dataset.avatarShape;
-          markDirty();
+          markDirty("avatarShape");
         });
       }
       for (const button of root.querySelectorAll("[data-avatar-color]")) {
         button.addEventListener("click", () => {
           draft.avatarColor = button.dataset.avatarColor;
-          markDirty();
+          markDirty("avatarColor");
         });
       }
       chooseAvatar?.addEventListener("click", () => fileInput?.click());
@@ -1450,7 +1515,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
         photoPending = false;
         draft.avatarPngBase64 = null;
         if (fileInput) fileInput.value = "";
-        markDirty();
+        markDirty("avatarPngBase64");
       });
       fileInput?.addEventListener("change", async () => {
         const file = fileInput.files?.[0];
@@ -1477,7 +1542,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
           if (!base64 || base64.length > Math.ceil(PROFILE_MAX_AVATAR_BYTES * 4 / 3)) throw new Error("A foto excedeu o tamanho permitido.");
           draft.avatarPngBase64 = base64;
           photoPending = false;
-          markDirty();
+          markDirty("avatarPngBase64");
         } catch (error) {
           if (!root.isConnected || photoRevision !== selectionRevision) return;
           status.className = "ob-profile-status err";
@@ -1510,21 +1575,13 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
         status.textContent = "Salvando…";
         saveLabel.textContent = "Salvando…";
         try {
-          const api = profileAgent();
-          if (typeof api?.updateLocalProfile !== "function") throw new Error("Perfil local indisponível");
-          const saved = await api.updateLocalProfile({
-            name: nextName,
-            avatarId: draft.avatarId,
-            avatarShape: draft.avatarShape,
-            avatarColor: draft.avatarColor,
-            avatarPngBase64: draft.avatarPngBase64,
-          });
-           if (!root.isConnected || draftRevision !== submitRevision) return;
-           profileRevision += 1;
-           profileState = normalizeProfileState(saved);
-           profileLoaded = true;
+          draft.name = nextName;
+          const patch = Object.fromEntries(Object.entries(draft).filter(([key, value]) => editedFields.has(key) && value !== savedProfile[key]));
+          await persistLocalProfile(patch);
+          if (!root.isConnected || draftRevision !== submitRevision) return;
           draft = { ...profileState };
           savedProfile = { ...profileState };
+          editedFields.clear();
           input.value = profileState.name;
           renderProfileAvatar(root, profileState);
           try { localStorage.removeItem(PROFILE_KEY); } catch {}
@@ -1554,29 +1611,31 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
         }
       });
       void (async () => {
-        const loadRevision = draftRevision;
-        const loadProfileRevision = profileRevision;
+        let loadProfileRevision = profileRevision;
         try {
           const api = profileAgent();
           if (typeof api?.getLocalProfile !== "function") throw new Error("Perfil local indisponível");
           let loaded = normalizeProfileState(await api.getLocalProfile());
-          if (!root.isConnected || draftRevision !== loadRevision || profileRevision !== loadProfileRevision) return;
+          if (!root.isConnected || profileRevision !== loadProfileRevision) return;
           const legacyName = legacyProfileName();
-          if (legacyName && legacyName !== PROFILE_DEFAULT_NAME && loaded.name === PROFILE_DEFAULT_NAME && typeof api.updateLocalProfile === "function") {
-            loaded = normalizeProfileState(await api.updateLocalProfile({ name: legacyName }));
+          if (legacyName && legacyName !== PROFILE_DEFAULT_NAME && loaded.name === PROFILE_DEFAULT_NAME && !editedFields.has("name") && typeof api.updateLocalProfile === "function") {
+            const migration = persistLocalProfile({ name: legacyName });
+            loadProfileRevision = profileRevision;
+            loaded = await migration;
+            if (!root.isConnected || profileState !== loaded) return;
+          } else {
+            profileState = loaded;
+            profileLoaded = true;
           }
-          if (!root.isConnected || draftRevision !== loadRevision || profileRevision !== loadProfileRevision) return;
-           profileState = loaded;
-           profileLoaded = true;
-          draft = { ...loaded };
           savedProfile = { ...loaded };
-          input.value = loaded.name;
-          saveButton.disabled = true;
-          renderProfileAvatar(root, loaded);
+          for (const key of Object.keys(loaded)) if (!editedFields.has(key)) draft[key] = loaded[key];
+          if (!editedFields.has("name")) input.value = draft.name;
+          syncSaveButton();
+          renderProfileAvatar(root, draft);
           applyProfileName(loaded.name);
           try { localStorage.removeItem(PROFILE_KEY); } catch {}
         } catch (error) {
-          if (!root.isConnected || draftRevision !== loadRevision) return;
+          if (!root.isConnected || profileRevision !== loadProfileRevision) return;
           status.className = "ob-profile-status err";
           status.textContent = userFacingError(error, "Não foi possível carregar este perfil. Tente novamente.");
           queueChangedStatus(status);
@@ -1703,7 +1762,28 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     if (pane && pane !== document.body) pane.setAttribute("data-openbot-hide", "1");
   }
 
+  function hideUnavailableAutoReview() {
+    const surfaces = document.querySelectorAll('[role="dialog"][aria-label="OpenBot settings"], [role="dialog"][aria-label="Configurações do OpenBot"]');
+    for (const surface of surfaces) {
+      for (const label of surface.querySelectorAll("label, span, div, h3")) {
+        if (label.children.length || !/^(Auto-review|Revisão automática|Auto-review Rules|Regras de revisão automática)$/.test(textOf(label))) continue;
+        if (/^(Auto-review Rules|Regras de revisão automática)$/.test(textOf(label))) {
+          const rules = label.parentElement?.parentElement;
+          if (rules && rules !== surface && !rules.contains(surface) && rules.querySelector("textarea, input, button")) rules.setAttribute("data-openbot-hide", "1");
+          continue;
+        }
+        for (let row = label.parentElement; row && row !== surface && !row.matches("section"); row = row.parentElement) {
+          if (row.querySelector('[role="switch"], input[type="checkbox"]')) {
+            row.setAttribute("data-openbot-hide", "1");
+            break;
+          }
+        }
+      }
+    }
+  }
+
   function hideChrome() {
+    hideUnavailableAutoReview();
     for (const el of document.querySelectorAll("button, [role='button'], [role='menuitem'], [role='option'], a")) {
       if (el.closest(`#${ROOT_ID}`) || el.id === STOP_ID) continue;
       const aria = (el.getAttribute("aria-label") || "").trim();
@@ -1711,7 +1791,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       if (isComputerChrome(aria, label)) hideMatching(el);
       else if (/^Plugins$/i.test(aria) || /^Plugins$/i.test(label) || UNSUPPORTED_COMMAND_LABELS.test(firstVisibleLine(el))) hideMatching(el);
       else if (/^(Sign out|Log out|Sair)$/i.test(label)) hideMatching(el);
-      else if (/start voice input|microphone|microfone/i.test(aria) || /start voice input/i.test(label)) hideMatching(el);
+      else if (!el.matches(".sand-prompt-send") && (/start voice input|microphone|microfone/i.test(aria) || /start voice input/i.test(label))) hideMatching(el);
       else if (el.matches(".sand-new-chat-row, [role='option']") && NATIVE_CREATE_LABEL.test(label)) {
         hideMatching(el);
       }
@@ -1801,13 +1881,8 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       saving = true;
       input.disabled = true;
       try {
-        const api = profileAgent();
-        if (typeof api?.updateLocalProfile !== "function") throw new Error("Perfil local indisponível");
-        const saved = normalizeProfileState(await api.updateLocalProfile({ name }));
+        const saved = await persistLocalProfile({ name });
         if (saved.name !== name) throw new Error("O nome salvo não foi confirmado");
-        profileRevision += 1;
-        profileState = saved;
-        profileLoaded = true;
         restore();
       } catch (error) {
         saving = false;
@@ -1852,6 +1927,13 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
 
   function handleVisibilityChange() {
     reconcileAgentAvatars();
+    if (document.visibilityState !== "visible" || !document.hasFocus()) return;
+    // Retorno/reconexão: reconsulta o estado autoritativo (leitura pura). Nenhuma
+    // mensagem é reenviada e nenhuma operação é executada por esta consulta.
+    promptStatusRevision += 1;
+    promptRecoverySignature = "";
+    schedulePromptStatus(0);
+    schedulePromptRecovery(0);
   }
 
   function markFirstInteraction() {
@@ -3069,6 +3151,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   const busyAgentIds = new Set();
   const cancellingAgentIds = new Set();
   const unknownAgentIds = new Set();
+  const promptStates = new Map();
   let stopAnchorRect = null;
 
   function syncGenerating() {
@@ -3076,7 +3159,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   }
 
   function selectedAgentRow() {
-    return [...document.querySelectorAll(".sand-agent-item[data-layout='expanded']")].find((row) =>
+    return [...document.querySelectorAll(".sand-agent-item[data-agent-id]")].find((row) =>
       isVisibleElement(row) && (row.getAttribute("aria-current") === "page" || row.dataset.active === "true")) || null;
   }
 
@@ -3086,11 +3169,16 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   }
 
   function handleAgentSelectionClick(event) {
-    const row = event.target?.closest?.(".sand-agent-item[data-layout='expanded']");
+    const row = event.target?.closest?.(".sand-agent-item[data-agent-id]");
     if (!(row instanceof Element)) return;
     activePromptAgentId = row.getAttribute("data-agent-id") || null;
     ensureStop(cachedSendAction);
+    // Trocar de bot não pode misturar estados: cada bot mantém o seu próprio
+    // estado confirmado e a sua própria consulta de recuperação.
+    promptRecoverySignature = "";
+    ensureRetryActions();
     schedulePromptStatus(0);
+    schedulePromptRecovery(0);
     scheduleSettingsScan(0);
     setLocalTimeout(() => refreshActivePromptAgent()
       .then(() => window.dispatchEvent(new Event("openbot:memory-ui-rescan")))
@@ -3111,6 +3199,105 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     const size = 30;
     const inset = shell === composer ? 0 : 9;
     stopAnchorRect = { left: rect.right - inset - size, top: rect.bottom - inset - size, width: size, height: size };
+  }
+
+  // ── Estado real da execução ────────────────────────────────────────────────
+  // Cada etapa abaixo só é exibida quando o backend confirma o acontecimento
+  // correspondente. Polling, heartbeat e a atualização deste contador NÃO
+  // provam progresso; a ausência de eventos nunca é tratada como travamento.
+  const EXECUTION_PHASE_LABELS = {
+    "preparing": "Preparando mensagem e contexto",
+    "awaiting-slot": "Aguardando vaga para chamar o provedor",
+    "awaiting-provider": "Aguardando resposta do provedor",
+    "receiving": "Recebendo resposta",
+    "tool": "Executando ferramenta",
+  };
+  const ACTIVITY_LABELS = {
+    "provider-request": "requisição",
+    "provider-stream": "resposta",
+    "tool": "ferramenta",
+    "reasoning": "raciocínio",
+  };
+  const TURN_TERMINAL_LABELS = { success: "Resposta concluída.", aborted: "Turno interrompido.", error: "Falha confirmada." };
+  const TURN_STALE_AFTER_MS = 20000;
+  let turnStatusTicker = 0;
+
+  function formatElapsed(milliseconds) {
+    const total = Math.max(0, Math.round(milliseconds / 1000));
+    if (total < 60) return `${total}s`;
+    return `${Math.floor(total / 60)}m ${String(total % 60).padStart(2, "0")}s`;
+  }
+
+  function describeTurnStatus(agentId, state, now) {
+    if (!agentId) return "";
+    if (unknownAgentIds.has(agentId)) return "Conexão indisponível — o estado pode estar desatualizado.";
+    if (busyAgentIds.has(agentId)) {
+      if (cancellingAgentIds.has(agentId)) return "Cancelamento solicitado — aguardando confirmação do término.";
+      const execution = state?.execution;
+      if (!execution || typeof execution.phase !== "string") {
+        return `Preparando mensagem e contexto${state?.queued?.length ? ` · ${state.queued.length} na fila` : ""}`;
+      }
+      const phase = EXECUTION_PHASE_LABELS[execution.phase] || "Executando";
+      const parts = [execution.phase === "tool" && execution.toolName ? `${phase}: ${execution.toolName}` : phase];
+      if (typeof execution.startedAtMs === "number" && now >= execution.startedAtMs) parts.push(formatElapsed(now - execution.startedAtMs));
+      const activityAt = typeof execution.lastActivityAtMs === "number" ? execution.lastActivityAtMs : execution.startedAtMs;
+      if (typeof activityAt === "number" && now >= activityAt) {
+        const idle = now - activityAt;
+        parts.push(idle >= TURN_STALE_AFTER_MS
+          ? `sem atualização há ${formatElapsed(idle)}`
+          : `atividade: ${ACTIVITY_LABELS[execution.lastActivity] || "recebida"} há ${formatElapsed(idle)}`);
+      }
+      if (state?.queued?.length) parts.push(`${state.queued.length} na fila`);
+      return parts.join(" · ");
+    }
+    const last = state?.lastTurn;
+    return typeof last?.outcome === "string" && TURN_TERMINAL_LABELS[last.outcome] ? TURN_TERMINAL_LABELS[last.outcome] : "";
+  }
+
+  // O indicador nativo de atividade é a superfície única enquanto está visível:
+  // etapa, tempo e última atividade real entram NELE, sem uma segunda linha.
+  function nativeActivityRow() {
+    return [...document.querySelectorAll('[data-row-key="sand-typing-indicator"]')].find((element) =>
+      element instanceof Element && getComputedStyle(element).display !== "none" && element.getBoundingClientRect().height > 0) || null;
+  }
+
+  /**
+   * Acomoda o detalhe real no rótulo nativo. Devolve true quando o indicador
+   * nativo está presente e a linha local não deve ser usada.
+   */
+  function integrateNativeActivityDetail(description) {
+    const row = nativeActivityRow();
+    if (!row) {
+      clearNativeActivityDetail();
+      return false;
+    }
+    const label = row.querySelector(".sand-activity-label__text") || row;
+    let detail = label.querySelector(":scope > [data-openbot-activity-detail]");
+    if (!detail) {
+      detail = document.createElement("span");
+      detail.className = "ob-activity-detail";
+      detail.setAttribute("data-openbot-activity-detail", "1");
+      label.append(detail);
+    }
+    detail.textContent = description ? ` · ${description}` : "";
+    return true;
+  }
+
+  function clearNativeActivityDetail() {
+    for (const detail of document.querySelectorAll("[data-openbot-activity-detail]")) detail.remove();
+  }
+
+  function syncTurnStatusTicker(active) {
+    if (active && !turnStatusTicker) {
+      turnStatusTicker = window.setInterval(() => {
+        if (localUiClosed) return;
+        ensureStop(document.querySelector('[data-openbot-send="1"]'));
+      }, 1000);
+      localTimers.add(turnStatusTicker);
+    } else if (!active && turnStatusTicker) {
+      clearLocalTimeout(turnStatusTicker);
+      turnStatusTicker = 0;
+    }
   }
 
   function ensureStop(send) {
@@ -3151,11 +3338,13 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
         if (button.disabled) return;
         button.disabled = true;
         const agentId = await refreshActivePromptAgent();
+        const current = promptStates.get(agentId);
         try {
-          if (!agentId) throw new Error("Bot da geração indisponível");
+          if (!agentId || !current?.turnId || !current?.conversationId) throw new Error("Turno da geração indisponível");
+          promptStatusRevision += 1;
           cancellingAgentIds.add(agentId);
           ensureStop(cachedSendAction);
-          const result = await desktop()?.agent?.cancelPrompt?.({ agentId });
+          const result = await desktop()?.agent?.cancelPrompt?.({ agentId, conversationId: current.conversationId, turnId: current.turnId, scope: "current" });
           if (!result?.cancelled) throw new Error("Nenhuma geração foi cancelada");
           busyAgentIds.add(agentId);
           if (optimisticAgentId === agentId) optimisticGeneration = false;
@@ -3174,7 +3363,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     }
     if (stopAnchorRect) {
       const size = Math.max(28, Math.min(36, Math.round(Math.min(stopAnchorRect.width, stopAnchorRect.height))));
-      button.style.left = `${Math.round(stopAnchorRect.left + (stopAnchorRect.width - size) / 2)}px`;
+      button.style.left = `${Math.round(stopAnchorRect.left - size - 8)}px`;
       button.style.top = `${Math.round(stopAnchorRect.top + (stopAnchorRect.height - size) / 2)}px`;
       button.style.width = `${size}px`;
       button.style.height = `${size}px`;
@@ -3182,9 +3371,10 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     button.dataset.openbotActiveAgent = activePromptAgentId ?? "";
     button.dataset.openbotBusyAgents = [...busyAgentIds].join(",");
     button.dataset.openbotOptimistic = optimisticGeneration ? "1" : "0";
-    const shouldHide = !busyAgentIds.has(activePromptAgentId) || !stopAnchorRect;
+    const currentState = promptStates.get(activePromptAgentId);
+    const shouldHide = !busyAgentIds.has(activePromptAgentId) || !stopAnchorRect || !currentState?.turnId;
     button.hidden = shouldHide;
-    button.disabled = cancellingAgentIds.has(activePromptAgentId) || !busyAgentIds.has(activePromptAgentId);
+    button.disabled = cancellingAgentIds.has(activePromptAgentId) || !currentState?.canCancel;
     button.textContent = unknownAgentIds.has(activePromptAgentId) ? "Tentar parar" : "Parar";
     button.setAttribute("aria-label", cancellingAgentIds.has(activePromptAgentId) ? "Cancelamento solicitado" : `${button.textContent} geração`);
     button.title = button.getAttribute("aria-label");
@@ -3195,14 +3385,174 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       status.setAttribute("role", "status");
       status.hidden = true;
     }
-    status.textContent = unknownAgentIds.has(activePromptAgentId)
-      ? "Conexão indisponível — término não confirmado."
-      : cancellingAgentIds.has(activePromptAgentId)
-        ? "Cancelamento solicitado — aguardando término."
-        : "";
+    const description = describeTurnStatus(activePromptAgentId, currentState, Date.now());
+    const integrated = integrateNativeActivityDetail(description);
+    status.textContent = integrated ? "" : description;
+    // Só há linha a atualizar enquanto o turno está vivo; o término confirmado
+    // é um estado estável e não mantém contador rodando.
+    syncTurnStatusTicker(description !== "" && (busyAgentIds.has(activePromptAgentId) || unknownAgentIds.has(activePromptAgentId)));
     const dock = (liveAction || fallbackComposer)?.closest(".sand-chat-input-dock");
     if (dock && status.parentElement !== dock) dock.prepend(status);
-    status.hidden = shouldHide || !status.textContent;
+    status.hidden = !status.textContent;
+    renderPromptQueue(dock, activePromptAgentId, currentState);
+  }
+
+  async function openQueueRecovery(agentId, item, trigger) {
+    const api = desktop()?.agent;
+    if (!api?.getQueuedPrompt || !api?.reviseQueuedPrompt) throw new Error("Controles de recuperação indisponíveis nesta versão do aplicativo.");
+    const original = await api.getQueuedPrompt({ agentId, conversationId: item.conversationId, clientNonce: item.clientNonce });
+    if (localUiClosed || selectedAgentRow()?.getAttribute("data-agent-id") !== agentId) throw new Error("O bot selecionado mudou.");
+    if (document.getElementById("openbot-queue-recovery")) return;
+    const dialog = document.createElement("dialog");
+    dialog.id = "openbot-queue-recovery";
+    dialog.setAttribute("aria-labelledby", "openbot-queue-recovery-title");
+    dialog.innerHTML = '<h2 id="openbot-queue-recovery-title">Revisar mensagem não enviada</h2><p class="ob-recovery-help"></p><label>Mensagem<textarea rows="7" aria-label="Mensagem recuperada"></textarea></label><div class="ob-recovery-files"></div><p class="ob-recovery-status" role="status" aria-live="polite"></p><div class="ob-recovery-controls"><label>Adicionar anexos<input type="file" multiple aria-label="Adicionar anexos à mensagem recuperada"></label><button type="button" data-recovery="close">Fechar</button><button type="button" data-recovery="send">Enviar revisão</button></div>';
+    dialog.querySelector(".ob-recovery-help").textContent = `Conversa: ${item.conversationTitle || item.conversationId}. Revise o texto e remova ou substitua anexos indisponíveis. A mensagem só será executada ao confirmar o envio.`;
+    const editor = dialog.querySelector("textarea"); editor.value = original.prompt;
+    const files = dialog.querySelector(".ob-recovery-files");
+    const upload = dialog.querySelector("input[type=file]");
+    const status = dialog.querySelector(".ob-recovery-status");
+    const submit = dialog.querySelector('[data-recovery="send"]');
+    const close = dialog.querySelector('[data-recovery="close"]');
+    const attachments = (original.attachments || []).map(attachment => ({ ...attachment }));
+    const stagedIds = [];
+    let busy = false;
+    let attempted = false;
+    let accepted = false;
+    let request = null;
+    let requestSignature = "";
+    const setBusy = value => {
+      busy = value;
+      for (const control of dialog.querySelectorAll("button,input,textarea")) control.disabled = value;
+      dialog.setAttribute("aria-busy", String(value));
+    };
+    const renderAttachments = () => {
+      files.replaceChildren();
+      attachments.forEach((attachment, index) => {
+        const row = document.createElement("div"); row.className = "ob-recovery-file";
+        const name = document.createElement("span"); name.textContent = attachment.name || "Anexo";
+        const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "Remover"; remove.disabled = busy;
+        remove.setAttribute("aria-label", `Remover anexo ${attachment.name || index + 1}`);
+        remove.addEventListener("click", () => { attachments.splice(index, 1); renderAttachments(); });
+        row.append(name, remove); files.append(row);
+      });
+    };
+    upload.addEventListener("change", async () => {
+      if (busy) return;
+      const selected = [...(upload.files || [])]; upload.value = "";
+      if (!selected.length) return;
+      if (attachments.length + selected.length > 16) { status.textContent = "Use no máximo 16 anexos."; return; }
+      if (selected.some(file => file.size > 2 * 1024 * 1024)) { status.textContent = "Cada anexo deve ter no máximo 2 MiB; arquivos de texto têm limite de 256 KiB."; return; }
+      setBusy(true); status.textContent = "Preparando anexos…";
+      try {
+        const bridge = desktop()?.p23;
+        if (!bridge?.stageAttachmentBytes) throw new Error("Envio de anexos indisponível.");
+        for (const file of selected) {
+          if (!dialog.isConnected) break;
+          const result = await bridge.stageAttachmentBytes(agentId, file.name, new Uint8Array(await file.arrayBuffer()));
+          if (typeof result?.attachmentId !== "string" || !result.attachmentId) throw new Error("O anexo não foi confirmado.");
+          stagedIds.push(result.attachmentId);
+          if (!dialog.isConnected) { await bridge.discardStagedAttachment(agentId, result.attachmentId); continue; }
+          attachments.push({ path: `attachment:${result.attachmentId}`, name: result.name || file.name });
+        }
+        status.textContent = "Anexos preparados.";
+      } catch (error) { status.textContent = userFacingError(error, "Não foi possível preparar o anexo."); }
+      finally { setBusy(false); renderAttachments(); }
+    });
+    close.addEventListener("click", () => dialog.close());
+    dialog.addEventListener("cancel", event => { if (busy) event.preventDefault(); });
+    submit.addEventListener("click", async () => {
+      if (busy || (!editor.value.trim() && !attachments.length)) return;
+      const payload = { agentId, conversationId: item.conversationId, prompt: editor.value, attachments: attachments.map(attachment => ({ ...attachment })),
+        ...(original.replyContext ? { replyContext: original.replyContext } : {}),
+        ...(original.richText && editor.value === original.prompt ? { richText: original.richText } : {}) };
+      const signature = JSON.stringify(payload);
+      if (!request || signature !== requestSignature) {
+        requestSignature = signature;
+        request = { ...payload, originalNonce: item.clientNonce, clientNonce: window.crypto.randomUUID() };
+      }
+      setBusy(true); attempted = true; status.textContent = "Confirmando envio…";
+      try {
+        const result = await api.reviseQueuedPrompt(request);
+        if (!result?.accepted) throw new Error("O envio ainda não foi confirmado.");
+        accepted = true;
+        busyAgentIds.add(agentId);
+        queueActionErrors.delete(JSON.stringify([agentId, item.conversationId, item.clientNonce]));
+        dialog.close();
+      } catch (error) {
+        status.textContent = `${userFacingError(error, "Não foi possível confirmar o envio.")} O texto foi mantido. Repetir sem editar verifica o mesmo pedido.`;
+      } finally { setBusy(false); schedulePromptStatus(0); }
+    });
+    const pageHide = () => dialog.close();
+    dialog.addEventListener("close", () => {
+      window.removeEventListener("pagehide", pageHide);
+      dialog.remove();
+      // Unknown acceptance keeps staged files until reconciliation/expiry, never deletes a live send.
+      if (!attempted || accepted) for (const id of stagedIds) Promise.resolve(desktop()?.p23?.discardStagedAttachment?.(agentId, id)).catch(() => undefined);
+      const focus = trigger?.isConnected ? trigger : document.querySelector('[aria-label="Prompt"]');
+      focus?.focus({ preventScroll: true });
+    }, { once: true });
+    window.addEventListener("pagehide", pageHide, { once: true });
+    document.body.append(dialog); renderAttachments(); dialog.showModal(); editor.focus({ preventScroll: true });
+  }
+
+  const queueActionErrors = new Map();
+
+  function renderPromptQueue(dock, agentId, state) {
+    if (!dock) return;
+    let list = document.getElementById("openbot-prompt-queue");
+    if (!list) { list = document.createElement("div"); list.id = "openbot-prompt-queue"; list.setAttribute("aria-label", "Mensagens na fila e pendências de revisão"); }
+    if (list.parentElement !== dock) dock.prepend(list);
+    const items = state?.queued || [];
+    const recoverable = state?.recoverable || [];
+    for (const send of dock.querySelectorAll('.sand-prompt-send[aria-label="Send message"]')) send.title = state?.isBusy ? "Adicionar à fila" : "Enviar mensagem";
+    const signature = JSON.stringify([agentId, items, recoverable, state?.recoverableTruncated]);
+    if (list.dataset.signature === signature) return;
+    list.dataset.signature = signature;
+    list.replaceChildren();
+    const appendRow = (item, index, recovery) => {
+      const key = JSON.stringify([agentId, item.conversationId, item.clientNonce]);
+      const row = document.createElement("div"); row.className = "ob-queued-row"; row.dataset.nonce = item.clientNonce;
+      const info = document.createElement("div"); info.className = "ob-queued-info";
+      const copy = document.createElement("div"); copy.className = "ob-queued-copy";
+      copy.textContent = `${recovery ? (item.canReview ? "Não enviada" : "Interrompida") : index + 1}. ${item.preview || "Mensagem com anexo"}`; copy.title = copy.textContent;
+      const origin = document.createElement("div"); origin.className = "ob-queued-origin"; origin.textContent = item.conversationTitle || item.conversationId; origin.title = origin.textContent;
+      const error = document.createElement("div"); error.className = "ob-queued-error"; error.setAttribute("role", "alert"); error.textContent = queueActionErrors.get(key) || ""; error.hidden = !error.textContent;
+      const showError = message => {
+        queueActionErrors.set(key, message);
+        while (queueActionErrors.size > 128) queueActionErrors.delete(queueActionErrors.keys().next().value);
+        error.textContent = message; error.hidden = false;
+      };
+      info.append(copy, origin); row.append(info);
+      if (recovery && item.canReview) {
+        const review = document.createElement("button"); review.type = "button"; review.textContent = "Revisar";
+        review.addEventListener("click", async () => {
+          review.disabled = true;
+          try { await openQueueRecovery(agentId, item, review); }
+          catch (failure) { showError(userFacingError(failure, "Não foi possível abrir a revisão.")); }
+          finally { review.disabled = false; }
+        });
+        row.append(review);
+      } else if (recovery) {
+        const hint = document.createElement("span"); hint.textContent = "Confira os resultados no histórico."; hint.className = "ob-queued-origin"; info.append(hint);
+      }
+      const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "×"; remove.setAttribute("aria-label", recovery ? "Dispensar pendência de revisão" : `Remover mensagem ${index + 1} da fila`);
+      remove.addEventListener("click", async () => {
+        remove.disabled = true;
+        try {
+          const result = await desktop()?.agent?.cancelPrompt?.({ scope: "queued", agentId, conversationId: item.conversationId, clientNonce: item.clientNonce });
+          if (!result?.cancelled) throw new Error("Remoção não confirmada.");
+          queueActionErrors.delete(key);
+        } catch { remove.disabled = false; showError("Não foi possível remover esta mensagem. Tente novamente."); }
+        schedulePromptStatus(0);
+      });
+      row.append(remove, error); list.append(row);
+    };
+    items.forEach((item, index) => appendRow(item, index, false));
+    recoverable.forEach((item, index) => appendRow(item, index, true));
+    if (state?.recoverableTruncated) {
+      const more = document.createElement("p"); more.textContent = "Mostrando as primeiras 100 pendências. Resolva ou dispense estas para exibir as demais."; list.append(more);
+    }
   }
 
   function schedulePromptStatus(delay = 250) {
@@ -3212,24 +3562,27 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       promptStatusTimer = 0;
       const revision = promptStatusRevision;
       try {
-        const globalStatus = await desktop()?.agent?.getPromptStatus?.({});
-        if (revision !== promptStatusRevision) return schedulePromptStatus(0);
-        if (globalStatus?.isBusy && typeof globalStatus.agentId === "string" && globalStatus.agentId) {
-          busyAgentIds.add(globalStatus.agentId);
-        }
         const activeAgentId = await refreshActivePromptAgent();
         const candidates = new Set(busyAgentIds);
         if (activeAgentId) candidates.add(activeAgentId);
-        const statuses = await Promise.allSettled([...candidates].map(async (agentId) => ({ agentId, status: await desktop()?.agent?.getPromptStatus?.({ agentId }) })));
+        const snapshot = await desktop()?.agent?.getPromptStatus?.({ agentIds: [...candidates] });
+        if (revision !== promptStatusRevision) return schedulePromptStatus(0);
+        // Older gateways remain usable during an upgrade; current gateways return one snapshot.
+        const statuses = Array.isArray(snapshot?.agents)
+          ? snapshot.agents.map(status => ({ status: "fulfilled", value: { agentId: status.agentId, status } }))
+          : await Promise.allSettled([...new Set([...candidates, ...(snapshot?.isBusy && snapshot.agentId ? [snapshot.agentId] : [])])]
+              .map(async (agentId) => ({ agentId, status: await desktop()?.agent?.getPromptStatus?.({ agentId }) })));
         if (revision !== promptStatusRevision) return schedulePromptStatus(0);
         for (const outcome of statuses) {
           if (outcome.status !== "fulfilled") continue;
           const { agentId, status } = outcome.value;
           if (typeof status?.isBusy !== "boolean") throw new Error("Estado da execução indisponível");
           unknownAgentIds.delete(agentId);
+          promptStates.set(agentId, status);
           if (status.isBusy) {
             busyAgentIds.add(agentId);
             if (status.cancelRequested) cancellingAgentIds.add(agentId);
+            else cancellingAgentIds.delete(agentId);
           } else {
             busyAgentIds.delete(agentId);
             cancellingAgentIds.delete(agentId);
@@ -3254,83 +3607,225 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     }, delay);
   }
 
-  const RETRYABLE_NOTICES = [
-    "O provedor atingiu o limite de uso.",
-    "O provedor demorou demais para responder.",
-    "Não foi possível conectar ao provedor.",
-    "O provedor está temporariamente indisponível.",
-    "O turno foi interrompido depois que sua mensagem foi aceita.",
-    "A resposta atingiu o limite seguro de tamanho.",
-    "Não foi possível concluir: o modelo excedeu o limite seguro de ferramentas.",
-    "O provedor concluiu sem retornar conteúdo.",
-    "Geração interrompida.",
-    "Falha ao processar o turno:",
-    "OpenBot foi reiniciado antes de concluir a resposta. Você pode tentar novamente.",
-  ];
+  // ── Recuperação determinada pelo backend ───────────────────────────────────
+  // Nenhuma ação é deduzida do texto exibido. O backend responde, por
+  // identificadores reais, quais ações são possíveis para a falha atual; a
+  // revalidação acontece de novo no clique. Sem esse contrato, ou sem
+  // confirmação, o fallback é conservador: nenhuma ação automática.
+  const RECOVERY_RETRY = "retry";
+  const RECOVERY_INSPECT = "inspect";
+  const RECOVERY_INSPECT_HINT = "Este turno já executou ferramentas ou foi interrompido durante uma operação. Confira os resultados e possíveis efeitos no histórico e envie uma nova instrução para continuar.";
+  const RECOVERY_ROW_ATTR = "data-openbot-recovery-signature";
+  const RECOVERY_HIGHLIGHT_ATTR = "data-openbot-recovery-highlight";
+  let promptRecoveryTimer = 0;
+  let promptRecoverySignature = "";
+  const promptRecovery = new Map();
+  const promptRecoveryTokens = new Map();
+
+  function currentAgentId() {
+    return activePromptAgentId || selectedAgentRow()?.getAttribute("data-agent-id") || null;
+  }
+
+  function failureRowEntryId(row) {
+    return row?.getAttribute("data-entry-id") || row?.getAttribute("data-row-key") || "";
+  }
+
+  function recoveryRows() {
+    return [...document.querySelectorAll('.sand-transcript-row[role="note"]')]
+      .filter((row) => row instanceof Element && !row.closest(`#${ROOT_ID}, #${EMPTY_ID}`));
+  }
+
+  function recoveryHostFor(row) {
+    const next = row.nextElementSibling;
+    return next instanceof Element && next.hasAttribute("data-openbot-recovery") ? next : null;
+  }
+
+  function schedulePromptRecovery(delay = 200) {
+    if (localUiClosed) return;
+    clearLocalTimeout(promptRecoveryTimer);
+    promptRecoveryTimer = setLocalTimeout(() => {
+      promptRecoveryTimer = 0;
+      const agentId = currentAgentId();
+      if (!agentId) return;
+      // Assinatura barata: só a mudança real do transcript (incluindo o avanço
+      // da conversa) dispara uma nova consulta autoritativa.
+      const signature = JSON.stringify([agentId, document.querySelectorAll(".sand-transcript-row").length, recoveryRows().map(failureRowEntryId)]);
+      if (signature === promptRecoverySignature) return;
+      promptRecoverySignature = signature;
+      void refreshPromptRecovery(agentId);
+    }, delay);
+  }
+
+  async function refreshPromptRecovery(agentId) {
+    const api = desktop()?.agent;
+    if (typeof api?.getPromptRecovery !== "function" || typeof api?.getActiveConversation !== "function") {
+      promptRecovery.delete(agentId);
+      ensureRetryActions();
+      return;
+    }
+    const token = (promptRecoveryTokens.get(agentId) || 0) + 1;
+    promptRecoveryTokens.set(agentId, token);
+    try {
+      const active = await api.getActiveConversation({ agentId });
+      const conversationId = typeof active?.id === "string" && active.id.trim() ? active.id : "";
+      if (!conversationId) throw new Error("Conversa indisponível");
+      const result = await api.getPromptRecovery({ agentId, conversationId });
+      if (promptRecoveryTokens.get(agentId) !== token) return;
+      const failure = result?.failure;
+      const entryId = typeof failure?.entryId === "string" ? failure.entryId : "";
+      const actions = Array.isArray(failure?.actions) ? failure.actions.filter((action) => action === RECOVERY_RETRY || action === RECOVERY_INSPECT) : [];
+      const historyEntryIds = Array.isArray(failure?.historyEntryIds)
+        ? failure.historyEntryIds.filter((id) => typeof id === "string" && id.length > 0)
+        : [];
+      promptRecovery.set(agentId, entryId && actions.length ? { entryId, actions, historyEntryIds } : null);
+    } catch {
+      if (promptRecoveryTokens.get(agentId) !== token) return;
+      promptRecovery.set(agentId, null);
+    }
+    ensureRetryActions();
+  }
 
   function ensureRetryActions() {
-    const candidates = [...document.querySelectorAll("p, span, div")].filter((node) => {
-      if (node.dataset.openbotRetryHost === "1" || node.closest(`#${ROOT_ID}, #${EMPTY_ID}`)) return false;
-      const value = textOf(node);
-      return RETRYABLE_NOTICES.some((prefix) => value.startsWith(prefix)) &&
-        ![...node.children].some((child) => RETRYABLE_NOTICES.some((prefix) => textOf(child).startsWith(prefix)));
-    });
-    for (const node of candidates) {
-      node.dataset.openbotRetryHost = "1";
-      const retry = document.createElement("button");
-      retry.type = "button";
-      retry.className = "ob-retry-generation";
-      retry.textContent = "Tentar novamente";
-      retry.setAttribute("aria-label", "Tentar gerar a resposta novamente");
-      retry.addEventListener("click", async () => {
-        if (retry.disabled) return;
-        retry.disabled = true;
-        retry.textContent = "Tentando…";
-        try {
-          const agentId = await refreshActivePromptAgent();
-          if (!agentId) throw new Error("Bot da tentativa indisponível");
-          const active = await desktop()?.agent?.getActiveConversation?.({ agentId }).catch(() => null);
-          const conversationId = typeof active?.id === "string" ? active.id : undefined;
-          const result = await desktop()?.agent?.retryPrompt?.({
-            agentId,
-            ...(conversationId ? { conversationId } : {}),
-          });
-          if (!result?.accepted) throw new Error("Retry não aceito");
-          busyAgentIds.add(agentId);
-          optimisticGeneration = false;
-          lastSendAt = Date.now();
-          syncGenerating();
-          ensureStop(document.querySelector('[data-openbot-send="1"]'));
-          schedulePromptStatus();
-          retry.textContent = "Tentativa iniciada";
-        } catch (error) {
-          retry.disabled = false;
-          retry.textContent = String(error?.message || error).includes("Este turno já executou ferramentas")
-            ? "Confira os resultados e possíveis efeitos e envie uma nova instrução para continuar."
-            : userFacingError(error, "Não foi possível tentar novamente.");
-        }
-      });
-      node.insertAdjacentElement("afterend", retry);
+    if (localUiClosed) return;
+    const agentId = currentAgentId();
+    const confirmed = agentId ? promptRecovery.get(agentId) || null : null;
+    for (const row of recoveryRows()) {
+      const entryId = failureRowEntryId(row);
+      const actions = confirmed && entryId && entryId === confirmed.entryId ? confirmed.actions : [];
+      const signature = actions.join("+");
+      if ((row.getAttribute(RECOVERY_ROW_ATTR) || "") === signature) continue;
+      recoveryHostFor(row)?.remove();
+      if (!signature) {
+        row.removeAttribute(RECOVERY_ROW_ATTR);
+        continue;
+      }
+      row.setAttribute(RECOVERY_ROW_ATTR, signature);
+      const host = actions.includes(RECOVERY_RETRY) ? createRetryAction(row, entryId) : createInspectAction(row, confirmed?.historyEntryIds ?? []);
+      row.insertAdjacentElement("afterend", host);
+    }
+    // Uma linha que perdeu o papel de aviso deixaria a ação órfã.
+    for (const host of document.querySelectorAll("[data-openbot-recovery]")) {
+      const previous = host.previousElementSibling;
+      if (!(previous instanceof Element) || previous.getAttribute("role") !== "note") host.remove();
     }
   }
 
-  function mutationNeedsRetryAction(node) {
-    const element = node instanceof Element ? node : node?.parentElement;
-    if (!(element instanceof Element) || element.closest(`#${ROOT_ID}, #${EMPTY_ID}`)) return false;
-    const candidates = element.matches("p, span, div")
-      ? [element, ...element.querySelectorAll("p, span, div")]
-      : [...element.querySelectorAll("p, span, div")];
-    return candidates.some((candidate) => candidate.dataset.openbotRetryHost !== "1" &&
-      RETRYABLE_NOTICES.some((prefix) => textOf(candidate).startsWith(prefix)));
+  function createInspectAction(row, historyEntryIds) {
+    const inspect = document.createElement("button");
+    inspect.type = "button";
+    inspect.className = "ob-recovery-inspect";
+    inspect.setAttribute("data-openbot-recovery", RECOVERY_INSPECT);
+    inspect.textContent = "Conferir resultados e possíveis efeitos";
+    inspect.setAttribute("aria-label", "Destacar os resultados e possíveis efeitos deste turno sem reenviar o pedido");
+    inspect.title = "Destaca o histórico relevante. Nada é reenviado.";
+    let report = null;
+    inspect.addEventListener("click", () => {
+      const located = revealFailureContext(historyEntryIds);
+      if (!report) {
+        report = document.createElement("p");
+        report.className = "ob-recovery-note";
+        report.setAttribute("role", "status");
+        report.setAttribute("aria-live", "polite");
+        inspect.insertAdjacentElement("afterend", report);
+      }
+      report.textContent = located > 0
+        ? `${RECOVERY_INSPECT_HINT} Histórico deste turno destacado (${located} linha${located === 1 ? "" : "s"}).`
+        : `${RECOVERY_INSPECT_HINT} Os resultados deste turno não estão visíveis nesta conversa.`;
+      document.querySelector('main.sand-chat [contenteditable="true"], main.sand-chat textarea')?.focus?.({ preventScroll: false });
+    });
+    return inspect;
+  }
+
+  /**
+   * Localiza o histórico do turno por IDENTIDADE — os identificadores reais das
+   * entries informados pelo backend — nunca pela posição das linhas visíveis.
+   * Somente apresentação: nada é reenviado e nenhuma operação é executada.
+   */
+  function revealFailureContext(historyEntryIds) {
+    const wanted = new Set(Array.isArray(historyEntryIds) ? historyEntryIds.filter((id) => typeof id === "string" && id.length > 0) : []);
+    if (wanted.size === 0) return 0;
+    const rows = [...document.querySelectorAll(".sand-transcript-row")].filter((element) => {
+      const key = failureRowEntryId(element);
+      return key.length > 0 && wanted.has(key);
+    });
+    if (rows.length === 0) return 0;
+    for (const element of rows) element.setAttribute(RECOVERY_HIGHLIGHT_ATTR, "1");
+    // Rola somente quando o trecho relevante está fora da vista: mover a
+    // leitura de quem já está olhando o histórico não ajudaria.
+    const first = rows[0];
+    const container = first.closest(".sand-virtual-transcript");
+    const firstRect = first.getBoundingClientRect();
+    const viewRect = (container ?? document.documentElement).getBoundingClientRect();
+    if (firstRect.top < viewRect.top || firstRect.bottom > viewRect.bottom) first.scrollIntoView?.({ block: "nearest" });
+    return rows.length;
+  }
+
+  function createRetryAction(row, entryId) {
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "ob-retry-generation";
+    retry.setAttribute("data-openbot-recovery", RECOVERY_RETRY);
+    retry.textContent = "Tentar novamente";
+    retry.setAttribute("aria-label", "Tentar gerar a resposta novamente");
+    let report = null;
+    const reportError = (message) => {
+      if (!report) {
+        report = document.createElement("p");
+        report.className = "ob-recovery-inspect";
+        report.setAttribute("role", "status");
+        report.setAttribute("aria-live", "polite");
+        retry.insertAdjacentElement("afterend", report);
+      }
+      report.textContent = message;
+    };
+    retry.addEventListener("click", async () => {
+      if (retry.disabled) return;
+      const hadFocus = document.activeElement === retry;
+      retry.disabled = true;
+      retry.textContent = "Tentando…";
+      try {
+        const expectedFailureEntryId = failureRowEntryId(row);
+        const agentId = await refreshActivePromptAgent();
+        if (!agentId) throw new Error("Bot da tentativa indisponível");
+        if (!expectedFailureEntryId) throw new Error("Não foi possível identificar a falha. Reabra a conversa.");
+        const active = await desktop()?.agent?.getActiveConversation?.({ agentId });
+        const conversationId = typeof active?.id === "string" && active.id.trim() ? active.id : undefined;
+        if (!conversationId) throw new Error("Não foi possível confirmar a conversa. Tente novamente.");
+        if (!row.isConnected || selectedAgentRow()?.getAttribute("data-agent-id") !== agentId || failureRowEntryId(row) !== expectedFailureEntryId) {
+          throw new Error("A conversa mudou. Use a ação da conversa atual.");
+        }
+        const result = await desktop()?.agent?.retryPrompt?.({
+          agentId, conversationId, expectedFailureEntryId,
+        });
+        if (!result?.accepted) throw new Error("Retry não aceito");
+        busyAgentIds.add(agentId);
+        optimisticGeneration = false;
+        lastSendAt = Date.now();
+        syncGenerating();
+        ensureStop(document.querySelector('[data-openbot-send="1"]'));
+        schedulePromptStatus();
+        retry.textContent = "Tentativa iniciada";
+      } catch (error) {
+        retry.disabled = false;
+        retry.textContent = "Tentar novamente";
+        reportError(userFacingError(error, "Não foi possível tentar novamente."));
+        // A recusa e a rejeição de uma ação antiga vêm do backend: reconsulta
+        // as ações reais em vez de interpretar a mensagem de erro.
+        schedulePromptRecovery(0);
+        if (hadFocus && retry.isConnected && document.activeElement === document.body) {
+          retry.focus({ preventScroll: true });
+        }
+      }
+    });
+    return retry;
   }
 
   function handlePromptSubmit(event) {
     const target = event.target;
     if (!(target instanceof Element)) return;
     const send = target.closest(".sand-prompt-send");
-    // A second click of the send gesture must not activate the newly exposed mic.
-    if (event.type === "click" && event.detail > 1 && send === lastSubmitAction
-      && send?.getAttribute("aria-label") === "Start voice input") {
+    // Voice input is unavailable, including when React reuses the send control.
+    if (send && /^(Start voice input|Stop dictation)$/.test(send.getAttribute("aria-label") || "")) {
       event.preventDefault();
       event.stopImmediatePropagation();
       return;
@@ -3385,6 +3880,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     if (send) send.dataset.openbotSend = "1";
     ensureStop(anchor);
     ensureRetryActions();
+    schedulePromptRecovery();
     if (promptStatusTimer === 0) schedulePromptStatus(50);
   }
 
@@ -3420,8 +3916,12 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   }
 
   function classifyTranscriptRows() {
+    classifyTranscriptRowSet(document.querySelectorAll(".sand-transcript-row"));
+  }
+
+  function classifyTranscriptRowSet(rows) {
     const name = String(profileState?.name || "").trim();
-    for (const row of document.querySelectorAll(".sand-transcript-row")) {
+    for (const row of rows) {
       const role = row.getAttribute("data-role");
       let side = role === "user" || role === "assistant" ? role : "";
       const labelledBy = row.getAttribute("aria-labelledby") || "";
@@ -3439,12 +3939,17 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     }
   }
 
+  const messageAvatarSources = new WeakMap();
   function reconcileAssistantMessageAvatars() {
+    reconcileMessageAvatarSet(document.querySelectorAll(".sand-transcript-row"));
+  }
+
+  function reconcileMessageAvatarSet(rows) {
     const selected = selectedAgentRow();
     const source = selected?.querySelector(".sand-agent-item__avatar-disc .sand-agent-avatar");
     const agentId = selected?.getAttribute("data-agent-id") || "";
     const sourceFg = source instanceof HTMLElement ? source.style.getPropertyValue("--fg") : "";
-    for (const row of document.querySelectorAll(".sand-transcript-row")) {
+    for (const row of rows) {
       const existing = row.querySelector(":scope > .sand-row-content > .openbot-message-avatar");
       if (row.getAttribute("data-openbot-side") !== "assistant") {
         existing?.remove();
@@ -3452,8 +3957,9 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       }
       const content = row.querySelector(":scope > .sand-row-content");
       if (!(content instanceof HTMLElement) || !(source instanceof HTMLElement)) continue;
-      if (existing instanceof HTMLElement && existing.dataset.agentId === agentId) {
-        existing.style.setProperty("--openbot-message-avatar-fg", sourceFg);
+      if (existing instanceof HTMLElement && existing.dataset.agentId === agentId && messageAvatarSources.get(existing) === source) {
+        if (existing.style.getPropertyValue("--openbot-message-avatar-fg") !== sourceFg)
+          existing.style.setProperty("--openbot-message-avatar-fg", sourceFg);
         continue;
       }
       existing?.remove();
@@ -3463,8 +3969,51 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       avatar.dataset.agentId = agentId;
       avatar.style.setProperty("--openbot-message-avatar-fg", sourceFg);
       avatar.append(source.cloneNode(true));
+      messageAvatarSources.set(avatar, source);
       content.prepend(avatar);
     }
+  }
+
+  const pendingTranscriptRows = new Set();
+  let transcriptReconcileFrame = 0;
+  let transcriptReconcileAll = false;
+  let transcriptAvatarSource = null;
+  let transcriptAppearanceKey = "";
+
+  function queueTranscriptReconciliation(mutations) {
+    const selected = selectedAgentRow();
+    const source = selected?.querySelector(".sand-agent-item__avatar-disc .sand-agent-avatar");
+    const appearance = JSON.stringify([selected?.getAttribute("data-agent-id"), profileState?.name, source?.style.getPropertyValue("--fg")]);
+    if (source !== transcriptAvatarSource || appearance !== transcriptAppearanceKey) {
+      transcriptReconcileAll = true;
+      transcriptAvatarSource = source;
+      transcriptAppearanceKey = appearance;
+    }
+    const collect = node => {
+      const element = node instanceof Element ? node : node?.parentElement;
+      if (!(element instanceof Element) || element.closest(".openbot-message-avatar")) return;
+      const row = element.closest(".sand-transcript-row");
+      if (row) pendingTranscriptRows.add(row);
+      else for (const child of element.querySelectorAll(".sand-transcript-row")) pendingTranscriptRows.add(child);
+    };
+    for (const mutation of mutations) {
+      // Streaming text changes neither author classification nor avatar identity.
+      if (mutation.type === "characterData") continue;
+      if (mutation.type === "attributes") collect(mutation.target);
+      else for (const node of mutation.addedNodes) collect(node);
+    }
+    if (transcriptReconcileFrame || (!transcriptReconcileAll && !pendingTranscriptRows.size)) return;
+    transcriptReconcileFrame = window.requestAnimationFrame(() => {
+      transcriptReconcileFrame = 0;
+      if (localUiClosed) return;
+      const rows = transcriptReconcileAll ? [...document.querySelectorAll(".sand-transcript-row")]
+        : [...pendingTranscriptRows].filter(row => row.isConnected);
+      transcriptReconcileAll = false;
+      pendingTranscriptRows.clear();
+      classifyTranscriptRowSet(rows);
+      reconcileMessageAvatarSet(rows);
+      schedulePromptRecovery();
+    });
   }
 
   function reconcileConfirmedDeliveries() {
@@ -3674,14 +4223,15 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   const observer = new MutationObserver((mutations) => {
     let localFeatureAdded = false;
     let avatarChanged = false;
-    let retryActionNeeded = false;
     let settingsScanNeeded = false;
     let accountMenuAdded = false;
+    let messageMenuAdded = false;
     for (const mutation of mutations) {
       if (mutation.type === "childList") {
         if (mutation.target instanceof Element && mutation.target.closest(".obp23-dialog")) localFeatureAdded = true;
         for (const node of mutation.addedNodes) {
           const element = node instanceof Element ? node : node.parentElement;
+          if (element?.closest('[role="menu"][aria-label="More message actions"], [role="menu"][aria-label="Message actions"]') || element?.querySelector('[role="menu"][aria-label="More message actions"], [role="menu"][aria-label="Message actions"]')) messageMenuAdded = true;
           if (element?.closest('[role="menu"][aria-label="Account"], [role="menu"][aria-label="Conta"]') || element?.querySelector('[role="menu"][aria-label="Account"]')) accountMenuAdded = true;
           collectMotionTargets(node);
           if (node instanceof Element) {
@@ -3689,7 +4239,6 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
             if (node.matches("[data-placeholder], [aria-placeholder], [placeholder]")) sanitizePlaceholderCopy(node);
             for (const field of node.querySelectorAll("[data-placeholder], [aria-placeholder], [placeholder]")) sanitizePlaceholderCopy(field);
           }
-          if (!retryActionNeeded && mutationNeedsRetryAction(node)) retryActionNeeded = true;
           if (!settingsScanNeeded && mutationNeedsSettingsScan(node)) settingsScanNeeded = true;
           if (node instanceof Element && (node.matches(".obp23-dialog") || node.querySelector(".obp23-dialog"))) localFeatureAdded = true;
           if (mutation.target === document.body) observePortalRoot(node);
@@ -3711,15 +4260,14 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     }
     // Mutation observers run before paint; do not defer menu localization to
     // the settings scan, which otherwise exposes the native English labels.
+    if (messageMenuAdded) hideChrome();
     if (accountMenuAdded) {
       hideChrome();
       polishNativeLanguage();
     }
     if (localFeatureAdded) polishLocalFeatureCopy();
-    if (retryActionNeeded) ensureRetryActions();
     if (avatarChanged) reconcileAgentAvatars();
-    classifyTranscriptRows();
-    reconcileAssistantMessageAvatars();
+    queueTranscriptReconciliation(mutations);
     bindObserver();
     if (settingsScanNeeded && !scanTimer) scheduleSettingsScan(120);
   });
@@ -3727,7 +4275,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   function observePortalRoot(node) {
     if (!(node instanceof Element) || observedPortals.has(node) || node.id === "root" || node.id === WELCOME_ID || node.id === STOP_ID) return;
     observedPortals.add(node);
-    observer.observe(node, { childList: true, subtree: true, attributes: true, attributeFilter: ["hidden", "aria-hidden", "aria-expanded", "data-state", "data-placeholder", "data-role"] });
+    observer.observe(node, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["hidden", "aria-hidden", "aria-expanded", "data-state", "data-placeholder", "data-role", "data-activity", "data-exiting", "data-typing", "data-active", "aria-current", "aria-labelledby"] });
   }
 
   function bindObserver() {
@@ -3738,7 +4286,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     observer.disconnect();
     observedRoot = nextKey;
     if (nextRoot) {
-      observer.observe(nextRoot, { childList: true, subtree: true, attributes: true, attributeFilter: ["hidden", "aria-hidden", "aria-expanded", "data-state", "data-placeholder", "data-role"] });
+      observer.observe(nextRoot, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["hidden", "aria-hidden", "aria-expanded", "data-state", "data-placeholder", "data-role", "data-activity", "data-exiting", "data-typing", "data-active", "aria-current", "aria-labelledby"] });
       if (nextBody && nextBody !== nextRoot) {
         observer.observe(nextBody, { childList: true });
         for (const child of nextBody.children) observePortalRoot(child);
@@ -3791,6 +4339,9 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     unsubscribeDraftStatus?.();
     unsubscribePromptDelivery?.();
     observer.disconnect();
+    if (transcriptReconcileFrame) window.cancelAnimationFrame(transcriptReconcileFrame);
+    transcriptReconcileFrame = 0;
+    pendingTranscriptRows.clear();
     observedRoot = null;
     document.removeEventListener("click", blockLegacyAuthClick, true);
     document.removeEventListener("click", blockUnavailableNavigation, true);

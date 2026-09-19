@@ -45,6 +45,7 @@ class AsyncTaskStore extends DurableAsyncTaskStore {
           else if (property === "recordProgress") clock = Number((input?.progress as Record<string, unknown> | undefined)?.updatedAtMs);
           else if (property === "steer" || property === "abort") clock = Number(input?.requestedAtMs);
           else if (property === "commitTerminal") clock = Number(input?.finishedAtMs);
+          else if (property === "markUnsafeEffectStarted") clock = Number(input?.markedAtMs);
           else if ((property === "expireBudgetExhaustedTasks" || property === "recoverExpiredLeases") && args[0] !== undefined) clock = Number(args[0]);
           else if (property === "reserveTaskBudget" && args[4] !== undefined) clock = Number(args[4]);
           else if (property === "reconcileTaskBudget" && args[5] !== undefined) clock = Number(args[5]);
@@ -426,6 +427,39 @@ describe("AsyncTaskStore claiming", () => {
       expect(heartbeat).toMatchObject({ status: "running", version: 4, lineage: claimed.task.lineage });
       expect(heartbeat.lease).toEqual({ ownerId: "worker-a", expiresAtMs: 1_630, attempt: 1, version: 4 });
       expect(store.listUndeliveredOutbox()).toHaveLength(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("persists the unsafe-effect fence before dispatch and rejects retry transitions", () => {
+    const store = new AsyncTaskStore({ path: temporaryDatabasePath() });
+    try {
+      const task = store.dispatch(dispatchInput()).task;
+      store.claimNext(task.agentId, { ownerId: "worker-effect", nowMs: 1_100, leaseDurationMs: 500 });
+      store.start({ taskId: task.taskId, expectedVersion: 2, leaseOwnerId: "worker-effect", attempt: 1, startedAtMs: 1_120 });
+      const marked = store.markUnsafeEffectStarted({
+        taskId: task.taskId, expectedVersion: 3, leaseOwnerId: "worker-effect", attempt: 1, markedAtMs: 1_130,
+      });
+      expect(marked).toMatchObject({ status: "running", version: 4 });
+      expect(store.listAttempts(task.taskId)[0]).toMatchObject({ unsafeEffectStarted: true, version: 3 });
+      expect(store.markUnsafeEffectStarted({
+        taskId: task.taskId, expectedVersion: 4, leaseOwnerId: "worker-effect", attempt: 1, markedAtMs: 1_131,
+      })).toEqual(marked);
+      expect(() => store.heartbeat({
+        taskId: task.taskId, expectedVersion: 3, leaseOwnerId: "worker-effect", attempt: 1,
+        nowMs: 1_135, leaseDurationMs: 500,
+      })).toThrow();
+      expect(store.heartbeat({
+        taskId: task.taskId, expectedVersion: 4, leaseOwnerId: "worker-effect", attempt: 1,
+        nowMs: 1_135, leaseDurationMs: 500,
+      })).toMatchObject({ version: 5, status: "running" });
+      expect(store.listAttempts(task.taskId)[0]).toMatchObject({ unsafeEffectStarted: true });
+      expect(() => store.transition({
+        taskId: task.taskId, expectedVersion: 5, to: "retry_wait", atMs: 1_140,
+        leaseOwnerId: "worker-effect", attempt: 1, nextAttemptAtMs: 1_200,
+        error: { code: "provider_error", message: "retry later", retryable: true },
+      })).toThrow("outcome is uncertain");
     } finally {
       store.close();
     }
@@ -1103,6 +1137,78 @@ describe("AsyncTaskStore recovery", () => {
       const waiting = store.transition({ taskId: task.taskId, expectedVersion: 4, to: "retry_wait", atMs: 1_610, nextAttemptAtMs: 1_700 });
       expect(waiting).toMatchObject({ status: "retry_wait", version: 5, attempt: 1 });
       expect(store.claimNext(task.agentId, { ownerId: "worker-new", nowMs: 1_700, leaseDurationMs: 500 })?.task.attempt).toBe(2);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps an abandoned unsafe effect terminal instead of requeueing it", () => {
+    const store = new AsyncTaskStore({ path: temporaryDatabasePath() });
+    try {
+      const task = store.dispatch(dispatchInput()).task;
+      store.claimNext(task.agentId, { ownerId: "worker-dead-effect", nowMs: 1_100, leaseDurationMs: 500 });
+      store.start({ taskId: task.taskId, expectedVersion: 2, leaseOwnerId: "worker-dead-effect", attempt: 1, startedAtMs: 1_120 });
+      store.markUnsafeEffectStarted({ taskId: task.taskId, expectedVersion: 3, leaseOwnerId: "worker-dead-effect", attempt: 1, markedAtMs: 1_130 });
+      const recovered = store.recoverExpiredLeases(1_600)[0]!;
+      expect(recovered.status).toBe("abandoned");
+      expect(store.listAttempts(task.taskId)[0]?.unsafeEffectStarted).toBe(true);
+      const failed = store.transition({
+        taskId: task.taskId, expectedVersion: recovered.version, to: "failed", atMs: 1_600,
+        error: { code: "internal_error", message: "Task effect outcome is uncertain after lease recovery; automatic retry is blocked.", retryable: false },
+      });
+      expect(failed).toMatchObject({ status: "failed", error: { retryable: false } });
+      expect(() => store.claimNext(task.agentId, { ownerId: "worker-new", nowMs: 1_700, leaseDurationMs: 500 })).not.toThrow();
+      expect(store.listAttempts(task.taskId).map((entry) => entry.status)).toEqual(["abandoned"]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("terminalizes a conservative legacy retry-wait marker before claiming", () => {
+    const databasePath = temporaryDatabasePath();
+    const store = new AsyncTaskStore({ path: databasePath });
+    try {
+      const task = store.dispatch(dispatchInput()).task;
+      store.claimNext(task.agentId, { ownerId: "worker-legacy", nowMs: 1_100, leaseDurationMs: 500 });
+      store.start({ taskId: task.taskId, expectedVersion: 2, leaseOwnerId: "worker-legacy", attempt: 1, startedAtMs: 1_120 });
+      store.transition({
+        taskId: task.taskId, expectedVersion: 3, to: "retry_wait", atMs: 1_200,
+        leaseOwnerId: "worker-legacy", attempt: 1, nextAttemptAtMs: 1_300,
+        error: { code: "provider_error", message: "legacy retry", retryable: true },
+      });
+      const legacyConnection = new Database(databasePath);
+      legacyConnection.prepare("UPDATE async_task_attempts SET status = 'abandoned', unsafe_effect_started = 1 WHERE task_id = ? AND attempt = 1").run(task.taskId);
+      legacyConnection.close();
+
+      expect(store.claimNext(task.agentId, { ownerId: "worker-new", nowMs: 1_300, leaseDurationMs: 500 })).toBeNull();
+      expect(store.getTask(task.taskId)).toMatchObject({
+        status: "failed",
+        error: { code: "internal_error", retryable: false, message: "Legacy retry-wait effect outcome is uncertain; automatic retry is blocked." },
+      });
+      expect(store.listAttempts(task.taskId).map((entry) => entry.status)).toEqual(["failed"]);
+      expect(store.listUndeliveredOutbox().at(-1)).toMatchObject({ taskId: task.taskId, wakeKind: "task_terminal" });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("excludes active claim task IDs from bounded lease recovery", () => {
+    const store = new AsyncTaskStore({ path: temporaryDatabasePath() });
+    try {
+      const active = store.dispatch(dispatchInput({ clientNonce: "active-claim" })).task;
+      const orphan = store.dispatch(dispatchInput({
+        agentId: "agent-b", parentTurnId: "turn-b", clientNonce: "expired-orphan",
+        input: { version: 1, objective: "Executar tarefa de teste", source: { kind: "parent_turn", agentId: "agent-b", turnEntryId: "turn-b" } },
+      })).task;
+      const activeClaim = store.claimNext(active.agentId, { ownerId: "worker-active", nowMs: 1_100, leaseDurationMs: 100 })!;
+      store.start({ taskId: active.taskId, expectedVersion: activeClaim.task.version, leaseOwnerId: "worker-active", attempt: 1, startedAtMs: 1_100 });
+      const orphanClaim = store.claimNext(orphan.agentId, { ownerId: "worker-orphan", nowMs: 1_100, leaseDurationMs: 100 })!;
+      store.start({ taskId: orphan.taskId, expectedVersion: orphanClaim.task.version, leaseOwnerId: "worker-orphan", attempt: 1, startedAtMs: 1_100 });
+
+      const recovered = store.recoverExpiredLeases(1_200, undefined, [active.taskId]);
+      expect(recovered).toEqual([expect.objectContaining({ taskId: orphan.taskId, status: "abandoned" })]);
+      expect(store.getTask(active.taskId)).toMatchObject({ status: "running", lease: { ownerId: "worker-active", attempt: 1 } });
+      expect(store.recoverExpiredLeases(1_200, undefined, [active.taskId])).toEqual([]);
     } finally {
       store.close();
     }
@@ -1893,10 +1999,10 @@ describe("AsyncTaskStore persistence validation", () => {
 });
 
 describe("OpenBot async task schema v13", () => {
-  it("migrates a populated v7 async-task schema to v15 without losing legacy state", () => {
+  it("migrates a populated v7 async-task schema to the current version without losing legacy state", () => {
     const database = new Database(":memory:");
     try {
-      expect(OPENBOT_SCHEMA_VERSION).toBe(15);
+      expect(OPENBOT_SCHEMA_VERSION).toBe(19);
       const legacyInput = dispatchInput({ agentId: "legacy-agent", parentTurnId: "legacy-turn", clientNonce: "legacy-nonce" });
       const legacyGrant = legacyInput.grant as ProviderCapabilityGrant;
       const legacyAttemptId = randomUUID();
@@ -2105,6 +2211,9 @@ describe("OpenBot async task schema v13", () => {
         attempt_id: legacyAttemptId,
         status: "running",
         lease_owner: "legacy-worker",
+      });
+      expect(database.prepare("SELECT unsafe_effect_started FROM async_task_attempts WHERE task_id = ?").get(legacyInput.taskId)).toEqual({
+        unsafe_effect_started: 1,
       });
       expect(database.prepare("SELECT grant_id, grant_json FROM async_task_grants WHERE task_id = ?").get(legacyInput.taskId)).toEqual({
         grant_id: legacyGrant.grantId,

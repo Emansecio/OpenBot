@@ -207,6 +207,7 @@ interface CachedToolList {
 }
 
 const MCP_NEGATIVE_CACHE_BACKOFF_MS = [5_000, 30_000, 120_000] as const;
+const MAX_MCP_TOOL_PAGES = MAX_MCP_TOOLS;
 const negativeCacheKind = (error: unknown): string => error instanceof McpTimeoutError
   ? "timeout"
   : error instanceof McpValidationError
@@ -684,31 +685,58 @@ export class McpManager {
 
   private async fetchServerTools(config: McpServerConfig, agentId: string, sourceSignal?: AbortSignal): Promise<ListToolsResult> {
     const timeoutMs = config.timeoutMs ?? this.defaultTimeoutMs;
+    const deadlineAt = Date.now() + timeoutMs;
     let entry: CachedSession | undefined;
     let session: McpClientSession;
     try {
-      const acquired = await this.runWithDeadline((signal) => this.waitForSession(config, agentId, signal), timeoutMs, sourceSignal);
+      const acquired = await this.runWithDeadline(
+        (signal) => this.waitForSession(config, agentId, signal),
+        remainingBudget(deadlineAt),
+        sourceSignal,
+      );
       entry = acquired.entry;
       session = acquired.session;
     } catch (error) {
       throw sanitizeExternalError(error, "MCP connection failed");
     }
-    let listed: ListToolsResult;
-    try {
-      listed = await this.runWithDeadline((signal) => session.listTools(undefined, {
-        signal,
-        timeout: timeoutMs,
-        maxTotalTimeout: timeoutMs,
-      }), timeoutMs, sourceSignal);
-    } catch (error) {
-      if (entry !== undefined && isSessionTransportFailure(error)) this.invalidateSession(entry, session);
-      throw sanitizeExternalError(error, "MCP tool listing failed");
+    const maxResultBytes = config.maxResultBytes ?? this.defaultMaxResultBytes;
+    const tools: Tool[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    let pageCount = 0;
+    let listingBytes = 0;
+    while (true) {
+      if (sourceSignal !== undefined) throwIfAborted(sourceSignal);
+      if (pageCount >= MAX_MCP_TOOL_PAGES) throw new McpValidationError("MCP tool page count exceeds the limit");
+      const pageTimeoutMs = remainingBudget(deadlineAt);
+      let listed: ListToolsResult;
+      try {
+        listed = await this.runWithDeadline((signal) => session.listTools(
+          cursor === undefined ? undefined : { cursor },
+          { signal, timeout: pageTimeoutMs, maxTotalTimeout: pageTimeoutMs },
+        ), pageTimeoutMs, sourceSignal);
+      } catch (error) {
+        if (entry !== undefined && isSessionTransportFailure(error)) this.invalidateSession(entry, session);
+        throw sanitizeExternalError(error, "MCP tool listing failed");
+      }
+      pageCount += 1;
+      if (!Array.isArray(listed.tools)) throw new McpValidationError("MCP tool list is invalid");
+      if (listed.tools.length > MAX_MCP_TOOLS - tools.length) throw new McpValidationError("MCP tool count exceeds the limit");
+      const pageBytes = jsonBytes(listed);
+      if (pageBytes > maxResultBytes || listingBytes > maxResultBytes - pageBytes) {
+        throw new McpResultLimitError("MCP tool list exceeds the byte limit");
+      }
+      listingBytes += pageBytes;
+      tools.push(...listed.tools);
+      if (jsonBytes({ tools }) > maxResultBytes) throw new McpResultLimitError("MCP tool list exceeds the byte limit");
+
+      const nextCursor = listed.nextCursor;
+      if (nextCursor === undefined) return { tools };
+      if (typeof nextCursor !== "string") throw new McpValidationError("MCP pagination cursor is invalid");
+      if (seenCursors.has(nextCursor)) throw new McpValidationError("MCP pagination cursor repeated");
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
     }
-    if (!Array.isArray(listed.tools) || listed.tools.length > MAX_MCP_TOOLS) throw new McpValidationError("MCP tool count exceeds the limit");
-    if (jsonBytes(listed) > (config.maxResultBytes ?? this.defaultMaxResultBytes)) {
-      throw new McpResultLimitError("MCP tool list exceeds the byte limit");
-    }
-    return listed;
   }
 
   private cachedServerTools(config: McpServerConfig, agentId: string): CachedToolList {

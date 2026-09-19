@@ -74,6 +74,27 @@ describe("OpenAI Responses API — GPT-5.6", () => {
       expect(JSON.parse(adapter.serializeRequest(request))).not.toHaveProperty("service_tier");
     } finally { catalog.close(); }
   });
+  it("serializes reasoning.effort only when the resolved model declares it", async () => {
+    const catalog = new ModelCatalogService({ sources: { openai: {
+      connectionKey: async () => "a".repeat(64),
+      discover: async () => [{ id: "gpt-6-astra", supportedReasoningEfforts: ["medium", "high"] }],
+    } } });
+    try {
+      await catalog.get("openai");
+      const adapter = new OpenAiAdapter({ protocol: "codex" });
+      const declared = catalog.resolve("openai", "gpt-6-astra", "high");
+      expect(JSON.parse(adapter.serializeRequest({ ...request, model: "gpt-6-astra", reasoningEffort: "high", modelResolution: declared })))
+        .toMatchObject({ reasoning: { effort: "high" } });
+      // Mesmo esforço, modelo que declara só "medium": fail-closed, omitido.
+      const incompatible = { ...declared, supportedReasoningEfforts: ["medium" as const] };
+      expect(JSON.parse(adapter.serializeRequest({ ...request, model: "gpt-6-astra", reasoningEffort: "high", modelResolution: incompatible })))
+        .not.toHaveProperty("reasoning");
+      // Sem resolução de catálogo, o esforço nunca é inferido.
+      expect(JSON.parse(adapter.serializeRequest({ ...request, model: "gpt-6-astra", reasoningEffort: "high" })))
+        .not.toHaveProperty("reasoning");
+    } finally { catalog.close(); }
+  });
+
   it.each(["gpt-5.6-sol", "gpt-6-astra"])("envia payload Responses e acumula deltas de texto para %s", async model => {
     const out = await run([
       { type: "response.created", response: { id: "resp_1" } },

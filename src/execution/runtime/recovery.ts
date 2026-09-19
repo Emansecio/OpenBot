@@ -8,6 +8,7 @@
  */
 
 interface RuntimeLeaseIdentity {
+  recoveryKind?: "native-job-v1";
   leaseId: string;
   agentId: string;
   runtimeBootId: string;
@@ -109,12 +110,15 @@ export function parseRuntimeLeaseRecord(value: unknown): RuntimeLeaseRecord {
   if (!isRecord(value)) throw invalidRecord("record must be an object");
   const keys = Object.keys(value);
   const pending = value.pending === true;
-  const expected = pending ? PENDING_RECORD_KEYS : ACTIVE_RECORD_KEYS;
+  const baseKeys = pending ? PENDING_RECORD_KEYS : ACTIVE_RECORD_KEYS;
+  if (value.recoveryKind !== undefined && value.recoveryKind !== "native-job-v1") throw invalidRecord("recovery kind is invalid");
+  const expected = value.recoveryKind === undefined ? baseKeys : [...baseKeys, "recoveryKind"];
   if (!hasExactKeys(keys, expected)) throw invalidRecord("record fields are invalid");
   for (const key of IDENTITY_KEYS) {
     if (!validRuntimeIdentifier(value[key])) throw invalidRecord(`${key} is invalid`);
   }
   const identity = {
+    ...(value.recoveryKind === "native-job-v1" ? { recoveryKind: "native-job-v1" as const } : {}),
     leaseId: value.leaseId as string,
     agentId: value.agentId as string,
     runtimeBootId: value.runtimeBootId as string,

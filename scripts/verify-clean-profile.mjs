@@ -5,8 +5,9 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import { captureProcessEvidence, terminateOwnedProcess } from "./release-common.mjs";
+import { connectCdp, startE2eWatchdog } from "./e2e-runtime.mjs";
 
 const execFile = promisify(execFileCallback);
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -199,34 +200,6 @@ async function waitGatewayHealth(url, pid, timeoutMs = 20_000) {
   throw new Error("clean-profile gateway did not become ready");
 }
 
-function connectCdp(url) {
-  const socket = new WebSocket(url);
-  const pending = new Map();
-  let id = 0;
-  const ready = new Promise((resolveReady, rejectReady) => {
-    socket.addEventListener("open", resolveReady, { once: true });
-    socket.addEventListener("error", rejectReady, { once: true });
-  });
-  socket.addEventListener("message", (event) => {
-    const message = JSON.parse(String(event.data));
-    const pendingCall = pending.get(message.id);
-    if (!pendingCall) return;
-    pending.delete(message.id);
-    if (message.error) pendingCall.reject(new Error("CDP command failed")); else pendingCall.resolve(message.result);
-  });
-  return {
-    ready,
-    send(method, params = {}) {
-      const callId = ++id;
-      return new Promise((resolveCall, rejectCall) => {
-        pending.set(callId, { resolve: resolveCall, reject: rejectCall });
-        socket.send(JSON.stringify({ id: callId, method, params }));
-      });
-    },
-    close() { socket.close(); },
-  };
-}
-
 export async function waitElectronTarget(cdpPort, child, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -289,7 +262,7 @@ export async function waitChildExit(child, timeoutMs = 15_000) {
 
 async function launchElectron(paths, env, label, productPort = 1340) {
   const electron = process.env.ELECTRON_PATH?.trim() || join(REPO_ROOT, "node_modules", "electron", "dist", "electron.exe");
-  const electronMain = join(REPO_ROOT, "client", "extracted", "dist", "electron-main", "main.cjs");
+  const electronMain = join(REPO_ROOT, "scripts", "openbot-electron.cjs");
   if (!(await fileExists(electron)) || !(await fileExists(electronMain))) throw new Error("clean-profile Electron executable or entrypoint unavailable");
   const cdpPort = await freePort(0);
   const devControlPort = await freePort(0);
@@ -391,6 +364,16 @@ async function requestRpc(port, method, body, token) {
   return value.value;
 }
 
+export function isPersistedConfigStable(first, next) {
+  if (!first || !next) return false;
+  const { revision: firstRevision, ...firstValues } = first;
+  const { revision: nextRevision, ...nextValues } = next;
+  // ConfigStore increments its CAS revision even for idempotent renderer writes.
+  return Number.isSafeInteger(firstRevision) && firstRevision >= 0
+    && Number.isSafeInteger(nextRevision) && nextRevision >= firstRevision
+    && isDeepStrictEqual(firstValues, nextValues);
+}
+
 /** Runs the real isolated gateway + Electron first-boot/restart gate. */
 export async function runCleanProfile(options = {}) {
   const productPort = Number(options.productPort ?? 1340);
@@ -412,6 +395,15 @@ export async function runCleanProfile(options = {}) {
   let stage = "prepare";
   const rendererEvidence = [];
   let lifecycle = options.lifecycle;
+  const disarmWatchdog = startE2eWatchdog(
+    Number(process.env.OPENBOT_E2E_BUDGET_MS ?? 10 * 60_000),
+    async () => {
+      const pid = electron?.child?.pid;
+      if (pid && process.platform === "win32") {
+        await execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }).catch(() => undefined);
+      }
+    },
+  );
   try {
     await ensureRoots(paths);
     replaceEnvironment(cleanEnv);
@@ -462,7 +454,7 @@ export async function runCleanProfile(options = {}) {
       stage = `${label}.config-persist`;
       const config = await readJson(paths.configPath);
       if (index === 0) firstConfig = config;
-      else if (JSON.stringify(config) !== JSON.stringify(firstConfig)) throw new Error("clean-profile configuration did not persist");
+      else if (!isPersistedConfigStable(firstConfig, config)) throw new Error("clean-profile configuration did not persist");
       stage = `${label}.gateway-stop`;
       const shutdown = await lifecycle.stopGateway(paths);
       if (shutdown.ok !== true || shutdown.forced === true || shutdown.teardownProven !== true || shutdown.gracefulAccepted !== true || shutdown.reason === "stale" || shutdown.reason === "graceful-unavailable") throw new Error("clean-profile gateway teardown was not graceful");
@@ -482,6 +474,7 @@ export async function runCleanProfile(options = {}) {
     try { if (gateway && lifecycle?.stopGateway) await lifecycle.stopGateway(paths); } catch { /* preserve diagnostic root */ }
     throw new Error(`clean-profile RED; stage=${stage}; diagnosticRoot=${paths.tempRoot}`);
   } finally {
+    disarmWatchdog();
     replaceEnvironment(previousEnv);
     if (green && ownRoot) await rm(paths.tempRoot, { recursive: true, force: true });
   }

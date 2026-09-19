@@ -58,7 +58,7 @@ import { registerA2AHandlers } from "./a2a.js";
 import type { A2AStore } from "../a2a/store.js";
 import type { A2ARuntime } from "../a2a/runtime.js";
 import { defaultRegistry } from "../providers/router.js";
-import { AgentLifecycleFence, rpcAgentIds } from "./agent-lifecycle.js";
+import { AgentLifecycleFence, rpcAgentIds, waitForDeletionDrain } from "./agent-lifecycle.js";
 
 export {
   reconcileRosterHomes,
@@ -121,7 +121,12 @@ function pageArgs(body: unknown): { agentId: string; limit?: number; beforeSeq?:
   };
 }
 
-function registerTranscriptHandlers(gateway: Gateway, store: TranscriptStore, runner?: TurnRunner): void {
+function registerTranscriptHandlers(
+  gateway: Gateway,
+  store: TranscriptStore,
+  runner?: TurnRunner,
+  activateAgent?: (agentId: string) => void,
+): void {
   const pageHandler = (method: typeof TRANSCRIPT_METHODS[number]): RpcHandler => (body) => {
     const args = pageArgs(body);
     try {
@@ -132,6 +137,9 @@ function registerTranscriptHandlers(gateway: Gateway, store: TranscriptStore, ru
       const page = method === "getAgentTranscriptTail"
         ? store.getAgentTranscriptTail(args.agentId, args.limit, args.beforeSeq, args.conversationId)
         : store.openAgentTail(args.agentId, args.limit, args.beforeSeq, args.conversationId);
+      // A desktop open must acknowledge the host selection before it settles.
+      // Background reads and older-page loads must never switch the active chat.
+      if (method === "openAgentTail" && args.beforeSeq === undefined) activateAgent?.(args.agentId);
       return page;
     } catch (error) {
       throw new RpcError(400, error instanceof Error ? error.message : "transcript: argumentos inválidos");
@@ -197,6 +205,8 @@ function registerConversationHandlers(
   store: ConversationStoreLike,
   runner: ReturnType<typeof registerSendPromptHandler>,
   config?: ConfigStore,
+  onConversationArchived?: (agentId: string, conversationId: string) => void,
+  onConversationDeleted?: (agentId: string, conversationId: string) => void,
 ): void {
   const bindPublisher = (ctx: { publish: (channel: string, payload: unknown) => void }): void => {
     runner.setPublish(ctx.publish);
@@ -323,6 +333,7 @@ function registerConversationHandlers(
       const conversation = store.archive
         ? store.archive(agentId, conversationId)
         : (() => { throw new Error("conversation store não suporta archive"); })();
+      onConversationArchived?.(agentId, conversationId);
       const page = conversationPage(store, agentId);
       publishActive(agentId);
       return { conversation, page };
@@ -345,6 +356,7 @@ function registerConversationHandlers(
       const result = store.delete
         ? store.delete(agentId, conversationId, { memoryPolicy })
         : (() => { throw new Error("conversation store não suporta delete"); })();
+      onConversationDeleted?.(agentId, conversationId);
       const page = conversationPage(store, agentId);
       const conversation = store.getActive(agentId);
       runner.publishConversationSnapshot(agentId, conversation?.id);
@@ -406,6 +418,7 @@ function registerMemoryHandlers(gateway: Gateway, store: TranscriptStore, config
   };
   const memoryUiItem = (memory: Memory) => ({
     id: memory.id,
+    scope: memory.agentId === USER_PROFILE_AGENT_ID ? "user" : "agent",
     kind: memory.kind,
     text: memory.text,
     trust: memory.trust,
@@ -602,6 +615,8 @@ function registerMemoryHandlers(gateway: Gateway, store: TranscriptStore, config
 export function registerRpcHandlers(
   gateway: Gateway,
   opts: TurnRunnerOptions & {
+    onConversationArchived?: (agentId: string, conversationId: string) => void;
+    onConversationDeleted?: (agentId: string, conversationId: string) => void;
     store?: TranscriptStore;
     conversationStore?: ConversationStoreLike;
     config?: ConfigStore;
@@ -665,7 +680,17 @@ export function registerRpcHandlers(
   const runner = registerSendPromptHandler(gateway, { ...opts, store, activity, conversationStore, resolveKickstartReadiness: kickstartReadiness });
   const homeLifecycleFence = opts.homeLifecycleFence ?? (async <T>(agentId: string, operation: () => Promise<T>): Promise<T> => {
     runner.fenceAgents([agentId]);
+    let releaseAsyncFence: (() => void) | undefined;
+    let releaseRuntimeFence: (() => void) | undefined;
+    let releaseBrokerFence: (() => void) | undefined;
     try {
+      releaseAsyncFence = opts.asyncTaskRuntime?.fenceAgent(agentId);
+      releaseRuntimeFence = opts.runtimeManager?.fenceAgentMaintenance?.(agentId);
+      releaseBrokerFence = opts.executionBroker?.fenceAgent(agentId);
+      await Promise.all([
+        opts.asyncTaskRuntime?.drainAgent(agentId),
+        opts.executionBroker?.drainAgent(agentId, 5_000),
+      ]);
       await runner.flush(agentId);
       // Workspace lifecycle operations must not leave a tab, profile lock, or
       // browser lease pointing at the home while it is restored/imported/
@@ -678,11 +703,40 @@ export function registerRpcHandlers(
       return await operation();
     } finally {
       runner.releaseAgentFence([agentId]);
+      releaseBrokerFence?.();
+      releaseRuntimeFence?.();
+      releaseAsyncFence?.();
     }
   });
-  registerTranscriptHandlers(gateway, store, runner);
+  const deletionAsyncFences = new Map<string, () => void>();
+  const deletionBrokerFences = new Map<string, () => void>();
+  const deletionDrains = new Map<string, Promise<void>>();
+  const deletionReleaseScheduled = new Set<Promise<void>>();
+  const releaseDeletion = (agentIds: readonly string[]): void => {
+    runner.releaseAgentFence(agentIds);
+    for (const agentId of agentIds) {
+      deletionAsyncFences.get(agentId)?.();
+      deletionAsyncFences.delete(agentId);
+      deletionBrokerFences.get(agentId)?.();
+      deletionBrokerFences.delete(agentId);
+      deletionDrains.delete(agentId);
+      opts.asyncTaskStore?.clearAgentFence(agentId);
+      opts.a2aStore?.clearAgentFence(agentId);
+    }
+    const roster = new Set(opts.config!.snapshot().agents.map((agent) => agent.id.toLowerCase()));
+    const rolledBack = agentIds.filter((agentId) => roster.has(agentId.toLowerCase()));
+    if (rolledBack.length > 0) deletionJournal.completeAgentDeletion?.(rolledBack);
+    lifecycleFence.endDeletion(agentIds);
+  };
   registerMemoryHandlers(gateway, store, opts.config);
-  if (conversationStore) registerConversationHandlers(gateway, conversationStore, runner, opts.config);
+  if (conversationStore) registerConversationHandlers(
+    gateway,
+    conversationStore,
+    runner,
+    opts.config,
+    opts.onConversationArchived,
+    opts.onConversationDeleted,
+  );
   registerSkillHandlers(gateway, {
     catalog: opts.skillCatalog,
     resolveSkillPolicy: opts.resolveSkillPolicy,
@@ -692,8 +746,9 @@ export function registerRpcHandlers(
     config: opts.config,
     keystore: opts.keystore,
   });
+  let activateAgent: ((agentId: string) => void) | undefined;
   if (opts.config) {
-    registerRosterHandlers(
+    const roster = registerRosterHandlers(
       gateway,
       opts.config,
       opts.homes,
@@ -702,10 +757,11 @@ export function registerRpcHandlers(
       opts.registry,
       store,
       async (agentIds) => {
-        for (const agentId of agentIds) runner.cancelPrompt(agentId);
-        await Promise.all(agentIds.map((agentId) => runner.flush(agentId)));
-        await Promise.all(agentIds.map(async (agentId) => opts.runtimeManager?.stop(agentId, "agent-delete")));
-        await Promise.all(agentIds.map(async (agentId) => opts.attachmentStaging?.purgeAgent(agentId)));
+        await waitForDeletionDrain(Promise.all(agentIds.map((agentId) => {
+          const drain = deletionDrains.get(agentId);
+          if (!drain) throw new RpcError(503, "Encerramento do bot não foi iniciado com segurança.");
+          return drain;
+        })).then(() => undefined));
       },
       async (agentIds) => {
         if (opts.browserLifecycle) {
@@ -720,37 +776,86 @@ export function registerRpcHandlers(
         }
       },
       async (agentIds) => {
+        if (agentIds.some((agentId) => deletionDrains.has(agentId))) {
+          throw new RpcError(409, "O encerramento anterior ainda está pendente. O bot não foi excluído.");
+        }
         deletionJournal.beginAgentDeletion?.(agentIds);
-        await lifecycleFence.beginDeletion(agentIds);
+        const admittedDrain = lifecycleFence.beginDeletion(agentIds);
         runner.fenceAgents(agentIds);
         for (const agentId of agentIds) {
+          const release = opts.asyncTaskRuntime?.fenceAgent(agentId);
+          if (release !== undefined) deletionAsyncFences.set(agentId, release);
+          const releaseBroker = opts.executionBroker?.fenceAgent(agentId);
+          if (releaseBroker !== undefined) deletionBrokerFences.set(agentId, releaseBroker);
           opts.asyncTaskStore?.fenceAgent(agentId);
           opts.a2aStore?.fenceAgent(agentId);
           opts.asyncTaskStore?.terminalizeAgentTasks(agentId);
         }
+        for (const agentId of agentIds) runner.cancelPrompt(agentId);
+        const drain = (async () => {
+          const results = await Promise.allSettled([
+            admittedDrain,
+            ...agentIds.map((agentId) => runner.flush(agentId)),
+            ...agentIds.map((agentId) => opts.asyncTaskRuntime?.drainAgent(agentId)),
+            ...agentIds.map((agentId) => opts.executionBroker?.drainAgent(agentId, 5_000)),
+            ...agentIds.map((agentId) => opts.runtimeManager?.stop(agentId, "agent-delete")),
+          ]);
+          const failed = results.find((result) => result.status === "rejected");
+          if (failed?.status === "rejected") throw failed.reason;
+        })();
+        for (const agentId of agentIds) deletionDrains.set(agentId, drain);
+        // A failed drain is deliberately retained: no proof that late writers stopped.
+        void drain.catch(() => undefined);
       },
       (agentIds) => {
-        runner.releaseAgentFence(agentIds);
-        for (const agentId of agentIds) {
-          opts.asyncTaskStore?.clearAgentFence(agentId);
-          opts.a2aStore?.clearAgentFence(agentId);
-        }
-        const roster = new Set(opts.config!.snapshot().agents.map((agent) => agent.id.toLowerCase()));
-        const rolledBack = agentIds.filter((agentId) => roster.has(agentId.toLowerCase()));
-        if (rolledBack.length > 0) deletionJournal.completeAgentDeletion?.(rolledBack);
-        lifecycleFence.endDeletion(agentIds);
+        const drains = [...new Set(agentIds.map((agentId) => deletionDrains.get(agentId)).filter((drain) => drain !== undefined))];
+        if (drains.length === 0) return releaseDeletion(agentIds);
+        // A retry while the previous drain is pending must not schedule a second release.
+        if (drains.some((drain) => deletionReleaseScheduled.has(drain))) return;
+        for (const drain of drains) deletionReleaseScheduled.add(drain);
+        void Promise.all(drains).then(() => releaseDeletion(agentIds)).catch(() => undefined)
+          .finally(() => { for (const drain of drains) deletionReleaseScheduled.delete(drain); });
       },
       async (agentIds) => {
-        runner.cleanupDeletedAgents(agentIds);
-        for (const agentId of agentIds) {
-          opts.asyncTaskStore?.purgeAgentTasks(agentId);
-          opts.a2aStore?.retireAgent(agentId);
-          opts.a2aStore?.clearAgentFence(agentId);
-          opts.reactionStore?.purgeAgent(agentId);
+        const cleanupFailures: unknown[] = [];
+        try {
+          runner.cleanupDeletedAgents(agentIds);
+        } catch (error) {
+          cleanupFailures.push(error);
         }
-        await Promise.all(agentIds.map(async (agentId) => opts.attachmentStaging?.purgeAgent(agentId)));
-        await Promise.all(agentIds.map(async (agentId) => opts.keystore?.purgeScope(agentId)));
-        opts.onDeleteAgentsCommitted?.(agentIds);
+        for (const agentId of agentIds) {
+          for (const cleanup of [
+            () => opts.asyncTaskStore?.purgeAgentTasks(agentId),
+            () => opts.a2aStore?.retireAgent(agentId),
+            () => opts.a2aStore?.clearAgentFence(agentId),
+            () => opts.reactionStore?.purgeAgent(agentId),
+          ]) {
+            try {
+              cleanup();
+            } catch (error) {
+              cleanupFailures.push(error);
+            }
+          }
+        }
+        const settleCleanup = async (operations: readonly Promise<unknown>[]): Promise<void> => {
+          const results = await Promise.allSettled(operations);
+          for (const result of results) {
+            if (result.status === "rejected") cleanupFailures.push(result.reason);
+          }
+        };
+        await settleCleanup(agentIds.map((agentId) => Promise.resolve().then(() => opts.attachmentStaging?.purgeAgent(agentId))));
+        await settleCleanup(agentIds.map((agentId) => Promise.resolve().then(() => opts.keystore?.purgeScope(agentId))));
+        await settleCleanup(agentIds.map((agentId) => Promise.resolve().then(() => opts.browserLifecycle?.purgeAgent(agentId))));
+        try {
+          opts.onDeleteAgentsCommitted?.(agentIds);
+        } catch (error) {
+          cleanupFailures.push(error);
+        }
+        if (cleanupFailures.length > 0) {
+          throw cleanupFailures.length === 1
+            ? cleanupFailures[0]
+            : new AggregateError(cleanupFailures, "deleteAgents: falhas na limpeza pós-commit");
+        }
         deletionJournal.completeAgentDeletion?.(agentIds);
       },
       opts.runtimeManager,
@@ -761,7 +866,9 @@ export function registerRpcHandlers(
       (agentId) => deletionJournal.hasPendingAgentDeletion?.(agentId) ?? false,
       opts.assertManagedDiskBudget,
     );
+    activateAgent = roster.activateAgent;
   }
+  registerTranscriptHandlers(gateway, store, runner, activateAgent);
   if (opts.a2aStore) registerA2AHandlers(gateway, {
     store: opts.a2aStore,
     activeAgents: opts.config ? () => opts.config!.snapshot().agents.map((agent) => agent.id) : undefined,

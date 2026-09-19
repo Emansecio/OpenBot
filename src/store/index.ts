@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { createPromptQueue, type PromptQueueStore } from "./prompt-queue.js";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -20,6 +21,7 @@ import { SqliteConversationStore } from "../conversations/store.js";
 import { SqliteMemoryStore } from "../memory/sqlite-store.js";
 import type { MemoryAgentSnapshot } from "../memory/types.js";
 import {
+  MAX_RESUME_EFFECT_IDS,
   boundedResumeResult,
   checkpointMatchesScope,
   validateOpaqueResumeCursor,
@@ -70,6 +72,8 @@ export interface SqliteTranscriptStoreOptions {
   processIdentity?: (pid: number) => ProcessIdentity | null;
   conversationStore?: SqliteConversationStore;
   memoryStore?: SqliteMemoryStore;
+  /** Known sensitive values (e.g. keystore-held credentials) the default memory store must reject. */
+  secretValues?: () => readonly string[];
 }
 
 export interface ProcessIdentity {
@@ -155,6 +159,7 @@ export interface SqliteTurnCompletionRowSnapshot {
 
 /** Full SQLite rollback snapshot, including conversation domain and bound rows. */
 export interface SqliteTranscriptAgentSnapshot extends TranscriptAgentSnapshot {
+  promptQueueRows?: Array<{ sequence: number; agent_id: string; conversation_id: string; nonce: string; args_json: string; inference_json: string; state: string; payload_digest?: string; payload_compacted?: number; recovery_of?: string | null }>;
   conversations: SqliteConversationSnapshot[];
   activeConversationId: string | null;
   transcriptRows: SqliteTranscriptRowSnapshot[];
@@ -163,6 +168,8 @@ export interface SqliteTranscriptAgentSnapshot extends TranscriptAgentSnapshot {
   interactionDecisionRows: SqliteInteractionDecisionRowSnapshot[];
   turnAttemptRows: SqliteTurnAttemptRowSnapshot[];
   turnCompletionRows: SqliteTurnCompletionRowSnapshot[];
+  resumeCheckpoints: Array<ResumeCheckpoint & { updatedAtMs: number }>;
+  resumeEffects: ResumeEffectRecord[];
   kickstartRuns: KickstartRunRecord[];
   memorySnapshot?: MemoryAgentSnapshot;
 }
@@ -584,6 +591,8 @@ function isSqliteTranscriptAgentSnapshot(snapshot: TranscriptAgentSnapshot): sna
     Array.isArray(candidate.interactionDecisionRows) &&
     Array.isArray(candidate.turnAttemptRows) &&
     Array.isArray(candidate.turnCompletionRows) &&
+    Array.isArray(candidate.resumeCheckpoints) &&
+    Array.isArray(candidate.resumeEffects) &&
     (typeof candidate.activeConversationId === "string" || candidate.activeConversationId === null);
 }
 
@@ -683,6 +692,7 @@ function sameProcessIdentity(record: StoreOwnershipRecord, observed: ProcessIden
 
 
 export class SqliteTranscriptStore implements TranscriptStore {
+  readonly promptQueue: PromptQueueStore;
   private readonly db: Database.Database;
   private readonly ownsDatabase: boolean;
   readonly path: string;
@@ -753,11 +763,12 @@ export class SqliteTranscriptStore implements TranscriptStore {
         this.db.pragma("busy_timeout = 5000");
       }
       migrateOpenBotSchema(this.db);
-      const memoryStore = opts.memoryStore ?? new SqliteMemoryStore({ path: opts.path, database: this.db });
+      this.promptQueue = createPromptQueue(this.db);
+      const memoryStore = opts.memoryStore ?? new SqliteMemoryStore({ path: opts.path, database: this.db, secretValues: opts.secretValues });
       if (!memoryStore.sharesDatabase(this.db)) {
         throw new Error("store: memoryStore injetado deve usar a mesma conexão SQLite");
       }
-      const conversationStore = opts.conversationStore ?? new SqliteConversationStore({ path: opts.path, database: this.db, memoryStore });
+      const conversationStore = opts.conversationStore ?? new SqliteConversationStore({ path: opts.path, database: this.db, memoryStore, secretValues: opts.secretValues });
       if (!conversationStore.sharesDatabase(this.db)) {
         throw new Error("store: conversationStore injetado deve usar a mesma conexão SQLite");
       }
@@ -765,6 +776,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
       this.conversationStore = conversationStore;
       this.registerOwnershipAndReconcile();
       this.statements = this.prepareStatements();
+      this.promptQueue.compactTerminal();
     } catch (error) {
       if (this.ownsDatabase && database !== undefined) {
         this.unregisterOwnership();
@@ -801,10 +813,11 @@ export class SqliteTranscriptStore implements TranscriptStore {
         ));
         const alreadyNoticed = parsed.some((entry) => entry.kind === "notice" && entry.type === "restart-interrupted" && entry.turnId === attempt.turn_id);
         if (durableEcho && !alreadyNoticed) {
+          // Failed I/O and process limits do not establish that earlier effects rolled back.
           const possibleEffects = parsed.some((entry) => entry.kind === "tool-call"
             && typeof entry.localToolCallId === "string" && entry.localToolCallId.startsWith(`${attempt.turn_id}\0`)
             && (entry.status === "completed" || entry.status === "running"
-              || (entry.result?.ok === false && ["aborted", "process_aborted", "process_failed"].includes(entry.result.code ?? ""))));
+              || (entry.result?.ok === false && ["aborted", "process_aborted", "process_failed", "io_error", "timed_out", "output_limit", "process_timeout", "process_output_limit"].includes(entry.result.code ?? ""))));
           const notice = normalizeTranscriptEntry({
             kind: "notice",
             id: `notice:${attempt.turn_id}:restart-interrupted`,
@@ -1242,6 +1255,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
         deleteCheckpoints.run(agentId);
         deleteEffects.run(agentId);
         deleteKickstarts.run(agentId);
+        this.promptQueue.clear(agentId);
         this.memoryStore.clearAgentRows(agentId);
         deleteConversations.run(agentId);
       }
@@ -1279,6 +1293,16 @@ export class SqliteTranscriptStore implements TranscriptStore {
         SELECT agent_id, conversation_id, client_nonce, turn_id, completed_at_ms
         FROM turn_completions WHERE agent_id = ? ORDER BY completed_at_ms ASC, turn_id ASC
       `).all(agentId);
+      const resumeCheckpointRows = this.db.prepare<unknown[], ResumeCheckpointRow & { updated_at_ms: number }>(`
+        SELECT checkpoint_id, agent_id, conversation_id, turn_id, provider, model, cursor,
+               safe_sequence_id, completed_effect_ids_json, expires_at_ms, version, budget_json, updated_at_ms
+        FROM turn_checkpoints WHERE agent_id = ? ORDER BY updated_at_ms ASC, checkpoint_id ASC
+      `).all(agentId).map((row) => ({ ...parseResumeCheckpoint(row), updatedAtMs: row.updated_at_ms }));
+      const resumeEffectRows = this.db.prepare<unknown[], ResumeEffectRow>(`
+        SELECT agent_id, conversation_id, turn_id, effect_id, fingerprint_hash, status,
+               result_json, created_at_ms, started_at_ms, completed_at_ms
+        FROM turn_effects WHERE agent_id = ? ORDER BY created_at_ms ASC, conversation_id ASC, turn_id ASC, effect_id ASC
+      `).all(agentId).map(parseResumeEffect);
       const kickstartRuns = this.db.prepare<unknown[], KickstartRunRow>(`
         SELECT agent_id, client_nonce, conversation_id, origin, version, attempt, turn_id, provider, model,
                status, observable_output, result_json, error, created_at_ms, updated_at_ms
@@ -1368,7 +1392,10 @@ export class SqliteTranscriptStore implements TranscriptStore {
           turnId: row.turn_id,
           completedAtMs: row.completed_at_ms,
         })),
+        resumeCheckpoints: resumeCheckpointRows,
+        resumeEffects: resumeEffectRows,
         kickstartRuns,
+        promptQueueRows: this.db.prepare<unknown[], NonNullable<SqliteTranscriptAgentSnapshot["promptQueueRows"]>[number]>("SELECT * FROM prompt_queue WHERE agent_id=? ORDER BY sequence").all(agentId),
         memorySnapshot: this.memoryStore.snapshotAgent(agentId),
       } satisfies SqliteTranscriptAgentSnapshot;
     });
@@ -1384,6 +1411,9 @@ export class SqliteTranscriptStore implements TranscriptStore {
     }
     if (snapshot.activeConversationId !== null && !conversationIds.has(snapshot.activeConversationId)) {
       throw new Error("snapshot aponta para conversa ativa inválida");
+    }
+    for (const row of snapshot.promptQueueRows ?? []) {
+      if (row.agent_id !== agentId || !conversationIds.has(row.conversation_id)) throw new Error("snapshot contém fila de outra conversa");
     }
 
     const transcriptSequences = new Set<number>();
@@ -1439,6 +1469,63 @@ export class SqliteTranscriptStore implements TranscriptStore {
       completionTurnIds.add(row.turnId);
     }
 
+    const checkpointIds = new Set<string>();
+    for (const checkpoint of snapshot.resumeCheckpoints) {
+      if (checkpoint.agentId !== agentId) throw new Error("snapshot contém checkpoint de outro agente");
+      validateResumeScope(checkpoint);
+      validateBoundConversationId(conversationIds, checkpoint.conversationId, "checkpoint");
+      validateOpaqueResumeCursor(checkpoint.cursor);
+      if (typeof checkpoint.checkpointId !== "string" || checkpoint.checkpointId.length === 0) throw new Error("snapshot contém checkpoint inválido");
+      if (checkpointIds.has(checkpoint.checkpointId)) throw new Error("snapshot contém checkpoint duplicado");
+      checkpointIds.add(checkpoint.checkpointId);
+      if (!Number.isSafeInteger(checkpoint.safeSequenceId) || checkpoint.safeSequenceId < 0) throw new Error("snapshot contém checkpoint inválido");
+      if (!Array.isArray(checkpoint.completedEffectIds) || checkpoint.completedEffectIds.length > MAX_RESUME_EFFECT_IDS) throw new Error("snapshot contém ledger de checkpoint inválido");
+      const effectIds = new Set<string>();
+      for (const effectId of checkpoint.completedEffectIds) {
+        if (typeof effectId !== "string" || effectId.length === 0 || effectIds.has(effectId)) throw new Error("snapshot contém ledger de checkpoint inválido");
+        effectIds.add(effectId);
+      }
+      if (!Number.isSafeInteger(checkpoint.expiresAtMs) || checkpoint.expiresAtMs <= 0
+        || !Number.isSafeInteger(checkpoint.version) || checkpoint.version < 1
+        || !Number.isSafeInteger(checkpoint.updatedAtMs) || checkpoint.updatedAtMs < 0) {
+        throw new Error("snapshot contém checkpoint inválido");
+      }
+      parseResumeBudget(checkpoint.budget);
+    }
+
+    const effectKeys = new Set<string>();
+    for (const effect of snapshot.resumeEffects) {
+      if (effect.agentId !== agentId) throw new Error("snapshot contém efeito de outro agente");
+      validateAgentId(effect.agentId);
+      validateConversationId(effect.conversationId);
+      validateBoundConversationId(conversationIds, effect.conversationId, "efeito");
+      if (typeof effect.turnId !== "string" || effect.turnId.length === 0
+        || typeof effect.effectId !== "string" || effect.effectId.length === 0
+        || typeof effect.fingerprintHash !== "string" || effect.fingerprintHash.length === 0) {
+        throw new Error("snapshot contém efeito inválido");
+      }
+      const key = `${effect.conversationId}\u0000${effect.turnId}\u0000${effect.effectId}`;
+      if (effectKeys.has(key)) throw new Error("snapshot contém efeito duplicado");
+      effectKeys.add(key);
+      if (!["prepared", "started", "completed", "unsafe"].includes(effect.status)) {
+        throw new Error("snapshot contém efeito inválido");
+      }
+      if (!Number.isSafeInteger(effect.createdAtMs) || effect.createdAtMs < 0
+        || (effect.startedAtMs !== undefined && (!Number.isSafeInteger(effect.startedAtMs) || effect.startedAtMs < 0))
+        || (effect.completedAtMs !== undefined && (!Number.isSafeInteger(effect.completedAtMs) || effect.completedAtMs < 0))) {
+        throw new Error("snapshot contém efeito inválido");
+      }
+      if (effect.result !== undefined) {
+        let encoded: string | undefined;
+        try {
+          encoded = JSON.stringify(effect.result);
+        } catch {
+          throw new Error("snapshot contém resultado de efeito inválido");
+        }
+        if (encoded === undefined) throw new Error("snapshot contém resultado de efeito inválido");
+      }
+    }
+
     const kickstartNonces = new Set<string>();
     for (const run of snapshot.kickstartRuns ?? []) {
       if (run.agentId !== agentId) throw new Error("snapshot contém kickstart de outro agente");
@@ -1457,9 +1544,9 @@ export class SqliteTranscriptStore implements TranscriptStore {
   restoreAgent(agentId: string, snapshot: TranscriptAgentSnapshot | SqliteTranscriptAgentSnapshot): void {
     validateAgentId(agentId);
     this.ensureOpen();
-    this.liveEntries.delete(agentId);
     const fullSnapshot = isSqliteTranscriptAgentSnapshot(snapshot);
     if (fullSnapshot) this.validateFullRestoreSnapshot(agentId, snapshot);
+    this.liveEntries.delete(agentId);
     const conversationId = fullSnapshot ? undefined : ensureDefaultConversation(this.db, agentId);
     // Prepared once: better-sqlite3 compiles every prepare call, so preparing
     // inside the loops below would recompile one statement per restored row.
@@ -1487,6 +1574,20 @@ export class SqliteTranscriptStore implements TranscriptStore {
       INSERT INTO turn_completions(agent_id, conversation_id, client_nonce, turn_id, completed_at_ms)
       VALUES (?, ?, ?, ?, ?)
     `);
+    const insertResumeCheckpoint = this.db.prepare(`
+      INSERT INTO turn_checkpoints
+        (checkpoint_id, agent_id, conversation_id, turn_id, provider, model, cursor,
+         safe_sequence_id, completed_effect_ids_json, expires_at_ms, version, budget_json, updated_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertResumeEffect = this.db.prepare(`
+      INSERT INTO turn_effects
+        (agent_id, conversation_id, turn_id, effect_id, fingerprint_hash, status,
+         result_json, created_at_ms, started_at_ms, completed_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const deleteResumeCheckpoints = this.db.prepare("DELETE FROM turn_checkpoints WHERE agent_id = ?");
+    const deleteResumeEffects = this.db.prepare("DELETE FROM turn_effects WHERE agent_id = ?");
     const insertKickstartRow = this.db.prepare(`
       INSERT INTO kickstart_runs
         (agent_id, client_nonce, conversation_id, origin, version, attempt, turn_id, provider, model,
@@ -1506,7 +1607,12 @@ export class SqliteTranscriptStore implements TranscriptStore {
       this.statements.deleteInteractionDecisions.run(agentId);
       this.statements.deleteAgentTurnAttempts.run(agentId);
       this.statements.deleteAgentTurnCompletions.run(agentId);
+      if (complete) {
+        deleteResumeCheckpoints.run(agentId);
+        deleteResumeEffects.run(agentId);
+      }
       this.db.prepare("DELETE FROM kickstart_runs WHERE agent_id = ?").run(agentId);
+      this.promptQueue.clear(agentId);
       this.memoryStore.clearAgentRows(agentId);
       if (complete) {
         this.db.prepare("DELETE FROM agent_conversations WHERE agent_id = ?").run(agentId);
@@ -1544,6 +1650,37 @@ export class SqliteTranscriptStore implements TranscriptStore {
         for (const row of state.turnCompletionRows) {
           insertTurnCompletionRow.run(agentId, row.conversationId, row.clientNonce, row.turnId, row.completedAtMs);
         }
+        for (const checkpoint of state.resumeCheckpoints) {
+          insertResumeCheckpoint.run(
+            checkpoint.checkpointId,
+            agentId,
+            checkpoint.conversationId,
+            checkpoint.turnId,
+            checkpoint.provider,
+            checkpoint.model,
+            checkpoint.cursor,
+            checkpoint.safeSequenceId,
+            JSON.stringify(checkpoint.completedEffectIds),
+            checkpoint.expiresAtMs,
+            checkpoint.version,
+            JSON.stringify(checkpoint.budget),
+            checkpoint.updatedAtMs,
+          );
+        }
+        for (const effect of state.resumeEffects) {
+          insertResumeEffect.run(
+            agentId,
+            effect.conversationId,
+            effect.turnId,
+            effect.effectId,
+            effect.fingerprintHash,
+            effect.status,
+            effect.result === undefined ? null : JSON.stringify(effect.result),
+            effect.createdAtMs,
+            effect.startedAtMs ?? null,
+            effect.completedAtMs ?? null,
+          );
+        }
         for (const run of state.kickstartRuns ?? []) {
           insertKickstartRow.run(
             agentId,
@@ -1561,6 +1698,11 @@ export class SqliteTranscriptStore implements TranscriptStore {
             run.createdAtMs,
             run.updatedAtMs,
           );
+        }
+        for (const row of state.promptQueueRows ?? []) {
+          if (row.agent_id !== agentId) throw new Error("Invalid prompt queue snapshot owner");
+          this.db.prepare("INSERT INTO prompt_queue(sequence,agent_id,conversation_id,nonce,args_json,inference_json,state,payload_digest,payload_compacted,recovery_of) VALUES(?,?,?,?,?,?,?,?,?,?)")
+            .run(row.sequence, agentId, row.conversation_id, row.nonce, row.args_json, row.inference_json, row.state, row.payload_digest ?? "", row.payload_compacted ?? 0, row.recovery_of ?? null);
         }
         const memorySnapshot = state.memorySnapshot ?? {
           settings: null,
@@ -1676,6 +1818,12 @@ export class SqliteTranscriptStore implements TranscriptStore {
       }
       insert.run(this.ownership!.token, process.pid, this.currentProcessIdentity.startedAtMs, normalizeExecutablePath(this.currentProcessIdentity.executablePath));
       if (!hasLiveOwner) {
+        this.db.prepare("UPDATE prompt_queue SET state='interrupted' WHERE state='running'").run();
+        this.db.prepare(`UPDATE attachment_staging SET expires_at_ms=? WHERE expires_at_ms=? AND NOT EXISTS (
+          SELECT 1 FROM prompt_queue q, json_each(q.args_json,'$.attachments') a
+          WHERE q.agent_id=attachment_staging.agent_id AND q.state IN ('queued','running')
+            AND json_extract(a.value,'$.path')='attachment:' || attachment_staging.id
+        )`).run(Date.now() + 24 * 60 * 60_000, Number.MAX_SAFE_INTEGER);
         this.reconcileAcceptedNonces();
         this.reconcileInterruptedTurnAttempts();
         this.reconcileInterruptedEntries();
@@ -2338,18 +2486,28 @@ export class SqliteTranscriptStore implements TranscriptStore {
     throughSequenceId: number,
     conversationId?: string,
   ): readonly TranscriptEntry[] {
+    return this.getEntriesWithSequenceByRange(agentId, fromSequenceId, throughSequenceId, conversationId)
+      .map((row) => row.entry);
+  }
+
+  getEntriesWithSequenceByRange(
+    agentId: string,
+    fromSequenceId: number,
+    throughSequenceId: number,
+    conversationId?: string,
+  ): readonly { sequenceId: number; entry: TranscriptEntry }[] {
     validateAgentId(agentId);
     if (!Number.isSafeInteger(fromSequenceId) || fromSequenceId < 0) throw new Error("fromSequenceId inválido");
     if (!Number.isSafeInteger(throughSequenceId) || throughSequenceId < fromSequenceId) throw new Error("throughSequenceId inválido");
     this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
-    const rows = this.db.prepare<unknown[], EntryRow>(`
-      SELECT payload_json
+    const rows = this.db.prepare<unknown[], EntryRow & { sequence_id: number }>(`
+      SELECT sequence_id, payload_json
       FROM transcript_entries
       WHERE agent_id = ? AND conversation_id = ? AND sequence_id BETWEEN ? AND ?
       ORDER BY sequence_id ASC
     `).all(agentId, resolvedConversationId, fromSequenceId, throughSequenceId);
-    return rows.map((row) => parseEntry(row.payload_json));
+    return rows.map((row) => ({ sequenceId: row.sequence_id, entry: parseEntry(row.payload_json) }));
   }
 
   getInteractionDecision(agentId: string, requestId: string, kind: string, conversationId?: string): InteractionDecision | null {

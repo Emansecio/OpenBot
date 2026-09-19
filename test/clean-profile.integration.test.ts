@@ -31,7 +31,7 @@ function realTcpLifecycle() {
       await writeFile(join(paths.logs, `boot-${bootCount}.log`), paths.tempRoot, "utf8");
       const tokenPath = join(paths.dataRoot, "gateway.token");
       if (bootCount === 1) await writeFile(tokenPath, `${token}\n`, "utf8");
-      try { await readFile(paths.configPath, "utf8"); } catch { await writeFile(paths.configPath, JSON.stringify({ version: 1, agents: [] }), "utf8"); }
+      try { await readFile(paths.configPath, "utf8"); } catch { await writeFile(paths.configPath, JSON.stringify({ version: 1, revision: 0, agents: [] }), "utf8"); }
       await writeFile(paths.processStatePath, JSON.stringify({ pid: process.pid, root: paths.installRoot }), "utf8");
       server = createServer((request, response) => {
         if (request.url === "/health") {
@@ -62,6 +62,17 @@ function realTcpLifecycle() {
 }
 
 describe("clean profile gate", () => {
+  it("aceita somente revisão monotônica com todos os valores preservados", () => {
+    const first = { revision: 8, agents: [], hostSettings: { timezone: "UTC" }, globalModel: "fixture" };
+    expect(runner.isPersistedConfigStable(first, { ...first, revision: 16 })).toBe(true);
+    expect(runner.isPersistedConfigStable(first, first)).toBe(true);
+    for (const revision of [undefined, -1, 7, 8.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(runner.isPersistedConfigStable(first, { ...first, revision })).toBe(false);
+    }
+    expect(runner.isPersistedConfigStable(first, { ...first, revision: 16, globalModel: "changed" })).toBe(false);
+    expect(runner.isPersistedConfigStable(first, { ...first, revision: 16, hostSettings: { timezone: "changed" } })).toBe(false);
+    expect(runner.isPersistedConfigStable(first, { ...first, revision: 16, agents: [{ id: "invented" }] })).toBe(false);
+  });
   it("copia o addon DPAPI real da arquitetura efetiva para o install isolado", async () => {
     const root = isolatedRoot("dpapi-addon");
     try {
@@ -158,11 +169,12 @@ describe("clean profile gate", () => {
     let launches = 0;
     (lifecycle as any).launchElectron = async (paths: any, ...args: any[]) => {
       launches += 1;
+      const config = JSON.parse(await readFile(paths.configPath, "utf8"));
       if (launches === 1) {
-        const config = JSON.parse(await readFile(paths.configPath, "utf8"));
         config.hostSettings = { initializedByRenderer: true };
-        await writeFile(paths.configPath, JSON.stringify(config), "utf8");
       }
+      config.revision += 1;
+      await writeFile(paths.configPath, JSON.stringify(config), "utf8");
       return launch(paths, ...args);
     };
     try {

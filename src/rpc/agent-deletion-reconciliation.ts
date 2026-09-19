@@ -20,14 +20,16 @@ export interface AgentDeletionReconciliationResult {
 /**
  * Resolves crash-interrupted deletions before RPC admission opens. Roster
  * presence means deletion never committed and its intent is cancelled;
- * absence means every agent-scoped persistence surface is purged idempotently
- * before the durable tombstone is removed.
+ * absence means every available agent-scoped persistence surface is purged
+ * idempotently before the durable tombstone is removed. If browser cleanup is
+ * unavailable, the journal remains pending until that capability returns.
  */
 export async function reconcileAgentDeletions(options: {
   config: Pick<ConfigStore, "snapshot">;
   store: AgentDeletionJournalStore;
   keystore?: Keystore;
   attachmentStaging?: AttachmentStagingStore;
+  browserLifecycle?: { purgeAgent(agentId: string): Promise<void> };
   asyncTaskStore?: AsyncTaskStore;
   a2aStore?: A2AStore;
   reactionStore?: ReactionStore;
@@ -51,6 +53,14 @@ export async function reconcileAgentDeletions(options: {
   if (committed.length > 1 && options.store.clearAgents !== undefined) options.store.clearAgents(committed);
   else for (const agentId of committed) options.store.clear(agentId);
 
+  const browserLifecycle = options.browserLifecycle;
+  const browserPurgeUnavailable = browserLifecycle === undefined;
+  if (browserPurgeUnavailable) {
+    console.warn(
+      `[openbot] agent deletion reconciliation pending: browser purge capability unavailable for ${committed.join(", ")}`,
+    );
+  }
+
   for (const agentId of committed) {
     options.asyncTaskStore?.purgeAgentTasks(agentId);
     options.a2aStore?.retireAgent(agentId);
@@ -58,7 +68,9 @@ export async function reconcileAgentDeletions(options: {
     options.reactionStore?.purgeAgent(agentId);
     await options.attachmentStaging?.purgeAgent(agentId);
     await options.keystore?.purgeScope(agentId);
+    if (browserLifecycle !== undefined) await browserLifecycle.purgeAgent(agentId);
   }
+  if (browserPurgeUnavailable) return result;
   options.store.completeAgentDeletion(committed);
   result.completed.push(...committed);
   return result;

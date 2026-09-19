@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { resolve, win32 } from "node:path";
 import { runInNewContext } from "node:vm";
-import { describe, expect, it } from "vitest";
+import { pathToFileURL } from "node:url";
+import { describe, expect, it, vi } from "vitest";
 
 const root = resolve(new URL("..", import.meta.url).pathname.replace(/^\/(.):/, "$1:"));
 const main = readFileSync(resolve(root, "client/extracted/dist/electron-main/main.cjs"), "utf8");
@@ -28,6 +29,15 @@ function between(source: string, start: string, end: string): string {
 }
 
 describe("Electron/Windows local integration patches", () => {
+  it.each(["expanded", "collapsed", "pinned"])("resolves the selected bot in %s layout", (layout) => {
+    const row = { dataset: { active: "true", layout }, getAttribute: (key: string) => key === "data-agent-id" ? "selected-bot" : null };
+    const resolveSelected = runInNewContext(`${between(settings, "function selectedAgentRow()", "function handleAgentSelectionClick")} refreshActivePromptAgent`, {
+      activePromptAgentId: null,
+      isVisibleElement: () => true,
+      document: { querySelectorAll: (selector: string) => selector === ".sand-agent-item[data-agent-id]" ? [row] : [] },
+    });
+    return expect(resolveSelected()).resolves.toBe("selected-bot");
+  });
   it("keeps routine draft saves out of the composer layout while preserving failure feedback", () => {
     const notice = { hidden: true, firstChild: { textContent: "" }, lastChild: { hidden: true } };
     const context = {
@@ -79,33 +89,79 @@ describe("Electron/Windows local integration patches", () => {
   it.each([false, true])("sets the window and taskbar identity before loading main (installed=%s)", installed => {
     const bootstrap = readFileSync(resolve(root, "scripts/openbot-electron.cjs"), "utf8");
     const events: string[] = [];
-    let created: (_event: unknown, window: { setIcon: (path: string) => void; setAppDetails: (details: unknown) => void }) => void;
-    let icon: string | undefined;
+    const windowImage = { isEmpty: () => false };
+    const loadedImages: string[] = [];
+    let created: (_event: unknown, window: { setIcon: (image: unknown) => void; setAppDetails: (details: unknown) => void; webContents: { on: (event: string, handler: () => void) => void } }) => void;
+    let icon: unknown;
     let details: unknown;
     runInNewContext(bootstrap, {
       __dirname: "C:\\OpenBot Test\\scripts",
       process: { platform: "win32", env: { SystemRoot: "C:\\Windows", ...(installed ? { OPENBOT_RELEASE_ROOT: "C:\\Installed\\versions\\v1", OPENBOT_INSTALL_ROOT: "C:\\Installed" } : {}) } },
       require(id: string) {
         if (id === "node:path") return win32;
-        if (id === "electron") return { app: {
+        if (id === "node:url") return { pathToFileURL };
+        if (id === "electron") return { nativeImage: {
+          createFromPath(path: string) { loadedImages.push(path); return windowImage; },
+        }, app: {
           setName(name: string) { events.push(name); },
           setAppUserModelId(appId: string) { events.push(appId); },
-          on(event: string, handler: typeof created) { expect(event).toBe("browser-window-created"); created = handler; },
+          on(event: string, handler: typeof created) { if (event === "browser-window-created") created = handler; },
         } };
         expect(id).toBe("../client/extracted/dist/electron-main/main.cjs");
         events.push("main");
-        created(null, { setIcon(value) { icon = value; }, setAppDetails(value) { details = value; } });
+        created(null, { setIcon(value) { icon = value; }, setAppDetails(value) { details = value; }, webContents: { on() {} } });
       },
     });
     expect(events).toEqual(["OpenBot", "OpenBot.Desktop", "main"]);
     const expectedIcon = installed ? "C:\\Installed\\versions\\v1\\assets\\openbot.ico" : "C:\\OpenBot Test\\assets\\openbot.ico";
-    expect(icon).toBe(expectedIcon);
+    expect(icon).toBe(windowImage);
+    expect(loadedImages).toEqual([expectedIcon.replace(/\.ico$/, ".png"), expectedIcon]);
     expect(details).toEqual({
       appId: "OpenBot.Desktop", appIconPath: expectedIcon, appIconIndex: 0,
       relaunchCommand: installed ? '"C:\\Windows\\System32\\wscript.exe" "C:\\Installed\\OpenBot.vbs"' : '"C:\\Windows\\System32\\wscript.exe" "C:\\OpenBot Test\\scripts\\openbot-desktop.vbs"',
       relaunchDisplayName: "OpenBot",
     });
     expect(launcher).toContain('"%CD%\\scripts\\openbot-electron.cjs"');
+  });
+
+  it.each([".ico", ".png"])("refuses missing %s branding instead of using Electron defaults", extension => {
+    const bootstrap = readFileSync(resolve(root, "scripts/openbot-electron.cjs"), "utf8");
+    let mainLoaded = false;
+    expect(() => runInNewContext(bootstrap, {
+      __dirname: "C:/OpenBot/scripts",
+      process: { platform: "win32", env: {} },
+      require(id: string) {
+        if (id === "node:path") return win32;
+        if (id === "node:url") return { pathToFileURL };
+        if (id === "electron") return {
+          app: {}, nativeImage: { createFromPath: (path: string) => ({ isEmpty: () => path.endsWith(extension) }) },
+        };
+        mainLoaded = true;
+      },
+    })).toThrow(/icons are missing or invalid/);
+    expect(mainLoaded).toBe(false);
+  });
+
+  it("confirms Start-menu taskbar registration before starting the gateway", () => {
+    expect(launcher).toContain('setup-desktop-shortcut.mjs" --taskbar-only');
+    expect(launcher.indexOf('setup-desktop-shortcut.mjs" --taskbar-only')).toBeLessThan(launcher.indexOf('set "GATEWAY_STARTED=0"'));
+    expect(launcher).toMatch(/--taskbar-only\r?\nif errorlevel 1 \([\s\S]*?exit \/b 1/);
+  });
+
+  it("routes maintained desktop verification through the branded production entrypoint", () => {
+    for (const script of [
+      "visual-ui-verify.mjs", "bridge-real-verify.mjs", "electron-p22-tasks-verify.mjs",
+      "electron-p23-verify.mjs", "electron-p27-profile.mjs", "memory-flow-e2e.mjs",
+      "verify-clean-profile.mjs", "e2e-desktop-run.ps1",
+    ]) {
+      const source = readFileSync(resolve(root, "scripts", script), "utf8");
+      expect(source, script).toMatch(/(?:const electronMain|\$electronMain)[^\r\n]*openbot-electron\.cjs/);
+      if (script === "e2e-desktop-run.ps1") expect(source).toContain("Stop-OwnTree -ProcessId $electronProcess.Id -ExpectedCommandPart $electronMain -ExpectedRoot $userData");
+    }
+    expect(readFileSync(resolve(root, "scripts/visual-electron.cmd"), "utf8"))
+      .toContain('scripts\\openbot-electron.cjs');
+    expect(packageJson.scripts["desktop:shortcut"]).toBe("node scripts/setup-desktop-shortcut.mjs");
+    expect(packageJson.scripts["verify:desktop-identity"]).toContain("test/desktop-identity.test.ts");
   });
 
   it("aligns user and assistant chat bubbles on opposite sides", () => {
@@ -209,7 +265,7 @@ describe("Electron/Windows local integration patches", () => {
     expect(settings).toContain('selectedAgentRow()?.getAttribute("data-agent-id")');
     expect(settings).toContain('document.getElementById("sand-settings-panel-general")');
     expect(settings).toContain('renderSettings(mount, globalMount ? "global" : "agent")');
-    expect(settings).toContain("cancelPrompt?.({ agentId })");
+    expect(settings).toContain('turnId: current.turnId, scope: "current"');
     expect(settings).toContain('button.textContent = "Tentar parar"');
     let selected = "agent-a";
     let save!: (event: unknown, request: Record<string, unknown>) => Promise<unknown>;
@@ -252,8 +308,12 @@ describe("Electron/Windows local integration patches", () => {
     expect(settings).toContain("getPromptStatus");
     expect(settings).toContain("retryPrompt");
     expect(settings).toContain('retry.textContent = "Tentar novamente"');
-    expect(settings).toContain("O turno foi interrompido depois que sua mensagem foi aceita.");
-    expect(settings).toContain("A resposta atingiu o limite seguro de tamanho.");
+    // A recuperação é decidida pelo backend: nenhuma ação depende do texto exibido.
+    expect(settings).toContain("getPromptRecovery");
+    expect(settings).not.toContain("RETRYABLE_NOTICES");
+    expect(main).toContain('"sand:prompt-recovery"');
+    expect(preload).toContain('invoke("sand:prompt-recovery", args ?? {})');
+    expect(main).toMatch(/"sand:prompt-recovery"[\s\S]{0,300}assertTrustedSecretsSender[\s\S]{0,300}getPromptRecovery/);
     expect(settings).toContain("getActiveConversation");
     expect(settings).toContain("conversationId");
     const scope = { selectedAgentRow: () => ({ getAttribute: () => "agent-a" }), activePromptAgentId: "agent-b" };
@@ -272,7 +332,9 @@ describe("Electron/Windows local integration patches", () => {
     expect(settings).not.toContain("rememberSelectedAgent(selectedAgentRow(), globalStatus.agentId)");
     expect(settings).not.toContain("stopFallbackTimer");
     expect(settings).not.toContain("120000");
-    expect(settings).toMatch(/retry\.addEventListener\("click"[\s\S]{0,500}getActiveConversation\?\.\(\{ agentId \}\)[\s\S]{0,180}conversationId[\s\S]{0,180}retryPrompt\?\.\(\{[\s\S]{0,100}agentId,[\s\S]{0,100}conversationId/);
+    const retryAction = between(settings, "function createRetryAction(", "function handlePromptSubmit(");
+    expect(retryAction).toContain('getActiveConversation?.({ agentId })');
+    expect(retryAction).toContain('agentId, conversationId, expectedFailureEntryId,');
   });
 
   it("observa Enter e clique no envio sem depender da montagem do botão e limita o otimismo ao bot selecionado", () => {
@@ -320,8 +382,14 @@ describe("Electron/Windows local integration patches", () => {
     label = "Start voice input";
     submit(event(2));
     expect({ prevented, stopped, submits }).toEqual({ prevented: 1, stopped: 1, submits: 1 });
-    submit(event(1)); // A subsequent deliberate mic gesture remains available.
-    expect(prevented).toBe(1);
+    submit(event(1)); // Voice input remains unavailable for deliberate clicks too.
+    expect(prevented).toBe(2);
+    label = "Stop dictation";
+    submit(event(1));
+    expect(prevented).toBe(3);
+    label = "Send message";
+    submit(event(1));
+    expect(submits).toBe(2);
   });
 
   it("reports durable acceptance from the coordinator without leaking prompt content", () => {
@@ -358,13 +426,14 @@ describe("Electron/Windows local integration patches", () => {
     const scope = { localUiClosed: false, optimisticGeneration: true, optimisticAgentId: "a", optimisticNonce: "new",
       promptStatusRevision: 0, promptStatusTimer: 0, promptStatusFailures: 0, lastSendAt: Date.now(),
       busyAgentIds: new Set<string>(), cancellingAgentIds: new Set(), unknownAgentIds: new Set(),
+      promptStates: new Map(),
       activePromptAgentId: "a", cachedSendAction: null, clearLocalTimeout: () => {},
       setLocalTimeout: (callback: () => Promise<void>) => { callbacks.push(callback); return callbacks.length; },
       desktop: () => ({ agent: { getPromptStatus: async () => ({ agentId: "a", isBusy: false }) } }),
       refreshActivePromptAgent: async () => "a", syncGenerating: () => {}, ensureStop: () => {},
       document: { querySelector: () => null },
     };
-    const deliver = runInNewContext(`${between(settings, "function schedulePromptStatus", "const RETRYABLE_NOTICES")}
+    const deliver = runInNewContext(`${between(settings, "function schedulePromptStatus", "const RECOVERY_RETRY")}
       ${between(settings, "function handlePromptDelivery", "function watchComposer")} handlePromptDelivery`, scope);
     deliver({ agentId: "a", nonce: "old", phase: "accepted" });
     expect(scope.optimisticGeneration).toBe(true);
@@ -374,6 +443,23 @@ describe("Electron/Windows local integration patches", () => {
     await callbacks.at(-1)!();
     expect(scope.busyAgentIds.size).toBe(0); // Fast completion does not wait five seconds.
     expect(scope.promptStatusFailures).toBe(0);
+  });
+
+  it("clears previous cancellation when a newer turn is busy and cancelable", async () => {
+    const callbacks: Array<() => Promise<void>> = [];
+    const scope = {
+      localUiClosed: false, optimisticGeneration: false, optimisticAgentId: "a", lastSendAt: 0,
+      promptStatusRevision: 0, promptStatusTimer: 0, promptStatusFailures: 0,
+      busyAgentIds: new Set(["a"]), cancellingAgentIds: new Set(["a"]), unknownAgentIds: new Set(), promptStates: new Map(),
+      clearLocalTimeout: () => {}, setLocalTimeout: (callback: () => Promise<void>) => { callbacks.push(callback); return callbacks.length; },
+      desktop: () => ({ agent: { getPromptStatus: async () => ({ agentId: "a", isBusy: true, canCancel: true, turnId: "new-turn", conversationId: "conversation" }) } }),
+      refreshActivePromptAgent: async () => "a", syncGenerating: () => {}, ensureStop: () => {}, document: { querySelector: () => null },
+    };
+    const schedule = runInNewContext(`${between(settings, "function schedulePromptStatus", "const RECOVERY_RETRY")} schedulePromptStatus`, scope);
+    schedule(0);
+    await callbacks[0]!();
+    expect(scope.cancellingAgentIds.has("a")).toBe(false);
+    expect(scope.promptStates.get("a")).toMatchObject({ turnId: "new-turn", canCancel: true });
   });
 
   it("bounds prompt-control IPC and tracks generation per agent", () => {
@@ -605,6 +691,31 @@ describe("Electron/Windows local integration patches", () => {
     expect(preload).toContain('invoke("sand:local-profile-set", profile)');
   });
 
+  it("applies confirmed profile saves after unmount without accepting stale acknowledgements", async () => {
+    const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+    const scope = {
+      profileRevision: 0, profileWriteSequence: 0, profileAppliedWrite: 0,
+      profileState: { name: "Before" }, profileLoaded: false,
+      normalizeProfileState: (value: unknown) => value,
+      profileAgent: () => ({ updateLocalProfile: () => new Promise((resolve, reject) => pending.push({ resolve, reject })) }),
+      applyProfileName: vi.fn(),
+    };
+    const persist = runInNewContext(`${between(settings, "async function persistLocalProfile(", "function ensureLocalProfileLoaded()")} persistLocalProfile`, scope);
+    const first = persist({ name: "First" });
+    const second = persist({ name: "Second" });
+    pending[1]!.resolve({ name: "Second" });
+    await second;
+    pending[0]!.resolve({ name: "First" });
+    await first;
+    expect(scope.profileState).toEqual({ name: "Second" });
+    expect(scope.profileLoaded).toBe(true);
+    expect(scope.applyProfileName).toHaveBeenCalledTimes(1);
+    const unconfirmed = persist({ name: "Not stored" });
+    pending[2]!.resolve({ name: "Second" });
+    await expect(unconfirmed).rejects.toThrow("O perfil salvo não foi confirmado");
+    expect(scope.profileState).toEqual({ name: "Second" });
+  });
+
   it("persists the local profile name through the profile RPC", () => {
     expect(settings).toContain('const PROFILE_KEY = "openbot.profile.name.v1"');
     expect(settings).toContain('root.id = PROFILE_ID');
@@ -613,7 +724,7 @@ describe("Electron/Windows local integration patches", () => {
     expect(settings).toContain('maxlength="80"');
     expect(settings).toContain('aria-label="Salvar perfil"');
     expect(settings).toContain('<span class="ob-profile-save-label">Salvar</span>');
-    expect(settings).toContain('const markDirty = () => {');
+    expect(settings).toContain('const markDirty = (field) => {');
     expect(settings).toContain('saveLabel.textContent = "Salvo"');
     expect(settings).toContain('id="openbot-profile-status" role="status" aria-live="polite"');
     expect(settings).toContain("getLocalProfile()");
@@ -743,6 +854,175 @@ describe("Electron/Windows local integration patches", () => {
     resolveSave({ agentId: "alpha", provider: "openai", model: control.value, reasoningEffort: "high" });
     await late;
     expect(statuses).not.toContain("resposta atrasada");
+  });
+
+  it.each(["retry", "inspect", "none", "unknown-contract"])("offers recovery actions only when the backend confirms them (%s)", async (mode) => {
+    const failureEntryId = "notice:turn:a:provider-error";
+    const rows: unknown[] = [];
+    const hosts: unknown[] = [];
+    const created: Element[] = [];
+    class Element {
+      attributes = new Map<string, string>();
+      next: Element | null = null;
+      previousElementSibling: Element | null = null;
+      isConnected = true;
+      removed = false;
+      disabled = false;
+      textContent = "";
+      className = "";
+      type = "";
+      handlers = new Map<string, () => Promise<void>>();
+      get nextElementSibling() { return this.next; }
+      getAttribute(name: string) { return this.attributes.get(name) ?? null; }
+      setAttribute(name: string, value: string) { this.attributes.set(name, String(value)); }
+      removeAttribute(name: string) { this.attributes.delete(name); }
+      hasAttribute(name: string) { return this.attributes.has(name); }
+      closest() { return null; }
+      remove() { this.removed = true; if (this.previousElementSibling) this.previousElementSibling.next = null; }
+      insertAdjacentElement(_position: string, element: Element) { this.next = element; element.previousElementSibling = this; hosts.push(element); return element; }
+      addEventListener(kind: string, handler: () => Promise<void>) { this.handlers.set(kind, handler); }
+    }
+    const row = new Element();
+    row.setAttribute("role", "note");
+    row.setAttribute("data-entry-id", failureEntryId);
+    rows.push(row);
+    const getPromptRecovery = mode === "unknown-contract" ? undefined : vi.fn(async () => ({
+      conversationId: "current-conversation",
+      failure: { entryId: failureEntryId, turnId: "turn:a", actions: mode === "retry" ? ["retry"] : mode === "inspect" ? ["inspect"] : [] },
+    }));
+    const scope = {
+      ROOT_ID: "settings", EMPTY_ID: "empty",
+      RECOVERY_RETRY: "retry", RECOVERY_INSPECT: "inspect",
+      RECOVERY_INSPECT_HINT: "Este turno já executou ferramentas ou foi interrompido durante uma operação. Confira os resultados e possíveis efeitos no histórico e envie uma nova instrução para continuar.",
+      RECOVERY_ROW_ATTR: "data-openbot-recovery-signature",
+      localUiClosed: false, activePromptAgentId: "alpha", promptRecoveryTimer: 0, promptRecoverySignature: "",
+      promptRecovery: new Map(), promptRecoveryTokens: new Map(),
+      Element,
+      document: {
+        querySelectorAll: (selector: string) => selector === "[data-openbot-recovery]" ? [...hosts] : [...rows],
+        createElement: () => { const element = new Element(); created.push(element); return element; },
+        querySelector: () => null,
+      },
+      selectedAgentRow: () => ({ getAttribute: () => "alpha" }),
+      refreshActivePromptAgent: async () => "alpha",
+      desktop: () => ({ agent: { retryPrompt: async () => ({ accepted: true }), getActiveConversation: async () => ({ id: "current-conversation" }), getPromptRecovery } }),
+      busyAgentIds: new Set<string>(), optimisticGeneration: false, lastSendAt: 0,
+      syncGenerating() {}, ensureStop() {}, schedulePromptStatus() {},
+      clearLocalTimeout() {}, setLocalTimeout: () => 1,
+      userFacingError: (error: unknown, fallback: string) => (error instanceof Error ? error.message : String(error || "")) || fallback,
+    };
+    const api = runInNewContext(`${between(settings, "function currentAgentId()", "function handlePromptSubmit(")}
+      ({ refreshPromptRecovery, ensureRetryActions })`, scope);
+    await api.refreshPromptRecovery("alpha");
+    api.ensureRetryActions();
+
+    if (mode === "retry") {
+      expect(getPromptRecovery).toHaveBeenCalledExactlyOnceWith({ agentId: "alpha", conversationId: "current-conversation" });
+      expect(created).toHaveLength(1);
+      expect(created[0]!.className).toBe("ob-retry-generation");
+      expect(created[0]!.textContent).toBe("Tentar novamente");
+      expect(row.getAttribute("data-openbot-recovery-signature")).toBe("retry");
+      // Reprocessar a mesma falha não duplica a ação.
+      api.ensureRetryActions();
+      expect(created).toHaveLength(1);
+      return;
+    }
+    expect(created.some((element) => element.className === "ob-retry-generation")).toBe(false);
+    if (mode === "inspect") {
+      expect(created).toHaveLength(1);
+      expect(created[0]!.className).toBe("ob-recovery-inspect");
+      expect(created[0]!.textContent).toBe("Conferir resultados e possíveis efeitos");
+      expect(row.getAttribute("data-openbot-recovery-signature")).toBe("inspect");
+      return;
+    }
+    // Nenhuma ação automática: contrato ausente ou falha sem recuperação segura.
+    expect(created).toHaveLength(0);
+    expect(row.getAttribute("data-openbot-recovery-signature")).toBeNull();
+  });
+
+  it("revalidates a retry click in the backend and re-reads the confirmed actions on refusal", async () => {
+    const failureEntryId = "notice:turn:a:provider-error";
+    const rows: unknown[] = [];
+    const hosts: unknown[] = [];
+    const created: Element[] = [];
+    const scheduled: Array<() => void> = [];
+    let activeElement: unknown;
+    const body = {};
+    class Element {
+      attributes = new Map<string, string>();
+      next: Element | null = null;
+      previousElementSibling: Element | null = null;
+      isConnected = true;
+      textContent = "";
+      className = "";
+      type = "";
+      handlers = new Map<string, () => Promise<void>>();
+      focus: (options?: { preventScroll?: boolean }) => void = () => {};
+      /** Desabilitar um botão focado tira o foco dele, como no navegador. */
+      #disabled = false;
+      get disabled() { return this.#disabled; }
+      set disabled(value: boolean) { this.#disabled = value; if (value && activeElement === this) activeElement = body; }
+      get nextElementSibling() { return this.next; }
+      getAttribute(name: string) { return this.attributes.get(name) ?? null; }
+      setAttribute(name: string, value: string) { this.attributes.set(name, String(value)); }
+      removeAttribute(name: string) { this.attributes.delete(name); }
+      hasAttribute(name: string) { return this.attributes.has(name); }
+      closest() { return null; }
+      remove() { this.removed = true; }
+      removed = false;
+      insertAdjacentElement(_position: string, element: Element) { this.next = element; element.previousElementSibling = this; hosts.push(element); return element; }
+      addEventListener(kind: string, handler: () => Promise<void>) { this.handlers.set(kind, handler); }
+    }
+    const row = new Element();
+    row.setAttribute("role", "note");
+    row.setAttribute("data-entry-id", failureEntryId);
+    rows.push(row);
+    const retryPrompt = vi.fn(async () => { throw new Error("Error invoking remote method 'sand:retry-prompt': Error: retryPrompt: a falha selecionada não é mais a falha atual"); });
+    const scope = {
+      ROOT_ID: "settings", EMPTY_ID: "empty",
+      RECOVERY_RETRY: "retry", RECOVERY_INSPECT: "inspect",
+      RECOVERY_INSPECT_HINT: "Confira os resultados e possíveis efeitos no histórico.",
+      RECOVERY_ROW_ATTR: "data-openbot-recovery-signature",
+      localUiClosed: false, activePromptAgentId: "alpha", promptRecoveryTimer: 0, promptRecoverySignature: "",
+      promptRecovery: new Map([["alpha", { entryId: failureEntryId, actions: ["retry"] }]]), promptRecoveryTokens: new Map(),
+      Element,
+      document: {
+        body,
+        get activeElement() { return activeElement; },
+        querySelectorAll: (selector: string) => selector === "[data-openbot-recovery]" ? [...hosts] : [...rows],
+        createElement: () => { const element = new Element(); created.push(element); return element; },
+        querySelector: () => null,
+      },
+      selectedAgentRow: () => ({ getAttribute: () => "alpha" }),
+      refreshActivePromptAgent: async () => "alpha",
+      desktop: () => ({ agent: { retryPrompt, getActiveConversation: async () => ({ id: "current-conversation" }), getPromptRecovery: async () => ({ conversationId: "current-conversation", failure: { entryId: failureEntryId, turnId: "turn:a", actions: ["inspect"] } }) } }),
+      busyAgentIds: new Set<string>(), optimisticGeneration: false, lastSendAt: 0,
+      syncGenerating() {}, ensureStop() {}, schedulePromptStatus() {},
+      clearLocalTimeout() {}, setLocalTimeout: (callback: () => void) => { scheduled.push(callback); return scheduled.length; },
+      userFacingError: (error: unknown, fallback: string) => {
+        const message = error instanceof Error ? error.message : String(error || "");
+        return /(?:invoking remote method|unauthorized|gateway-command-failed|\bsand:)/i.test(message) ? fallback : (message || fallback);
+      },
+    };
+    const recovery = runInNewContext(`${between(settings, "function currentAgentId()", "function handlePromptSubmit(")} ensureRetryActions`, scope);
+    recovery();
+    const retry = created[0]!;
+    const focus = vi.fn(() => { activeElement = retry; });
+    retry.focus = focus;
+    activeElement = retry;
+    await retry.handlers.get("click")!();
+
+    // A ação revalida pelo identificador real e nunca inventa um turno novo.
+    expect(retryPrompt).toHaveBeenCalledExactlyOnceWith({ agentId: "alpha", conversationId: "current-conversation", expectedFailureEntryId: failureEntryId });
+    // A recusa é sanitizada: nada de IPC, stack ou credencial na interface.
+    expect(retry.disabled).toBe(false);
+    expect(retry.textContent).toBe("Tentar novamente");
+    const report = retry.nextElementSibling!;
+    expect(report.textContent).toBe("Não foi possível tentar novamente.");
+    expect(report.textContent).not.toContain("sand:retry-prompt");
+    // Foco preservado e reconsulta autoritativa agendada.
+    expect(focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+    expect(scheduled).toHaveLength(1);
   });
 
   it("commits native attachments through the available upload RPC for the captured bot", async () => {
@@ -889,6 +1169,7 @@ describe("Electron/Windows local integration patches", () => {
     expect(settings).toContain("visibleLegacyScreenIn");
     expect(settings).toContain("[class*='computer'],[class*='screen']");
     expect(settings).toContain('#sand-conversation-details:has(.sand-computer-stage__placeholder){display:none!important}');
+    expect(settings).toContain('.sand-chat-header__computer{display:none!important}');
     expect(settings).toMatch(/Can't reach \.\+ screen\|\.\+\['’\]s screen/);
     expect(settings).toContain("hideLegacyScreenPane(el)");
     expect(settings).toContain('details.dataset.openbotLegacyScreen = "1"');

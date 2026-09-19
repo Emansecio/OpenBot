@@ -472749,6 +472749,21 @@ import_electron50.app.whenReady().then(async () => {
     assertOpenBotLocalMode();
     return callOpenBotProviderRpc("getPromptStatus", request3 ?? {}, { timeoutMs: PROMPT_STATUS_TIMEOUT_MS });
   });
+  import_electron50.ipcMain.handle("sand:prompt-recovery", (_event, request3) => {
+    senderGuards.assertTrustedSecretsSender(_event);
+    assertOpenBotLocalMode();
+    return callOpenBotProviderRpc("getPromptRecovery", request3 ?? {}, { timeoutMs: PROMPT_STATUS_TIMEOUT_MS });
+  });
+  import_electron50.ipcMain.handle("sand:queued-prompt-get", (_event, request3) => {
+    senderGuards.assertTrustedSecretsSender(_event);
+    assertOpenBotLocalMode();
+    return withActiveOpenBotAgent(request3, (next) => callOpenBotProviderRpc("getQueuedPrompt", next, { timeoutMs: PROMPT_STATUS_TIMEOUT_MS }));
+  });
+  import_electron50.ipcMain.handle("sand:queued-prompt-revise", (_event, request3) => {
+    senderGuards.assertTrustedSecretsSender(_event);
+    assertOpenBotLocalMode();
+    return withActiveOpenBotAgent(request3, (next) => callOpenBotProviderRpc("reviseQueuedPrompt", next, { timeoutMs: PROMPT_CONTROL_TIMEOUT_MS }));
+  });
   import_electron50.ipcMain.handle("sand:runtime-status", async (_event, request3) => {
     senderGuards.assertTrustedSecretsSender(_event);
     assertOpenBotLocalMode();

@@ -132,6 +132,14 @@ export interface HeartbeatAsyncTaskInput {
   readonly leaseDurationMs: number;
 }
 
+export interface MarkUnsafeEffectStartedInput {
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly leaseOwnerId: string;
+  readonly attempt: number;
+  readonly markedAtMs: number;
+}
+
 export interface RecordAsyncTaskProgressInput {
   readonly taskId: string;
   readonly expectedVersion: number;
@@ -148,6 +156,8 @@ export interface TransitionAsyncTaskInput {
   readonly leaseOwnerId?: string;
   readonly attempt?: number;
   readonly nextAttemptAtMs?: number;
+  /** Schedule an abandoned-task retry at the store's authoritative operation time. */
+  readonly retryAtOperationNow?: boolean;
   readonly error?: AsyncTaskFailure | null;
 }
 
@@ -220,6 +230,7 @@ interface AttemptRow {
   lease_owner: string | null;
   lease_expires_at_ms: number | null;
   lease_version: number | null;
+  unsafe_effect_started: number;
   error_json: string | null;
 }
 
@@ -688,6 +699,11 @@ function attemptFromRow(row: AttemptRow, sensitiveValues: readonly string[] = []
     finishedAtMs: nullableInteger(row.finished_at_ms, "attempt.finishedAtMs"),
     lease: parseLease(row),
     error: parseOptionalJson(row.error_json, "attempt error", (value) => parseFailure(value, sensitiveValues)),
+    unsafeEffectStarted: row.unsafe_effect_started === 1
+      ? true
+      : row.unsafe_effect_started === 0
+        ? false
+        : invalid("Persisted unsafe effect marker is invalid."),
   };
   const mustHaveLease = record.status === "admitted" || record.status === "running" || record.status === "cancelling";
   if (mustHaveLease !== (record.lease !== null)) invalid("Persisted attempt lease does not match its status.");
@@ -1062,6 +1078,53 @@ export class AsyncTaskStore {
     if (atMs < this.currentAttemptFence(task)) invalid(`${operation} timestamp precedes the current attempt fence.`);
   }
 
+  /**
+   * Legacy retry-wait attempts have no durable effect boundary marker. When a
+   * migration conservatively marks one as uncertain, terminalize it before a
+   * worker can claim the retry and repeat an external mutation.
+   */
+  private terminalizeUncertainRetryWaitInTransaction(task: AsyncTaskRecord, operationNow: number): AsyncTaskRecord {
+    if (task.status !== "retry_wait" || task.attempt === 0) invalid("Uncertain retry-wait task is incoherent.");
+    const attemptRow = this.db.prepare<unknown[], AttemptRow>("SELECT * FROM async_task_attempts WHERE task_id = ? AND attempt = ?")
+      .get(task.taskId, task.attempt);
+    if (attemptRow === undefined) invalid("Current retry-wait attempt is missing.");
+    const attempt = this.attemptFromRow(attemptRow);
+    if (!attempt.unsafeEffectStarted) return task;
+    this.assertTimestampAtOrAfterCurrentAttempt(task, operationNow, "Uncertain retry-wait terminalization");
+    const error: AsyncTaskFailure = {
+      code: "internal_error",
+      message: "Legacy retry-wait effect outcome is uncertain; automatic retry is blocked.",
+      retryable: false,
+    };
+    const nextVersion = task.version + 1;
+    const changed = this.db.prepare(`
+      UPDATE async_tasks
+      SET status = 'failed', version = ?, finished_at_ms = ?, next_attempt_at_ms = NULL,
+          lease_owner = NULL, lease_expires_at_ms = NULL, lease_attempt = NULL, lease_version = NULL,
+          error_json = ?
+      WHERE task_id = ? AND status = 'retry_wait' AND version = ? AND attempt = ?
+    `).run(nextVersion, operationNow, JSON.stringify(parseFailure(error, this.sensitiveValues())), task.taskId, task.version, task.attempt);
+    if (changed.changes !== 1) casRejected("Uncertain retry-wait terminalization lost its compare-and-swap fence.");
+    const attemptChanged = this.db.prepare(`
+      UPDATE async_task_attempts
+      SET status = 'failed', version = version + 1, finished_at_ms = ?,
+          lease_owner = NULL, lease_expires_at_ms = NULL, lease_version = NULL, error_json = ?
+      WHERE task_id = ? AND attempt = ? AND status IN ('retry_wait', 'abandoned')
+    `).run(operationNow, JSON.stringify(error), task.taskId, task.attempt);
+    if (attemptChanged.changes !== 1) casRejected("Uncertain retry-wait attempt terminalization failed.");
+    this.revokeGrantInTransaction(task.taskId, operationNow);
+    this.insertOutbox(task.taskId, nextVersion, "task_terminal", {
+      status: "failed",
+      attempt: task.attempt,
+      summary: error.message,
+      code: error.code,
+      resultRef: null,
+    }, operationNow);
+    const terminal = this.requireTask(task.taskId);
+    this.settleParentBudgetInTransaction(terminal, operationNow);
+    return terminal;
+  }
+
   private expireBudgetExhaustedTasksInTransaction(operationNow: number): AsyncTaskRecord[] {
     const rows = this.db.prepare<unknown[], TaskRow>(`
       SELECT * FROM async_tasks
@@ -1383,15 +1446,27 @@ export class AsyncTaskStore {
       while (candidate === undefined) {
         const candidates = listCandidates.all(agentId, operationNow, offset);
         candidate = candidates.find((row) => {
+          let task: AsyncTaskRecord;
+          let window: { readonly effectDeadlineMs: number };
           try {
-            const task = this.taskFromRow(row);
-            const window = this.operationalWindow(task);
-            return operationNow >= this.currentAttemptFence(task) && operationNow < window.effectDeadlineMs;
+            task = this.taskFromRow(row);
+            window = this.operationalWindow(task);
+            if (operationNow < this.currentAttemptFence(task) || operationNow >= window.effectDeadlineMs) return false;
           } catch (error) {
             // An unreadable candidate is skipped so one bad row cannot stall every claim.
             if (error instanceof AsyncTaskContractError) return false;
             throw error;
           }
+          if (task.status === "retry_wait" && task.attempt > 0) {
+            const attemptRow = this.db.prepare<unknown[], AttemptRow>("SELECT * FROM async_task_attempts WHERE task_id = ? AND attempt = ?")
+              .get(task.taskId, task.attempt);
+            if (attemptRow === undefined) invalid("Current retry-wait attempt is missing.");
+            if (this.attemptFromRow(attemptRow).unsafeEffectStarted) {
+              this.terminalizeUncertainRetryWaitInTransaction(task, operationNow);
+              return false;
+            }
+          }
+          return true;
         });
         if (candidate !== undefined || candidates.length < 64) break;
         offset += candidates.length;
@@ -1516,6 +1591,55 @@ export class AsyncTaskStore {
     return operation.immediate();
   }
 
+  /**
+   * Durably fences a potentially non-idempotent effect before its call crosses
+   * the external boundary. The marker is intentionally never cleared: a
+   * process crash after the effect but before terminal commit must remain
+   * non-retryable after lease recovery.
+   */
+  markUnsafeEffectStarted(input: MarkUnsafeEffectStartedInput): AsyncTaskRecord {
+    this.ensureOpen();
+    const taskId = identifier(input.taskId, "taskId");
+    const expectedVersion = positiveInteger(input.expectedVersion, "expectedVersion");
+    const leaseOwnerId = identifier(input.leaseOwnerId, "leaseOwnerId");
+    assertNoKnownSensitiveValue(leaseOwnerId, this.sensitiveValues(), "Effect leaseOwnerId");
+    const attempt = positiveInteger(input.attempt, "attempt");
+    const markedAtMs = nonNegativeInteger(input.markedAtMs, "markedAtMs");
+    const operation = this.db.transaction(() => {
+      const operationNow = this.operationNow(markedAtMs, "Effect admission");
+      const current = this.requireTask(taskId);
+      this.assertTimestampAtOrAfterCurrentAttempt(current, markedAtMs, "Effect admission");
+      this.assertBudgetLeaseAuthorityInTransaction(taskId, {
+        leaseOwnerId, attempt, expectedTaskVersion: expectedVersion,
+      }, operationNow);
+      if (current.attempt !== attempt || current.lease?.ownerId !== leaseOwnerId) {
+        casRejected("Effect admission lost its task attempt or lease ownership fence.");
+      }
+      const attemptRow = this.db.prepare<unknown[], AttemptRow>("SELECT * FROM async_task_attempts WHERE task_id = ? AND attempt = ?")
+        .get(taskId, attempt);
+      if (attemptRow === undefined) invalid("Current task attempt is missing.");
+      const currentAttempt = this.attemptFromRow(attemptRow);
+      if (currentAttempt.unsafeEffectStarted) return current;
+      const nextVersion = expectedVersion + 1;
+      const changed = this.db.prepare(`
+        UPDATE async_tasks
+        SET version = ?, lease_version = ?
+        WHERE task_id = ? AND status IN ('admitted', 'running') AND version = ? AND attempt = ?
+          AND lease_owner = ? AND lease_attempt = ? AND lease_expires_at_ms > ?
+      `).run(nextVersion, nextVersion, taskId, expectedVersion, attempt, leaseOwnerId, attempt, operationNow);
+      if (changed.changes !== 1) casRejected("Effect admission lost its task version or lease ownership fence.");
+      const attemptChanged = this.db.prepare(`
+        UPDATE async_task_attempts
+        SET version = version + 1, lease_version = ?, unsafe_effect_started = 1
+        WHERE task_id = ? AND attempt = ? AND status IN ('admitted', 'running')
+          AND lease_owner = ? AND lease_expires_at_ms > ?
+      `).run(nextVersion, taskId, attempt, leaseOwnerId, operationNow);
+      if (attemptChanged.changes !== 1) casRejected("Effect admission could not fence the current attempt.");
+      return this.requireTask(taskId);
+    });
+    return operation.immediate();
+  }
+
   recordProgress(input: RecordAsyncTaskProgressInput): AsyncTaskRecord {
     this.ensureOpen();
     const taskId = identifier(input.taskId, "taskId");
@@ -1568,6 +1692,7 @@ export class AsyncTaskStore {
     const atMs = nonNegativeInteger(input.atMs, "atMs");
     const leaseOwnerId = input.leaseOwnerId === undefined ? undefined : identifier(input.leaseOwnerId, "leaseOwnerId");
     if (leaseOwnerId !== undefined) assertNoKnownSensitiveValue(leaseOwnerId, this.sensitiveValues(), "Transition leaseOwnerId");
+    if (input.retryAtOperationNow !== undefined && typeof input.retryAtOperationNow !== "boolean") invalid("retryAtOperationNow must be a boolean.");
     const error = input.error === undefined || input.error === null ? null : parseFailure(input.error, this.sensitiveValues());
     const operation = this.db.transaction(() => {
       const operationNow = this.operationNow(atMs, "Transition");
@@ -1590,8 +1715,20 @@ export class AsyncTaskStore {
           casRejected("Transition lost its task lease ownership fence.");
         }
       }
+      const retryAtOperationNow = input.retryAtOperationNow === true;
+      if (retryAtOperationNow && (current.status !== "abandoned" || to !== "retry_wait")) {
+        invalid("retryAtOperationNow is only valid for abandoned retry transitions.");
+      }
+      if (to === "retry_wait" && current.attempt > 0) {
+        const attemptRow = this.db.prepare<unknown[], AttemptRow>("SELECT * FROM async_task_attempts WHERE task_id = ? AND attempt = ?")
+          .get(taskId, current.attempt);
+        if (attemptRow === undefined) invalid("Current task attempt is missing.");
+        if (this.attemptFromRow(attemptRow).unsafeEffectStarted) {
+          invalid("Task effect outcome is uncertain; automatic retry is blocked.");
+        }
+      }
       const nextAttemptAtMs = to === "retry_wait"
-        ? nonNegativeInteger(input.nextAttemptAtMs, "nextAttemptAtMs")
+        ? retryAtOperationNow ? operationNow : nonNegativeInteger(input.nextAttemptAtMs, "nextAttemptAtMs")
         : null;
       if (nextAttemptAtMs !== null && nextAttemptAtMs < operationNow) invalid("nextAttemptAtMs cannot precede the authoritative transition time.");
       if (to === "retry_wait") {
@@ -2242,29 +2379,54 @@ export class AsyncTaskStore {
     }).immediate();
   }
 
-  recoverExpiredLeases(nowMsValue = this.now(), agentIdValue?: string): AsyncTaskRecord[] {
+  recoverExpiredLeases(
+    nowMsValue = this.now(),
+    agentIdValue?: string,
+    excludedTaskIdsValue?: readonly string[],
+    includeAbandonedValue = false,
+  ): AsyncTaskRecord[] {
     this.ensureOpen();
     const nowMs = nonNegativeInteger(nowMsValue, "nowMs");
     const agentId = agentIdValue === undefined ? undefined : identifier(agentIdValue, "agentId");
+    if (excludedTaskIdsValue !== undefined && !Array.isArray(excludedTaskIdsValue)) invalid("excludedTaskIds must be an array.");
+    if (typeof includeAbandonedValue !== "boolean") invalid("includeAbandoned must be a boolean.");
+    const excludedTaskIds = excludedTaskIdsValue === undefined
+      ? []
+      : Array.from(new Set(excludedTaskIdsValue.map((taskId, index) => identifier(taskId, `excludedTaskIds[${index}]`))));
+    if (excludedTaskIds.length > 64) invalid("excludedTaskIds cannot contain more than 64 task IDs.");
     const operation = this.db.transaction(() => {
       const operationNow = this.operationNow(nowMs, "Lease recovery");
+      const exclusionClause = excludedTaskIds.length === 0
+        ? ""
+        : `AND task_id NOT IN (${excludedTaskIds.map(() => "?").join(", ")})`;
       const candidates = this.db.prepare<unknown[], TaskRow>(`
         SELECT * FROM async_tasks
-        WHERE status IN ('admitted', 'running', 'cancelling')
-          AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms <= ?
+        WHERE (
+            (status IN ('admitted', 'running', 'cancelling')
+              AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms <= ?)
+            ${includeAbandonedValue ? "OR status = 'abandoned'" : ""}
+          )
           ${agentId === undefined ? "" : "AND agent_id = ?"}
+          ${exclusionClause}
         ORDER BY lease_expires_at_ms, task_id
-      `).all(operationNow, ...(agentId === undefined ? [] : [agentId]));
+      `).all(operationNow, ...(agentId === undefined ? [] : [agentId]), ...excludedTaskIds);
       const recovered: AsyncTaskRecord[] = [];
       for (const row of candidates) {
         let current: AsyncTaskRecord;
         try {
           current = this.taskFromRow(row);
-          this.assertTimestampAtOrAfterCurrentAttempt(current, nowMs, "Lease recovery");
+          if (current.status !== "abandoned") this.assertTimestampAtOrAfterCurrentAttempt(current, nowMs, "Lease recovery");
         } catch (error) {
           // A single unreadable row must not abort recovery for every other task.
           if (error instanceof AsyncTaskContractError) continue;
           throw error;
+        }
+        if (current.status === "abandoned") {
+          // A prior recovery may have persisted the abandonment before a
+          // policy transition failed. Return it for a later retry rather than
+          // stranding the task outside the leased candidate statuses.
+          recovered.push(current);
+          continue;
         }
         const from = current.status;
         assertTaskTransition(from, "abandoned");

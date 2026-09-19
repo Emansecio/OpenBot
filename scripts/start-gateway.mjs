@@ -55,6 +55,16 @@ export async function startGateway(options = {}) {
       windowsHide: true,
       stdio: "ignore",
     });
+    gateway.spawnError = null;
+    gateway.once?.("error", (error) => { gateway.spawnError = error; });
+    // A failed spawn has no usable PID. Give the child one turn to publish its
+    // asynchronous error before attempting ownership capture, so the launcher
+    // reports the real cause and never records a marker for a missing process.
+    if (!Number.isInteger(gateway.pid) || gateway.pid <= 0) {
+      await new Promise((resolveSpawn) => setImmediate(resolveSpawn));
+      if (gateway.spawnError) throw new Error(`Local gateway failed to start: ${gateway.spawnError.message}`, { cause: gateway.spawnError });
+      throw new Error("Local gateway did not provide a process identifier.");
+    }
     // Inspect identity after readiness, so the ownership capture also proves
     // the executable/script behind the healthy PID before publishing it.
     if (options.waitForReady === true) await waitForGateway(url, gateway.pid, gateway, options.timeoutMs);
@@ -79,7 +89,13 @@ export async function startGateway(options = {}) {
     gateway.unref();
     return { pid: gateway.pid, gateway, adopted: false };
   } catch (error) {
-    const stopped = await stopGatewayChild(gateway, options.childTimeoutMs);
+    const childPid = Number(gateway?.pid);
+    // A spawn error normally leaves pid undefined and there is no child to
+    // tear down. Calling kill/wait in that state only delays failure and can
+    // mask the original error with an impossible teardown result.
+    const stopped = !Number.isInteger(childPid) || childPid <= 0
+      ? true
+      : await stopGatewayChild(gateway, options.childTimeoutMs);
     if (!stopped) throw new Error("OpenBot gateway ownership could not be recorded and child teardown was not proven", { cause: error });
     await removeOwnedProcessState(options.processStatePath ?? installLayout(installRoot).processState, instanceId).catch(() => undefined);
     throw error instanceof Error ? error : new Error("OpenBot gateway ownership could not be recorded");
@@ -116,7 +132,7 @@ async function waitForGateway(url, expectedPid, child, timeoutMs = 20_000) {
   while (Date.now() < deadline) {
     const health = await readGatewayHealth(url);
     if (health?.pid === expectedPid) return health;
-    if (child?.spawnError) throw child.spawnError;
+    if (child?.spawnError) throw new Error(`Local gateway failed to start: ${child.spawnError.message}`, { cause: child.spawnError });
     if (child?.exitCode != null) throw new Error(`Local gateway exited with code ${child.exitCode}`);
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
   }

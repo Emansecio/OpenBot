@@ -367,6 +367,8 @@ export interface AsyncTaskAttemptRecord {
   readonly finishedAtMs: number | null;
   readonly lease: AsyncTaskLease | null;
   readonly error: AsyncTaskFailure | null;
+  /** Durable fence set before a potentially non-idempotent effect is dispatched. */
+  readonly unsafeEffectStarted: boolean;
 }
 
 export type AsyncTaskWakeKind =
@@ -478,6 +480,8 @@ function hasLoneSurrogate(value: string): boolean {
   return /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value);
 }
 
+const INLINE_SECRET_PATTERN = /(?:["']?\b(?:api[_\s-]?key|access[_\s-]?token|refresh[_\s-]?token|client[_\s-]?secret|password|cookie|authorization)\b["']?\s*[:=]\s*(?:bearer\s+)?(?:"[^"]+"|'[^']+'|[^\s,;]+)|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}\b|\bsk-[A-Za-z0-9_-]{8,}\b)/iu;
+
 /** Parse and canonicalize the immutable text-only task input boundary. */
 export function parseTaskInputV1(value: unknown): TaskInputV1 {
   if (typeof value !== "object" || value === null || Array.isArray(value)) invalidContract("Task input must be an object.");
@@ -490,7 +494,7 @@ export function parseTaskInputV1(value: unknown): TaskInputV1 {
   }
   // Text-only means no secret-bearing prompt-shaped values. Actual configured
   // secret values are checked again by AsyncTaskStore before persistence.
-  if (/(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|cookie|authorization|bearer\s+|sk-[A-Za-z0-9_-]{8,})/iu.test(objective)) {
+  if (INLINE_SECRET_PATTERN.test(objective)) {
     invalidContract("Task objective appears to contain secret material.");
   }
   if (typeof input.source !== "object" || input.source === null || Array.isArray(input.source)) invalidContract("Task input source is invalid.");

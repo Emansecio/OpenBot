@@ -2,11 +2,14 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { ConfigStore } from "../src/config/store.js";
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
-import { AgentLifecycleFence } from "../src/rpc/agent-lifecycle.js";
+import { AgentLifecycleFence, waitForDeletionDrain } from "../src/rpc/agent-lifecycle.js";
+import { reconcileAgentDeletions } from "../src/rpc/agent-deletion-reconciliation.js";
 import type { RpcHandler } from "../src/server/gateway.js";
+import { SqliteTranscriptStore } from "../src/store/index.js";
 
 const handles: ServerHandle[] = [];
 const roots: string[] = [];
@@ -39,6 +42,24 @@ function paths(root: string) {
 }
 
 describe("agent lifecycle fence", () => {
+  it("bounds deletion waiting without releasing pending writers", async () => {
+    const fence = new AgentLifecycleFence();
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const active = fence.run(["pending"], () => pending);
+    const drain = fence.beginDeletion(["pending"]);
+    try {
+      await expect(waitForDeletionDrain(drain, 20)).rejects.toMatchObject({ status: 503 });
+      expect(fence.isDeleting("pending")).toBe(true);
+      expect(() => fence.run(["pending"], () => undefined)).toThrow(/excluído/);
+    } finally {
+      release();
+      await active;
+      await drain;
+      fence.endDeletion(["pending"]);
+    }
+    expect(fence.run(["pending"], () => "ready")).toBe("ready");
+  });
   it("closes admission before draining an already-running mutation", async () => {
     const fence = new AgentLifecycleFence();
     let release!: () => void;
@@ -60,6 +81,72 @@ describe("agent lifecycle fence", () => {
 });
 
 describe("durable agent deletion reconciliation", () => {
+  it("returns a bounded deletion error and preserves the bot while its queue is pending", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-delete-pending-"));
+    roots.push(root);
+    const handle = await startServer(0, paths(root));
+    handles.push(handle);
+    await rpc(handle, "createAgent")({ id: "pending-victim", name: "Pending" }, context(handle));
+    const conversation = handle.conversationStore.ensureDefault("pending-victim");
+    handle.store.append("pending-victim", [{ kind: "message", id: "preserved", role: "user", content: "keep", timestampMs: 1 }], conversation.id);
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const flush = vi.spyOn(handle.runner, "flush").mockImplementation((id) => id === "pending-victim" ? pending : Promise.resolve());
+    const cancel = vi.spyOn(handle.runner, "cancelPrompt");
+    try {
+      await expect(rpc(handle, "deleteAgents")({ ids: ["pending-victim"] }, context(handle))).rejects.toMatchObject({ status: 503 });
+      expect(cancel).toHaveBeenCalledWith("pending-victim");
+      expect(handle.config.snapshot().agents.some(agent => agent.id === "pending-victim")).toBe(true);
+      expect(handle.store.getEntries("pending-victim", conversation.id)).toContainEqual(expect.objectContaining({ id: "preserved" }));
+      expect(() => rpc(handle, "updateAgent")({ agentId: "pending-victim", name: "late" }, context(handle))).toThrow(/excluído/);
+      await expect(rpc(handle, "deleteAgents")({ ids: ["pending-victim"] }, context(handle))).rejects.toMatchObject({ status: 409 });
+      expect(() => rpc(handle, "updateAgent")({ agentId: "pending-victim", name: "late" }, context(handle))).toThrow(/excluído/);
+      release();
+      await vi.waitFor(() => expect(handle.store.pendingAgentDeletions()).toEqual([]));
+      flush.mockRestore();
+      await expect(rpc(handle, "deleteAgents")({ ids: ["pending-victim"] }, context(handle))).resolves.toMatchObject({ ok: true });
+    } finally {
+      release();
+      flush.mockRestore();
+      cancel.mockRestore();
+    }
+  }, 15_000);
+  it("mantém journal legado pendente sem capacidade browser e conclui quando ela retorna", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-delete-browser-capability-"));
+    roots.push(root);
+    const config = new ConfigStore({ configPath: join(root, "config.json") });
+    const store = new SqliteTranscriptStore({ path: join(root, "store.db") });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      config.update({ agents: [{ id: "legacy-browser-victim", name: "Legacy browser victim", avatarId: "legacy-browser-victim" }] });
+      store.beginAgentDeletion(["legacy-browser-victim"], 10);
+      config.update({ agents: [] });
+
+      const pending = await reconcileAgentDeletions({ config, store });
+
+      expect(pending.completed).toEqual([]);
+      expect(store.pendingAgentDeletions()).toEqual([
+        { agentId: "legacy-browser-victim", startedAtMs: 10 },
+      ]);
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("browser purge capability unavailable"));
+
+      const purge = vi.fn(async () => undefined);
+      const completed = await reconcileAgentDeletions({
+        config,
+        store,
+        browserLifecycle: { purgeAgent: purge },
+      });
+
+      expect(completed.completed).toEqual(["legacy-browser-victim"]);
+      expect(purge).toHaveBeenCalledOnce();
+      expect(store.pendingAgentDeletions()).toEqual([]);
+    } finally {
+      warning.mockRestore();
+      store.close();
+      config.close();
+    }
+  });
+
   it("completes normal deletion only after scoped secrets and staging are purged", async () => {
     const root = mkdtempSync(join(tmpdir(), "openbot-delete-commit-"));
     roots.push(root);

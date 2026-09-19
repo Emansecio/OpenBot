@@ -22,15 +22,19 @@ Leitura, escrita, organização e busca passam por contratos estritos, workspace
 
 ### Runtime Developer
 
-Todos os bots usam `runtimeMode: developer`. `process.run` executa processos nativos no host Windows confiável, sob a conta do usuário, via `LocalRuntimeDriver` e `LocalProcessRunner`. O pedido passa por contrato estruturado (`executable`, `argv`, `cwd`, `env`); não há shell arbitrário na bridge HTTP. O processo herda o ambiente do OpenBot (`process.env` mesclado com `env` explícito do pedido), pode invocar qualquer executável instalado, usar `cwd` relativo no workspace do agente ou `cwd` absoluto em qualquer unidade montada, e usa rede do host (`networkProfile` aceita somente `"host"`). Não há contenção de kernel, sandbox WSL2 nem allowlist de binários em produção; a fronteira é a confiança no operador, no provider e no prompt.
+Todos os bots usam `runtimeMode: developer`. `process.run` executa processos nativos no host Windows confiável, sob a conta do usuário, via `LocalRuntimeDriver` e `LocalProcessRunner`. O pedido passa por contrato estruturado (`executable`, `argv`, `cwd`, `env`); não há shell arbitrário na bridge HTTP. O processo preserva o perfil e as credenciais do usuário. Herda o ambiente do OpenBot, acrescenta defaults de temporários/cache em `.openbot-runtime` na home do bot e aplica `env` explícito por último (nomes sem distinção de maiúsculas no Windows), pode invocar qualquer executável instalado, usar `cwd` relativo no workspace do agente ou `cwd` absoluto em qualquer unidade montada, e usa rede do host (`networkProfile` aceita somente `"host"`). Não há contenção de kernel, sandbox WSL2 nem allowlist de binários em produção; a fronteira é a confiança no operador, no provider e no prompt.
 
-A quota do workspace é verificada antes, durante e depois do processo; excedê-la aborta a execução e bloqueia novas enquanto o workspace permanecer acima do limite. NTFS não fornece quota transacional por pasta para bots sob a mesma conta: pode existir pequena ultrapassagem entre uma escrita e a próxima medição, e arquivos já gravados não são revertidos automaticamente.
+Job Objects nomeados e identidades versionadas no journal permitem encerrar e reconciliar árvores de processos gerenciadas sem terminar processos por PID isolado. Registros legados sem prova de ownership permanecem bloqueados para recuperação manual. Job Objects controlam o ciclo de vida, não reduzem as permissões da conta Windows. O runtime continua de primeiro plano e limitado; não fornece uma API de daemons livres ou serviços persistentes.
+
+A quota do workspace é verificada antes, durante e depois do processo, com observador compartilhado por home e reconciliação periódica/final; excedê-la aborta a execução e bloqueia novas enquanto o workspace permanecer acima do limite. NTFS não fornece quota transacional por pasta para bots sob a mesma conta: pode existir pequena ultrapassagem entre uma escrita e a próxima medição, e arquivos já gravados não são revertidos automaticamente.
 
 Um modo WSL2 confinado (allowlist, namespaces, rede `none`) permanece no repositório apenas como gate de teste opt-in (`OPENBOT_RUNTIME_WSL_LIVE_TEST=1`); produção não o usa.
 
 ### Navegador
 
 O host Electron é compartilhado e iniciado sob demanda. Cada bot recebe partição persistente, downloads e leases próprios. Páginas usam renderer sandboxed, `contextIsolation`, `nodeIntegration: false`, permissões negadas e proxy autenticado que bloqueia loopback, redes privadas, endereços especiais e rebinding. O processo auxiliar recebe uma allowlist mínima de ambiente; chaves de provider e tokens arbitrários do pai não são herdados.
+
+Manutenção fecha e drena sessões sem apagar o estado persistente da partição. Apagar esse estado é uma operação separada, usada na exclusão explícita do bot.
 
 Partições separam estado web normal, mas o processo principal do browser continua compartilhado sob a conta Windows. Isso não equivale a um processo ou VM por bot e não promete proteção contra comprometimento do Electron/Chromium.
 
@@ -72,7 +76,7 @@ npm run typecheck
 npm run verify:skills-mcp
 npm run verify:e2e:browser
 npm run verify:runtime-wsl-live
-npm test -- --maxWorkers=1 --no-file-parallelism
+npm test -- --no-file-parallelism
 ```
 
 Testes usam AppData e homes temporários. `verify:runtime-wsl-live` é gate opcional do modo WSL de teste: importa uma distribuição temporária, exerce processo, identidade, timeout, abort, cleanup e rollback, e confirma que as distribuições pessoais permaneceram inalteradas.

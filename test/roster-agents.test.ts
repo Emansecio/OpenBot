@@ -338,6 +338,46 @@ describe.concurrent("roster multi-agent", () => {
     expect(def.json).toMatchObject({ ok: true, value: { model: "gpt-5.6-sol", modelId: "gpt-5.6-sol" } });
   });
 
+  it("get/setAgentDefaultModel devolvem esforço e Fast efetivos do agente", async () => {
+    const handle = await boot();
+    const agentId = "openbot-default";
+    const provider = await post(handle, "setProviderConfig", {
+      agentId,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "low",
+      serviceTier: "default",
+    });
+    expect(provider.status).toBe(200);
+
+    const current = await post(handle, "getAgentDefaultModel", { agentId });
+    expect(current.json).toMatchObject({
+      ok: true,
+      value: {
+        model: "gpt-5.6-sol",
+        modelId: "gpt-5.6-sol",
+        maxMode: true,
+        parameters: [
+          { id: "effort", value: "low" },
+          { id: "fast", value: "false" },
+        ],
+      },
+    });
+
+    const changed = await post(handle, "setAgentDefaultModel", { agentId, model: "gpt-5.6-terra" });
+    expect(changed.json).toMatchObject({
+      ok: true,
+      value: {
+        model: "gpt-5.6-terra",
+        modelId: "gpt-5.6-terra",
+        parameters: [
+          { id: "effort", value: "low" },
+          { id: "fast", value: "false" },
+        ],
+      },
+    });
+  });
+
   it("recusa selecionar openai-compat sem baseURL", async () => {
     const handle = await boot();
 
@@ -471,6 +511,23 @@ describe.concurrent("roster multi-agent", () => {
     });
   });
 
+  it("duplicateAgent carrega o avatar customizado para a cópia", async () => {
+    const handle = await boot();
+    const created = await post(handle, "createAgent", { name: "Com foto", origin: "user" });
+    const id = (created.json.value as { agent: { id: string } }).agent.id;
+    const pngBase64 = Buffer.from("89504e470d0a1a0a00000000", "hex").toString("base64");
+    expect((await post(handle, "setAgentAvatarBytes", { id, pngBase64 })).status).toBe(200);
+
+    const duplicated = await post(handle, "duplicateAgent", { agentId: id });
+
+    expect(duplicated.status).toBe(200);
+    const copyId = (duplicated.json.value as { agent: { id: string; hasCustomPicture: boolean } }).agent.id;
+    expect((duplicated.json.value as { agent: { hasCustomPicture: boolean } }).agent.hasCustomPicture).toBe(true);
+    const avatar = await post(handle, "getAgentAvatar", { id: copyId });
+    expect(avatar.json).toMatchObject({ ok: true, value: { pngBase64 } });
+    expect(handle.config.snapshot().agents.find((agent) => agent.id === copyId)).toMatchObject({ hasCustomAvatar: true });
+  });
+
   it("duplicateAgent materializa o Title efetivo de um registro legado", async () => {
     const handle = await boot();
     expect(handle.config.snapshot().agents[0]?.title).toBeUndefined();
@@ -586,13 +643,34 @@ describe.concurrent("roster multi-agent", () => {
     expect(listed.find((agent) => agent.id === "survivor")?.isActive).toBe(true);
   });
 
+  it("exclui bot cuja home tem manifesto corrompido em vez de prendê-lo", async () => {
+    const handle = await bootEmpty();
+    await post(handle, "createAgent", { id: "corrupt-victim", name: "Corrupt" });
+    const victimRoot = handle.homes!.pathFor("corrupt-victim");
+    writeFileSync(join(victimRoot, ".openbot", "home.json"), "{not-json");
+
+    const deleted = await post(handle, "deleteAgents", { ids: ["corrupt-victim"] });
+
+    expect(deleted.status).toBe(200);
+    expect(handle.config.snapshot().agents).toEqual([]);
+    expect(existsSync(victimRoot)).toBe(false);
+    // Os bytes ficam contidos em quarentena — nada é destruído.
+    const quarantined = await handle.homes!.listQuarantineMetadata();
+    expect(quarantined.map((entry) => entry.agentId)).toEqual(["corrupt-victim"]);
+  });
+
   it("reverte homes anteriores quando uma exclusão em lote falha", async () => {
     const handle = await bootEmpty();
     await post(handle, "createAgent", { id: "batch-first", name: "First" });
     await post(handle, "createAgent", { id: "batch-second", name: "Second" });
     const firstRoot = handle.homes!.pathFor("batch-first");
     const secondRoot = handle.homes!.pathFor("batch-second");
-    writeFileSync(join(secondRoot, ".openbot", "home.json"), "not-json");
+    // Manifesto que parseia mas declara outro agente prova conteúdo estranho —
+    // a quarentena tolerante recusa (manifesto ilegível seria tolerado).
+    writeFileSync(
+      join(secondRoot, ".openbot", "home.json"),
+      JSON.stringify({ agentId: "foreign-agent", createdAt: "2026-01-01T00:00:00.000Z", layoutVersion: 2 }),
+    );
 
     const deleted = await post(handle, "deleteAgents", { ids: ["batch-first", "batch-second"] });
     expect(deleted.status).toBe(500);
@@ -637,6 +715,29 @@ describe.concurrent("roster multi-agent", () => {
     handle.store.append("partial-victim", [seedEntry]);
     handle.store.rememberAcceptedNonce("partial-victim", "seed:nonce");
     handle.store.rememberInteractionDecision("partial-victim", "seed:request", "tool", "allow");
+    const conversation = handle.conversationStore.ensureDefault("partial-victim");
+    const resumeScope = {
+      agentId: "partial-victim",
+      conversationId: conversation.id,
+      turnId: "turn-rollback",
+      provider: "xai",
+      model: "grok-4.6",
+    } as const;
+    handle.store.createResumeCheckpoint({
+      checkpointId: "checkpoint-rollback",
+      ...resumeScope,
+      cursor: "fixture-v1:rollback:1",
+      safeSequenceId: 0,
+      completedEffectIds: [],
+      expiresAtMs: Date.now() + 60_000,
+      version: 1,
+      budget: { maxProviderAttempts: 2, providerAttemptsUsed: 0, maxToolRounds: 8, toolRoundsUsed: 0, maxToolCalls: 16, toolCallsUsed: 0 },
+    });
+    handle.store.prepareResumeEffect(resumeScope, "effect-rollback", "hash-rollback");
+    const beforeResume = {
+      checkpoint: handle.store.getResumeCheckpoint(resumeScope),
+      effect: handle.store.getResumeEffect(resumeScope, "effect-rollback"),
+    };
 
     handle.registry.register({
       name: "xai",
@@ -670,6 +771,8 @@ describe.concurrent("roster multi-agent", () => {
     expect(handle.store.hasAcceptedNonce("partial-victim", "seed:nonce")).toBe(true);
     expect(handle.store.getInteractionDecision("partial-victim", "seed:request", "tool"))
       .toMatchObject({ decision: "allow" });
+    expect(handle.store.getResumeCheckpoint(resumeScope)).toEqual(beforeResume.checkpoint);
+    expect(handle.store.getResumeEffect(resumeScope, "effect-rollback")).toEqual(beforeResume.effect);
     const afterActivity = ((await post(handle, "listAgents", {})).json.value as Array<{
       id: string;
       lastMessagePreview: string | null;

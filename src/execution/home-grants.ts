@@ -7,9 +7,10 @@
  * a pasta resolve no redirect privado do bot — nunca na real.
  */
 
-import { readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+
+import { writeFileAtomic } from "../shared/fs-atomic.js";
 
 export const GRANTS_VERSION = 1;
 
@@ -70,21 +71,13 @@ export async function readSharedGrants(homeRoot: string): Promise<GrantsDocument
   return { version: GRANTS_VERSION, grants };
 }
 
-/** Grava `.openbot/grants.json` de forma atômica (tmp + rename). */
+/** Grava `.openbot/grants.json` de forma atômica e durável (tmp + fsync + rename). */
 export async function writeSharedGrants(homeRoot: string, document: GrantsDocument): Promise<void> {
   if (document.version !== GRANTS_VERSION || !isPlainObject(document.grants)) {
     throw new GrantsError("grants document inválido");
   }
   const target = join(homeRoot, ".openbot", "grants.json");
-  const temporary = `${target}.${randomUUID()}.tmp`;
-  let renamed = false;
-  try {
-    await writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
-    await rename(temporary, target);
-    renamed = true;
-  } finally {
-    if (!renamed) await unlink(temporary).catch(() => undefined);
-  }
+  await writeFileAtomic(target, `${JSON.stringify(document, null, 2)}\n`);
 }
 
 /** Grant efetivo de uma pasta: expirado ou ausente → "none". */

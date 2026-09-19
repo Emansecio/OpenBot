@@ -20,6 +20,7 @@ import { promises as fsp } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type Database from "better-sqlite3";
 import { extractPdfText } from "../rpc/attachments.js";
+import { writeFileExclusive } from "../shared/fs-atomic.js";
 
 export const STAGED_PATH_PREFIX = "attachment:";
 /** Default lifetime for a staged attachment before the sweep discards it. */
@@ -236,10 +237,19 @@ export class AttachmentStagingStore {
     };
   }
 
-  private async deleteBytes(id: string, storedPath: string): Promise<void> {
+  private async deleteBytes(id: string, storedPath: string, strict = false): Promise<void> {
     const target = resolve(storedPath);
-    if (!this.ownedPath(target)) return;
-    try { await fsp.rm(target, { force: true }); } catch { /* best effort */ }
+    if (!this.ownedPath(target)) {
+      if (strict) throw new Error(`attachment staging: caminho fora da raiz (${id})`);
+      return;
+    }
+    try {
+      await fsp.rm(target, { force: true });
+    } catch (error) {
+      if (strict) throw error;
+      // Expiry/discard cleanup is best effort; deletion reconciliation uses
+      // the strict path below so failed bytes remain referenced for retry.
+    }
   }
 
   private ownedPath(target: string): boolean {
@@ -303,7 +313,7 @@ export class AttachmentStagingStore {
       const storedPath = resolve(join(this.root, id + ext));
       await fsp.mkdir(this.root, { recursive: true });
       try {
-        await fsp.writeFile(storedPath, bytes, { flag: "wx" });
+        await writeFileExclusive(storedPath, bytes);
         const now = this.nowFn();
         this.statements.insert.run(id, agentId, input.conversationId ?? null, filename, detected.kind, storedPath, bytes.length, sha256Of(bytes), now, now + STAGING_LIFETIME_MS);
         return fromRow(this.statements.getById.get(id) as StagingRow, this.root);
@@ -357,12 +367,14 @@ export class AttachmentStagingStore {
     return true;
   }
 
-  /** Revokes every staged reference and removes its bytes before agent deletion. */
+  /** Removes every staged byte before deleting references for agent deletion. */
   async purgeAgent(agentId: string): Promise<number> {
     return this.withAgentStageLock(agentId, async () => {
       const rows = this.statements.listByAgent.all(agentId) as StagingRow[];
+      for (const row of rows) {
+        await this.deleteBytes(row.id, fromRow(row, this.root).storedPath, true);
+      }
       this.db.transaction(() => this.statements.deleteByAgent.run(agentId))();
-      await Promise.all(rows.map((row) => this.deleteBytes(row.id, fromRow(row, this.root).storedPath)));
       return rows.length;
     });
   }

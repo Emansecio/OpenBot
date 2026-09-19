@@ -1418,7 +1418,7 @@ async function main() {
         const button = [...document.querySelectorAll("button")].find((candidate) => {
           const style = getComputedStyle(candidate);
           const rect = candidate.getBoundingClientRect();
-          return candidate.textContent?.trim() === "Tentar novamente" && !candidate.disabled && style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+          return candidate.textContent?.trim() === "Tentar novamente" && candidate.previousElementSibling?.textContent?.startsWith("O provedor está temporariamente indisponível") && !candidate.disabled && style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
         });
         if (!button) return null;
         const rect = button.getBoundingClientRect();
@@ -1429,14 +1429,14 @@ async function main() {
     }
     if (!retryButton) throw new Error("retry button was not visible after provider failure");
     const retryButtonFocused = await evaluate(`(() => {
-      const button = [...document.querySelectorAll("button")].find((candidate) => candidate.textContent?.trim() === "Tentar novamente" && !candidate.disabled);
+      const button = [...document.querySelectorAll("button")].find((candidate) => candidate.textContent?.trim() === "Tentar novamente" && candidate.previousElementSibling?.textContent?.startsWith("O provedor está temporariamente indisponível") && !candidate.disabled);
       if (!button) return false;
       button.focus();
       return document.activeElement === button;
     })()`);
     if (!retryButtonFocused) throw new Error("retry button could not receive keyboard focus");
     const retryActivated = await evaluate(`(() => {
-      const button = [...document.querySelectorAll("button")].find((candidate) => candidate.textContent?.trim() === "Tentar novamente" && !candidate.disabled);
+      const button = [...document.querySelectorAll("button")].find((candidate) => candidate.textContent?.trim() === "Tentar novamente" && candidate.previousElementSibling?.textContent?.startsWith("O provedor está temporariamente indisponível") && !candidate.disabled);
       if (!button) return false;
       button.click();
       return true;

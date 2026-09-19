@@ -13,7 +13,7 @@ export async function consumeA2ATurn(
     ? message.payload.text
     : `[A2A task-result-ref ${message.payload.taskId}] ${message.payload.summary}`;
   const clientNonce = `a2a:${message.messageId}`;
-  runner.sendAgentPrompt({ agentId: message.recipientAgentId, prompt, clientNonce }, message.senderAgentId);
+  await runner.sendAgentPrompt({ agentId: message.recipientAgentId, prompt, clientNonce }, message.senderAgentId);
   await runner.flush(message.recipientAgentId);
   if (!runner.isPromptCompleted(message.recipientAgentId, clientNonce)) {
     throw new Error("a2a: consumer turn did not reach a durable completion");

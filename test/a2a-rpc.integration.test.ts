@@ -91,7 +91,8 @@ describe("P2.1 A2A RPC ownership and lifecycle", () => {
     const started = new Promise<void>((resolve) => { deletionStarted = resolve; });
     const release = new Promise<void>((resolve) => { releaseDeletion = resolve; });
     const handle = await boot({
-      async teardownAgent(agentId) {
+      async teardownAgent() {},
+      async purgeAgent(agentId) {
         if (agentId === "agent-b") {
           deletionStarted();
           await release;

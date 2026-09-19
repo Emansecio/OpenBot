@@ -91,7 +91,10 @@ export function applyNativeAsyncTaskClientEvent(
   // the next authoritative snapshot must replace the local list.
   if (type === "resync") {
     return {
-      state: { ...state, epoch: epoch ?? state.epoch, sequence: Math.max(state.sequence, sequence), resyncRequired: true, eventsApplied: state.eventsApplied + 1 },
+      // A marker is a recovery request, not an applied cursor. Keep the last
+      // accepted epoch/sequence so the following authoritative snapshot may
+      // legitimately reuse that cursor (or establish a new epoch).
+      state: { ...state, resyncRequired: true, eventsApplied: state.eventsApplied + 1 },
       handled: true,
       resyncRequired: true,
       reason: event.reason ?? "resync",
@@ -102,8 +105,9 @@ export function applyNativeAsyncTaskClientEvent(
     // Snapshots are always authoritative: they REPLACE the whole local list
     // (never concatenate). The resyncRequired flag on a snapshot tells the
     // client that its previous cursor was stale; the replacement is still the
-    // SQLite truth. An older/equal snapshot is deduplicated and ignored.
-    if (state.epoch === epoch && sequence <= state.sequence) {
+    // SQLite truth. An older/equal snapshot is deduplicated unless it is the
+    // authoritative response to an outstanding resync marker.
+    if (!state.resyncRequired && state.epoch === epoch && sequence <= state.sequence) {
       return { state, handled: false, resyncRequired: state.resyncRequired, reason: "dedupe" };
     }
     const items = itemsOf(event);
@@ -112,7 +116,7 @@ export function applyNativeAsyncTaskClientEvent(
       channel: state.channel,
       items: [...items],
       epoch,
-      sequence: Math.max(state.sequence, sequence),
+      sequence: state.epoch === epoch ? Math.max(state.sequence, sequence) : sequence,
       eventsApplied: state.eventsApplied + 1,
       resyncRequired: false,
     };

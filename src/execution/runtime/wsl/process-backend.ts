@@ -8,7 +8,7 @@ import type {
 import { RuntimeManagerError } from "../manager.js";
 import { runtimeCapabilityForRequest } from "../policy.js";
 import { WorkspaceQuotaError } from "../../quota.js";
-import type { QuotaDelta } from "../../quota.js";
+import type { WorkspaceProcessObservation, QuotaDelta } from "../../quota.js";
 import { WorkspaceQuotaObserver } from "../../quota-observer.js";
 
 export interface RuntimeProcessRunner {
@@ -27,6 +27,7 @@ export interface WslProcessBackendOptions {
 
 export interface RuntimeWorkspaceQuotaGuard {
   readonly workspaceRoot?: string;
+  observeProcesses?(onError: (error: Error) => void): Promise<WorkspaceProcessObservation>;
   assertWithinQuota(): Promise<void>;
   refreshUsage?(): Promise<unknown>;
   applyExternalDelta?(delta: QuotaDelta, scopePath?: string): Promise<void>;
@@ -92,12 +93,14 @@ export class WslProcessBackend implements ExecutionBackend {
   private readonly runner: RuntimeProcessRunner;
   private readonly quota?: RuntimeWorkspaceQuotaGuard;
   private readonly quotaObserverFactory: RuntimeQuotaObserverFactory;
+  private readonly sharedObservation: boolean;
 
   constructor(options: WslProcessBackendOptions) {
     this.agentId = options.agentId;
     this.manager = options.manager;
     this.runner = options.runner;
     this.quota = options.quota;
+    this.sharedObservation = options.quota?.observeProcesses !== undefined && options.quotaObserverFactory === undefined;
     this.quotaObserverFactory = options.quotaObserverFactory ?? ((observerOptions) => new WorkspaceQuotaObserver(observerOptions));
   }
 
@@ -109,9 +112,18 @@ export class WslProcessBackend implements ExecutionBackend {
       return processFailure("process_not_allowed", "Process network profile is not allowed.");
     }
     if (signal?.aborted) return processFailure("process_aborted", "Process execution was aborted.");
+    let observation: WorkspaceProcessObservation | undefined;
+    const controller = new AbortController();
+    let quotaFailure: unknown;
+    const recordQuotaFailure = (error: unknown): void => {
+      if (quotaFailure === undefined) quotaFailure = error;
+      this.quota?.markUsageDirty?.();
+      controller.abort();
+    };
     if (this.quota !== undefined) {
       try {
-        await verifyExternalUsage(this.quota);
+        if (this.sharedObservation) observation = await this.quota.observeProcesses!(recordQuotaFailure);
+        else await verifyExternalUsage(this.quota);
       } catch (error) {
         if (error instanceof WorkspaceQuotaError) this.quota.markUsageDirty?.();
         return error instanceof WorkspaceQuotaError
@@ -124,17 +136,13 @@ export class WslProcessBackend implements ExecutionBackend {
     try {
       lease = await this.manager.acquire(this.agentId, runtimeCapabilityForRequest(request), signal);
     } catch (error) {
+      await observation?.close().catch(() => this.quota?.markUsageDirty?.());
       return runtimeFailure(error);
     }
 
-    const controller = new AbortController();
-    let quotaFailure: unknown;
-    const recordQuotaFailure = (error: unknown): void => {
-      if (quotaFailure === undefined) quotaFailure = error;
-      this.quota?.markUsageDirty?.();
-      controller.abort();
-    };
-    const quotaObserver = this.quota?.workspaceRoot !== undefined && this.quota.applyExternalDelta !== undefined
+    const quotaObserver: RuntimeQuotaObserver | undefined = observation !== undefined
+      ? { start: async () => undefined, drain: () => observation!.drain(), close: () => observation!.close() }
+      : this.quota?.workspaceRoot !== undefined && this.quota.applyExternalDelta !== undefined
       ? this.quotaObserverFactory({
           root: this.quota.workspaceRoot,
           onDelta: async (delta, absolutePath) => this.quota!.applyExternalDelta!(delta, absolutePath),
@@ -172,8 +180,10 @@ export class WslProcessBackend implements ExecutionBackend {
       let executionError: unknown;
       if (quotaFailure !== undefined) {
         result = processFailure("runtime_unhealthy", "Workspace quota could not be verified.");
-      } else if (signal?.aborted) {
-        result = processFailure("process_aborted", "Process execution was aborted.");
+      } else if (signal?.aborted || controller.signal.aborted) {
+        result = timedOut
+          ? processFailure("process_timeout", "Process execution timed out.")
+          : processFailure("process_aborted", "Process execution was aborted.");
       } else {
         try {
           result = runnerResult = await this.runner.run(lease, request, controller.signal);
@@ -182,7 +192,7 @@ export class WslProcessBackend implements ExecutionBackend {
         }
       }
       await closeQuotaObserver();
-      if (this.quota !== undefined) {
+      if (this.quota !== undefined && !this.sharedObservation) {
         try {
           await verifyExternalUsage(this.quota);
         } catch (error) {

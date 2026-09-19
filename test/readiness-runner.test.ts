@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 // the TypeScript build. Its small pure helpers remain importable for regression
 // coverage.
 // @ts-expect-error -- no declaration file is emitted for scripts/*.mjs
-import { buildIsolatedEnvironment, evaluateCommandResult, findOperationLocks, getRootProcesses, listStaleReadinessRoots, parseVitestSkipEvidence } from "../scripts/verify-readiness.mjs";
+import { buildIsolatedEnvironment, evaluateCommandResult, findOperationLocks, getRootProcesses, listStaleReadinessRoots, parseVitestSkipEvidence, READINESS_GATES } from "../scripts/verify-readiness.mjs";
 // @ts-expect-error -- no declaration file is emitted for scripts/*.mjs
 import { shortcutPaths } from "../scripts/release-common.mjs";
 
@@ -185,5 +185,106 @@ describe("readiness runner classification", () => {
 
   it("treats a non-zero command without an environment marker as RED", () => {
     expect(evaluateCommandResult({ exitCode: 1, output: "assertion failed" })).toMatchObject({ status: "RED" });
+  });
+
+  it("runs the DPAPI live file outside npm test's inherited exclusions", () => {
+    const step = READINESS_GATES.find((gate: { id: number }) => gate.id === 12)?.commands[1];
+    expect(step).toMatchObject({
+      args: ["exec", "--", "vitest", "run", "test/keystore-dpapi-live.test.ts", "--reporter=json", "--maxWorkers=1", "--no-file-parallelism"],
+      requiredTestFiles: ["test/keystore-dpapi-live.test.ts"],
+      requireTestExecution: true,
+      resultFormat: "vitest-json",
+    });
+  });
+
+  it("includes lint, provenance and renderer boundary in the master gate", () => {
+    const args = READINESS_GATES.flatMap((gate: { commands: Array<{ args: string[] }> }) => gate.commands.map((step) => step.args));
+    for (const script of ["lint", "typecheck", "verify:provenance", "verify:renderer-boundary"]) {
+      expect(args).toContainEqual(["run", script]);
+    }
+  });
+
+  it("requires collected and passing data recovery tests outside npm test exclusions", () => {
+    const step = READINESS_GATES.find((gate: { id: number }) => gate.id === 4)?.commands[1];
+    expect(step).toMatchObject({
+      args: ["exec", "--", "vitest", "run", "test/data-recovery-live.test.ts", "--reporter=json", "--maxWorkers=1", "--no-file-parallelism"],
+      requiredTestFiles: ["test/data-recovery-live.test.ts"],
+      requireTestExecution: true,
+      resultFormat: "vitest-json",
+    });
+    for (const status of ["missing", "skipped", "passed"]) {
+      const output = JSON.stringify({
+        numPassedTests: status === "passed" ? 1 : 0,
+        numPendingTests: status === "skipped" ? 1 : 0,
+        testResults: status === "missing" ? [] : [{
+          name: "C:/SuperAgent/openbot/test/data-recovery-live.test.ts",
+          assertionResults: [{ status }],
+        }],
+      });
+      expect(evaluateCommandResult({ ...step, exitCode: 0, output }).status)
+        .toBe(status === "passed" ? "GREEN" : "RED");
+    }
+  });
+
+  it("rejects a green command when the required DPAPI file was not collected or executed", () => {
+    expect(evaluateCommandResult({
+      exitCode: 0,
+      output: "Test Files 0 passed (0)\nTests 0 passed (0)",
+      requiredTestFiles: ["test/keystore-dpapi-live.test.ts"],
+      requireTestExecution: true,
+    })).toMatchObject({
+      status: "RED",
+      missingRequiredTestFiles: ["test/keystore-dpapi-live.test.ts"],
+      executedTests: 0,
+    });
+    expect(evaluateCommandResult({
+      exitCode: 0,
+      output: "test/keystore-dpapi-live.test.ts\nTests 5 passed (5)",
+      requiredTestFiles: ["test/keystore-dpapi-live.test.ts"],
+      requireTestExecution: true,
+    })).toMatchObject({
+      status: "RED",
+      missingRequiredTestFiles: ["test/keystore-dpapi-live.test.ts"],
+    });
+  });
+
+  it("rejects a skipped DPAPI file and accepts a collected executed file", () => {
+    const requiredTestFiles = ["test/keystore-dpapi-live.test.ts"];
+    expect(evaluateCommandResult({
+      exitCode: 0,
+      output: " ↓ test/keystore-dpapi-live.test.ts (5 tests | 5 skipped)\nTests 5 skipped (5)",
+      requiredTestFiles,
+      requireTestExecution: true,
+    })).toMatchObject({
+      status: "RED",
+      requiredSkippedFiles: requiredTestFiles,
+      executedTests: 0,
+    });
+    expect(evaluateCommandResult({
+      exitCode: 0,
+      output: " ✓ test/keystore-dpapi-live.test.ts (5 tests)\nTests 5 passed (5)",
+      requiredTestFiles,
+      requireTestExecution: true,
+    })).toMatchObject({ status: "GREEN", executedTests: 5 });
+  });
+
+  it("uses structured Vitest JSON for the required DPAPI collection proof", () => {
+    const requiredTestFiles = ["test/keystore-dpapi-live.test.ts"];
+    const output = JSON.stringify({
+      numPassedTests: 5,
+      numFailedTests: 0,
+      numPendingTests: 0,
+      numTodoTests: 0,
+      testResults: [{
+        name: "C:/SuperAgent/openbot/test/keystore-dpapi-live.test.ts",
+        assertionResults: [{ status: "passed" }],
+      }],
+    });
+    expect(evaluateCommandResult({ exitCode: 0, output, requiredTestFiles, requireTestExecution: true, resultFormat: "vitest-json" }))
+      .toMatchObject({ status: "GREEN", executedTests: 5 });
+    expect(evaluateCommandResult({ exitCode: 0, output: `${requiredTestFiles[0]}\n${output}`, requiredTestFiles, requireTestExecution: true, resultFormat: "vitest-json" }))
+      .toMatchObject({ status: "GREEN", executedTests: 5 });
+    expect(evaluateCommandResult({ exitCode: 0, output: "not-json", requiredTestFiles, requireTestExecution: true, resultFormat: "vitest-json" }))
+      .toMatchObject({ status: "RED" });
   });
 });

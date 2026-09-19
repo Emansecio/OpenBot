@@ -1,4 +1,4 @@
-import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -80,6 +80,56 @@ describe("WslProcessBackend", () => {
     expect(manager.acquire).not.toHaveBeenCalled();
     expect(runner.run).not.toHaveBeenCalled();
     expect(held.release).not.toHaveBeenCalled();
+  });
+
+  it("does not start the runner when quota authority fails during queued lease acquisition", async () => {
+    let failQuota!: (error: Error) => void;
+    const close = vi.fn(async () => undefined);
+    const quota = {
+      assertWithinQuota: vi.fn(async () => undefined),
+      observeProcesses: async (onError: (error: Error) => void) => {
+        failQuota = onError;
+        return { drain: async () => undefined, close };
+      },
+      markUsageDirty: vi.fn(),
+    };
+    const held = lease();
+    const manager = managerFor(held);
+    let acquiring!: () => void;
+    const acquired = new Promise<void>((resolve) => { acquiring = resolve; });
+    let admit!: () => void;
+    const admission = new Promise<void>((resolve) => { admit = resolve; });
+    vi.mocked(manager.acquire).mockImplementation(async () => {
+      acquiring();
+      await admission;
+      return held;
+    });
+    const runner = { run: vi.fn(async () => success()) };
+    const backend = new WslProcessBackend({ agentId: "agent-a", manager, runner, quota });
+    const execution = backend.execute(request());
+    await acquired;
+    failQuota(new WorkspaceQuotaError());
+    admit();
+    await expect(execution).resolves.toMatchObject({ ok: false, code: "quota_exceeded" });
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(held.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("checks scoped limits in the shared initial inventory before lease admission", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-process-quota-scope-"));
+    roots.push(root);
+    await mkdir(join(root, "Downloads"));
+    await writeFile(join(root, "Downloads", "existing.txt"), "12345");
+    const quota = new WorkspaceQuota(await WorkspaceSandbox.create(root), {
+      maxBytes: 100, maxFiles: 10, maxEntries: 10,
+      scopes: { downloads: { maxBytes: 4, maxFiles: 10 } },
+    });
+    const manager = managerFor(lease());
+    const backend = new WslProcessBackend({ agentId: "agent-a", manager, runner: { run: vi.fn() }, quota });
+    await expect(backend.execute(request())).resolves.toMatchObject({ ok: false, code: "quota_exceeded" });
+    expect(manager.acquire).not.toHaveBeenCalled();
+    expect(quota.metrics()).toMatchObject({ scans: 1, activeObservers: 0, activeProcesses: 0 });
   });
 
   it("interrompe o lease quando o processo ultrapassa a quota durante a execução", async () => {
@@ -174,6 +224,61 @@ describe("WslProcessBackend", () => {
 
     await expect(backend.execute(request())).resolves.toMatchObject({ ok: true });
     expect(scan).toHaveBeenCalledTimes(2);
+  });
+
+  it("shares one observer across backend instances and scans only at group boundaries", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-process-quota-overlap-"));
+    roots.push(root);
+    const quota = new WorkspaceQuota(await WorkspaceSandbox.create(root), { maxBytes: 100, maxFiles: 10, maxEntries: 10, observationIdleMs: 0 });
+    const finish: Array<() => void> = [];
+    let bothStarted!: () => void;
+    const started = new Promise<void>((resolve) => { bothStarted = resolve; });
+    const runner: RuntimeProcessRunner = { run: async () => {
+      await new Promise<void>((resolve) => {
+        finish.push(resolve);
+        if (finish.length === 2) bothStarted();
+      });
+      return success();
+    } };
+    const backends = [0, 1].map(() => new WslProcessBackend({ agentId: "agent-a", manager: managerFor(lease()), runner, quota }));
+    const executions = backends.map((backend) => backend.execute(request()));
+    await started;
+    try {
+      expect(quota.metrics()).toMatchObject({ scans: 1, observationStarts: 1, activeObservers: 1, activeProcesses: 2 });
+      finish[0]!();
+      await expect(executions[0]).resolves.toMatchObject({ ok: true });
+      expect(quota.metrics()).toMatchObject({ scans: 1, activeObservers: 1, activeProcesses: 1 });
+      finish[1]!();
+      await expect(executions[1]).resolves.toMatchObject({ ok: true });
+      expect(quota.metrics()).toMatchObject({ scans: 2, activeObservers: 0, activeProcesses: 0 });
+    } finally {
+      for (const resolve of finish) resolve();
+      await Promise.all(executions);
+    }
+  });
+
+  it("aborts all overlapping managed processes when the shared quota is exceeded", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-process-quota-shared-abort-"));
+    roots.push(root);
+    const quota = new WorkspaceQuota(await WorkspaceSandbox.create(root), { maxBytes: 4, maxFiles: 10, maxEntries: 10, observationIdleMs: 0 });
+    let count = 0;
+    let bothStarted!: () => void;
+    const started = new Promise<void>((resolve) => { bothStarted = resolve; });
+    const runner: RuntimeProcessRunner = { run: async (_lease, _request, signal) => {
+      return await new Promise<ExecutionResult>((resolve) => {
+        signal.addEventListener("abort", () => resolve({ ok: false, operation: "process.run", code: "process_aborted", message: "aborted" }), { once: true });
+        count += 1;
+        if (count === 2) bothStarted();
+      });
+    } };
+    const backend = new WslProcessBackend({ agentId: "agent-a", manager: managerFor(lease()), runner, quota });
+    const executions = [backend.execute(request()), backend.execute(request())];
+    await started;
+    await writeFile(join(root, "external.txt"), "12345");
+    const results = await Promise.all(executions);
+    expect(results).toHaveLength(2);
+    for (const result of results) expect(result).toMatchObject({ ok: false, code: "quota_exceeded" });
+    expect(quota.metrics()).toMatchObject({ observationStarts: 1, activeObservers: 0, activeProcesses: 0 });
   });
 
   it("aborta e marca uso dirty quando o observador perde autoridade", async () => {

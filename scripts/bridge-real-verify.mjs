@@ -7,11 +7,12 @@ import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { resolveElectronExecutable } from "./electron-executable.mjs";
+import { cleanE2eEnvironment, connectCdp, startE2eWatchdog } from "./e2e-runtime.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(process.env.OPENBOT_ROOT || fileURLToPath(new URL("..", import.meta.url)));
 const exe = resolveElectronExecutable(repoRoot);
-const electronMain = process.env.OPENBOT_ELECTRON_MAIN || join(repoRoot, "client", "extracted", "dist", "electron-main", "main.cjs");
+const electronMain = process.env.OPENBOT_ELECTRON_MAIN || join(repoRoot, "scripts", "openbot-electron.cjs");
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -34,7 +35,8 @@ async function waitCdp(cdpUrl, timeoutMs = 20000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      const targets = await (await fetch(cdpUrl)).json();
+      // AbortSignal: um fetch travado não pode passar do deadline do loop.
+      const targets = await (await fetch(cdpUrl, { signal: AbortSignal.timeout(2000) })).json();
       const page = targets.find((target) => target.title === "OpenBot" && target.type === "page");
       if (page) return page;
     } catch {}
@@ -58,28 +60,7 @@ async function stopProcessTree(child, exited) {
 }
 
 function connect(url) {
-  const ws = new WebSocket(url);
-  const pending = new Map();
-  let next = 1;
-  const ready = new Promise((resolve, reject) => {
-    ws.addEventListener("open", resolve);
-    ws.addEventListener("error", reject);
-  });
-  ws.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
-    if (message.id && pending.has(message.id)) {
-      const { resolve, reject } = pending.get(message.id);
-      pending.delete(message.id);
-      if (message.error) reject(new Error(JSON.stringify(message.error)));
-      else resolve(message.result);
-    }
-  });
-  const send = (method, params = {}) => {
-    const id = next++;
-    ws.send(JSON.stringify({ id, method, params }));
-    return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
-  };
-  return { ws, ready, send };
+  return connectCdp(url);
 }
 
 function createGatewayState() {
@@ -441,6 +422,17 @@ export async function runBridgeRealVerify() {
   const state = createGatewayState();
   const token = createHash("sha256").update(randomUUID()).digest("hex").slice(0, 24);
   const gateway = buildGateway(state, token);
+  const startedAt = Date.now();
+  const log = (label) => console.log(`[bridge-real +${((Date.now() - startedAt) / 1000).toFixed(1)}s] ${label}`);
+  // Orçamento global: uma chamada CDP/renderer travada não pode segurar o gate
+  // para sempre — sem isso o hang era mudo e indiagnosável.
+  const disarmWatchdog = startE2eWatchdog(
+    Number(process.env.OPENBOT_E2E_BUDGET_MS ?? 10 * 60_000),
+    async () => {
+      await stopProcessTree(child, exited);
+      try { gateway.close(); } catch { /* best-effort */ }
+    },
+  );
   try {
     runRoot = mkdtempSync(join(tmpdir(), "openbot-bridge-real-"));
     const userData = join(runRoot, "user-data");
@@ -470,8 +462,7 @@ export async function runBridgeRealVerify() {
       electronMain,
     ], {
       cwd: repoRoot,
-      env: {
-        ...process.env,
+      env: cleanE2eEnvironment({
         APPDATA: appData,
         LOCALAPPDATA: localAppData,
         OPENBOT_USER_DATA: userData,
@@ -480,16 +471,19 @@ export async function runBridgeRealVerify() {
         OPENBOT_VISUAL_TEST: "1",
         SAND_HOST_GATEWAY_URL: `http://127.0.0.1:${gatewayPort}`,
         SAND_HOST_GATEWAY_TOKEN: token,
-      },
+      }),
       stdio: ["ignore", "pipe", "pipe"],
     });
     exited = new Promise((resolve) => child.once("close", resolve));
     child.stdout.on("data", (chunk) => process.stdout.write(chunk));
     child.stderr.on("data", (chunk) => process.stderr.write(chunk));
+    log(`electron spawned (pid ${child.pid}, cdp :${cdpPort})`);
 
     const page = await waitCdp(cdpUrl);
+    log("cdp page found");
     const { ws, ready, send } = connect(page.webSocketDebuggerUrl);
     await ready;
+    log("cdp websocket ready");
     await send("Runtime.enable");
     await send("Page.enable");
     await sleep(2500);
@@ -517,6 +511,7 @@ export async function runBridgeRealVerify() {
     }
 
     const call = async (method, args) => {
+      log(`call ${method}`);
       const reload = ["createConversation", "activateConversation", "archiveConversation", "deleteConversation"].includes(method);
       const before = reload ? await evaluate("performance.timeOrigin") : null;
       const expression = `(async () => {
@@ -633,6 +628,7 @@ export async function runBridgeRealVerify() {
       throw new Error(`delete memory call log mismatch: ${JSON.stringify(deleteMemoryCalls)}`);
     }
 
+    log("catalog-ui");
     const catalogUi = await verifyCatalogUi(evaluate, send, state, evidenceDir);
     const report = {
       catalogUi,
@@ -648,6 +644,7 @@ export async function runBridgeRealVerify() {
     ws.close();
     return { evidenceDir, report };
   } finally {
+    disarmWatchdog();
     await stopProcessTree(child, exited);
     if (gateway.listening) await new Promise((resolve) => gateway.close(resolve));
     if (runRoot) rmSync(runRoot, { recursive: true, force: true });

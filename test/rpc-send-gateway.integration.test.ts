@@ -475,6 +475,10 @@ describe("T11 gateway — rotas de transcript SQLite", () => {
     await createAgent(handle);
     const sse = await openSse(handle);
 
+    handle.store.memoryStore.setSettings(DEFAULT_AGENT_ID, "off");
+    // Bootstrap adds create_bot even with tools: []; this test targets raw SSE.
+    handle.runner.toolsFor = async () => [];
+
     const accepted = await postJson(handle, "/api/sendPrompt", {
       agentId: DEFAULT_AGENT_ID,
       prompt: "stream ativo",

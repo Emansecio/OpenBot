@@ -12,7 +12,8 @@ const call = (name: string, args: unknown, id = "process-1"): ProviderToolCall =
 describe("process_run tool translation", () => {
   it("exposes workspace discovery and preserves explicit shared upload paths", () => {
     expect(toolCallToExecutionRequest(call("workspace_info", {}))).toEqual({ request: { operation: "workspace.info" } });
-    expect(toolCallToExecutionRequest(call("workspace_info", { path: "C:\\Windows" })).error).toMatch(/unsupported fields/i);
+    expect(toolCallToExecutionRequest(call("workspace_info", { path: "C:\\Windows" })).error)
+      .toMatch(/unsupported fields.*remove path/i);
     expect(toolCallToExecutionRequest(call("browser_upload", { selector: "#file", path: "shared://Documents/report.txt" })))
       .toEqual({ request: { operation: "browser.upload", selector: "#file", path: "shared://Documents/report.txt" } });
   });
@@ -51,7 +52,7 @@ describe("process_run tool translation", () => {
       command: "node --version",
     }));
     expect(result.request).toBeUndefined();
-    expect(result.error).toMatch(/unsupported fields/i);
+    expect(result.error).toMatch(/unsupported fields.*remove command/i);
   });
 });
 
@@ -115,7 +116,7 @@ describe("browser tools translation", () => {
     ["browser_handoff", { extra: true }],
     ["browser_close", { extra: true }],
   ] as const)("recusa campos extras em %s", (name, args) => {
-    expect(toolCallToExecutionRequest(call(name, args)).error).toMatch(/unsupported fields/i);
+    expect(toolCallToExecutionRequest(call(name, args)).error).toMatch(/unsupported fields.*remove extra/i);
   });
 });
 
@@ -135,5 +136,10 @@ describe("whatsapp tool translation", () => {
 
   it("rejects host paths in chat", () => {
     expect(toolCallToExecutionRequest(call("whatsapp", { op: "send", chat: "C:\\\\Users\\\\x", text: "oi" })).error).toBeDefined();
+  });
+
+  it("explains the op-only contract for doctor and sweep", () => {
+    expect(toolCallToExecutionRequest(call("whatsapp", { op: "sweep", limit: 20 })).error)
+      .toMatch(/unsupported fields.*whatsapp sweep accepts only the op field.*limit/i);
   });
 });

@@ -6,8 +6,19 @@ import { existsSync, readFileSync } from "node:fs";
 import { cp, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { promisify } from "node:util";
+
+// Every default shortcut lookup, including fixture subprocesses and generated
+// wrappers, stays outside the real Desktop and Start Menu for this entire file.
+const fallbackShortcutRoot = await mkdtemp(join(tmpdir(), "openbot-release-default-shortcuts-"));
+const previousShortcutRoot = process.env.OPENBOT_SHORTCUT_ROOT;
+process.env.OPENBOT_SHORTCUT_ROOT = fallbackShortcutRoot;
+afterAll(async () => {
+  if (previousShortcutRoot === undefined) delete process.env.OPENBOT_SHORTCUT_ROOT;
+  else process.env.OPENBOT_SHORTCUT_ROOT = previousShortcutRoot;
+  await rm(fallbackShortcutRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+});
 
 const repoRoot = join(import.meta.dirname, "..");
 const isolatedGatewayUrl = `http://127.0.0.1:${40_000 + (process.pid % 20_000)}`;
@@ -37,10 +48,11 @@ async function runFailure(script: string, args: string[] = [], cwd = repoRoot): 
   throw new Error(`Expected ${script} to fail`);
 }
 
-async function shortcutDetails(path: string): Promise<{ target: string; arguments: string; windowStyle: number; iconLocation: string }> {
+async function shortcutDetails(path: string): Promise<{ target: string; arguments: string; windowStyle: number; iconLocation: string; appId: string }> {
   const quoted = path.replaceAll("'", "''");
   const script = `$s=(New-Object -ComObject WScript.Shell).CreateShortcut('${quoted}'); `
-    + "[pscustomobject]@{target=$s.TargetPath;arguments=$s.Arguments;windowStyle=$s.WindowStyle;iconLocation=$s.IconLocation}|ConvertTo-Json -Compress";
+    + `$folder=(New-Object -ComObject Shell.Application).Namespace([IO.Path]::GetDirectoryName('${quoted}')); $item=$folder.ParseName([IO.Path]::GetFileName('${quoted}')); `
+    + "[pscustomobject]@{target=$s.TargetPath;arguments=$s.Arguments;windowStyle=$s.WindowStyle;iconLocation=$s.IconLocation;appId=$item.ExtendedProperty('System.AppUserModel.ID')}|ConvertTo-Json -Compress";
   const { stdout } = await execFileAsync("powershell.exe", ["-NoLogo", "-NoProfile", "-Command", script], {
     encoding: "utf8",
     windowsHide: true,
@@ -76,7 +88,7 @@ async function createFixture(root: string, version: string): Promise<string> {
   await cp(join(repoRoot, "assets", "openbot.png"), join(root, "assets", "openbot.png"));
   await cp(join(repoRoot, "assets", "openbot.ico"), join(root, "assets", "openbot.ico"));
   await cp(join(repoRoot, "native", "dpapi", "win32-x64", "openbot-dpapi.node"), join(root, "native", "dpapi", "win32-x64", "openbot-dpapi.node"));
-  for (const scriptName of ["launch.mjs", "shutdown-gateway.mjs", "release-common.mjs", "install.mjs", "update.mjs", "uninstall.mjs", "recovery-center.mjs", "openbot-browser-host.cjs", "openbot-electron.cjs"]) {
+  for (const scriptName of ["launch.mjs", "shutdown-gateway.mjs", "release-common.mjs", "install.mjs", "update.mjs", "uninstall.mjs", "recovery-center.mjs", "openbot-browser-host.cjs", "openbot-electron.cjs", "execution-diagnostics.mjs", "shortcut-appid.mjs"]) {
     await cp(join(repoRoot, "scripts", scriptName), join(root, "scripts", scriptName));
   }
   return root;
@@ -180,6 +192,34 @@ async function stopFixtureChild(child: ReturnType<typeof spawn> | null): Promise
   });
 }
 
+function lifecycleTestChild(pid: number) {
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const child = {
+    pid,
+    exitCode: null as number | null,
+    signalCode: null as string | null,
+    spawnError: null as Error | null,
+    once(event: string, callback: (...args: unknown[]) => void) {
+      const callbacks = listeners.get(event) ?? [];
+      callbacks.push(callback);
+      listeners.set(event, callbacks);
+      return child;
+    },
+    emit(event: string, ...args: unknown[]) {
+      const callbacks = listeners.get(event) ?? [];
+      listeners.delete(event);
+      for (const callback of callbacks) callback(...args);
+      return callbacks.length > 0;
+    },
+    kill() {
+      child.exitCode ??= 1;
+      child.emit("exit", child.exitCode, null);
+      return true;
+    },
+  };
+  return child;
+}
+
 describe.concurrent("Windows local release lifecycle", () => {
   it("keeps the launcher stable while the shortcut icon tracks the immutable release", async () => {
     const root = await mkdtemp(join(tmpdir(), "openbot-shortcut-repair-"));
@@ -193,13 +233,75 @@ describe.concurrent("Windows local release lifecycle", () => {
       };
       await writeReleaseShortcuts(root, shortcuts, { env: process.env, releaseId: "0.1.1-build-a" });
       const desktop = await shortcutDetails(shortcuts.desktop);
-      expect(desktop.arguments).toBe(`"${join(root, "OpenBot.vbs")}"`);
+      expect(resolve(desktop.target)).toBe(resolve(join(root, "OpenBot.vbs")));
+      expect(desktop.arguments).toBe("");
+      expect(desktop.appId).toBe("OpenBot.Desktop");
       expect(resolve(desktop.iconLocation.split(",")[0]!)).toBe(resolve(join(root, "versions", "0.1.1-build-a", "assets", "openbot.ico")));
       expect(desktop.arguments).not.toContain(join(root, "versions"));
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("never acquires skipped shortcuts and preserves foreign links through maintenance and uninstall", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-shortcut-ownership-"));
+    try {
+      // @ts-expect-error Native release helpers have no declarations.
+      const { installRelease, repairRelease } = await import("../scripts/install.mjs");
+      // @ts-expect-error Native release helpers have no declarations.
+      const { updateRelease, rollbackRelease } = await import("../scripts/update.mjs");
+      // @ts-expect-error Native release helpers have no declarations.
+      const { uninstallRelease } = await import("../scripts/uninstall.mjs");
+      // @ts-expect-error Native release helpers have no declarations.
+      const { createShortcut, shortcutPaths } = await import("../scripts/release-common.mjs");
+      const source = await createFixture(join(root, "source"), "1.0.0");
+      const first = await packageFixture(source, join(root, "release-v1"), "1.0.0");
+      await createFixture(source, "2.0.0");
+      const second = await packageFixture(source, join(root, "release-v2"), "2.0.0");
+      const installRoot = join(root, "install");
+      const shortcutRoot = join(root, "shortcuts");
+      const paths = shortcutPaths(shortcutRoot);
+      const foreignRoot = join(root, "other install");
+      await mkdir(foreignRoot);
+      await writeFile(join(foreignRoot, "OpenBot.vbs"), "WScript.Quit 0\r\n");
+      for (const path of Object.values(paths)) await createShortcut(join(foreignRoot, "OpenBot.vbs"), path, { allowFallback: false });
+      const foreignDesktop = await readFile(paths.desktop);
+      const foreignMenu = await readFile(paths.startMenu);
+      const options = { installRoot, shortcutRoot, dataRoot: join(root, "data"), localDataRoot: join(root, "local"), gatewayUrl: isolatedGatewayUrl };
+      await installRelease({ ...options, packagePath: first.root, skipShortcuts: true });
+      expect(JSON.parse(await readFile(join(installRoot, "state.json"), "utf8")).shortcuts).toEqual({});
+      const skippedLegacy = JSON.parse(await readFile(join(installRoot, "state.json"), "utf8"));
+      delete skippedLegacy.shortcutOwnershipVersion;
+      skippedLegacy.shortcuts = paths;
+      await writeFile(join(installRoot, "state.json"), JSON.stringify(skippedLegacy));
+      await repairRelease({ ...options, packagePath: first.root });
+      await updateRelease({ ...options, packagePath: second.root });
+      await rollbackRelease(options);
+      expect(JSON.parse(await readFile(join(installRoot, "state.json"), "utf8")).shortcuts).toEqual({});
+      await expect(readFile(paths.desktop)).resolves.toEqual(foreignDesktop);
+      await expect(readFile(paths.startMenu)).resolves.toEqual(foreignMenu);
+      // Simulate old versions which incorrectly claimed default links despite
+      // --skip-shortcuts. Uninstall must independently verify each actual link.
+      const legacy = JSON.parse(await readFile(join(installRoot, "state.json"), "utf8"));
+      delete legacy.shortcutOwnershipVersion;
+      legacy.shortcuts = paths;
+      await writeFile(join(installRoot, "state.json"), JSON.stringify(legacy));
+      await uninstallRelease(options);
+      await expect(readFile(paths.desktop)).resolves.toEqual(foreignDesktop);
+      await expect(readFile(paths.startMenu)).resolves.toEqual(foreignMenu);
+
+      // Newly created links are owned, but ownership does not survive another
+      // install reassigning one of those same paths to its own launcher.
+      await installRelease({ ...options, packagePath: first.root });
+      await createShortcut(join(foreignRoot, "OpenBot.vbs"), paths.desktop, { allowFallback: false });
+      const reassigned = await readFile(paths.desktop);
+      await uninstallRelease(options);
+      await expect(readFile(paths.desktop)).resolves.toEqual(reassigned);
+      await expect(stat(paths.startMenu)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  }, 120_000);
 
   it("keeps only production dependency roots when a lockfile is available", async () => {
     const { productionPackagePaths } = await import("../scripts/release.mjs");
@@ -473,6 +575,86 @@ describe.concurrent("Windows local release lifecycle", () => {
     }
   });
 
+  it.each([
+    { event: "exit" as const, label: "saída", electronPid: 62_101 },
+    { event: "error" as const, label: "erro", electronPid: 62_102 },
+  ])("observa $label do Electron durante o bookkeeping e limpa o gateway próprio", async ({ event, electronPid }) => {
+    const root = await mkdtemp(join(tmpdir(), `openbot-launch-early-${event}-`));
+    const source = join(root, "source");
+    const release = join(root, "release");
+    const installRoot = join(root, "install");
+    const dataRoot = join(root, "data");
+    const localRoot = join(root, "local");
+    const gateway = lifecycleTestChild(62_100);
+    const electron = lifecycleTestChild(electronPid);
+    let gatewayTeardownCalls = 0;
+    let electronTeardownCalls = 0;
+    try {
+      await createFixture(source, "1.0.0");
+      const packaged = await packageFixture(source, release, "1.0.0");
+      // @ts-expect-error executable local release helper has no declaration file.
+      const { installRelease } = await import("../scripts/install.mjs");
+      await installRelease({ packagePath: packaged.root, installRoot, dataRoot, localDataRoot: localRoot, skipShortcuts: true });
+      const activeRoot = installedReleaseRoot(installRoot);
+      // @ts-expect-error executable local launch helper has no declaration file.
+      const { launchRelease } = await import("../scripts/launch.mjs");
+      const evidence = async (pid: number, options: { expectedExecutable?: string; expectedRoot?: string } = {}) => {
+        const result = {
+          pid,
+          creationTime: "launch-test",
+          executablePath: options.expectedExecutable ?? process.execPath,
+          expectedRoot: options.expectedRoot ?? activeRoot,
+          commandLine: `${options.expectedExecutable ?? process.execPath} ${join(activeRoot, "app", "dist", "main.js")}`,
+        };
+        if (pid === electron.pid) {
+          // The real child can finish while process evidence and the state
+          // marker are still being recorded. Keep the event ahead of the
+          // capture promise's resolution so the old late-listener ordering
+          // would wait forever.
+          queueMicrotask(() => {
+            if (event === "exit") {
+              electron.exitCode = 0;
+              electron.emit("exit", 0, null);
+            } else {
+              electron.emit("error", new Error("electron launch failed"));
+            }
+          });
+          await new Promise<void>((resolveCapture) => setImmediate(resolveCapture));
+        }
+        return result;
+      };
+      const launch = launchRelease({
+        root: activeRoot,
+        installRoot,
+        dataRoot,
+        localDataRoot: localRoot,
+        spawnGateway: () => gateway,
+        spawnElectron: () => electron,
+        captureProcessEvidence: evidence,
+        waitForGateway: async () => ({ ok: true, pid: gateway.pid }),
+        terminateOwnedProcess: async () => {
+          electronTeardownCalls += 1;
+          return { teardownProven: true };
+        },
+        shutdownGateway: async () => {
+          gatewayTeardownCalls += 1;
+          return { teardownProven: true };
+        },
+      });
+      if (event === "exit") {
+        await expect(launch).resolves.toMatchObject({ ok: true, exitCode: 0 });
+        expect(electronTeardownCalls).toBe(0);
+      } else {
+        await expect(launch).rejects.toThrow("electron launch failed");
+        expect(electronTeardownCalls).toBe(1);
+      }
+      expect(gatewayTeardownCalls).toBe(1);
+      await expect(readFile(join(installRoot, "process.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("attempts gateway cleanup even when Electron teardown fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "openbot-launch-cleanup-"));
     const source = join(root, "source");
@@ -560,6 +742,9 @@ describe.concurrent("Windows local release lifecycle", () => {
       const { preflightRelease, releaseRequiredFiles, treeDigest } = await import("../scripts/release-common.mjs");
 
       expect(packaged.manifest.requiredFiles).toContain("scripts/shutdown-gateway.mjs");
+      expect(packaged.manifest.requiredFiles).toContain("app/scripts/execution-diagnostics.mjs");
+      expect(await readFile(join(packaged.root, "app", "scripts", "execution-diagnostics.mjs"), "utf8"))
+        .toBe(await readFile(join(repoRoot, "scripts", "execution-diagnostics.mjs"), "utf8"));
       expect(releaseRequiredFiles()).toContain("scripts/shutdown-gateway.mjs");
       await expect(readFile(join(packaged.root, "scripts", "shutdown-gateway.mjs"), "utf8"))
         .resolves.toContain("shutdownGateway");
@@ -600,18 +785,20 @@ describe.concurrent("Windows local release lifecycle", () => {
       await rm(desktopShortcut, { force: true });
 
       expect(await run("scripts/install.mjs", args)).toMatchObject({ ok: true, alreadyInstalled: true });
-      expect((await shortcutDetails(desktopShortcut)).arguments).toContain("OpenBot.vbs");
+      expect((await shortcutDetails(desktopShortcut)).target).toContain("OpenBot.vbs");
 
       await writeFile(desktopShortcut, "not a Windows shortcut");
       expect(await run("scripts/install.mjs", args)).toMatchObject({ ok: true, alreadyInstalled: true });
-      expect((await shortcutDetails(desktopShortcut)).target.toLowerCase()).toMatch(/wscript\.exe$/u);
-      expect((await shortcutDetails(desktopShortcut)).arguments).toContain("OpenBot.vbs");
+      // A path recorded in state is not permission to overwrite an unrelated
+      // file which has replaced the originally created shortcut.
+      await expect(readFile(desktopShortcut, "utf8")).resolves.toBe("not a Windows shortcut");
 
       const startMenuShortcut = join(shortcutRoot, "Start Menu", "OpenBot.lnk");
       await writeFile(desktopShortcut, "preserve original desktop shortcut");
       await rm(startMenuShortcut, { force: true });
       await mkdir(startMenuShortcut);
-      expect(await runFailure("scripts/install.mjs", args)).toBeTruthy();
+      expect(await run("scripts/install.mjs", args)).toMatchObject({ ok: true, alreadyInstalled: true });
+      expect((await stat(startMenuShortcut)).isDirectory()).toBe(true);
       await expect(readFile(desktopShortcut, "utf8")).resolves.toBe("preserve original desktop shortcut");
       expect(await run("scripts/install.mjs", [...args, "--skip-shortcuts"])).toMatchObject({ ok: true, alreadyInstalled: true });
       await expect(readFile(desktopShortcut, "utf8")).resolves.toBe("preserve original desktop shortcut");
@@ -921,11 +1108,12 @@ describe.concurrent("Windows local release lifecycle", () => {
         localDataRoot,
       });
       const desktopShortcut = await shortcutDetails(join(shortcutRoot, "Desktop", "OpenBot.lnk"));
-      expect(desktopShortcut.target.toLowerCase()).toMatch(/wscript\.exe$/);
-      expect(desktopShortcut.arguments).toContain("OpenBot.vbs");
+      expect(resolve(desktopShortcut.target)).toBe(resolve(join(installRoot, "OpenBot.vbs")));
+      expect(desktopShortcut.arguments).toBe("");
+      expect(desktopShortcut.appId).toBe("OpenBot.Desktop");
       expect(desktopShortcut.windowStyle).toBe(7);
       expect(resolve(desktopShortcut.iconLocation.split(",")[0]!)).toBe(resolve(join(installRoot, "versions", v1.manifest.releaseId, "assets", "openbot.ico")));
-      expect((await shortcutDetails(join(shortcutRoot, "Start Menu", "OpenBot.lnk"))).arguments).toContain("OpenBot.vbs");
+      expect((await shortcutDetails(join(shortcutRoot, "Start Menu", "OpenBot.lnk"))).target).toContain("OpenBot.vbs");
       await expect(readFile(join(installRoot, "OpenBot.ico"))).resolves.toEqual(await readFile(join(source, "assets", "openbot.ico")));
       const uninstallWrapper = await readFile(join(installRoot, "Uninstall-OpenBot.cmd"), "utf8");
       expect(uninstallWrapper).toContain('pushd "%TEMP%"');

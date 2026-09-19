@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
-import { REFLECTION_REQUEST_MAX_BYTES, REFLECTION_REQUEST_RETRY_BYTES } from "../src/memory/context.js";
-import { createProviderRegistry, type ProviderChatRequest, type ProviderStreamEvent } from "../src/providers/router.js";
+import { ContextAssembler, REFLECTION_REQUEST_MAX_BYTES, REFLECTION_REQUEST_RETRY_BYTES } from "../src/memory/context.js";
+import { createProviderRegistry, ProviderError, type ProviderChatRequest, type ProviderStreamEvent } from "../src/providers/router.js";
+import { OpenAiAdapter } from "../src/providers/openai.js";
 
 const handles: ServerHandle[] = [];
 const roots: string[] = [];
@@ -27,6 +28,66 @@ async function waitFor<T>(read: () => T, predicate: (value: T) => boolean, timeo
 }
 
 describe("memory reflection integration", () => {
+  it("aborts an active reflection transport only after a successful archive RPC", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-reflection-archive-"));
+    roots.push(root);
+    let signal: AbortSignal | undefined;
+    let cancelled = false;
+    let calls = 0;
+    const registry = createProviderRegistry();
+    registry.register(new OpenAiAdapter({ name: "xai", protocol: "responses", apiKey: "fixture", fetchImpl: async (_url, init) => {
+      calls += 1;
+      signal = init?.signal as AbortSignal;
+      return new Response(new ReadableStream({ cancel() { cancelled = true; } }));
+    } }));
+    const handle = await startServer(0, { stateRoot: root, registry, disableAgentHome: true, allowUnauthenticatedLocalGateway: true });
+    handles.push(handle);
+    const agentId = "archive-test";
+    handle.config.update({ agents: [{ id: agentId, name: "Archive", avatarId: "avatar-default" }] });
+    const conversationId = handle.conversationStore.ensureDefault(agentId).id;
+    handle.store.append(agentId, [{ kind: "message", id: "source", role: "user", content: "context", timestampMs: 1 }], conversationId);
+    const job = handle.store.memoryStore.enqueueJob({ agentId, conversationId, provider: "xai", model: "grok-4.6",
+      fromSequenceId: 0, throughSequenceId: handle.store.getLatestSequenceId(agentId, conversationId)!, summaryRequested: true, memoryRequested: false });
+    handle.reflectionWorker!.start();
+    await waitFor(() => signal, value => value !== undefined);
+    const archive = handle.gateway.listHandlers().get("archiveConversation")!;
+    const context = { method: "archiveConversation", getStatus: () => ({ isBusy: false, activeAgentId: null }), publish: () => {} };
+    expect(() => archive({ agentId, conversationId }, context)).toThrow();
+    expect(signal!.aborted).toBe(false);
+    expect(handle.store.memoryStore.getJob(agentId, job.id)?.status).toBe("running");
+    handle.conversationStore.create(agentId);
+    archive({ agentId, conversationId }, context);
+    expect(signal!.aborted).toBe(true);
+    await handle.reflectionWorker!.waitForIdle();
+    await waitFor(() => cancelled, Boolean);
+    expect(calls).toBe(1);
+    expect(handle.store.memoryStore.getJob(agentId, job.id)).toMatchObject({ status: "dead", lastErrorCode: "conversation_archived", attempts: 1 });
+    expect(handle.store.memoryStore.getSummary(agentId, conversationId)).toBeNull();
+  });
+
+  it("does not retry a reflection job after a permanent Responses failure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-reflection-permanent-"));
+    roots.push(root);
+    let calls = 0;
+    const registry = createProviderRegistry();
+    registry.register(new OpenAiAdapter({ name: "xai", protocol: "responses", apiKey: "fixture", fetchImpl: async () => {
+      calls += 1;
+      return new Response('data: {"type":"response.failed","response":{"error":{"code":"invalid_prompt"}}}\n\n');
+    } }));
+    const handle = await startServer(0, { stateRoot: root, registry, disableAgentHome: true, allowUnauthenticatedLocalGateway: true });
+    handles.push(handle);
+    const agentId = "permanent-test";
+    handle.config.update({ agents: [{ id: agentId, name: "Permanent", avatarId: "avatar-default" }] });
+    const conversationId = handle.conversationStore.ensureDefault(agentId).id;
+    handle.store.append(agentId, [{ kind: "message", id: "source", role: "user", content: "context", timestampMs: 1 }], conversationId);
+    const job = handle.store.memoryStore.enqueueJob({ agentId, conversationId, provider: "xai", model: "grok-4.6",
+      fromSequenceId: 0, throughSequenceId: handle.store.getLatestSequenceId(agentId, conversationId)!, summaryRequested: true, memoryRequested: false });
+    handle.reflectionWorker!.start();
+    await handle.reflectionWorker!.waitForIdle();
+    expect(calls).toBe(1);
+    expect(handle.store.memoryStore.getJob(agentId, job.id)).toMatchObject({ status: "dead", lastErrorCode: "provider_validation", attempts: 1 });
+    expect(handle.store.memoryStore.listRunnableJobs(Number.MAX_SAFE_INTEGER)).toEqual([]);
+  });
   it("schedules, completes, and shuts down the durable reflection worker through startServer", async () => {
     const root = mkdtempSync(join(tmpdir(), "openbot-memory-reflection-integration-"));
     roots.push(root);
@@ -37,7 +98,8 @@ describe("memory reflection integration", () => {
       async streamChat(request: ProviderChatRequest, emit: (event: ProviderStreamEvent) => void) {
         requests.push(request);
         if (request.system?.includes("maintain OpenBot summaries")) {
-          const payload = JSON.parse(String(request.messages[0]?.content ?? "{}")) as { summaryRequested?: boolean; memoryRequested?: boolean };
+          const payload = JSON.parse(String(request.messages[0]?.content ?? "{}")) as { summaryRequested?: boolean; memoryRequested?: boolean; entries?: Array<{ id?: string }> };
+          const citedEntryId = payload.entries?.find((entry) => typeof entry.id === "string")?.id;
           emit({
             type: "delta",
             delta: JSON.stringify({
@@ -55,6 +117,7 @@ describe("memory reflection integration", () => {
                   canonicalKey: "reflection-result",
                   text: "lembrança consolidada",
                   trust: "verified_tool",
+                  sourceEntryIds: citedEntryId === undefined ? [] : [citedEntryId],
                 },
               }] : [],
             }),
@@ -168,7 +231,8 @@ describe("memory reflection integration", () => {
       async streamChat(request: ProviderChatRequest, emit: (event: ProviderStreamEvent) => void) {
         if (request.system?.includes("maintain OpenBot summaries")) {
           recoveredRequests.push({ purpose: request.purpose, model: request.model, reasoningEffort: request.reasoningEffort });
-          const payload = JSON.parse(String(request.messages[0]?.content ?? "{}")) as { summaryRequested?: boolean; memoryRequested?: boolean };
+          const payload = JSON.parse(String(request.messages[0]?.content ?? "{}")) as { summaryRequested?: boolean; memoryRequested?: boolean; entries?: Array<{ id?: string }> };
+          const citedEntryId = payload.entries?.find((entry) => typeof entry.id === "string")?.id;
           emit({
             type: "delta",
             delta: JSON.stringify({
@@ -186,6 +250,7 @@ describe("memory reflection integration", () => {
                   canonicalKey: "restart-recovery",
                   text: "job recuperado",
                   trust: "verified_tool",
+                  sourceEntryIds: citedEntryId === undefined ? [] : [citedEntryId],
                 },
               }] : [],
             }),
@@ -332,5 +397,348 @@ describe("memory reflection integration", () => {
       expect(JSON.stringify(payload)).not.toContain("C:\\\\tmp\\\\");
     }
     expect(handle.store.memoryStore.getSummary(agentId, conversation.id)?.renderedText).toBe("resumo compacto");
+  });
+
+  it("advances the summary only to the covered boundary and enqueues the deferred tail", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-memory-reflection-covered-"));
+    roots.push(root);
+    const payloads: Array<{ fromSequenceId?: number; throughSequenceId?: number; deferredThroughSequenceId?: number }> = [];
+    const registry = createProviderRegistry();
+    registry.register({
+      name: "xai",
+      async streamChat(request: ProviderChatRequest, emit: (event: ProviderStreamEvent) => void) {
+        if (request.system?.includes("maintain OpenBot summaries")) {
+          const payload = JSON.parse(String(request.messages[0]?.content ?? "{}")) as {
+            fromSequenceId?: number; throughSequenceId?: number; deferredThroughSequenceId?: number;
+          };
+          payloads.push(payload);
+          emit({
+            type: "delta",
+            delta: JSON.stringify({
+              summary: {
+                throughSequenceId: payload.throughSequenceId,
+                summaryJson: { covered: true },
+                renderedText: `coberto até ${payload.throughSequenceId}`,
+              },
+              operations: [],
+            }),
+          });
+          return;
+        }
+        emit({ type: "delta", delta: "turn ok" });
+      },
+    });
+
+    const handle = await startServer(0, {
+      stateRoot: root,
+      disableAgentHome: true,
+      registry,
+      allowUnauthenticatedLocalGateway: true,
+    });
+    handles.push(handle);
+
+    const agentId = "openbot-default";
+    const conversation = handle.conversationStore.getActive(agentId) ?? handle.conversationStore.ensureDefault(agentId);
+    handle.store.memoryStore.setSettings(agentId, "automatic");
+
+    handle.store.append(agentId, Array.from({ length: 40 }, (_, index) => ({
+      kind: "message" as const,
+      id: `m-${index}`,
+      role: "user" as const,
+      content: `mensagem ${index} ${"X".repeat(20_000)}`,
+      timestampMs: index + 1,
+      streaming: false,
+    })), conversation.id);
+    const lastSequence = handle.store.getLatestSequenceId!(agentId, conversation.id)!;
+
+    handle.store.memoryStore.enqueueJob({
+      agentId,
+      conversationId: conversation.id,
+      provider: "xai",
+      model: "grok-4.6",
+      fromSequenceId: 1,
+      throughSequenceId: lastSequence,
+      summaryRequested: true,
+      memoryRequested: false,
+    });
+    handle.reflectionWorker!.start();
+
+    await waitFor(
+      () => handle.store.memoryStore.listJobs(agentId, { limit: 20 }),
+      (jobs) => jobs.length > 0 && jobs.every((job) => job.status === "complete"),
+      10_000,
+    );
+
+    expect(payloads.length).toBeGreaterThan(1);
+    expect(payloads[0]!.deferredThroughSequenceId).toBe(lastSequence);
+    expect(payloads[0]!.throughSequenceId).toBeLessThan(lastSequence);
+    for (let index = 1; index < payloads.length; index += 1) {
+      expect(payloads[index]!.fromSequenceId).toBe(payloads[index - 1]!.throughSequenceId! + 1);
+    }
+    expect(payloads.at(-1)!.throughSequenceId).toBe(lastSequence);
+    expect(handle.store.memoryStore.getSummary(agentId, conversation.id)?.throughSequenceId).toBe(lastSequence);
+  });
+
+  it("keeps the summary prefix when a memory-only predecessor is still running", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-memory-reflection-coalesced-prefix-"));
+    roots.push(root);
+    const payloads: Array<{
+      fromSequenceId?: number;
+      throughSequenceId?: number;
+      summaryRequested?: boolean;
+      memoryRequested?: boolean;
+      previousSummary?: { renderedText?: string } | null;
+      entries?: Array<{ id?: string; content?: string }>;
+    }> = [];
+    let firstStartedResolve!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { firstStartedResolve = resolve; });
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let reflectionCalls = 0;
+    const registry = createProviderRegistry();
+    registry.register({
+      name: "xai",
+      async streamChat(request: ProviderChatRequest, emit: (event: ProviderStreamEvent) => void) {
+        if (!request.system?.includes("maintain OpenBot summaries")) {
+          emit({ type: "delta", delta: "turn ok" });
+          return;
+        }
+        const payload = JSON.parse(String(request.messages[0]?.content ?? "{}")) as typeof payloads[number];
+        payloads.push(payload);
+        reflectionCalls += 1;
+        if (reflectionCalls === 1) {
+          firstStartedResolve();
+          await firstGate;
+        }
+        const sourceEntryId = payload.entries?.find((entry) => typeof entry.id === "string")?.id;
+        const includesDecision = payload.entries?.some((entry) => entry.content === "DECISAO_INICIAL_PRESERVADA") === true;
+        emit({
+          type: "delta",
+          delta: JSON.stringify({
+            ...(payload.summaryRequested ? {
+              summary: {
+                throughSequenceId: payload.throughSequenceId,
+                summaryJson: { includesDecision },
+                renderedText: includesDecision ? "resumo com decisão inicial" : "resumo sem decisão inicial",
+              },
+            } : {}),
+            operations: payload.memoryRequested ? [{
+              op: "upsert",
+              memory: {
+                kind: "fact",
+                canonicalKey: `coalesced-${reflectionCalls}`,
+                text: `memória ${reflectionCalls}`,
+                trust: "verified_tool",
+                sourceEntryIds: sourceEntryId === undefined ? [] : [sourceEntryId],
+              },
+            }] : [],
+          }),
+        });
+      },
+    });
+
+    const handle = await startServer(0, {
+      stateRoot: root,
+      disableAgentHome: true,
+      registry,
+      allowUnauthenticatedLocalGateway: true,
+    });
+    handles.push(handle);
+    try {
+      const agentId = "openbot-default";
+      const conversation = handle.conversationStore.getActive(agentId) ?? handle.conversationStore.ensureDefault(agentId);
+      handle.store.memoryStore.setSettings(agentId, "automatic");
+      handle.store.append(agentId, Array.from({ length: 41 }, (_, index) => ({
+        kind: "message" as const,
+        id: `coalesced-${index}`,
+        role: "user" as const,
+        content: index === 0 ? "DECISAO_INICIAL_PRESERVADA" : `mensagem ${index}`,
+        timestampMs: index + 1,
+        streaming: false,
+      })), conversation.id);
+
+      const predecessor = handle.store.memoryStore.enqueueJob({
+        id: "coalesced-predecessor",
+        agentId,
+        conversationId: conversation.id,
+        provider: "xai",
+        model: "grok-4.6",
+        fromSequenceId: 0,
+        throughSequenceId: 39,
+        summaryRequested: false,
+        memoryRequested: true,
+      });
+      handle.reflectionWorker!.start();
+      await firstStarted;
+
+      const successor = handle.store.memoryStore.enqueueJob({
+        id: "coalesced-successor",
+        agentId,
+        conversationId: conversation.id,
+        provider: "xai",
+        model: "grok-4.6",
+        fromSequenceId: 0,
+        throughSequenceId: 41,
+        summaryRequested: true,
+        memoryRequested: true,
+      });
+      expect(successor).toMatchObject({
+        id: "coalesced-successor",
+        fromSequenceId: 0,
+        throughSequenceId: 41,
+        summaryRequested: true,
+        memoryRequested: true,
+        status: "pending",
+      });
+      expect(handle.store.memoryStore.getJob(agentId, predecessor.id)).toMatchObject({ status: "running", throughSequenceId: 39 });
+
+      releaseFirst();
+      await waitFor(
+        () => handle.store.memoryStore.getJob(agentId, successor.id),
+        (job) => job?.status === "complete",
+        10_000,
+      );
+      expect(payloads).toHaveLength(2);
+      expect(payloads[0]).toMatchObject({ fromSequenceId: 0, throughSequenceId: 39, summaryRequested: false, memoryRequested: true });
+      expect(payloads[1]).toMatchObject({ fromSequenceId: 0, throughSequenceId: 41, summaryRequested: true, memoryRequested: true });
+      expect(payloads[1]!.entries?.some((entry) => entry.content === "DECISAO_INICIAL_PRESERVADA")).toBe(true);
+      expect(handle.store.memoryStore.getSummary(agentId, conversation.id)).toMatchObject({
+        throughSequenceId: 41,
+        renderedText: "resumo com decisão inicial",
+      });
+    } finally {
+      releaseFirst();
+    }
+  });
+
+  it("keeps the previous summary and range start after a predecessor failure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-memory-reflection-failed-predecessor-"));
+    roots.push(root);
+    const payloads: Array<{
+      fromSequenceId?: number;
+      throughSequenceId?: number;
+      summaryRequested?: boolean;
+      memoryRequested?: boolean;
+      previousSummary?: { renderedText?: string } | null;
+    }> = [];
+    let reflectionCalls = 0;
+    const registry = createProviderRegistry();
+    registry.register({
+      name: "xai",
+      async streamChat(request: ProviderChatRequest, emit: (event: ProviderStreamEvent) => void) {
+        if (!request.system?.includes("maintain OpenBot summaries")) {
+          emit({ type: "delta", delta: "turn ok" });
+          return;
+        }
+        const payload = JSON.parse(String(request.messages[0]?.content ?? "{}")) as typeof payloads[number];
+        payloads.push(payload);
+        reflectionCalls += 1;
+        if (reflectionCalls === 1) {
+          throw new ProviderError("fixture predecessor failure", { kind: "validation", code: "fixture_predecessor" });
+        }
+        emit({
+          type: "delta",
+          delta: JSON.stringify({
+            ...(payload.summaryRequested ? {
+              summary: {
+                throughSequenceId: payload.throughSequenceId,
+                summaryJson: { previousSummarySeen: payload.previousSummary?.renderedText === "decisão anterior" },
+                renderedText: payload.previousSummary?.renderedText === "decisão anterior"
+                  ? "resumo preservado após falha: decisão anterior"
+                  : "resumo sem contexto anterior",
+              },
+            } : {}),
+            operations: [],
+          }),
+        });
+      },
+    });
+
+    const handle = await startServer(0, {
+      stateRoot: root,
+      disableAgentHome: true,
+      registry,
+      allowUnauthenticatedLocalGateway: true,
+    });
+    handles.push(handle);
+    const agentId = "openbot-default";
+    const conversation = handle.conversationStore.getActive(agentId) ?? handle.conversationStore.ensureDefault(agentId);
+    handle.store.append(agentId, Array.from({ length: 5 }, (_, index) => ({
+      kind: "message" as const,
+      id: `failed-predecessor-${index}`,
+      role: "user" as const,
+      content: `mensagem ${index}`,
+      timestampMs: index + 1,
+      streaming: false,
+    })), conversation.id);
+    handle.store.memoryStore.upsertSummary(agentId, {
+      conversationId: conversation.id,
+      throughSequenceId: 1,
+      summaryJson: { decision: "anterior" },
+      renderedText: "decisão anterior",
+    });
+
+    const predecessor = handle.store.memoryStore.enqueueJob({
+      id: "failed-predecessor",
+      agentId,
+      conversationId: conversation.id,
+      provider: "xai",
+      model: "grok-4.6",
+      fromSequenceId: 2,
+      throughSequenceId: 3,
+      summaryRequested: false,
+      memoryRequested: true,
+    });
+    handle.reflectionWorker!.start();
+    await waitFor(
+      () => handle.store.memoryStore.getJob(agentId, predecessor.id),
+      (job) => job?.status === "dead",
+      5_000,
+    );
+    expect(handle.store.memoryStore.getJob(agentId, predecessor.id)).toMatchObject({
+      status: "dead",
+      lastErrorCode: "provider_validation",
+    });
+
+    const successor = handle.store.memoryStore.enqueueJob({
+      id: "failed-predecessor-successor",
+      agentId,
+      conversationId: conversation.id,
+      provider: "xai",
+      model: "grok-4.6",
+      fromSequenceId: 2,
+      throughSequenceId: 5,
+      summaryRequested: true,
+      memoryRequested: true,
+    });
+    expect(successor).toMatchObject({ fromSequenceId: 2, throughSequenceId: 5, status: "pending" });
+    handle.reflectionWorker!.start();
+    await waitFor(
+      () => handle.store.memoryStore.getJob(agentId, successor.id),
+      (job) => job?.status === "complete",
+      5_000,
+    );
+    expect(payloads[1]).toMatchObject({
+      fromSequenceId: 2,
+      throughSequenceId: 5,
+      summaryRequested: true,
+      previousSummary: { renderedText: "decisão anterior" },
+    });
+    expect(handle.store.memoryStore.getSummary(agentId, conversation.id)).toMatchObject({
+      throughSequenceId: 5,
+      renderedText: "resumo preservado após falha: decisão anterior",
+    });
+    const assembled = new ContextAssembler().assemble({
+      agentId,
+      conversationId: conversation.id,
+      prompt: "continue",
+      recentStore: handle.store,
+      memoryStore: handle.store.memoryStore,
+      mode: "automatic",
+      conversation: { temporary: false },
+      systemText: "",
+      toolText: "",
+    });
+    expect(JSON.stringify(assembled.messages)).toContain("anterior");
   });
 });

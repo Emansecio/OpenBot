@@ -1,5 +1,5 @@
 (() => {
-  // openbot-memory-ui-v10-settings-recovery
+  // openbot-memory-ui-v13-ordered-task-list
   const STYLE_ID = "openbot-memory-ui-style";
   const MEMORY_SECTION_ID = "openbot-memory-settings";
   const MEMORY_DIALOG_ID = "openbot-memory-dialog";
@@ -1239,6 +1239,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     var s = state;
     state = null;
     if (!s) return;
+    s.closed = true;
     if (s.root && s.root.parentNode) s.root.parentNode.removeChild(s.root);
     if (s.style && s.style.parentNode) s.style.parentNode.removeChild(s.style);
     if (typeof s.onKeyDown === "function") document.removeEventListener("keydown", s.onKeyDown, true);
@@ -1254,6 +1255,22 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       try { s.trigger.focus({ preventScroll: true }); } catch (_e) {}
     }
     if (typeof openbotP23._closedHook === "function") { try { openbotP23._closedHook(); } catch (_e) {} }
+  }
+  function isCurrent(s) {
+    return !!(s && state === s && !s.closed && s.root && s.root.isConnected);
+  }
+  function sessionStatus(s, id, msg, isError) {
+    if (isCurrent(s)) setStatus(id, msg, isError);
+  }
+  function discardStaged(s, id) {
+    if (!s || !id) return;
+    var b = bridge();
+    if (b && s.agentId) {
+      try {
+        var result = b.discardStagedAttachment(s.agentId, id);
+        if (result && typeof result.catch === "function") result.catch(function () {});
+      } catch (_e) {}
+    }
   }
   function setStatus(id, msg, isError) {
     var el = document.getElementById(id);
@@ -1306,14 +1323,16 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
   function doSearch(s, query, options) {
     var b = bridge();
     var a = s.agentId;
-    if (!b || !a) { setStatus("obp23-search-status", "Bot ativo indisponível.", true); return; }
+    if (!isCurrent(s)) return;
+    if (!b || !a) { sessionStatus(s, "obp23-search-status", "Bot ativo indisponível.", true); return; }
     var cursor = options && typeof options.cursor === "string" ? options.cursor : undefined;
     if (!options || options.reset) { s.search.pageHistory = []; s.search.nextCursor = undefined; s.search.current = null; }
-    setStatus("obp23-search-status", "Buscando\u2026");
+    sessionStatus(s, "obp23-search-status", "Buscando\u2026");
     var request = cursor === undefined
       ? b.searchTranscript(a, query, s.search.conversationId)
       : b.searchTranscript(a, query, s.search.conversationId, cursor);
     Promise.resolve(request).then(function (page) {
+      if (!isCurrent(s)) return;
       var items = page && Array.isArray(page.items) ? page.items : [];
       s.search.items = items;
       s.search.nextCursor = page && typeof page.nextCursor === "string" ? page.nextCursor : undefined;
@@ -1322,15 +1341,16 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       s.search.pageLabel = "p\u00e1gina " + labelPage + " (" + items.length + ")";
       s.search.pageLabel = (options && options.reset && items.length === 0) ? "" : s.search.pageLabel;
       renderResults(s);
-      setStatus("obp23-search-status", "" + items.length + " resultado(s)");
+      sessionStatus(s, "obp23-search-status", "" + items.length + " resultado(s)");
     }).catch(function (e) {
+      if (!isCurrent(s)) return;
       if (cursor !== undefined && s.search.noCursorBridge) {
         s.search.nextCursor = undefined;
         renderResults(s);
-        setStatus("obp23-search-status", "Paginação indisponível nesta superfície.", true);
+        sessionStatus(s, "obp23-search-status", "Paginação indisponível nesta superfície.", true);
         return;
       }
-      setStatus("obp23-search-status", String(e && e.message ? e.message : e), true);
+      sessionStatus(s, "obp23-search-status", String(e && e.message ? e.message : e), true);
     });
   }
   function handleAction(s, act, btn) {
@@ -1343,6 +1363,10 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       if (!b || !a) { setStatus("obp23-stage-status", "Bot ativo indisponível.", true); return; }
       var bytes = new TextEncoder().encode(val);
       b.stageAttachmentBytes(a, "anexo-p23.txt", bytes).then(function (res) {
+        if (!isCurrent(s)) {
+          if (res && res.attachmentId) discardStaged(s, res.attachmentId);
+          return;
+        }
         if (res && res.attachmentId) {
           s.staged.push({ id: res.attachmentId, name: res.name || "anexo-p23.txt", kind: res.kind || "text", sizeBytes: res.sizeBytes || bytes.length, sha256: res.sha256 || "", expiresAtMs: res.expiresAtMs || 0, preview: textPreview(bytes, 200) });
           renderStaged(s);
@@ -1350,7 +1374,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
           setStatus("obp23-stage-status", "Em staging: " + res.attachmentId);
           var send = document.getElementById("obp23-sendatt"); if (send) send.disabled = false;
         } else { setStatus("obp23-stage-status", "Falha ao adicionar anexo.", true); }
-      }).catch(function (e) { setStatus("obp23-stage-status", String(e && e.message ? e.message : e), true); });
+      }).catch(function (e) { sessionStatus(s, "obp23-stage-status", String(e && e.message ? e.message : e), true); });
       return;
     }
     if (act === "p23-pick-file") {
@@ -1372,13 +1396,14 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       var atts = s.staged.map(function (it) { return { path: "attachment:" + it.id, name: it.name }; });
       b.sendPrompt(a, "Envio com anexo: " + atts[0].name, { attachments: atts, clientNonce: nonce("p23att") })
         .then(function (out) {
+          if (!isCurrent(s)) return out;
           setStatus("obp23-stage-status", "Enviado (aceito): " + JSON.stringify(out).slice(0, 120));
           s.staged = [];
           renderStaged(s);
           var send = document.getElementById("obp23-sendatt"); if (send) send.disabled = true;
           return out;
         })
-        .catch(function (e) { setStatus("obp23-stage-status", String(e && e.message ? e.message : e), true); });
+        .catch(function (e) { sessionStatus(s, "obp23-stage-status", String(e && e.message ? e.message : e), true); });
       return;
     }
     if (act === "p23-search" || act === "p23-search-prev" || act === "p23-search-next") {
@@ -1416,8 +1441,8 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       if (!prompt) { setStatus("obp23-reply-status", "Escreva a resposta.", true); return; }
       if (!b || !a || !s.reply) { setStatus("obp23-reply-status", "Selecione um alvo primeiro.", true); return; }
       b.sendPrompt(a, prompt, { clientNonce: nonce("p23reply"), conversationId: s.reply.conversationId, replyContext: { replyToId: s.reply.replyToId, conversationId: s.reply.conversationId } })
-        .then(function (out) { setStatus("obp23-reply-status", "Resposta enviada: " + JSON.stringify(out).slice(0, 120)); })
-        .catch(function (e) { setStatus("obp23-reply-status", String(e && e.message ? e.message : e), true); });
+        .then(function (out) { sessionStatus(s, "obp23-reply-status", "Resposta enviada: " + JSON.stringify(out).slice(0, 120)); })
+        .catch(function (e) { sessionStatus(s, "obp23-reply-status", String(e && e.message ? e.message : e), true); });
       return;
     }
     if (act === "p23-close") { cleanup(); }
@@ -1432,13 +1457,19 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     document.body.appendChild(style); document.body.appendChild(root);
     var appRoot = document.getElementById("root");
     if (appRoot instanceof HTMLElement) appRoot.inert = true;
+    var s = {
+      root: root, style: style, trigger: trigger instanceof Element ? trigger : null, appRoot: appRoot,
+      staged: [], reply: null, agentId: null,
+      search: { items: [], nextCursor: undefined, pageHistory: [], pageLabel: "", conversationId: undefined, current: null },
+      closed: false,
+    };
     var panel = root.querySelector(".obp23-panel"); if (panel) panel.focus({ preventScroll: true });
     var fileInput = document.createElement("input");
     fileInput.id = "obp23-file-input";
     fileInput.type = "file";
     fileInput.style.display = "none";
     fileInput.addEventListener("change", function () {
-      if (!fileInput.files || fileInput.files.length === 0) return;
+      if (state !== s || s.closed || !fileInput.files || fileInput.files.length === 0) return;
       stageFiles(s, fileInput.files);
       fileInput.value = "";
     });
@@ -1456,58 +1487,62 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       dropZone.addEventListener("drop", function (e) {
         e.preventDefault();
         dropZone.classList.remove("obp23-over");
-        if (state && e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) stageFiles(state, e.dataTransfer.files);
+        if (state === s && !s.closed && e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) stageFiles(s, e.dataTransfer.files);
       });
     }
-    state = {
-      root: root, style: style, trigger: trigger instanceof Element ? trigger : null, appRoot: appRoot,
-      staged: [], reply: null, agentId: null,
-      search: { items: [], nextCursor: undefined, pageHistory: [], pageLabel: "", conversationId: undefined, current: null },
-      onKeyDown: function (e) { if (e.key === "Escape") { e.preventDefault(); cleanup(); } },
-      onPageHide: function () { cleanup(); },
-    };
-    document.addEventListener("keydown", state.onKeyDown, true);
-    window.addEventListener("pagehide", state.onPageHide);
+    s.onKeyDown = function (e) { if (e.key === "Escape") { e.preventDefault(); cleanup(); } };
+    s.onPageHide = function () { cleanup(); };
+    state = s;
+    document.addEventListener("keydown", s.onKeyDown, true);
+    window.addEventListener("pagehide", s.onPageHide);
     root.addEventListener("mousedown", function (e) { if (e.target instanceof Element && e.target.classList.contains("obp23-backdrop")) cleanup(); });
     root.addEventListener("click", function (e) {
       var btn = e.target instanceof Element ? e.target.closest("button[data-act]") : null;
-      if (btn) handleAction(state, btn.getAttribute("data-act"), btn);
+      if (btn && state === s && !s.closed) handleAction(s, btn.getAttribute("data-act"), btn);
     });
     activeAgent().then(function (agentId) {
-      if (!state) return;
-      state.agentId = agentId || null;
+      if (state !== s || s.closed) return;
+      s.agentId = agentId || null;
       if (!agentId) setStatus("obp23-stage-status", "Bot ativo indisponível.", true);
     });
   }
   function stageFiles(s, files) {
+    if (!isCurrent(s) || !files || typeof files.length !== "number") return;
     var b = bridge();
     var a = s.agentId;
-    if (!b || !a) { setStatus("obp23-stage-status", "Bot ativo indisponível.", true); return; }
+    if (!b || !a) { sessionStatus(s, "obp23-stage-status", "Bot ativo indisponível.", true); return; }
     var count = 0;
     var queue = Promise.resolve();
     for (var i = 0; i < files.length && count < 4; i += 1) {
       var file = files[i];
-      if (!(file instanceof File) || !file.name) continue;
+      if (typeof File === "undefined" || !(file instanceof File) || !file.name) continue;
       var lowerName = file.name.toLowerCase();
       var maxBytes = file.type.indexOf("image/") === 0 || lowerName.endsWith(".pdf") ? 2 * 1024 * 1024 : 256 * 1024;
       if (file.size > maxBytes) {
-        setStatus("obp23-stage-status", "Arquivo excede o limite permitido: " + file.name, true);
+        sessionStatus(s, "obp23-stage-status", "Arquivo excede o limite permitido: " + file.name, true);
         continue;
       }
       count += 1;
       (function (file) {
-        queue = queue.then(function () { return file.arrayBuffer(); }).then(function (buf) {
+        queue = queue.then(function () {
+          if (!isCurrent(s)) return null;
+          return file.arrayBuffer();
+        }).then(function (buf) {
+          if (!buf || !isCurrent(s)) return null;
           var bytes = new Uint8Array(buf);
           return b.stageAttachmentBytes(a, file.name, bytes).then(function (res) {
-            if (!state) return;
+            if (!isCurrent(s)) {
+              if (res && res.attachmentId) discardStaged(s, res.attachmentId);
+              return;
+            }
             if (res && res.attachmentId) {
-              state.staged.push({ id: res.attachmentId, name: res.name || file.name, kind: res.kind || "desconhecido", sizeBytes: res.sizeBytes || bytes.length, sha256: res.sha256 || "", expiresAtMs: res.expiresAtMs || 0, preview: res.kind === "text" ? textPreview(bytes, 200) : (res.kind === "image" ? "Imagem anexada (sem preview de bytes)." : "Anexo " + (res.kind || "arquivo") + " (sem preview de texto).") });
-              renderStaged(state);
-              var send = document.getElementById("obp23-sendatt"); if (send) send.disabled = false;
-              setStatus("obp23-stage-status", "Em staging: " + res.attachmentId);
-            } else { setStatus("obp23-stage-status", "Falha ao adicionar arquivo.", true); }
-          }).catch(function (e) { setStatus("obp23-stage-status", String(e && e.message ? e.message : e), true); });
-        }).catch(function (e) { setStatus("obp23-stage-status", String(e && e.message ? e.message : e), true); });
+              s.staged.push({ id: res.attachmentId, name: res.name || file.name, kind: res.kind || "desconhecido", sizeBytes: res.sizeBytes || bytes.length, sha256: res.sha256 || "", expiresAtMs: res.expiresAtMs || 0, preview: res.kind === "text" ? textPreview(bytes, 200) : (res.kind === "image" ? "Imagem anexada (sem preview de bytes)." : "Anexo " + (res.kind || "arquivo") + " (sem preview de texto).") });
+              renderStaged(s);
+              var send = s.root.querySelector("#obp23-sendatt"); if (send) send.disabled = false;
+              sessionStatus(s, "obp23-stage-status", "Em staging: " + res.attachmentId);
+            } else { sessionStatus(s, "obp23-stage-status", "Falha ao adicionar arquivo.", true); }
+          }).catch(function (e) { sessionStatus(s, "obp23-stage-status", String(e && e.message ? e.message : e), true); });
+        }).catch(function (e) { sessionStatus(s, "obp23-stage-status", String(e && e.message ? e.message : e), true); });
       })(file);
     }
   }
@@ -1583,7 +1618,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     var b = bridge();
     if (!b || s.streamOpened) return;
     s.streamOpened = true;
-    var opened = b.openStream ? Promise.resolve().then(function () { return b.openStream({ channels: ["async-tasks", "subagents"] }); }) : Promise.resolve(null);
+    var opened = b.openStream ? Promise.resolve().then(function () { return b.openStream({ channels: ["async-tasks"] }); }) : Promise.resolve(null);
     opened.catch(function () { s.streamOpened = false; });
     if (typeof b.onFrame === "function") {
       try {
@@ -1597,6 +1632,21 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     if (s.unsubscribe) { try { s.unsubscribe(); } catch (_e) {} s.unsubscribe = null; }
     if (b && typeof b.closeStream === "function") { try { var p = b.closeStream(); if (p && typeof p.then === "function") p.catch(function () {}); } catch (_e) {} }
   }
+  function terminalStatus(status) {
+    return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
+  }
+  function pendingAbortRow(s, row) {
+    if (!row || !row.id || !s.abortPending[row.id] || terminalStatus(row.status)) return row;
+    return Object.assign({}, row, { status: "cancelling", allowedActions: [] });
+  }
+  function reconcileAbortPending(s, rows) {
+    if (!Array.isArray(rows)) return rows;
+    for (var i = 0; i < rows.length; i += 1) {
+      var row = rows[i];
+      if (row && row.id && terminalStatus(row.status)) delete s.abortPending[row.id];
+    }
+    return rows.map(function (row) { return pendingAbortRow(s, row); });
+  }
   function loadRows(s, kind) {
     var b = bridge();
     if (!b || !s.agentId) {
@@ -1606,61 +1656,159 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     }
     s.status = kind === "resync" ? "resync" : "loading";
     s.error = "";
-    renderBody(s);
     var token = (s.listToken = (s.listToken || 0) + 1);
+    const pending = { token: token, snapshot: null, updates: new Map() };
+    s.pendingList = pending;
+    if (kind === "resync") {
+      s.resyncRequired = true;
+      s.resyncDirty = false;
+      s.resyncRequestToken = token;
+    }
+    renderBody(s);
     Promise.resolve().then(function () { return b.getAsyncTasks({ agentId: s.agentId, limit: TASK_LIST_LIMIT }); }).then(function (rows) {
       if (!state || token !== s.listToken || s.closed) return;
-      s.rows = Array.isArray(rows) ? rows.slice(-TASK_LIST_LIMIT) : [];
-      if (s.status !== "resync") s.status = s.rows.length === 0 ? "empty" : "ready";
+      // Replay events received while the cursorless list was in flight.
+      // An intervening snapshot replaces that older list altogether.
+      const base = pending.snapshot || (Array.isArray(rows) ? rows.slice(-TASK_LIST_LIMIT) : []);
+      const merged = new Map(base.map(row => [row.id, row]));
+      for (const [id, row] of pending.updates) merged.set(id, row);
+      s.rows = reconcileAbortPending(s, Array.from(merged.values()).slice(-TASK_LIST_LIMIT));
+      s.pendingList = null;
+      if (kind === "resync" && s.resyncRequestToken === token) {
+        s.resyncDirty = false;
+        s.resyncRequired = false;
+        s.resyncRequestToken = 0;
+        s.status = s.rows.length === 0 ? "empty" : "ready";
+      } else if (s.status !== "resync") s.status = s.rows.length === 0 ? "empty" : "ready";
       renderBody(s);
     }).catch(function (err) {
       if (!state || token !== s.listToken || s.closed) return;
+      s.pendingList = null;
+      if (pending.snapshot) return;
       s.error = err && err.message ? err.message : String(err);
       s.status = "error";
       renderBody(s);
     });
   }
   function applyFrame(s, frame) {
+    if (frame && frame.payload && typeof frame.payload === "object") frame = Object.assign({ channel: frame.channel }, frame.payload);
+    if (frame && ((frame.channel && frame.channel !== "async-tasks") || (frame.agentId && frame.agentId !== s.agentId))) return;
     if (!frame || s.closed || !s.root || !s.root.isConnected || typeof frame.type !== "string") return;
     var type = frame.type;
     var epoch = typeof frame.epoch === "string" && frame.epoch ? frame.epoch : (s.epoch || "");
     var seq = typeof frame.sequence === "number" ? frame.sequence : -1;
     var items = Array.isArray(frame.tasks) ? frame.tasks : Array.isArray(frame.subagents) ? frame.subagents : null;
     if (type === "snapshot") {
+      if (!s.resyncRequired && s.epoch === epoch && (s.seqByEpoch[epoch] ?? -1) >= seq) return;
+      if (s.pendingList) {
+        s.pendingList.snapshot = items ? items.slice(-TASK_LIST_LIMIT) : [];
+        s.pendingList.updates.clear();
+      }
       s.epoch = epoch;
       if (epoch) s.seqByEpoch[epoch] = seq;
-      s.rows = items ? items.slice(-TASK_LIST_LIMIT) : [];
+      s.rows = reconcileAbortPending(s, items ? items.slice(-TASK_LIST_LIMIT) : []);
+      s.resyncRequired = false;
+      s.resyncDirty = false;
+      s.resyncRequestToken = 0;
       s.status = s.rows.length === 0 ? "empty" : "ready";
       renderBody(s);
       return;
     }
     if (type === "update") {
-      if (epoch && (s.seqByEpoch[epoch] || -1) >= seq) return;
+      if (epoch && (s.seqByEpoch[epoch] ?? -1) >= seq) return;
+      if (s.resyncRequired) s.resyncDirty = true;
       if (epoch) s.seqByEpoch[epoch] = seq;
       if (!items) return;
+      if (s.pendingList) {
+        for (const row of items) {
+          s.pendingList.updates.delete(row.id);
+          s.pendingList.updates.set(row.id, row);
+        }
+        while (s.pendingList.updates.size > TASK_LIST_LIMIT) s.pendingList.updates.delete(s.pendingList.updates.keys().next().value);
+      }
       var byId = new Map();
       for (var i = 0; i < s.rows.length; i += 1) byId.set(s.rows[i].id, s.rows[i]);
-      for (var j = 0; j < items.length; j += 1) byId.set(items[j].id, items[j]);
+      var nextItems = reconcileAbortPending(s, items);
+      for (var j = 0; j < nextItems.length; j += 1) byId.set(nextItems[j].id, nextItems[j]);
       s.rows = Array.from(byId.values()).slice(-TASK_LIST_LIMIT);
       if (s.status !== "resync") s.status = s.rows.length === 0 ? "empty" : "ready";
-      if (!renderTaskUpdates(s, items)) renderBody(s);
+      if (!renderTaskUpdates(s, nextItems)) renderBody(s);
       return;
     }
     if (type === "resync") {
+      s.resyncRequired = true;
+      s.resyncDirty = false;
       s.status = "resync";
       s.error = "";
       renderBody(s);
       loadRows(s, "resync");
     }
   }
+  function activeSteerInput(s) {
+    return s.root && s.root.querySelector ? s.root.querySelector(".obp22-steer input[data-task-id]") : null;
+  }
+  function rememberSteerEdit(s) {
+    var input = activeSteerInput(s);
+    if (!input) return;
+    var id = input.getAttribute("data-task-id") || s.steerTaskId || "";
+    if (!id) return;
+    s.steerDrafts[id] = input.value;
+    s.steerEdit = {
+      taskId: id,
+      focused: document.activeElement === input,
+      start: typeof input.selectionStart === "number" ? input.selectionStart : null,
+      end: typeof input.selectionEnd === "number" ? input.selectionEnd : null,
+      direction: input.selectionDirection || "none",
+      composing: Boolean(input.isComposing || s.steerComposing),
+    };
+  }
+  function restoreSteerEdit(s) {
+    var edit = s.steerEdit;
+    if (!edit || !edit.taskId) return;
+    var input = null;
+    if (s.root && s.root.querySelectorAll) {
+      input = Array.from(s.root.querySelectorAll(".obp22-steer input[data-task-id]")).find(function (candidate) {
+        return candidate.getAttribute("data-task-id") === edit.taskId;
+      }) || null;
+    }
+    if (!input) return;
+    if (Object.prototype.hasOwnProperty.call(s.steerDrafts, edit.taskId)) input.value = s.steerDrafts[edit.taskId];
+    if (!edit.focused || edit.composing) return;
+    try {
+      input.focus({ preventScroll: true });
+      if (edit.start !== null && edit.end !== null && typeof input.setSelectionRange === "function") input.setSelectionRange(edit.start, edit.end, edit.direction);
+    } catch (_e) {}
+  }
+  function patchRowPreservingSteer(existing, next) {
+    var currentActions = existing.querySelector(".obp22-actions");
+    var currentChildren = Array.from(existing.children);
+    var nextChildren = Array.from(next.children);
+    var nextActions = next.querySelector(".obp22-actions");
+    if (!currentActions || !nextActions) {
+      existing.replaceWith(next);
+      return;
+    }
+    for (var i = 0; i < currentChildren.length; i += 1) {
+      if (currentChildren[i] !== currentActions) currentChildren[i].remove();
+    }
+    for (var j = 0; j < nextChildren.length; j += 1) {
+      if (nextChildren[j] !== nextActions) existing.insertBefore(nextChildren[j].cloneNode(true), currentActions);
+    }
+    existing.setAttribute("data-task-id", next.getAttribute("data-task-id") || "");
+  }
+  STATUS_TEXT.cancelling = "Cancelamento solicitado";
   function rowHtml(s, row) {
     var id = row.id || "";
     var status = STATUS_TEXT[row.status] || row.status || "Desconhecida";
     var parts = [];
-    parts.push("<span class=obp22-badge" + (row.status === "failed" ? " is-failed" : (row.status === "running" || row.status === "queued" ? " is-active" : "")) + ">" + esc(status) + "</span>");
+    parts.push('<span class="obp22-badge' + (row.status === "failed" ? " is-failed" : (row.status === "running" || row.status === "queued" || row.status === "cancelling" ? " is-active" : "")) + '">' + esc(status) + "</span>");
     if (typeof row.attempt === "number" && row.attempt > 1) parts.push("<span class=obp22-meta>Tentativa " + row.attempt + "</span>");
-    if (typeof row.startedAtMs === "number" && row.startedAtMs > 0 && row.status !== "completed") parts.push("<span class=obp22-meta>" + esc(humanize(Date.now() - row.startedAtMs)) + "</span>");
-    if (typeof row.startedAtMs === "number" && row.startedAtMs > 0 && (row.status === "completed" || row.status === "failed" || row.status === "cancelled") && row.finishedAtMs) parts.push("<span class=obp22-meta>" + esc(humanize(row.finishedAtMs - row.startedAtMs)) + "</span>");
+    if (typeof row.startedAtMs === "number" && row.startedAtMs > 0) {
+      if (terminalStatus(row.status)) {
+        if (typeof row.finishedAtMs === "number" && row.finishedAtMs >= row.startedAtMs)
+          parts.push("<span class=obp22-meta>Duração: " + esc(humanize(row.finishedAtMs - row.startedAtMs).replace(/^há /, "")) + "</span>");
+      } else parts.push("<span class=obp22-meta>Iniciada " + esc(humanize(Date.now() - row.startedAtMs)) + "</span>");
+    }
     var actions = "";
     var allowed = Array.isArray(row.allowedActions) ? row.allowedActions : [];
     if (row.status === "running" || row.status === "queued") {
@@ -1673,9 +1821,10 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     var error = (row.error && typeof row.error.message === "string" && row.error.message) ? "<div class=obp22-detail>" + esc(row.error.message) + "</div>" : "";
     var steer = "";
     if (s.steerTaskId === id) {
-      steer = "<div class=obp22-steer><input id=openbot-steer-input aria-label='mensagem de redirecionamento' maxlength=4096 placeholder='Instru\u00e7\u00f5es adicionais (m\u00e1x. 4096)'>" +
+      var draft = Object.prototype.hasOwnProperty.call(s.steerDrafts, id) ? s.steerDrafts[id] : "";
+      steer = "<div class=obp22-steer><input id=openbot-steer-input data-task-id=\"" + esc(id) + "\" aria-label='mensagem de redirecionamento' maxlength=4096 value=\"" + esc(draft) + "\" placeholder='Instru\u00e7\u00f5es adicionais (m\u00e1x. 4096)'>" +
         "<button type=button data-action=steer-send data-task-id=\"" + esc(id) + "\">Enviar</button>" +
-        "<button type=button data-action=steer-cancel>Cancelar</button></div>";
+        "<button type=button data-action=steer-cancel data-task-id=\"" + esc(id) + "\">Cancelar</button></div>";
     }
     return "<article class=ob-task-item data-task-id=\"" + esc(id) + "\"><div class=obp22-row><span class=obp22-label>" + esc(row.label || "") + "</span>" + parts.join("") + "</div>" + detail + progress + result + error + "<div class=obp22-actions>" + actions + steer + "</div></article>";
   }
@@ -1683,6 +1832,8 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     var body = s.root && s.root.querySelector ? s.root.querySelector(".obp22-body") : null;
     var list = body && body.querySelector ? body.querySelector(".obp22-list") : null;
     if (!list || !Array.isArray(items)) return false;
+    rememberSteerEdit(s);
+    var edit = s.steerEdit;
     for (var i = 0; i < items.length; i += 1) {
       var row = items[i];
       var wrapper = document.createElement("div");
@@ -1690,19 +1841,23 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       var next = wrapper.firstElementChild;
       if (!next) continue;
       var existing = Array.from(list.children).find(function (child) { return child.getAttribute("data-task-id") === row.id; });
-      if (existing) existing.replaceWith(next);
+      if (existing && edit && edit.composing && edit.taskId === row.id) patchRowPreservingSteer(existing, next);
+      else if (existing) existing.replaceWith(next);
       else list.appendChild(next);
     }
     var activeIds = new Set(s.rows.map(function (row) { return row.id; }));
     for (var child of Array.from(list.children)) {
       if (!activeIds.has(child.getAttribute("data-task-id"))) child.remove();
     }
+    if (!s.steerComposing) restoreSteerEdit(s);
     return true;
   }
   function renderBody(s) {
     if (!state || !s.root || !s.root.isConnected) return;
     var body = s.root.querySelector(".obp22-body");
     if (!body) return;
+    if (s.steerComposing && activeSteerInput(s)) { s.pendingRender = true; return; }
+    rememberSteerEdit(s);
     var html = "";
     if (s.status === "resync") html += "<p class=obp22-status>Sincronizando\u2026</p>";
     if (s.status === "loading") html += "<p class=obp22-status>Carregando tarefas\u2026</p>";
@@ -1714,35 +1869,54 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       html += "<div class=obp22-list>" + rows.map(function (row) { return rowHtml(s, row); }).join("") + "</div>";
     }
     body.innerHTML = html;
+    s.pendingRender = false;
+    restoreSteerEdit(s);
   }
   function handleControl(s, action, btn) {
     var b = bridge();
     var id = btn && btn.dataset ? (btn.dataset.taskId || btn.dataset.taskid || "") : "";
     if (!b || !s.agentId) return;
     if (action === "abort-task") {
+      if (!id || s.abortPending[id]) return;
+      var previous = s.rows.find(function (row) { return row.id === id; });
+      if (!previous || terminalStatus(previous.status)) return;
+      s.abortPending[id] = true;
+      s.abortPrevious[id] = previous;
+      s.rows = s.rows.map(function (row) { return row.id === id ? Object.assign({}, row, { status: "cancelling", allowedActions: [] }) : row; });
+      renderBody(s);
       var intent = intentId();
       Promise.resolve(b.abortAsyncTask({ agentId: s.agentId, taskId: id, intentId: intent, reason: "user" })).then(function () {
-        if (!state || s.closed) return;
-        s.rows = s.rows.map(function (row) { return row.id === id ? Object.assign({}, row, { status: "cancelled", allowedActions: [] }) : row; });
-        renderBody(s);
+        // The RPC acknowledges acceptance only. Keep the row in cancelling
+        // until a terminal status arrives through the authoritative list or
+        // stream frame.
+        if (!state || s.closed || !s.abortPending[id]) return;
       }).catch(function (err) {
         if (!state || s.closed) return;
+        var current = s.rows.find(function (row) { return row.id === id; });
+        if (current && terminalStatus(current.status)) { delete s.abortPending[id]; delete s.abortPrevious[id]; return; }
+        delete s.abortPending[id];
+        var restored = s.abortPrevious[id];
+        delete s.abortPrevious[id];
+        if (restored) s.rows = s.rows.map(function (row) { return row.id === id ? restored : row; });
         s.error = err && err.message ? err.message : String(err);
         s.status = "error";
         renderBody(s);
       });
       return;
     }
-    if (action === "steer-task") { s.steerTaskId = id; renderBody(s); return; }
-    if (action === "steer-cancel") { s.steerTaskId = null; renderBody(s); return; }
+    if (action === "steer-task") { rememberSteerEdit(s); s.steerTaskId = id; s.steerEdit = null; renderBody(s); return; }
+    if (action === "steer-cancel") { delete s.steerDrafts[id || s.steerTaskId || ""]; s.steerTaskId = null; s.steerEdit = null; renderBody(s); return; }
     if (action === "steer-send") {
       var input = document.getElementById("openbot-steer-input");
+      rememberSteerEdit(s);
       var message = input ? input.value : "";
       if (!message) return;
       message = String(message).slice(0, 4096);
       var intent2 = intentId();
       Promise.resolve(b.steerAsyncTask({ agentId: s.agentId, taskId: id, intentId: intent2, message: message })).then(function () {
         if (!state || s.closed) return;
+        delete s.steerDrafts[id];
+        s.steerEdit = null;
         s.steerTaskId = null;
         renderBody(s);
       }).catch(function (err) {
@@ -1767,7 +1941,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     var s = {
       root: root, style: style, trigger: trigger instanceof Element ? trigger : null, appRoot: appRoot,
       agentId: null, rows: [], status: "loading", error: "", seqByEpoch: {}, epoch: null,
-      streamOpened: false, unsubscribe: null, closed: false, listToken: 0, steerTaskId: null,
+      streamOpened: false, unsubscribe: null, closed: false, listToken: 0, pendingList: null, resyncRequired: false, resyncDirty: false, resyncRequestToken: 0, steerTaskId: null, steerDrafts: Object.create(null), steerEdit: null, steerComposing: false, pendingRender: false, abortPending: Object.create(null), abortPrevious: Object.create(null),
       onKeyDown: function (e) { if (e.key === "Escape") { e.preventDefault(); closeNow(); } },
       onPageHide: function () { closeNow(); },
     };
@@ -1782,6 +1956,24 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       if (action === "close-dialog") { closeNow(); return; }
       if (action === "retry-tasks") { loadRows(s, "retry"); return; }
       if (action === "abort-task" || action === "steer-task" || action === "steer-send" || action === "steer-cancel") { handleControl(s, action, btn); return; }
+    });
+    root.addEventListener("input", function (e) {
+      var input = e.target instanceof Element ? e.target.closest(".obp22-steer input[data-task-id]") : null;
+      if (!input || !s.root.contains(input)) return;
+      rememberSteerEdit(s);
+    });
+    root.addEventListener("compositionstart", function (e) {
+      var input = e.target instanceof Element ? e.target.closest(".obp22-steer input[data-task-id]") : null;
+      if (!input || !s.root.contains(input)) return;
+      s.steerComposing = true;
+      rememberSteerEdit(s);
+    });
+    root.addEventListener("compositionend", function (e) {
+      var input = e.target instanceof Element ? e.target.closest(".obp22-steer input[data-task-id]") : null;
+      if (!input || !s.root.contains(input)) return;
+      rememberSteerEdit(s);
+      s.steerComposing = false;
+      renderBody(s);
     });
     memoryAgent().then(function (agentId) {
       if (!state || s.closed) return;

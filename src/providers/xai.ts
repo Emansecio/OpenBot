@@ -57,7 +57,14 @@ export interface XaiAdapterOptions extends OpenAiAdapterOptions {
 export class XaiAdapter extends OpenAiAdapter {
   constructor(opts: XaiAdapterOptions = {}) {
     // Nome fixo "xai" — a base (OpenAiAdapter) usa opts.name ?? "openai".
-    super({ ...opts, name: opts.name ?? XAI_PROVIDER_NAME, baseUrl: opts.baseUrl ?? XAI_API_BASE_URL });
+    // A API xAI aceita `reasoning_effort` no chat.completions para modelos de
+    // raciocínio; o envio fica restrito a esforços declarados no catálogo.
+    super({
+      ...opts,
+      name: opts.name ?? XAI_PROVIDER_NAME,
+      baseUrl: opts.baseUrl ?? XAI_API_BASE_URL,
+      reasoningEffortPolicy: opts.reasoningEffortPolicy ?? "declared",
+    });
   }
 }
 

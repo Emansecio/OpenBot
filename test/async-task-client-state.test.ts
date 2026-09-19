@@ -80,7 +80,30 @@ describe("P2.2 native client state machine", () => {
     expect(cursorAhead.handled).toBe(true);
     expect(cursorAhead.resyncRequired).toBe(true);
     expect(cursorAhead.reason).toBe("cursor-ahead");
-    expect(cursorAhead.state).toMatchObject({ epoch: "epoch-9", sequence: 99, resyncRequired: true, items: [retained] });
+    expect(cursorAhead.state).toMatchObject({ epoch: "epoch-1", sequence: 1, resyncRequired: true, items: [retained] });
+  });
+
+  it("keeps recovery markers out of the cursor and accepts same-cursor snapshots", () => {
+    const base = applyNativeAsyncTaskClientEvent(
+      createNativeAsyncTaskClientState({ agentId: "agent-a", channel: "async-tasks" }),
+      snapshot("epoch-a", 50, [item("old", "running")]),
+    ).state;
+    const marker = applyNativeAsyncTaskClientEvent(base, {
+      type: "resync", agentId: "agent-a", parentAgentId: "agent-a", channel: "async-tasks",
+      epoch: "epoch-a", sequence: 50, resyncRequired: true, reason: "cursor-gap",
+    });
+    expect(marker.state).toMatchObject({ epoch: "epoch-a", sequence: 50, resyncRequired: true });
+    const recovered = applyNativeAsyncTaskClientEvent(marker.state, snapshot("epoch-a", 50, [item("fresh", "queued")]));
+    expect(recovered.handled).toBe(true);
+    expect(recovered.state.items.map((entry) => entry.id)).toEqual(["fresh"]);
+    expect(recovered.state.resyncRequired).toBe(false);
+
+    const newEpoch = applyNativeAsyncTaskClientEvent(marker.state, snapshot("epoch-b", 1, [item("b1", "queued")]));
+    expect(newEpoch.handled).toBe(true);
+    expect(newEpoch.state).toMatchObject({ epoch: "epoch-b", sequence: 1, resyncRequired: false });
+    const next = applyNativeAsyncTaskClientEvent(newEpoch.state, update("epoch-b", 2, item("b1", "running")));
+    expect(next.handled).toBe(true);
+    expect(next.state).toMatchObject({ epoch: "epoch-b", sequence: 2 });
   });
 
   it("exports a Last-Event-ID cursor and ignores foreign scopes", () => {

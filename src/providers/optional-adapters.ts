@@ -19,7 +19,7 @@ import { randomUUID } from "node:crypto";
 import type { ModelCatalogEntry } from "../shared/contracts.js";
 import { MAX_PROCESS_STDIN_BYTES, type ExecutionRequest } from "../execution/contracts.js";
 import type { LocalExecutionBroker } from "../execution/broker.js";
-import { resolveModelCapabilities, prepareProviderRound } from "../memory/model-context.js";
+import { DEFAULT_UNKNOWN_MODEL_CAPABILITIES, resolveModelCapabilities, prepareProviderRound } from "../memory/model-context.js";
 import {
   OpenAiToolCallAccumulator,
   extractOpenAiErrorMessage,
@@ -68,6 +68,44 @@ function hasImageParts(req: ProviderChatRequest): boolean {
     && (message.content as Array<{ type: string }>).some((part) => part.type === "image_url"));
 }
 
+type OpenRouterProviderCapability = ReturnType<typeof resolveProviderCapabilities>;
+
+/** OpenRouter catalog entries use the shared OpenAI-compatible provider tag. */
+function isOpenRouterCatalogProvider(value: unknown): boolean {
+  return value === "openrouter" || value === "openai-compat";
+}
+
+function isProviderCapability(value: unknown): value is OpenRouterProviderCapability {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.streaming === "boolean"
+    && typeof candidate.tools === "boolean"
+    && typeof candidate.images === "boolean"
+    && (candidate.cancellation === "abort-signal" || candidate.cancellation === "process-tree" || candidate.cancellation === "none")
+    && (candidate.authentication === "keystore-api-key" || candidate.authentication === "external-cli-session" || candidate.authentication === "none")
+    && (candidate.usage === "stream-events" || candidate.usage === "response-metadata" || candidate.usage === "none")
+    && (candidate.resume === "cursor" || candidate.resume === "none")
+    && typeof candidate.reasoning === "boolean";
+}
+
+/**
+ * A request snapshot is trusted only when it describes this exact model and
+ * the OpenRouter-compatible provider. Invalid or mismatched snapshots fall
+ * through to the adapter catalog and then the shared unknown-model floor.
+ */
+function matchingOpenRouterResolution(req: ProviderChatRequest): {
+  entry: ModelCatalogEntry;
+  capabilities: OpenRouterProviderCapability;
+} | undefined {
+  const value: unknown = req.modelResolution;
+  if (typeof value !== "object" || value === null) return undefined;
+  const candidate = value as { entry?: unknown; capabilities?: unknown };
+  if (typeof candidate.entry !== "object" || candidate.entry === null) return undefined;
+  const entry = candidate.entry as Partial<ModelCatalogEntry>;
+  if (entry.id !== req.model || !isOpenRouterCatalogProvider(entry.provider) || !isProviderCapability(candidate.capabilities)) return undefined;
+  return { entry: candidate.entry as ModelCatalogEntry, capabilities: candidate.capabilities };
+}
+
 function protocolError(message: string): ProviderError {
   return new ProviderError(message, { kind: "validation", code: "protocol_error" });
 }
@@ -88,6 +126,10 @@ export interface OpenRouterAdapterOptions {
   readonly httpReferer?: string;
   readonly appTitle?: string;
   readonly usageCollector?: UsageCollector;
+  /** Idle timeout reset on every SSE chunk. */
+  readonly timeoutMs?: number;
+  /** Absolute request duration cap. */
+  readonly maxDurationMs?: number;
 }
 
 export class OpenRouterAdapter implements ProviderAdapter {
@@ -102,6 +144,8 @@ export class OpenRouterAdapter implements ProviderAdapter {
   private readonly httpReferer?: string;
   private readonly appTitle?: string;
   private readonly usageCollector?: UsageCollector;
+  private readonly timeoutMs: number;
+  private readonly maxDurationMs: number;
 
   constructor(options: OpenRouterAdapterOptions = {}) {
     this.name = options.name ?? "openrouter";
@@ -123,6 +167,10 @@ export class OpenRouterAdapter implements ProviderAdapter {
     this.httpReferer = options.httpReferer;
     this.appTitle = options.appTitle;
     this.usageCollector = options.usageCollector;
+    this.timeoutMs = options.timeoutMs ?? 120_000;
+    this.maxDurationMs = options.maxDurationMs ?? Math.max(900_000, this.timeoutMs);
+    if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1) throw new Error("OpenRouter idle timeout is invalid");
+    if (!Number.isSafeInteger(this.maxDurationMs) || this.maxDurationMs < this.timeoutMs) throw new Error("OpenRouter max duration is invalid");
   }
 
   serializeRequest(req: ProviderChatRequest): string {
@@ -135,20 +183,21 @@ export class OpenRouterAdapter implements ProviderAdapter {
 
   async streamChat(req: ProviderChatRequest, emit: (event: ProviderStreamEvent) => void): Promise<void> {
     if (req.signal?.aborted) throw new ProviderError("stream aborted before start", { kind: "aborted", code: "ABORT_ERR" });
-    // A declared catalog is authoritative: when one is provided, the model
-    // must exist and its capability must be known (fail-closed). Without a
-    // catalog the caller owns model selection; capabilities still gate
-    // features via the matrix (unknown pairs fail closed).
+    // A request snapshot is authoritative for its exact OpenRouter-compatible
+    // model. Otherwise a declared adapter catalog is authoritative; with no
+    // declaration, context budgeting uses the shared unknown-model floor.
     const hasCatalog = this.modelCatalog.length > 0;
-    const entry = this.modelCatalog.find((candidate) => candidate.id === req.model);
-    if (hasCatalog && entry === undefined) {
+    const entry = this.modelCatalog.find((candidate) => candidate.id === req.model && isOpenRouterCatalogProvider(candidate.provider));
+    const resolution = matchingOpenRouterResolution(req);
+    if (hasCatalog && entry === undefined && resolution === undefined) {
       throw new ProviderError(`openrouter: modelo desconhecido: ${req.model}`, { kind: "validation", code: "model_capability_unknown" });
     }
-    const capability = resolveProviderCapabilities("openrouter", req.model);
-    if (hasCatalog && entry !== undefined && !capability.streaming) {
+    const capability = resolution?.capabilities ?? resolveProviderCapabilities("openrouter", req.model);
+    const enforceDeclaredCapability = hasCatalog || resolution !== undefined;
+    if (enforceDeclaredCapability && !capability.streaming) {
       throw new ProviderError(`openrouter: modelo sem capability conhecida: ${req.model}`, { kind: "validation", code: "model_capability_unknown" });
     }
-    if ((hasCatalog && !capability.images && hasImageParts(req)) || (hasCatalog && !capability.tools && (req.tools?.length ?? 0) > 0)) {
+    if (enforceDeclaredCapability && ((!capability.images && hasImageParts(req)) || (!capability.tools && (req.tools?.length ?? 0) > 0))) {
       throw new ProviderError("openrouter: feature não suportada por este modelo", { kind: "validation", code: "unsupported_feature" });
     }
 
@@ -156,8 +205,12 @@ export class OpenRouterAdapter implements ProviderAdapter {
     // prepared request must not need further truncation to cross the wire —
     // an under-budget call fails before fetch instead of silently shrinking
     // the prompt.
+    const declaredEntry = resolution?.entry ?? entry;
+    const modelCapabilities = declaredEntry === undefined
+      ? { ...DEFAULT_UNKNOWN_MODEL_CAPABILITIES }
+      : resolveModelCapabilities(declaredEntry, "openrouter", this.modelCatalog);
     const prepared = prepareProviderRound(req, {
-      capabilities: resolveModelCapabilities(entry ?? req.model, "openrouter", this.modelCatalog),
+      capabilities: modelCapabilities,
       maxBytes: this.maxRequestBytes,
       provider: "openrouter",
       serializeRequest: (candidate) => this.serializeRequest(candidate),
@@ -184,42 +237,67 @@ export class OpenRouterAdapter implements ProviderAdapter {
       ...(this.httpReferer === undefined ? {} : { "http-referer": this.httpReferer }),
       ...(this.appTitle === undefined ? {} : { "x-title": this.appTitle }),
     };
-    const signal = req.signal ?? new AbortController().signal;
-    const response = await this.fetchImpl(`${this.endpoint}/chat/completions`, {
-      method: "POST",
-      headers,
-      body: serializedBody,
-      signal,
-    });
-
-    if (!response.ok) {
-      const errorText = await this.readErrorBody(response, signal);
-      const rawMessage = extractOpenAiErrorMessage(parsedErrorBody(errorText)) ?? "openrouter request failed";
-      const sanitized = redactSecret(rawMessage, [secret]).slice(0, 2_048);
-      const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
-      const kind = response.status === 401 || response.status === 403
-        ? "auth" as const
-        : response.status === 429
-          ? "rate-limit" as const
-          : response.status >= 500
-            ? "server" as const
-            : "validation" as const;
-      throw new ProviderError(sanitized, {
-        kind,
-        status: response.status,
-        code: kind,
-        ...(kind === "auth" ? {} : { retryAfterMs }),
-      });
-    }
-    if (response.body === null) throw protocolError("openrouter: stream sem corpo");
-
-    let recorded = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-    const toolAccumulator = new OpenAiToolCallAccumulator();
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    const controller = signal;
-    let terminated = false;
+    const controller = new AbortController();
+    const onAbort = (): void => {
+      if (!controller.signal.aborted) controller.abort(req.signal?.reason);
+    };
+    req.signal?.addEventListener("abort", onAbort, { once: true });
+    if (req.signal?.aborted) onAbort();
+    let timeoutError: ProviderError | undefined;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const resetIdleTimer = (): void => {
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
+      if (controller.signal.aborted) return;
+      idleTimer = setTimeout(() => {
+        if (controller.signal.aborted) return;
+        timeoutError = new ProviderError("openrouter: stream timeout", { kind: "network", code: "ETIMEDOUT" });
+        controller.abort(timeoutError);
+      }, this.timeoutMs);
+    };
+    resetIdleTimer();
+    const maxDurationTimer = setTimeout(() => {
+      if (controller.signal.aborted) return;
+      timeoutError = new ProviderError("openrouter: stream duration limit exceeded", { kind: "network", code: "ETIMEDOUT" });
+      controller.abort(timeoutError);
+    }, this.maxDurationMs);
+    const signal = controller.signal;
+    let response: Response;
     try {
+      response = await this.fetchImpl(`${this.endpoint}/chat/completions`, {
+        method: "POST",
+        headers,
+        body: serializedBody,
+        signal,
+      });
+      resetIdleTimer();
+
+      if (!response.ok) {
+        const errorText = await this.readErrorBody(response, signal);
+        const rawMessage = extractOpenAiErrorMessage(parsedErrorBody(errorText)) ?? "openrouter request failed";
+        const sanitized = redactSecret(rawMessage, [secret]).slice(0, 2_048);
+        const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+        const kind = response.status === 401 || response.status === 403
+          ? "auth" as const
+          : response.status === 429
+            ? "rate-limit" as const
+            : response.status >= 500
+              ? "server" as const
+              : "validation" as const;
+        throw new ProviderError(sanitized, {
+          kind,
+          status: response.status,
+          code: kind,
+          ...(kind === "auth" ? {} : { retryAfterMs }),
+        });
+      }
+      if (response.body === null) throw protocolError("openrouter: stream sem corpo");
+
+      let recorded = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+      const toolAccumulator = new OpenAiToolCallAccumulator();
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let terminated = false;
+      try {
       // Line-oriented strict SSE parser: accepts both canonical frames split by
       // a blank line and single-newline separated data lines; multi-chunk
       // protection keeps the buffer bounded. Any non-data, non-comment line is
@@ -230,8 +308,9 @@ export class OpenRouterAdapter implements ProviderAdapter {
       // frames). Each data line is dispatched immediately; comments and SSE
       // metadata lines are ignored; any other line is a protocol error.
       while (!terminated) {
-        const { done, value } = await raceWithAbort(reader.read(), controller);
+        const { done, value } = await raceWithAbort(reader.read(), controller.signal);
         if (done) break;
+        resetIdleTimer();
         buffer += decoder.decode(value, { stream: true });
         if (Buffer.byteLength(buffer, "utf8") > 1_048_576) throw protocolError("openrouter: buffer SSE excedeu 1 MiB");
         let newline = buffer.indexOf("\n");
@@ -252,14 +331,22 @@ export class OpenRouterAdapter implements ProviderAdapter {
         }
       }
       if (!terminated) throw protocolError("openrouter: stream terminou antes de [DONE]");
+      } finally {
+        await reader.cancel().catch(() => undefined);
+        reader.releaseLock();
+      }
+      if (toolAccumulator.hasAny && !toolAccumulator.complete) throw protocolError("openrouter: tool call incompleta");
+      for (const call of toolAccumulator.calls()) emit({ type: "tool-call", call });
+      if (this.usageCollector !== undefined && recorded.totalTokens > 0) {
+        this.usageCollector.record({ ...recorded, provider: this.name, model: req.model });
+      }
+    } catch (error) {
+      if (timeoutError !== undefined) throw timeoutError;
+      throw error;
     } finally {
-      await reader.cancel().catch(() => undefined);
-      reader.releaseLock();
-    }
-    if (toolAccumulator.hasAny && !toolAccumulator.complete) throw protocolError("openrouter: tool call incompleta");
-    for (const call of toolAccumulator.calls()) emit({ type: "tool-call", call });
-    if (this.usageCollector !== undefined && recorded.totalTokens > 0) {
-      this.usageCollector.record({ ...recorded, provider: this.name, model: req.model });
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
+      clearTimeout(maxDurationTimer);
+      req.signal?.removeEventListener("abort", onAbort);
     }
   }
 

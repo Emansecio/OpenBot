@@ -69,7 +69,9 @@ function requestPurpose(request: AcceptanceRequest): string {
 }
 
 function turnProviderRequests(provider: AcceptanceProvider): AcceptanceRequest[] {
-  return provider.requests.filter((request) => requestPurpose(request) === "turn");
+  // Catalog discovery hits GET /models without a purpose header or JSON body;
+  // only the chat endpoint request is a real turn.
+  return provider.requests.filter((request) => request.url === "/v1/chat/completions" && requestPurpose(request) === "turn");
 }
 
 function isolatedPaths(workspacesRoot: string): IsolatedPaths {
@@ -139,7 +141,10 @@ function startAcceptanceProvider(
       return;
     }
 
-    if (options.failFirstStatus !== undefined && requests.length === 1) {
+    // Catalog discovery (GET /models) also lands in `requests`; the transient
+    // failure must hit the first chat completion, not the first request overall.
+    if (options.failFirstStatus !== undefined
+      && requests.filter((request) => request.url === "/v1/chat/completions").length === 1) {
       res.writeHead(options.failFirstStatus, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: "transient acceptance failure" } }));
       return;

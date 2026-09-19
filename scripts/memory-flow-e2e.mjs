@@ -7,11 +7,12 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { resolveElectronExecutable } from "./electron-executable.mjs";
+import { cleanE2eEnvironment, connectCdp, startE2eWatchdog } from "./e2e-runtime.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(process.env.OPENBOT_ROOT || fileURLToPath(new URL("..", import.meta.url)));
 const electronExe = resolveElectronExecutable(repoRoot);
-const electronMain = process.env.OPENBOT_ELECTRON_MAIN || join(repoRoot, "client", "extracted", "dist", "electron-main", "main.cjs");
+const electronMain = process.env.OPENBOT_ELECTRON_MAIN || join(repoRoot, "scripts", "openbot-electron.cjs");
 const rememberPrompt = "Lembre que minha campanha principal é Aurora.";
 const followupPrompt = "campanha principal Aurora";
 const memoryBlockMarker = "[[OPENBOT_UNTRUSTED_MEMORY_CONTEXT_BEGIN]]";
@@ -209,7 +210,8 @@ async function waitForCdpTarget(cdpUrl, timeoutMs = 20000) {
   return waitFor(
     async () => {
       try {
-        return await (await fetch(cdpUrl)).json();
+        // AbortSignal: fetch travado não pode passar do deadline do waitFor.
+        return await (await fetch(cdpUrl, { signal: AbortSignal.timeout(2000) })).json();
       } catch {
         return [];
       }
@@ -221,39 +223,7 @@ async function waitForCdpTarget(cdpUrl, timeoutMs = 20000) {
 }
 
 function connect(webSocketUrl) {
-  const socket = new WebSocket(webSocketUrl);
-  const pending = new Map();
-  let nextId = 1;
-  const ready = new Promise((resolve, reject) => {
-    socket.addEventListener("open", resolve, { once: true });
-    socket.addEventListener("error", reject, { once: true });
-  });
-  socket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
-    if (!message?.id || !pending.has(message.id)) return;
-    const { resolve, reject } = pending.get(message.id);
-    pending.delete(message.id);
-    if (message.error) reject(new Error(JSON.stringify(message.error)));
-    else resolve(message.result);
-  });
-  socket.addEventListener("close", () => {
-    for (const entry of pending.values()) entry.reject(new Error("CDP websocket closed"));
-    pending.clear();
-  });
-  const send = (method, params = {}) => {
-    const id = nextId++;
-    socket.send(JSON.stringify({ id, method, params }));
-    return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
-  };
-  return {
-    ready,
-    async close() {
-      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-        socket.close();
-      }
-    },
-    send,
-  };
+  return connectCdp(webSocketUrl);
 }
 
 async function stopProcessTree(child, exited) {
@@ -287,6 +257,10 @@ function createTestKeystore(dir) {
   return createKeystore({ dir, writeBackend: backend, legacyReadBackend: backend });
 }
 
+// Sessões Electron vivas — o watchdog global mata o que sobrar se o gate
+// travar num await que nunca resolve.
+const liveSessions = new Set();
+
 async function launchElectron({ label, evidenceDir, appData, localAppData, userData, dataRoot, gatewayPort, token }) {
   const cdpPort = await getFreePort();
   const stdoutPath = join(evidenceDir, `${label}.stdout.log`);
@@ -299,7 +273,7 @@ async function launchElectron({ label, evidenceDir, appData, localAppData, userD
       new Promise((resolve) => stderr.end(resolve)),
     ]);
   };
-  const env = { ...process.env };
+  const env = cleanE2eEnvironment();
   if (originalNodeEnv === undefined) delete env.NODE_ENV;
   else env.NODE_ENV = originalNodeEnv;
   env.APPDATA = appData;
@@ -336,7 +310,7 @@ async function launchElectron({ label, evidenceDir, appData, localAppData, userD
     await cdp.send("Page.enable");
     await cdp.send("DOM.enable");
     await cdp.send("Page.bringToFront");
-    return {
+    const session = {
       cdp,
       cdpPort,
       child,
@@ -345,6 +319,8 @@ async function launchElectron({ label, evidenceDir, appData, localAppData, userD
       stdoutPath,
       closeLogs,
     };
+    liveSessions.add(session);
+    return session;
   } catch (error) {
     const pid = child?.pid ?? null;
     await stopProcessTree(child, exited);
@@ -893,6 +869,16 @@ export async function runMemoryFlowE2e() {
   let firstHandle = null;
   let secondHandle = null;
   let firstSession = null;
+  const disarmWatchdog = startE2eWatchdog(
+    Number(process.env.OPENBOT_E2E_BUDGET_MS ?? 10 * 60_000),
+    async () => {
+      for (const session of liveSessions) {
+        try {
+          await stopProcessTree(session.child, session.exited);
+        } catch { /* best-effort */ }
+      }
+    },
+  );
   let secondSession = null;
   let provider = null;
   const report = {
@@ -1407,6 +1393,7 @@ export async function runMemoryFlowE2e() {
     }
     if (cleanupError) throw cleanupError;
   }
+  disarmWatchdog();
   console.log("MEMORY_FLOW_E2E_GREEN");
 }
 

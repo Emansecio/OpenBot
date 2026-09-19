@@ -384,6 +384,297 @@ describe("P2.6 resume protocol", () => {
     }
   });
 
+  it("keeps ordinary tool rounds out of the recovery allowance", async () => {
+    const restore = overrideProviderCapability("openai-compat", "openai-compatible", { resume: "cursor" });
+    try {
+      const store = createMemoryTranscriptStore();
+      const conversation = store.conversationStore!.ensureDefault("agent-a");
+      const registry = createProviderRegistry();
+      const calls = [
+        { id: "call-1", type: "function" as const, function: { name: "fixture_tool", arguments: '{"step":1}' } },
+        { id: "call-2", type: "function" as const, function: { name: "fixture_tool", arguments: '{"step":2}' } },
+      ];
+      let initialRounds = 0;
+      let executions = 0;
+      let resumes = 0;
+      registry.register({
+        name: "openai-compat",
+        async streamChat(_request, emit) {
+          initialRounds += 1;
+          if (initialRounds <= calls.length) {
+            const call = calls[initialRounds - 1]!;
+            emit({ type: "resume-cursor", cursor: `fixture-v1:multi:${initialRounds}` });
+            emit({ type: "tool-call", call });
+            return;
+          }
+          emit({ type: "resume-cursor", cursor: "fixture-v1:multi:3" });
+          throw Object.assign(new Error("fixture abort after tool rounds"), { name: "AbortError" });
+        },
+        async resumeChat(_request, cursor, emit) {
+          resumes += 1;
+          expect(cursor).toBe("fixture-v1:multi:3");
+          emit({ type: "delta", delta: "final" });
+        },
+      });
+      const runner = new TurnRunner({
+        store,
+        registry,
+        resolveProvider: () => ({ provider: "openai-compat", model: "openai-compatible" }),
+        tools: [{ type: "function", function: { name: "fixture_tool", description: "fixture", parameters: { type: "object" } } }],
+        toolExecutor: async () => {
+          executions += 1;
+          return { handled: true, ok: true, content: "ok", result: { ok: true } };
+        },
+      });
+
+      runner.sendPrompt({ agentId: "agent-a", prompt: "run two steps", clientNonce: "nonce-multi", conversationId: conversation.id });
+      await runner.flush("agent-a");
+      const user = store.getEntries("agent-a", conversation.id).find((entry) => entry.kind === "message" && entry.role === "user");
+      const turnId = user?.kind === "message" ? user.turnId : undefined;
+      expect(turnId).toBeTypeOf("string");
+      const before = store.findResumeCheckpoint!("agent-a", conversation.id, turnId!);
+      expect(before?.budget).toMatchObject({ providerAttemptsUsed: 3, toolRoundsUsed: 2, toolCallsUsed: 2 });
+      expect(before?.completedEffectIds).toHaveLength(2);
+
+      runner.resumePrompt("agent-a", turnId!, conversation.id);
+      await runner.flush("agent-a");
+
+      const after = store.findResumeCheckpoint!("agent-a", conversation.id, turnId!);
+      expect(resumes).toBe(1);
+      expect(executions).toBe(2);
+      expect(after?.budget.providerAttemptsUsed).toBe(4);
+      expect(after?.completedEffectIds).toEqual(before?.completedEffectIds);
+      const assistants = store.getEntries("agent-a", conversation.id).filter((entry) => entry.kind === "message" && entry.role === "assistant" && entry.turnId === turnId);
+      expect(assistants).toHaveLength(1);
+      expect(assistants[0]?.kind === "message" ? assistants[0].content : "").toBe("final");
+
+      runner.resumePrompt("agent-a", turnId!, conversation.id);
+      expect(resumes).toBe(1);
+      expect(store.getEntries("agent-a", conversation.id)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "notice", id: `notice:${turnId}:resume-resume_aborted` }),
+      ]));
+    } finally {
+      restore();
+    }
+  });
+
+  it("persists the hard resume ceiling after progress extends beyond the soft window", async () => {
+    const restore = overrideProviderCapability("openai-compat", "openai-compatible", { resume: "cursor" });
+    try {
+      const store = createMemoryTranscriptStore();
+      const conversation = store.conversationStore!.ensureDefault("agent-a");
+      const modelResolution = {
+        entry: {
+          id: "openai-compatible",
+          provider: "openai-compat",
+          displayName: "Fixture model",
+          // Keep the adaptive soft window at its default 16 rounds. The
+          // fixture then supplies a distinct successful result each round so
+          // the loop must extend it before the interrupted recovery point.
+          contextWindow: 64_000,
+          maxOutputTokens: 1_024,
+          maxRequestBytes: 1_048_576,
+          tokenizerStrategy: "estimated",
+          safetyMargin: 0.1,
+        },
+        capabilities: {
+          streaming: true,
+          tools: true,
+          images: false,
+          cancellation: "abort-signal",
+          authentication: "keystore-api-key",
+          usage: "stream-events",
+          resume: "cursor",
+          reasoning: false,
+        },
+        protocol: "chat",
+      } as never;
+      const calls = Array.from({ length: 17 }, (_, index) => ({
+        id: `long-call-${index + 1}`,
+        type: "function" as const,
+        function: { name: "fixture_tool", arguments: JSON.stringify({ step: index + 1 }) },
+      }));
+      let initialRounds = 0;
+      let executions = 0;
+      let finalizationCalls = 0;
+      let resumes = 0;
+      const resumedCursors: string[] = [];
+      const registry = createProviderRegistry();
+      registry.register({
+        name: "openai-compat",
+        async streamChat(request, emit) {
+          if (request.tools?.length === 0) {
+            finalizationCalls += 1;
+            emit({ type: "delta", delta: "unexpected soft-limit finalization" });
+            return;
+          }
+          initialRounds += 1;
+          if (initialRounds <= calls.length) {
+            const call = calls[initialRounds - 1]!;
+            emit({ type: "resume-cursor", cursor: `fixture-v1:long:${initialRounds}` });
+            emit({ type: "tool-call", call });
+            return;
+          }
+          emit({ type: "resume-cursor", cursor: "fixture-v1:long:18" });
+          throw Object.assign(new Error("fixture abort after extended progress"), { name: "AbortError" });
+        },
+        async resumeChat(_request, cursor, emit) {
+          resumes += 1;
+          resumedCursors.push(cursor);
+          emit({ type: "delta", delta: "final after extended progress" });
+        },
+      });
+      const runner = new TurnRunner({
+        store,
+        registry,
+        resolveProvider: () => ({ provider: "openai-compat", model: "openai-compatible", modelResolution }),
+        tools: [{ type: "function", function: { name: "fixture_tool", description: "fixture", parameters: { type: "object" } } }],
+        toolExecutor: async (context) => {
+          executions += 1;
+          return { handled: true, ok: true, content: `completed ${context.call.function.arguments}`, result: { ok: true } };
+        },
+      });
+
+      runner.sendPrompt({ agentId: "agent-a", prompt: "run beyond the soft window", clientNonce: "nonce-long-resume", conversationId: conversation.id });
+      await runner.flush("agent-a");
+      const user = store.getEntries("agent-a", conversation.id).find((entry) => entry.kind === "message" && entry.role === "user");
+      const turnId = user?.kind === "message" ? user.turnId : undefined;
+      expect(turnId).toBeTypeOf("string");
+      const before = store.findResumeCheckpoint!("agent-a", conversation.id, turnId!);
+      expect(finalizationCalls).toBe(0);
+      expect(initialRounds).toBe(18);
+      expect(executions).toBe(17);
+      expect(before).toMatchObject({ cursor: "fixture-v1:long:18", budget: { maxToolRounds: 128, maxToolCalls: 128, toolRoundsUsed: 17, toolCallsUsed: 17 } });
+      expect(before?.budget.toolRoundsUsed).toBeGreaterThan(16);
+      expect(before?.completedEffectIds).toHaveLength(17);
+
+      runner.resumePrompt("agent-a", turnId!, conversation.id);
+      await runner.flush("agent-a");
+      const after = store.findResumeCheckpoint!("agent-a", conversation.id, turnId!);
+      expect(resumes).toBe(1);
+      expect(resumedCursors).toEqual(["fixture-v1:long:18"]);
+      expect(executions).toBe(17);
+      expect(after?.budget).toMatchObject({ maxToolRounds: 128, maxToolCalls: 128, providerAttemptsUsed: 19, toolRoundsUsed: 17, toolCallsUsed: 17 });
+      expect(after?.completedEffectIds).toEqual(before?.completedEffectIds);
+      const assistants = store.getEntries("agent-a", conversation.id).filter((entry) => entry.kind === "message" && entry.role === "assistant" && entry.turnId === turnId);
+      expect(assistants).toHaveLength(1);
+      expect(assistants[0]?.kind === "message" ? assistants[0].content : "").toBe("final after extended progress");
+    } finally {
+      restore();
+    }
+  });
+
+  it("durably caps failed resume attempts before invoking the provider", async () => {
+    const restore = overrideProviderCapability("openai-compat", "openai-compatible", { resume: "cursor" });
+    try {
+      const store = createMemoryTranscriptStore();
+      const conversation = store.conversationStore!.ensureDefault("agent-a");
+      const scope = { agentId: "agent-a", conversationId: conversation.id, turnId: "turn-failed-resume", provider: "openai-compat", model: "openai-compatible" } as const;
+      store.append("agent-a", [{
+        kind: "message", id: "user-failed-resume", role: "user", content: "resume", timestampMs: 1,
+        streaming: false, turnId: scope.turnId, clientNonce: "nonce-failed-resume", provider: scope.provider, model: scope.model,
+      }], conversation.id);
+      store.append("agent-a", [{
+        kind: "message", id: "assistant-failed-resume", role: "assistant", content: "partial", timestampMs: 2,
+        streaming: false, turnId: scope.turnId, completionState: "interrupted",
+      }], conversation.id);
+      store.createResumeCheckpoint!({
+        checkpointId: "checkpoint-failed-resume", ...scope, cursor: "fixture-v1:failed:1", safeSequenceId: 1,
+        completedEffectIds: [], expiresAtMs: 9_999_999_999_999, version: 1,
+        budget: { maxProviderAttempts: 2, providerAttemptsUsed: 1, maxToolRounds: 8, toolRoundsUsed: 0, maxToolCalls: 16, toolCallsUsed: 0 },
+      });
+      let providerCalls = 0;
+      const registry = createProviderRegistry();
+      registry.register({
+        name: "openai-compat",
+        async streamChat() { throw new Error("initial stream must not run"); },
+        async resumeChat(_request, _cursor, emit) {
+          providerCalls += 1;
+          if (providerCalls === 2)
+            emit({ type: "resume-cursor", cursor: "fixture-v1:failed:2" });
+          throw new Error("fixture resume failure");
+        },
+      });
+      const runner = new TurnRunner({ store, registry, resolveProvider: () => ({ provider: scope.provider, model: scope.model }) });
+
+      runner.resumePrompt(scope.agentId, scope.turnId, scope.conversationId);
+      await runner.flush(scope.agentId);
+      expect(providerCalls).toBe(1);
+      expect(store.findResumeCheckpoint!(scope.agentId, scope.conversationId, scope.turnId)?.budget.providerAttemptsUsed).toBe(2);
+
+      runner.resumePrompt(scope.agentId, scope.turnId, scope.conversationId);
+      await runner.flush(scope.agentId);
+      expect(providerCalls).toBe(2);
+      expect(store.findResumeCheckpoint!(scope.agentId, scope.conversationId, scope.turnId)).toMatchObject({
+        cursor: "fixture-v1:failed:2",
+        budget: { providerAttemptsUsed: 3 },
+      });
+
+      runner.resumePrompt(scope.agentId, scope.turnId, scope.conversationId);
+      expect(providerCalls).toBe(2);
+      expect(store.getEntries(scope.agentId, scope.conversationId)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "notice", id: `notice:${scope.turnId}:resume-resume_budget_exhausted` }),
+      ]));
+    } finally {
+      restore();
+    }
+  });
+
+  it("consumes a reserved resume attempt when cancellation aborts the provider", async () => {
+    const restore = overrideProviderCapability("openai-compat", "openai-compatible", { resume: "cursor" });
+    try {
+      const store = createMemoryTranscriptStore();
+      const conversation = store.conversationStore!.ensureDefault("agent-a");
+      const scope = { agentId: "agent-a", conversationId: conversation.id, turnId: "turn-cancelled-resume", provider: "openai-compat", model: "openai-compatible" } as const;
+      store.append("agent-a", [{
+        kind: "message", id: "user-cancelled-resume", role: "user", content: "resume", timestampMs: 1,
+        streaming: false, turnId: scope.turnId, clientNonce: "nonce-cancelled-resume", provider: scope.provider, model: scope.model,
+      }], conversation.id);
+      store.append("agent-a", [{
+        kind: "message", id: "assistant-cancelled-resume", role: "assistant", content: "partial", timestampMs: 2,
+        streaming: false, turnId: scope.turnId, completionState: "interrupted",
+      }], conversation.id);
+      store.createResumeCheckpoint!({
+        checkpointId: "checkpoint-cancelled-resume", ...scope, cursor: "fixture-v1:cancelled:1", safeSequenceId: 1,
+        completedEffectIds: [], expiresAtMs: 9_999_999_999_999, version: 1,
+        budget: { maxProviderAttempts: 2, providerAttemptsUsed: 1, maxToolRounds: 8, toolRoundsUsed: 0, maxToolCalls: 16, toolCallsUsed: 0 },
+      });
+      let providerCalls = 0;
+      let started: () => void = () => undefined;
+      const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+      const registry = createProviderRegistry();
+      registry.register({
+        name: "openai-compat",
+        async streamChat() { throw new Error("initial stream must not run"); },
+        async resumeChat(request) {
+          providerCalls += 1;
+          started();
+          await new Promise<void>((_resolve, reject) => {
+            if (request.signal?.aborted) {
+              reject(Object.assign(new Error("cancelled"), { name: "AbortError" }));
+              return;
+            }
+            request.signal?.addEventListener("abort", () => reject(Object.assign(new Error("cancelled"), { name: "AbortError" })), { once: true });
+          });
+        },
+      });
+      const runner = new TurnRunner({ store, registry, resolveProvider: () => ({ provider: scope.provider, model: scope.model }) });
+
+      runner.resumePrompt(scope.agentId, scope.turnId, scope.conversationId);
+      await startedPromise;
+      runner.cancelPrompt(scope.agentId);
+      await runner.flush(scope.agentId);
+
+      expect(providerCalls).toBe(1);
+      expect(store.findResumeCheckpoint!(scope.agentId, scope.conversationId, scope.turnId)?.budget.providerAttemptsUsed).toBe(2);
+      expect(store.getEntries(scope.agentId, scope.conversationId)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "notice", id: `notice:${scope.turnId}:resume-ABORT_ERR` }),
+      ]));
+    } finally {
+      restore();
+    }
+  });
+
   it("records live tool usage and completed effect ids on the resume checkpoint", async () => {
     const restore = overrideProviderCapability("openai-compat", "openai-compatible", { resume: "cursor" });
     try {

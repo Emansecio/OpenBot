@@ -18,7 +18,7 @@
 import type { ProviderAdapter } from "./router.js";
 import type { LocalExecutionBroker } from "../execution/broker.js";
 import { OpenRouterAdapter, createCliProviderAdapter } from "./optional-adapters.js";
-import { OPENCODE_GO_MODELS, openCodeGoCatalogId } from "./opencode-go-models.js";
+import { OPENCODE_GO_MODELS, OPENCODE_ZEN_MODELS, openCodeGoCatalogId, openCodeZenCatalogId } from "./opencode-go-models.js";
 
 export type ProviderCapabilityCancellation = "abort-signal" | "process-tree" | "none";
 export type ProviderCapabilityAuthentication = "keystore-api-key" | "external-cli-session" | "none";
@@ -62,16 +62,19 @@ const KNOWN_CAPABILITIES: Record<string, Record<string, ProviderCapability>> = {
   xai: {
     "grok-4.6": { streaming: true, tools: true, images: true, cancellation: "abort-signal", authentication: "keystore-api-key", usage: "stream-events", resume: "none", reasoning: false },
   },
-  "opencode-go": Object.fromEntries(Object.keys(OPENCODE_GO_MODELS).map((id) => [openCodeGoCatalogId(id), {
+  "opencode-go": Object.fromEntries([
+    ...Object.keys(OPENCODE_GO_MODELS).map((id) => [openCodeGoCatalogId(id), OPENCODE_GO_MODELS[id]?.supportsVision === true]),
+    ...Object.keys(OPENCODE_ZEN_MODELS).map((id) => [openCodeZenCatalogId(id), OPENCODE_ZEN_MODELS[id]?.supportsVision === true]),
+  ].map(([catalogId, supportsVision]): [string, ProviderCapability] => [catalogId as string, {
     streaming: true,
     tools: true,
-    images: OPENCODE_GO_MODELS[id]?.supportsVision === true,
+    images: supportsVision === true,
     cancellation: "abort-signal",
     authentication: "keystore-api-key",
     usage: "stream-events",
     resume: "none",
     reasoning: false,
-  } satisfies ProviderCapability])),
+  }])),
   "openai-compat": {
     "openai-compatible": { streaming: true, tools: true, images: false, cancellation: "abort-signal", authentication: "keystore-api-key", usage: "stream-events", resume: "none", reasoning: false },
   },
@@ -118,7 +121,9 @@ export function resolveProviderCapabilities(provider: string, model?: string): P
   if (typeof provider !== "string" || typeof model !== "string" || model.length === 0) return CLOSED_CAPABILITY;
   const byModel = KNOWN_CAPABILITIES[provider];
   if (byModel === undefined) return CLOSED_CAPABILITY;
-  const capability = byModel[model];
+  // OpenAI-compatible: o contrato chat.completions é o mesmo para qualquer
+  // modelo servido pelo endpoint — a capacidade genérica cobre ids descobertos.
+  const capability = byModel[model] ?? (provider === "openai-compat" ? byModel["openai-compatible"] : undefined);
   if (capability === undefined) return CLOSED_CAPABILITY;
   const override = CAPABILITY_TEST_OVERRIDES.get(provider + "\u0000" + model);
   return override === undefined ? capability : { ...capability, ...override };

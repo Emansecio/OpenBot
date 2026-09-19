@@ -28,13 +28,14 @@ export function resolveCodexExecutable(): string {
 }
 
 export function createCodexCatalogSource(options: {
-  oauth: Pick<ProviderOAuthManager, "catalogConnectionKey" | "resolveCredential" | "refreshCredential">;
+  oauth: Pick<ProviderOAuthManager, "catalogConnectionKey" | "resolveCredential" | "refreshCredential" | "hasCredential">;
   stateDirectory: string;
   resolveExecutable?: () => string;
   spawnProcess?: (executable: string, args: string[], env: NodeJS.ProcessEnv) => ChildProcessWithoutNullStreams;
 }): CatalogSource {
   return {
     connectionKey: () => options.oauth.catalogConnectionKey("openai"),
+    hasConnection: () => options.oauth.hasCredential("openai"),
     async discover(signal) {
       const executable = (options.resolveExecutable ?? resolveCodexExecutable)();
       const credential = await options.oauth.resolveCredential("openai").catch(() => {

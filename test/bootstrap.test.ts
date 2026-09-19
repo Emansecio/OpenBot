@@ -179,21 +179,27 @@ describe("bootstrap (T1)", () => {
     const admission = new ProviderAdmissionScheduler({ maxActive: 1, maxQueued: 1 });
     const active = await admission.acquire("preexisting");
     const waiting = admission.acquire("queued").catch((error: unknown) => error);
-    const releaseTimer = setTimeout(() => active.release(), 10);
     try {
       await expect(startServer(occupied.port, {
         ...isolated(root),
         providerAdmission: admission,
       })).rejects.toThrow(/já está em uso/);
+      // O lease ativo segura a fila até o shutdown do listen-failure dispensar
+      // o waiter — liberar por timer corria contra a duração do bootstrap.
       expect(await waiting).toMatchObject({ code: "shutdown" });
+      active.release();
       await admission.drain();
       expect(admission.metrics()).toMatchObject({ active: 0, waiting: 0 });
       await expect(admission.acquire("after-failure")).rejects.toMatchObject({ code: "shutdown" });
     } finally {
-      clearTimeout(releaseTimer);
       active.release();
       await occupied.close();
-      rmSync(root, { recursive: true, force: true });
+      // O reject do listen dispara no timeout enquanto o cleanup ainda solta o
+      // handle do SQLite — no Windows o unlink pode chegar antes do close.
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try { rmSync(root, { recursive: true, force: true }); break; }
+        catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
+      }
     }
   });
 

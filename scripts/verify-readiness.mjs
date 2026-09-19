@@ -20,20 +20,29 @@ export const READINESS_GATES = Object.freeze([
     label: "sentinela de isolamento de paths",
     commands: [npmStep("keystore isolation", ["test", "--", "test/keystore.test.ts", "test/rpc-send.test.ts", "--maxWorkers=1", "--no-file-parallelism"])],
   },
-  { id: 2, label: "typecheck", commands: [npmStep("typecheck", ["run", "typecheck"])] },
+  { id: 2, label: "lint e typecheck", commands: [npmStep("lint", ["run", "lint"]), npmStep("typecheck", ["run", "typecheck"])] },
   {
     id: 3,
     label: "build e paridade de artefatos",
     commands: [
       npmStep("build", ["run", "build"]),
+      npmStep("provenance", ["run", "verify:provenance"]),
+      npmStep("renderer boundary", ["run", "verify:renderer-boundary"]),
       npmStep("backend artifacts", ["run", "verify:backend-artifacts"]),
       npmStep("client artifacts", ["run", "verify:client-artifacts"]),
     ],
   },
   {
     id: 4,
-    label: "suíte Vitest serial completa",
-    commands: [npmStep("full serial suite", ["test", "--", "--maxWorkers=1", "--no-file-parallelism"], { allowedSkipFiles: LIVE_SKIP_FILES, timeoutMs: 30 * 60_000 })],
+    label: "suíte Vitest padrão serial e recuperação de dados",
+    commands: [
+      npmStep("standard serial suite", ["test", "--", "--maxWorkers=1", "--no-file-parallelism"], { allowedSkipFiles: LIVE_SKIP_FILES, timeoutMs: 30 * 60_000 }),
+      npmStep("data recovery", ["exec", "--", "vitest", "run", "test/data-recovery-live.test.ts", "--reporter=json", "--maxWorkers=1", "--no-file-parallelism"], {
+        requiredTestFiles: ["test/data-recovery-live.test.ts"],
+        requireTestExecution: true,
+        resultFormat: "vitest-json",
+      }),
+    ],
   },
   {
     id: 5,
@@ -73,7 +82,12 @@ export const READINESS_GATES = Object.freeze([
     label: "DPAPI CurrentUser live e restart",
     commands: [
       npmStep("DPAPI artifacts", ["run", "verify:dpapi-artifacts"]),
-      npmStep("DPAPI live restart", ["test", "--", "test/keystore-dpapi-live.test.ts", "--maxWorkers=1", "--no-file-parallelism"], { env: { OPENBOT_RUN_DPAPI_LIVE: "1" } }),
+      npmStep("DPAPI live restart", ["exec", "--", "vitest", "run", "test/keystore-dpapi-live.test.ts", "--reporter=json", "--maxWorkers=1", "--no-file-parallelism"], {
+        env: { OPENBOT_RUN_DPAPI_LIVE: "1" },
+        requiredTestFiles: ["test/keystore-dpapi-live.test.ts"],
+        requireTestExecution: true,
+        resultFormat: "vitest-json",
+      }),
     ],
   },
   { id: 13, label: "inventário final", commands: [] },
@@ -101,24 +115,123 @@ export function parseVitestSkipEvidence(rawOutput) {
   return { count, files };
 }
 
-export function evaluateCommandResult({ exitCode, output, allowedSkipFiles = [] }) {
+function normalizeTestFile(file) {
+  return String(file ?? "").replaceAll("\\", "/").replace(/^\.\//u, "");
+}
+
+function parseVitestFileEvidence(rawOutput) {
+  const output = String(rawOutput ?? "").replace(ANSI, "");
+  const files = new Map();
+  for (const line of output.split(/\r?\n/u)) {
+    const match = line.match(/^\s*([✓×↓!])\s+(?:.*?\/)?(test[\\/][^\s(]+\.test\.ts)\b/u);
+    if (!match) continue;
+    const status = match[1] === "✓" ? "passed" : match[1] === "↓" ? "skipped" : "failed";
+    files.set(normalizeTestFile(match[2]), status);
+  }
+  return files;
+}
+
+function parseVitestTestSummary(rawOutput) {
+  const output = String(rawOutput ?? "").replace(ANSI, "");
+  let found = false;
+  let passed = 0;
+  let failed = 0;
+  let skipped = 0;
+  let todo = 0;
+  for (const line of output.split(/\r?\n/u)) {
+    if (!/^\s*Tests\b/u.test(line)) continue;
+    found = true;
+    for (const match of line.matchAll(/(\d+)\s+(passed|failed|skipped|todo)\b/gu)) {
+      const count = Number.parseInt(match[1], 10);
+      if (match[2] === "passed") passed = count;
+      else if (match[2] === "failed") failed = count;
+      else if (match[2] === "skipped") skipped = count;
+      else todo = count;
+    }
+  }
+  return { found, passed, failed, skipped, todo, executed: passed + failed };
+}
+
+function extractVitestFilePath(value) {
+  const normalized = String(value ?? "").replaceAll("\\", "/");
+  const marker = normalized.lastIndexOf("/test/");
+  if (marker >= 0) return normalized.slice(marker + 1);
+  return normalizeTestFile(normalized);
+}
+
+function parseVitestJsonEvidence(rawOutput) {
+  const output = String(rawOutput ?? "").replace(ANSI, "");
+  const start = output.indexOf("{");
+  const end = output.lastIndexOf("}");
+  if (start < 0 || end < start) return { valid: false };
+  let report;
+  try {
+    report = JSON.parse(output.slice(start, end + 1));
+  } catch {
+    return { valid: false };
+  }
+  if (!report || !Array.isArray(report.testResults)) return { valid: false };
+  const files = new Map();
+  const skippedFiles = [];
+  for (const result of report.testResults) {
+    const file = extractVitestFilePath(result?.name);
+    if (!file) continue;
+    const assertions = Array.isArray(result?.assertionResults) ? result.assertionResults : [];
+    const statuses = assertions.map((assertion) => String(assertion?.status ?? ""));
+    const status = statuses.includes("failed") ? "failed" : statuses.some((value) => value === "skipped" || value === "pending") ? "skipped" : statuses.includes("todo") ? "todo" : statuses.includes("passed") ? "passed" : "unknown";
+    files.set(file, status);
+    if (status === "skipped" || status === "todo") skippedFiles.push(file);
+  }
+  return {
+    valid: true,
+    files,
+    skippedFiles,
+    passed: Number(report.numPassedTests) || 0,
+    failed: Number(report.numFailedTests) || 0,
+    skipped: Number(report.numPendingTests) || 0,
+    todo: Number(report.numTodoTests) || 0,
+    executed: (Number(report.numPassedTests) || 0) + (Number(report.numFailedTests) || 0),
+  };
+}
+
+export function evaluateCommandResult({ exitCode, output, allowedSkipFiles = [], requiredTestFiles = [], requireTestExecution = false, resultFormat }) {
   const cleanOutput = String(output ?? "").replace(ANSI, "");
   const skipEvidence = parseVitestSkipEvidence(cleanOutput);
   const allowed = new Set(allowedSkipFiles.map((value) => value.replaceAll("\\", "/")));
-  const unexpectedSkipFiles = skipEvidence.files.filter((file) => !allowed.has(file));
+  const structuredEvidence = resultFormat === "vitest-json" ? parseVitestJsonEvidence(cleanOutput) : undefined;
+  const observedSkipFiles = structuredEvidence?.valid ? [...new Set([...skipEvidence.files, ...structuredEvidence.skippedFiles])] : skipEvidence.files;
+  const unexpectedSkipFiles = observedSkipFiles.filter((file) => !allowed.has(file));
+  const required = requiredTestFiles.map(normalizeTestFile).filter(Boolean);
+  const fileEvidence = structuredEvidence?.valid ? structuredEvidence.files : parseVitestFileEvidence(cleanOutput);
+  const missingRequiredTestFiles = required.filter((file) => !fileEvidence.has(file));
+  const requiredSkippedFiles = required.filter((file) => fileEvidence.get(file) === "skipped" || skipEvidence.files.includes(file));
+  const requiredUnpassedFiles = required.filter((file) => fileEvidence.get(file) !== "passed");
+  const testSummary = structuredEvidence?.valid ? structuredEvidence : parseVitestTestSummary(cleanOutput);
+  const skippedCount = structuredEvidence?.valid ? structuredEvidence.skipped : skipEvidence.count;
   const explicitBlocked = /["']status["']\s*:\s*["']BLOCKED_ENV["']/u.test(cleanOutput);
   const explicitRed = /["']status["']\s*:\s*["']RED["']/u.test(cleanOutput);
 
   if (exitCode === 2 || explicitBlocked) {
-    return { status: "BLOCKED_ENV", skipped: skipEvidence.count, unexpectedSkipFiles };
+    return { status: "BLOCKED_ENV", skipped: skippedCount, unexpectedSkipFiles };
   }
   if (exitCode !== 0 || explicitRed) {
-    return { status: "RED", skipped: skipEvidence.count, unexpectedSkipFiles };
+    return { status: "RED", skipped: skippedCount, unexpectedSkipFiles };
   }
-  if (skipEvidence.count > 0 && (skipEvidence.files.length === 0 || unexpectedSkipFiles.length > 0)) {
-    return { status: "RED", skipped: skipEvidence.count, unexpectedSkipFiles: skipEvidence.files.length === 0 ? ["unidentified-skip"] : unexpectedSkipFiles };
+  if (requireTestExecution && (resultFormat === "vitest-json" && !structuredEvidence?.valid || missingRequiredTestFiles.length > 0 || requiredSkippedFiles.length > 0 || requiredUnpassedFiles.length > 0 || testSummary.skipped > 0 || testSummary.todo > 0 || (!structuredEvidence?.valid && !testSummary.found) || testSummary.executed <= 0)) {
+    return {
+      status: "RED",
+      skipped: skippedCount,
+      unexpectedSkipFiles,
+      missingRequiredTestFiles,
+      requiredSkippedFiles,
+      requiredUnpassedFiles,
+      executedTests: testSummary.executed,
+    };
   }
-  return { status: "GREEN", skipped: skipEvidence.count, unexpectedSkipFiles: [] };
+  if (skippedCount > 0 && (observedSkipFiles.length === 0 || unexpectedSkipFiles.length > 0)) {
+    return { status: "RED", skipped: skippedCount, unexpectedSkipFiles: observedSkipFiles.length === 0 ? ["unidentified-skip"] : unexpectedSkipFiles };
+  }
+  return { status: "GREEN", skipped: skippedCount, unexpectedSkipFiles: [], executedTests: testSummary.executed };
 }
 
 async function main() {
@@ -202,14 +315,21 @@ async function main() {
   process.exitCode = status === "GREEN" ? 0 : status === "BLOCKED_ENV" ? 2 : 1;
 }
 
-async function runGate(gate, baseEnv) {
+export async function runGate(gate, baseEnv) {
   const commands = [];
   for (const step of gate.commands) {
     console.log(`[verify:readiness]   ${step.label}`);
     const started = Date.now();
     const child = await runNpm(step.args, { ...baseEnv, ...(step.env ?? {}) }, step.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-    const evaluation = evaluateCommandResult({ exitCode: child.exitCode, output: child.output, allowedSkipFiles: step.allowedSkipFiles });
-    commands.push({ label: step.label, status: evaluation.status, exitCode: child.exitCode, durationMs: Date.now() - started, skipped: evaluation.skipped, unexpectedSkipFiles: evaluation.unexpectedSkipFiles, timedOut: child.timedOut });
+    const evaluation = evaluateCommandResult({
+      exitCode: child.exitCode,
+      output: child.output,
+      allowedSkipFiles: step.allowedSkipFiles,
+      requiredTestFiles: step.requiredTestFiles,
+      requireTestExecution: step.requireTestExecution,
+      resultFormat: step.resultFormat,
+    });
+    commands.push({ label: step.label, status: evaluation.status, exitCode: child.exitCode, durationMs: Date.now() - started, skipped: evaluation.skipped, unexpectedSkipFiles: evaluation.unexpectedSkipFiles, missingRequiredTestFiles: evaluation.missingRequiredTestFiles ?? [], requiredSkippedFiles: evaluation.requiredSkippedFiles ?? [], requiredUnpassedFiles: evaluation.requiredUnpassedFiles ?? [], executedTests: evaluation.executedTests, timedOut: child.timedOut });
     if (evaluation.status !== "GREEN") {
       console.error(`[verify:readiness]   ${step.label} ${evaluation.status}`);
       return { id: gate.id, label: gate.label, status: evaluation.status, commands };

@@ -4,19 +4,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const fsRace = vi.hoisted(() => ({ file: null as string | null, winningToken: "" }));
+const fsRace = vi.hoisted(() => ({ file: null as string | null, winningToken: "", mode: undefined as Parameters<typeof import("node:fs").openSync>[2] }));
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
-    writeFileSync: (...args: unknown[]) => {
-      const [file, , options] = args;
-      if (typeof file === "string" && file === fsRace.file && typeof options === "object" && options !== null && Reflect.get(options, "flag") === "wx") {
+    openSync: (...args: Parameters<typeof actual.openSync>) => {
+      const [file, flags, mode] = args;
+      if (typeof file === "string" && file === fsRace.file && flags === "wx") {
+        fsRace.mode = mode;
         fsRace.file = null;
         actual.writeFileSync(file, `${fsRace.winningToken}\n`, "utf8");
+        throw Object.assign(new Error("another process won"), { code: "EEXIST" });
       }
-      return Reflect.apply(actual.writeFileSync, actual, args);
+      return actual.openSync(...args);
     },
   };
 });
@@ -25,6 +27,8 @@ import { loadOrCreateGatewayToken, resolveGatewayTokenPath, tokenFromRequest } f
 
 const dirs: string[] = [];
 afterEach(() => {
+  fsRace.file = null;
+  fsRace.mode = undefined;
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -39,6 +43,7 @@ describe("gateway auth", () => {
     fsRace.winningToken = "token-created-by-competing-process";
 
     expect(loadOrCreateGatewayToken(file)).toBe(fsRace.winningToken);
+    expect(fsRace.mode).toBe(0o600);
     expect(readFileSync(file, "utf8").trim()).toBe(fsRace.winningToken);
   });
 

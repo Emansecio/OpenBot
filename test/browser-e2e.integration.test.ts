@@ -79,6 +79,26 @@ describe("browser e2e gate", () => {
     await expect(execute({ operation: "browser.upload", selector: "#upload", path: "Documents/input.txt" }))
       .resolves.toMatchObject({ ok: true });
 
+    // Inventory is read-only; export/repair still drain browser work without
+    // erasing the persistent session.
+    for (const [method, extra, expectsDrained] of [
+      ["getWorkspaceInventory", {}, false],
+      ["exportAgentHome", { destination: join(root, "workspace-home.json") }, true],
+      ["repairAgentHome", {}, true],
+    ] as const) {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/${method}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agentId: "workspace-agent", ...extra }),
+      });
+      expect(response.status, method).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: true });
+      expect(handle.browserSessionManager!.activeLeaseCount).toBe(expectsDrained ? 0 : 1);
+      if (!expectsDrained) continue;
+      await expect(execute({ operation: "browser.open", url: `http://${hostname}:${port}/app` })).resolves.toMatchObject({ ok: true });
+      await expect(execute({ operation: "browser.snapshot" }))
+        .resolves.toMatchObject({ ok: true, snapshot: { text: expect.stringContaining("persisted-workspace") } });
+    }
+
     // Install only a controlled local package, with scripts and registry access disabled.
     await expect(execute({ operation: "file.mkdir", path: "Projects/fixture-package" })).resolves.toMatchObject({ ok: true });
     for (const [path, content] of Object.entries({

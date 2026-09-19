@@ -1,4 +1,5 @@
 import type { ConfigStore } from "../config/store.js";
+import { createPromptQueue, promptPayloadDigest, type PromptQueueStore } from "../store/prompt-queue.js";
 import type { Conversation } from "../conversations/store.js";
 import type { LocalExecutionBroker } from "../execution/broker.js";
 import type { ToolCallExecutor, ToolLoopOptions, ToolLoopResumableEffects } from "../execution/tool-loop.js";
@@ -60,6 +61,122 @@ export interface TranscriptInteractionDecision {
 }
 
 export type TurnAttemptPhase = "preparing" | "provider-pending" | "streaming";
+/**
+ * Detalhe ao vivo do turno em execução. Cada valor corresponde a um
+ * acontecimento real: montagem local (`preparing`), espera por vaga na
+ * admissão (`awaiting-slot`), requisição entregue ao transporte do provedor
+ * (`awaiting-provider`), fragmentos do provedor (`receiving`) e execução de
+ * ferramenta (`tool`). Polling, heartbeat da conexão e a atualização visual do
+ * contador NUNCA avançam esta fase.
+ */
+export type TurnExecutionPhase = "preparing" | "awaiting-slot" | "awaiting-provider" | "receiving" | "tool";
+/** Natureza do último acontecimento real do turno. */
+export type TurnActivityKind = "provider-request" | "provider-stream" | "tool" | "reasoning";
+export interface TurnExecution {
+    phase: TurnExecutionPhase;
+    startedAtMs: number;
+    phaseChangedAtMs: number;
+    /** Instante do último acontecimento real — nunca de polling, heartbeat ou renderização. */
+    lastActivityAtMs?: number;
+    lastActivity?: TurnActivityKind;
+    /** Rótulo legível (já sanitizado por `toolCallSummary`) enquanto `phase === "tool"`. */
+    toolName?: string;
+}
+/** Resultado confirmado do último turno encerrado de um agente. */
+export interface LastTurnOutcome {
+    turnId: string;
+    conversationId?: string;
+    outcome: "success" | "error" | "aborted";
+    finishedAtMs: number;
+}
+/** A fase ao vivo é um refinamento da fase durável já existente — não um segundo sistema. */
+export function durablePhaseFor(phase: TurnExecutionPhase): TurnAttemptPhase {
+    if (phase === "preparing") return "preparing";
+    return phase === "receiving" || phase === "tool" ? "streaming" : "provider-pending";
+}
+/**
+ * Ações de recuperação que o backend pode oferecer para uma falha.
+ * `retry` repete o pedido; `inspect` só orienta conferir resultados, porque
+ * repetir poderia duplicar operações já realizadas ou de resultado incerto.
+ * Lista vazia = nenhuma recuperação automática segura.
+ */
+export type RecoveryAction = "retry" | "inspect";
+export interface PromptRecoveryFailure {
+    /** Identificador real da entry de falha — nunca a posição ou o texto exibido. */
+    entryId: string;
+    turnId: string;
+    actions: RecoveryAction[];
+    /**
+     * Identificadores reais das entries que pertencem a esse turno. O cliente
+     * localiza o histórico por identidade do turno, sem depender da posição das
+     * linhas visíveis nem de varredura de texto.
+     */
+    historyEntryIds: string[];
+}
+export interface PromptRecoveryResult {
+    conversationId: string | null;
+    failure: PromptRecoveryFailure | null;
+}
+/** Mensagem autoritativa (e única) do caso "conferir resultados". */
+export const RECOVERY_INSPECT_MESSAGE = "Este turno já executou ferramentas ou foi interrompido durante uma operação. Confira os resultados e possíveis efeitos e envie uma nova instrução para continuar.";
+
+type FailureNotice = Extract<TranscriptEntry, { kind: "notice" }>;
+type FailureMessage = Extract<TranscriptEntry, { kind: "message" }>;
+/** Falha atual de uma conversa, já resolvida por identidade (nunca por texto). */
+interface FailureCandidate {
+    conversationId?: string;
+    failure: FailureNotice;
+    failureTurnId: string;
+    provider: string;
+    model: string;
+    entries: readonly TranscriptEntry[];
+    user?: FailureMessage;
+    originalNonce?: string;
+}
+type FailureRecoveryAssessment =
+    | { kind: "none"; reason: "absent" | "archived" | "advanced" | "message" | "origin"; candidate?: FailureCandidate }
+    | { kind: "inspect"; candidate: FailureCandidate }
+    | { kind: "retry"; candidate: FailureCandidate & { user: FailureMessage } };
+
+/** Teto do histórico devolvido para localização por identidade. */
+export const MAX_RECOVERY_HISTORY_ENTRIES = 40;
+
+/** Turno declarado pela entry, quando o contrato o expõe. */
+function entryTurnId(entry: TranscriptEntry): unknown {
+    switch (entry.kind) {
+        case "message":
+        case "user-attachment":
+        case "notice":
+        case "event":
+        case "widget":
+        case "tool-request":
+        case "tool-call":
+            return entry.turnId;
+        default:
+            return undefined;
+    }
+}
+
+/**
+ * Entries que pertencem ao turno da falha, resolvidas por identidade: o
+ * `turnId` do próprio turno ou o `localToolCallId` prefixado por ele. Nunca por
+ * posição na conversa.
+ */
+function turnHistoryEntryIds(candidate: FailureCandidate): string[] {
+    const ids: string[] = [];
+    for (const entry of candidate.entries) {
+        const localToolCallId = entry.kind === "tool-call" ? entry.localToolCallId : undefined;
+        const belongs = entry.kind === "tool-call"
+            ? typeof localToolCallId === "string" && localToolCallId.startsWith(`${candidate.failureTurnId}\u0000`)
+            : entryTurnId(entry) === candidate.failureTurnId;
+        if (!belongs) continue;
+        const id = entry.id;
+        if (typeof id !== "string" || id.length === 0) continue;
+        ids.push(id);
+        if (ids.length >= MAX_RECOVERY_HISTORY_ENTRIES) break;
+    }
+    return ids;
+}
 
 export interface TurnAttemptRecord {
     turnId: string;
@@ -143,6 +260,7 @@ export interface ConversationStoreLike {
 }
 
 export interface TranscriptStore {
+    promptQueue?: PromptQueueStore;
     getEntries(agentId: string, conversationId?: string): readonly TranscriptEntry[];
     append(agentId: string, entries: readonly TranscriptEntry[], conversationId?: string, consumeStagedAttachments?: boolean): void;
     beginTurnAttempt(attempt: TurnAttemptRecord): void;
@@ -242,6 +360,8 @@ interface TurnMetadata extends ResolvedProvider {
     clientNonce?: string;
     retryOfClientNonce?: string;
     phase: TurnAttemptPhase;
+    /** Estado ao vivo exposto por `promptStatus`; compartilhado com `currentTurns`. */
+    execution?: TurnExecution;
     responseLimited?: boolean;
     contextNoticePublished?: boolean;
     streamController?: AbortController;
@@ -259,6 +379,8 @@ interface TurnMetadata extends ResolvedProvider {
 interface LiveAssistantState {
     id: string;
     content: string;
+    /** UTF-8 byte length of `content`, incremented per accepted delta. */
+    byteCount: number;
     lastPublishMs: number;
     lastPersistMs: number;
     limited: boolean;
@@ -350,16 +472,17 @@ import { createHash, randomUUID } from "node:crypto";
 import { isCatalogProvider, type ModelResolution } from "../providers/model-catalog.js";
 import { MODEL_CATALOG } from "../config/models.js";
 import { makeToolCallEntry, stableToolCallId, toolCallLocalId, toolCallSummary } from "../execution/tool-card.js";
-import { MAX_TOOL_ROUNDS, runToolLoop } from "../execution/tool-loop.js";
+import { resolveToolLoopBudget, runToolLoop } from "../execution/tool-loop.js";
+import { BROWSER_TOOL_NAMES, selectTurnProviderTools, WHATSAPP_TOOL_NAME } from "../execution/home-tools.js";
 import { previewFromText } from "./activity.js";
 import { MAX_LIVE_RESPONSE_BYTES, STREAM_PERSIST_INTERVAL_MS, STREAM_PUBLISH_INTERVAL_MS, splitTranscriptFragments, } from "./stream-state.js";
 import { DEFAULT_SYSTEM_PROMPT, resolveAgentInference } from "./identity.js";
 import { MAX_ATTACHMENTS_PER_TURN, formatAttachmentContext } from "./attachments.js";
 import { composeToolExecutors } from "../integrations/shared-tools.js";
-import { buildMemorySystemGuidance, ContextAssembler, CONTEXT_HARD_LIMIT_BYTES, CONVERSATION_COMPACTION_SEQUENCE_INTERVAL, createMemoryForgetTool, createMemoryRememberTool, createMemorySearchTool, executeMemoryForgetTool, executeMemoryRememberTool, executeMemorySearchTool, isContextOverflowError, isExplicitMemoryIntent, MEMORY_FORGET_TOOL_NAME, MEMORY_REMEMBER_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME, OPENBOT_UNTRUSTED_MEMORY_CONTEXT_BEGIN, OPENBOT_UNTRUSTED_MEMORY_CONTEXT_NOTE, planReflectionJob, shouldCompactConversationContext, } from "../memory/context.js";
+import { buildMemorySystemGuidance, ContextAssembler, CONTEXT_HARD_LIMIT_BYTES, CONVERSATION_COMPACTION_SEQUENCE_INTERVAL, createMemoryForgetTool, createMemoryRememberTool, createMemorySearchTool, executeMemoryForgetTool, executeMemoryRememberTool, executeMemorySearchTool, isContextOverflowError, isExplicitMemoryForgetIntent, isExplicitMemoryIntent, MEMORY_FORGET_TOOL_NAME, MEMORY_REMEMBER_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME, OPENBOT_UNTRUSTED_MEMORY_CONTEXT_BEGIN, OPENBOT_UNTRUSTED_MEMORY_CONTEXT_NOTE, planReflectionJob, shouldCompactConversationContext, } from "../memory/context.js";
 import { providerSupportsImages, providerSupportsReasoning, resolveProviderCapabilities } from "../providers/capabilities.js";
 import { sanitizeDisplayFilename } from "../attachments/staging.js";
-import { computeModelContextBudget, classifyProviderMessageTokens, createContextTokenizer, fitProviderMessagesToByteBudget, prepareProviderRound, resolveModelCapabilities, selectCompleteMessageGroups, type ModelContextBudget, } from "../memory/model-context.js";
+import { computeModelContextBudget, classifyProviderMessageTokens, createContextTokenizer, fitProviderMessagesToByteBudget, prepareProviderRound, providerMessagesIdentical, resolveModelCapabilities, selectCompleteMessageGroups, type ModelContextBudget, } from "../memory/model-context.js";
 const DEFAULT_TRANSCRIPT_PAGE_LIMIT = 50;
 const MAX_TRANSCRIPT_PAGE_LIMIT = 1000;
 const SNAPSHOT_PAGE_LIMIT = 500;
@@ -368,6 +491,7 @@ import { RpcError, SSE_MAX_FRAME_BYTES } from "../server/gateway.js";
 import { transcriptAgentRef, transcriptUserRef, normalizeTranscriptEntry, } from "../shared/contracts.js";
 /** Implementação em memória do `TranscriptStore` (T10 — persistência mínima). */
 export function createMemoryTranscriptStore(): TranscriptStore {
+    const promptQueue = createPromptQueue();
     const DEFAULT_CONVERSATION = "__default__";
     const byAgent = new Map<string, Map<string, TranscriptEntry[]>>();
     const acceptedNonces = new Map<string, Map<string, Set<string>>>();
@@ -616,6 +740,7 @@ export function createMemoryTranscriptStore(): TranscriptStore {
             return conversation;
         },
         clear(agentId) {
+            promptQueue.clear(agentId);
             conversationsByAgent.delete(agentId);
             byAgent.delete(agentId);
             acceptedNonces.delete(agentId);
@@ -633,6 +758,7 @@ export function createMemoryTranscriptStore(): TranscriptStore {
     };
     return {
         conversationStore: memoryConversationStore,
+        promptQueue,
         getEntries(agentId, conversationId) {
             return mergeLive(agentId, conversationId, entriesFor(agentId, conversationId));
         },
@@ -839,6 +965,7 @@ export function createMemoryTranscriptStore(): TranscriptStore {
         },
         clear(agentId) {
             byAgent.delete(agentId);
+            promptQueue.clear(agentId);
             acceptedNonces.delete(agentId);
             acceptedNonceOrder.delete(agentId);
             completedNonces.delete(agentId);
@@ -1426,6 +1553,11 @@ function requestSerializerFor(
  * (snapshot/appended) com os shapes exatos do contrato.
  */
 export class TurnRunner {
+    private readonly scheduledPrompts = new Set<string>();
+    private readonly durablePromptSlots = new Set<string>();
+    private readonly currentTurns = new Map<string, { turnId: string; conversationId?: string; execution?: TurnExecution }>();
+    /** Último turno encerrado por agente: confirmação factual para a interface. */
+    private readonly lastTurns = new Map<string, LastTurnOutcome>();
     private readonly pendingAcceptances = new Map<string, Promise<{ accepted: true }>>();
     private readonly store: TranscriptStore;
     private readonly conversationStore?: ConversationStoreLike;
@@ -1452,6 +1584,8 @@ export class TurnRunner {
     private readonly liveAssistant = new Map<string, LiveAssistantState>();
     /** Independent ordered namespaces: one stable default stream plus one per live entry. */
     private readonly transcriptOrderByKey = new Map<string, { epoch: string; sequence: number }>();
+    private transcriptSnapshotDeferDepth = 0;
+    private readonly deferredTranscriptSnapshots = new Map<string, { agentId: string; conversationId?: string }>();
     /** P2.4: independent ordered namespace for sanitized reasoning progress (never persisted). */
     private readonly reasoningOrderByKey = new Map<string, { epoch: string; sequence: number }>();
     /** Fila exclusiva por agente (encadeamento de promises — serialização). */
@@ -1570,7 +1704,10 @@ export class TurnRunner {
             return;
         const currentSummary = memoryStore.getSummary(agentId, conversationId, true);
         const summaryBoundary = currentSummary?.throughSequenceId ?? -1;
-        const summaryRequested = contextPressure || throughSequenceId - summaryBoundary >= CONVERSATION_COMPACTION_SEQUENCE_INTERVAL;
+        const summaryRequested = contextPressure || transcript.getRecentEntries(agentId, {
+            afterSequenceId: Math.max(0, summaryBoundary),
+            limit: CONVERSATION_COMPACTION_SEQUENCE_INTERVAL,
+        }, conversationId).length >= CONVERSATION_COMPACTION_SEQUENCE_INTERVAL;
         const plan = planReflectionJob(memoryContext.mode, memoryContext.conversation, prompt, summaryRequested);
         if (plan === null)
             return;
@@ -1626,16 +1763,137 @@ export class TurnRunner {
         return epoch;
     }
     /**
-     * Aceita um `sendPrompt` → `{accepted:true}`. O ack é IMEDIATO e DURÁVEL:
-     * o nonce entra no ledger de aceitação ANTES do turno rodar — retry do mesmo
-     * nonce (mesmo concorrente, durante o turno em curso) retorna accepted SEM
-     * rodar de novo. O turno roda em background na fila exclusiva do agente.
+     * A primeira mensagem confirma após o echo persistido; mensagens aguardando
+     * confirmam após gravar o pedido recuperável. Ambas usam o mesmo executor FIFO.
      */
     sendPrompt(raw: SandSendPromptArgs): Promise<{ accepted: true }> {
         const args = normalizeSendPrompt(raw);
         delete args.retryOfClientNonce;
         delete args.retryFailureTurnId;
         return this.acceptPrompt(args, undefined, undefined, { kind: "user" });
+    }
+
+    /** Recover only requests that never began; interrupted turns require explicit retry. */
+    recoverQueuedPrompts(): void {
+        for (const item of this.store.promptQueue?.list() ?? []) {
+            const { args } = item;
+            if (this.config && !this.config.snapshot().agents.some(agent => agent.id === args.agentId)) {
+                this.store.promptQueue!.transition(args.agentId, args.conversationId!, args.clientNonce!, "queued", "cancelled");
+                continue;
+            }
+            try { this.validate(args); this.scheduleDurablePrompt(args); }
+            catch { this.store.promptQueue!.transition(args.agentId, args.conversationId!, args.clientNonce!, "queued", "interrupted"); }
+        }
+    }
+
+    private scheduleDurablePrompt(identity: Pick<SandSendPromptArgs, "agentId" | "conversationId" | "clientNonce">): void {
+        const queue = this.store.promptQueue!;
+        const { agentId, conversationId, clientNonce } = identity;
+        const key = JSON.stringify([agentId, conversationId, clientNonce]);
+        const generation = this.agentGenerations.get(agentId) ?? 0;
+        if (this.scheduledPrompts.has(key)) return;
+        this.scheduledPrompts.add(key);
+        this.durablePromptSlots.add(key);
+        this.pendingCounts.set(agentId, (this.pendingCounts.get(agentId) ?? 0) + 1);
+        this.enqueue(agentId, async () => {
+            try {
+                if (this.shuttingDown || this.fencedAgents.has(agentId)) return;
+                const pending = queue.get(agentId, conversationId!, clientNonce!);
+                if (!pending || pending.state !== "queued") return;
+                this.resolveConversation(agentId, conversationId, true);
+                if (!queue.transition(agentId, conversationId!, clientNonce!, "queued", "running")) return;
+                const args = pending.args;
+                let inference = pending.inference;
+                const catalog = this.config?.modelCatalog;
+                if (catalog && isCatalogProvider(inference.provider) && !inference.modelResolution) {
+                    await catalog.synchronize(inference.provider);
+                    inference = { ...inference, modelResolution: catalog.resolve(inference.provider, inference.model, inference.reasoningEffort, inference.serviceTier) };
+                }
+                if (this.shuttingDown || this.fencedAgents.has(agentId) || (this.agentGenerations.get(agentId) ?? 0) !== generation) {
+                    queue.transition(agentId, conversationId!, clientNonce!, "running", "interrupted");
+                    return;
+                }
+                const result = await this.runTurn(args, inference, { kind: "user" });
+                queue.transition(agentId, conversationId!, clientNonce!, "running", result.outcome === "success" && result.echoPersisted ? "completed" : "interrupted");
+            } catch (error) {
+                queue.transition(agentId, conversationId!, clientNonce!, "queued", "interrupted");
+                queue.transition(agentId, conversationId!, clientNonce!, "running", "interrupted");
+                this.appendAndPublish(agentId, [{ kind: "notice", level: "error", text: `Mensagem da fila não executada: ${error instanceof Error ? error.message : String(error)}` }], conversationId);
+            } finally {
+                this.scheduledPrompts.delete(key);
+                this.releaseDurablePromptSlot(agentId, conversationId!, clientNonce!);
+            }
+        }, undefined, conversationId);
+    }
+
+    private releaseDurablePromptSlot(agentId: string, conversationId: string, nonce: string): void {
+        if (!this.durablePromptSlots.delete(JSON.stringify([agentId, conversationId, nonce]))) return;
+        const count = (this.pendingCounts.get(agentId) ?? 1) - 1;
+        if (count > 0) this.pendingCounts.set(agentId, count); else this.pendingCounts.delete(agentId);
+        const isRunning = count > 0 || this.turnControllers.has(agentId) || this.preparingCatalog.has(agentId);
+        if (this.activity && this.activity.get(agentId).isRunning !== isRunning) this.activity.patch(agentId, { isRunning });
+        this.wakeMemoryWorker?.();
+    }
+
+    cancelCurrentTurn(agentId: string, conversationId: string, turnId: string): { cancelled: boolean; agentIds: string[] } {
+        const current = this.currentTurns.get(agentId);
+        if (!current || current.turnId !== turnId || current.conversationId !== conversationId)
+            throw new RpcError(409, "O turno mudou. Atualize o estado antes de cancelar.");
+        const controller = this.turnControllers.get(agentId);
+        if (!controller) return { cancelled: false, agentIds: [] };
+        controller.abort();
+        return { cancelled: true, agentIds: [agentId] };
+    }
+
+    removeQueuedPrompt(agentId: string, conversationId: string, nonce: string): { cancelled: boolean; agentIds: string[] } {
+        // Cancellation is safe for an archived conversation, but ownership remains mandatory.
+        if (this.conversationStore && !this.conversationById(agentId, conversationId)) throw new RpcError(404, "Conversa não encontrada.");
+        if (!this.conversationStore) this.store.validateConversation?.(agentId, conversationId);
+        const queue = this.store.promptQueue;
+        const item = queue?.get(agentId, conversationId, nonce);
+        if (!item) throw new RpcError(404, "Mensagem da fila não encontrada");
+        if (item.state === "cancelled") return { cancelled: true, agentIds: [agentId] };
+        if (item.state !== "queued" && item.state !== "interrupted") throw new RpcError(409, "A mensagem já saiu da fila");
+        if (!queue!.transition(agentId, conversationId, nonce, item.state, "cancelled")) throw new RpcError(409, "A mensagem já saiu da fila");
+        this.releaseDurablePromptSlot(agentId, conversationId, nonce);
+        return { cancelled: true, agentIds: [agentId] };
+    }
+
+    getQueuedPrompt(agentId: string, conversationId: string, nonce: string): SandSendPromptArgs {
+        this.validateAcceptanceConversation(agentId, conversationId);
+        const item = this.store.promptQueue?.get(agentId, conversationId, nonce);
+        if (!item || item.state !== "interrupted" || item.compacted) throw new RpcError(409, "A mensagem não está disponível para revisão.");
+        const echo = this.store.findUserEchoByNonce ? this.store.findUserEchoByNonce(agentId, nonce, conversationId)
+            : this.store.getEntries(agentId, conversationId).find(entry => entry.kind === "message" && entry.role === "user" && entry.clientNonce === nonce);
+        if (echo) {
+            throw new RpcError(409, "A mensagem já iniciou um turno. Confira os resultados no histórico antes de enviar uma nova instrução.");
+        }
+        return structuredClone(item.args);
+    }
+
+    reviseQueuedPrompt(raw: SandSendPromptArgs, originalNonce: string): { accepted: true } {
+        const args = normalizeSendPrompt(raw);
+        delete args.retryOfClientNonce;
+        delete args.retryFailureTurnId;
+        this.validate(args);
+        const { agentId, conversationId, clientNonce } = args;
+        if (!conversationId || !clientNonce || !originalNonce || clientNonce === originalNonce) throw new RpcError(400, "Identidade da revisão incompleta.");
+        this.validateAcceptanceConversation(agentId, conversationId);
+        if (this.shuttingDown || this.fencedAgents.has(agentId)) throw new RpcError(409, "O bot está em encerramento.");
+        if (this.config && !this.config.snapshot().agents.some(agent => agent.id === agentId)) throw new RpcError(404, "Bot não encontrado.");
+        const queue = this.store.promptQueue;
+        if (!queue) throw new RpcError(503, "Fila durável indisponível.");
+        const existing = queue.get(agentId, conversationId, clientNonce);
+        if (!existing) {
+            this.getQueuedPrompt(agentId, conversationId, originalNonce);
+            if ((this.pendingCounts.get(agentId) ?? 0) >= MAX_SEND_QUEUE_PER_AGENT) throw new RpcError(429, "sendPrompt: fila cheia para o agente");
+            if (args.replyContext) this.resolveReply(agentId, args.replyContext, conversationId);
+        }
+        let item;
+        try { item = queue.revise(agentId, conversationId, originalNonce, args); }
+        catch (error) { throw new RpcError(409, error instanceof Error ? error.message : "A revisão não pôde ser salva."); }
+        if (item.state === "queued") this.scheduleDurablePrompt(item.args);
+        return { accepted: true };
     }
 
     /** Internal A2A entrypoint; unlike the public RPC it never grants user authority. */
@@ -1764,7 +2022,7 @@ export class TurnRunner {
             const prepared = prepareProviderRound({
                 model: inference.model,
                 modelResolution: inference.modelResolution,
-                purpose: "turn",
+                purpose: "kickstart",
                 sessionId: createHash("sha256").update(JSON.stringify([agentId, "kickstart", clientNonce])).digest("hex"),
                 system: this.systemPromptFn(agentId),
                 messages: [{ role: "user", content: KICKSTART_INTERNAL_PROMPT }],
@@ -1844,6 +2102,28 @@ export class TurnRunner {
             cursor = page.nextCursor;
         } while (cursor !== undefined);
         return null;
+    }
+    /**
+     * Defers terminal-state snapshots while a batch is in flight so a round with
+     * several tool completions emits one resync frame instead of one per tool.
+     */
+    private deferTranscriptSnapshots(): void {
+        this.transcriptSnapshotDeferDepth += 1;
+    }
+    private flushTranscriptSnapshots(): void {
+        this.transcriptSnapshotDeferDepth -= 1;
+        if (this.transcriptSnapshotDeferDepth > 0) return;
+        const pending = [...this.deferredTranscriptSnapshots.values()];
+        this.deferredTranscriptSnapshots.clear();
+        for (const item of pending)
+            this.publishTranscriptSnapshot(item.agentId, item.conversationId);
+    }
+    private publishOrDeferTranscriptSnapshot(agentId: string, conversationId?: string): void {
+        if (this.transcriptSnapshotDeferDepth === 0) {
+            this.publishTranscriptSnapshot(agentId, conversationId);
+            return;
+        }
+        this.deferredTranscriptSnapshots.set(`${agentId}${conversationId ?? ""}`, { agentId, conversationId });
     }
     publishTranscriptSnapshot(agentId: string, conversationId?: string): void {
         const page = this.store.openDurableAgentTail !== undefined
@@ -1940,6 +2220,10 @@ export class TurnRunner {
         }
         if (clientNonce !== undefined && this.conversationStore !== undefined) {
             const requested = pinnedConversationId ?? args.conversationId;
+            if (requested) {
+                const retained = this.store.promptQueue?.get(agentId, requested, clientNonce);
+                if (retained && retained.digest !== promptPayloadDigest(args)) throw new RpcError(409, "Nonce already belongs to a different prompt");
+            }
             const scopes = requested === undefined
                 ? this.store.findAcceptedNonceConversations?.(agentId, clientNonce) ?? []
                 : this.store.hasAcceptedNonce(agentId, clientNonce, requested) ? [requested] : [];
@@ -1954,6 +2238,17 @@ export class TurnRunner {
             ? args
             : { ...args, conversationId };
         const inference = pinnedInference ?? this.resolveProviderFn(agentId, pinnedArgs);
+        if (origin.kind === "user" && args.retryFailureTurnId === undefined && conversationId && clientNonce && this.store.promptQueue) {
+            const existing = this.store.promptQueue.get(agentId, conversationId, clientNonce);
+            if (existing || (this.pendingCounts.get(agentId) ?? 0) > 0 || this.turnControllers.has(agentId)) {
+                if (!existing && (this.pendingCounts.get(agentId) ?? 0) >= MAX_SEND_QUEUE_PER_AGENT)
+                    throw new RpcError(429, "sendPrompt: fila cheia para o agente");
+                if (args.replyContext) this.resolveReply(agentId, args.replyContext, conversationId);
+                const item = this.store.promptQueue.put(pinnedArgs, inference);
+                if (item.state === "queued") this.scheduleDurablePrompt(item.args);
+                return Promise.resolve({ accepted: true });
+            }
+        }
         const catalog = this.config?.modelCatalog;
         if (catalog && isCatalogProvider(inference.provider) && !inference.modelResolution) {
             const generation = this.agentGenerations.get(agentId) ?? 0;
@@ -2052,84 +2347,31 @@ export class TurnRunner {
             return Promise.resolve({ accepted: true });
         throw new RpcError(503, "Envio ainda sem confirmação de persistência. Consulte a pendência antes de reenviar.");
     }
-    retryPrompt(agentId: string, requestedConversationId?: string): Promise<{ accepted: true }> {
+    retryPrompt(agentId: string, requestedConversationId?: string, expectedFailureEntryId?: string): Promise<{ accepted: true }> {
         if (typeof agentId !== "string" || agentId.trim().length === 0) {
             throw new RpcError(400, "retryPrompt: agentId é obrigatório");
         }
-        let selectedConversationId: string | undefined;
-        let entries: readonly TranscriptEntry[] = [];
-        let failure: Extract<TranscriptEntry, { kind: "notice" }> | undefined;
-        const inspectCandidate = (candidate: string | undefined): boolean => {
-            const scoped = this.store.getEntries(agentId, candidate);
-            const found = [...scoped].reverse().find((entry) => (entry.kind === "notice" &&
-                entry.level === "error" &&
-                entry.retryable === true &&
-                typeof entry.turnId === "string" &&
-                typeof entry.provider === "string" &&
-                typeof entry.model === "string"));
-            if (found?.kind === "notice") {
-                selectedConversationId = candidate;
-                entries = scoped;
-                failure = found;
-                return true;
-            }
-            return false;
-        };
-        if (requestedConversationId !== undefined) {
-            let requested;
-            try {
-                requested = this.resolveConversation(agentId, requestedConversationId, true);
-            }
-            catch (error) {
-                if (error instanceof RpcError && error.status === 409 && /arquivada/i.test(error.message)) {
-                    throw new RpcError(409, "retryPrompt: conversation arquivada");
-                }
-                throw error;
-            }
-            inspectCandidate(requested);
+        const assessment = this.assessFailureRecovery(agentId, requestedConversationId);
+        const candidate = assessment.candidate;
+        // Revalidação no clique: a linha clicada precisa continuar sendo a falha
+        // atual. Uma ação antiga nunca atua sobre outro turno.
+        if (candidate !== undefined && expectedFailureEntryId !== undefined && candidate.failure.id !== expectedFailureEntryId)
+            throw new RpcError(409, "retryPrompt: a falha selecionada não é mais a falha atual");
+        if (candidate !== undefined) {
+            const retryNonce = `retry:${candidate.failureTurnId}`;
+            if (this.store.hasAcceptedNonce(agentId, retryNonce, candidate.conversationId))
+                return this.confirmedAcceptance(agentId, retryNonce, candidate.conversationId);
         }
-        else if (this.conversationStore === undefined) {
-            inspectCandidate(undefined);
-        }
-        else {
-            let cursor: string | undefined;
-            search: do {
-                const page = this.conversationStore.list(agentId, { limit: 200, ...(cursor === undefined ? {} : { cursor }) });
-                for (const conversation of page.items) {
-                    if (conversation.archivedAtMs === null && inspectCandidate(conversation.id))
-                        break search;
-                }
-                cursor = page.nextCursor;
-            } while (cursor !== undefined);
-        }
-        if (failure?.kind !== "notice" ||
-            typeof failure.turnId !== "string" ||
-            typeof failure.provider !== "string" ||
-            typeof failure.model !== "string") {
+        if (assessment.kind === "none") {
+            if (assessment.reason === "archived") throw new RpcError(409, "retryPrompt: conversation arquivada");
+            if (assessment.reason === "advanced") throw new RpcError(409, "retryPrompt: a conversa avançou; a falha não é mais atual");
+            if (assessment.reason === "message") throw new RpcError(409, "retryPrompt: mensagem original não encontrada");
+            if (assessment.reason === "origin") throw new RpcError(409, "retryPrompt: origem da mensagem não é confiável");
             throw new RpcError(409, "retryPrompt: nenhuma falha recuperável atual");
         }
-        const failureTurnId = failure.turnId;
-        const retryNonce = `retry:${failureTurnId}`;
-        if (this.store.hasAcceptedNonce(agentId, retryNonce, selectedConversationId))
-            return this.confirmedAcceptance(agentId, retryNonce, selectedConversationId);
-        const failureIndex = entries.lastIndexOf(failure);
-        const conversationAdvanced = entries.slice(failureIndex + 1).some((entry) => (entry.kind === "message" && (entry.role === "user" || (entry.role === "assistant" && entry.turnId !== failureTurnId))));
-        if (conversationAdvanced)
-            throw new RpcError(409, "retryPrompt: a conversa avançou; a falha não é mais atual");
-        const originalNonce = typeof failure.retryOfClientNonce === "string"
-            ? failure.retryOfClientNonce
-            : typeof failure.clientNonce === "string" ? failure.clientNonce : undefined;
-        const user = [...entries].reverse().find((entry) => (entry.kind === "message" && entry.role === "user" && (entry.turnId === failureTurnId || (originalNonce !== undefined && entry.clientNonce === originalNonce))));
-        if (user?.kind !== "message" || user.role !== "user") {
-            throw new RpcError(409, "retryPrompt: mensagem original não encontrada");
-        }
-        if (entries.some((entry) => entry.kind === "tool-call"
-            && (entry.status === "completed" || (entry.result?.ok === false && ["process_aborted", "process_failed", "aborted"].includes(entry.result.code ?? "")))
-            && typeof entry.localToolCallId === "string"
-            && (entry.localToolCallId.startsWith(`${failureTurnId}\0`)
-                || (user.turnId !== undefined && entry.localToolCallId.startsWith(`${user.turnId}\0`))))) {
-            throw new RpcError(409, "Este turno já executou ferramentas ou foi interrompido durante uma operação. Confira os resultados e possíveis efeitos e envie uma nova instrução para continuar.");
-        }
+        if (assessment.kind === "inspect")
+            throw new RpcError(409, RECOVERY_INSPECT_MESSAGE);
+        const { failureTurnId, entries, user, originalNonce, provider, model } = assessment.candidate;
         let retryOrigin: TurnOrigin;
         if (user.fromAgent !== undefined) {
             retryOrigin = { kind: "agent", agentId: typeof user.fromAgent === "string" ? user.fromAgent : user.fromAgent.id };
@@ -2137,11 +2379,8 @@ export class TurnRunner {
         else if (originalNonce?.startsWith("a2a:")) {
             retryOrigin = { kind: "agent", agentId: "legacy-a2a" };
         }
-        else if (typeof user.fromUser === "object" && user.fromUser !== null) {
-            retryOrigin = { kind: "user" };
-        }
         else {
-            throw new RpcError(409, "retryPrompt: origem da mensagem não é confiável");
+            retryOrigin = { kind: "user" };
         }
         return this.acceptPrompt({
             agentId,
@@ -2152,15 +2391,124 @@ export class TurnRunner {
                 && entry.extractedText === undefined && entry.skipped === undefined
                 ? [{ name: entry.file_name, path: entry.file_path }]
                 : []),
-            clientNonce: retryNonce,
+            clientNonce: `retry:${failureTurnId}`,
             ...(originalNonce !== undefined ? { retryOfClientNonce: originalNonce } : {}),
             retryFailureTurnId: failureTurnId,
         }, {
-            provider: failure.provider,
-            model: failure.model,
+            provider,
+            model,
             modelResolution: user.modelResolution,
             reasoningEffort: user.reasoningEffort ?? this.resolveProviderFn(agentId, { agentId, prompt: user.content }).reasoningEffort,
-        }, selectedConversationId, retryOrigin);
+        }, assessment.candidate.conversationId, retryOrigin);
+    }
+    /**
+     * Consulta somente-leitura das ações de recuperação da falha atual. Usa a
+     * MESMA avaliação de `retryPrompt`, então a ação indicada e a ação executada
+     * nunca divergem. Não altera estado, não reenvia nada e não executa
+     * ferramentas.
+     */
+    getPromptRecovery(agentId: string, requestedConversationId?: string): PromptRecoveryResult {
+        if (typeof agentId !== "string" || agentId.trim().length === 0)
+            throw new RpcError(400, "getPromptRecovery: agentId é obrigatório");
+        const assessment = this.assessFailureRecovery(agentId, requestedConversationId);
+        const candidate = assessment.candidate;
+        const entryId = candidate?.failure.id;
+        if (candidate === undefined || typeof entryId !== "string" || entryId.length === 0)
+            return { conversationId: requestedConversationId ?? null, failure: null };
+        const actions: RecoveryAction[] = assessment.kind === "retry" ? ["retry"] : assessment.kind === "inspect" ? ["inspect"] : [];
+        return {
+            conversationId: candidate.conversationId ?? null,
+            failure: { entryId, turnId: candidate.failureTurnId, actions, historyEntryIds: turnHistoryEntryIds(candidate) },
+        };
+    }
+    /**
+     * Avaliação autoritativa e única de recuperação de falha. A ordem das
+     * verificações preserva a semântica anterior: a seleção explícita, a
+     * deduplicação por nonce, o avanço da conversa, os efeitos incertos e a
+     * confiança da origem.
+     */
+    private assessFailureRecovery(agentId: string, requestedConversationId?: string): FailureRecoveryAssessment {
+        const inspectCandidate = (candidate: string | undefined): FailureCandidate | undefined => {
+            const scoped = this.store.getEntries(agentId, candidate);
+            const found = [...scoped].reverse().find((entry) => (entry.kind === "notice" &&
+                entry.level === "error" &&
+                entry.retryable === true &&
+                typeof entry.turnId === "string" &&
+                typeof entry.provider === "string" &&
+                typeof entry.model === "string"));
+            if (found?.kind !== "notice" || typeof found.turnId !== "string")
+                return undefined;
+            const provider = found.provider;
+            const model = found.model;
+            if (typeof provider !== "string" || typeof model !== "string")
+                return undefined;
+            const failureTurnId = found.turnId;
+            const originalNonce = typeof found.retryOfClientNonce === "string"
+                ? found.retryOfClientNonce
+                : typeof found.clientNonce === "string" ? found.clientNonce : undefined;
+            const message = [...scoped].reverse().find((entry) => (entry.kind === "message" && entry.role === "user" && (entry.turnId === failureTurnId || (originalNonce !== undefined && entry.clientNonce === originalNonce))));
+            return {
+                ...(candidate === undefined ? {} : { conversationId: candidate }),
+                failure: found,
+                failureTurnId,
+                provider,
+                model,
+                entries: scoped,
+                ...(message?.kind === "message" ? { user: message } : {}),
+                ...(originalNonce === undefined ? {} : { originalNonce }),
+            };
+        };
+        let found: FailureCandidate | undefined;
+        if (requestedConversationId !== undefined) {
+            let requested: string | undefined;
+            try {
+                requested = this.resolveConversation(agentId, requestedConversationId, true);
+            }
+            catch (error) {
+                if (error instanceof RpcError && error.status === 409 && /arquivada/i.test(error.message))
+                    return { kind: "none", reason: "archived" };
+                return { kind: "none", reason: "absent" };
+            }
+            found = inspectCandidate(requested);
+        }
+        else if (this.conversationStore === undefined) {
+            found = inspectCandidate(undefined);
+        }
+        else {
+            let cursor: string | undefined;
+            search: do {
+                const page = this.conversationStore.list(agentId, { limit: 200, ...(cursor === undefined ? {} : { cursor }) });
+                for (const conversation of page.items) {
+                    if (conversation.archivedAtMs === null && (found = inspectCandidate(conversation.id)))
+                        break search;
+                }
+                cursor = page.nextCursor;
+            } while (cursor !== undefined);
+        }
+        if (found === undefined)
+            return { kind: "none", reason: "absent" };
+        const candidate = found;
+        const failureIndex = candidate.entries.lastIndexOf(candidate.failure);
+        const conversationAdvanced = candidate.entries.slice(failureIndex + 1).some((entry) => (entry.kind === "message" && (entry.role === "user" || (entry.role === "assistant" && entry.turnId !== candidate.failureTurnId))));
+        if (conversationAdvanced)
+            return { kind: "none", reason: "advanced", candidate };
+        // File I/O failures and process limits can leave effects even when the tool failed.
+        const effectsUncertain = candidate.entries.some((entry) => entry.kind === "tool-call"
+            && (entry.status === "completed" || (entry.result?.ok === false && ["process_aborted", "process_failed", "aborted", "io_error", "timed_out", "output_limit", "process_timeout", "process_output_limit"].includes(entry.result.code ?? "")))
+            && typeof entry.localToolCallId === "string"
+            && (entry.localToolCallId.startsWith(`${candidate.failureTurnId}\0`)
+                || (candidate.user?.turnId !== undefined && entry.localToolCallId.startsWith(`${candidate.user.turnId}\0`))));
+        if (effectsUncertain)
+            return { kind: "inspect", candidate };
+        if (candidate.user === undefined)
+            return { kind: "none", reason: "message", candidate };
+        const user = candidate.user;
+        const trustedOrigin = user.fromAgent !== undefined
+            || candidate.originalNonce?.startsWith("a2a:") === true
+            || (typeof user.fromUser === "object" && user.fromUser !== null);
+        if (!trustedOrigin)
+            return { kind: "none", reason: "origin", candidate };
+        return { kind: "retry", candidate: { ...candidate, user } };
     }
     resumePrompt(agentId: string, turnId: string, requestedConversationId?: string): { accepted: true } {
         if (typeof agentId !== "string" || agentId.trim().length === 0 || typeof turnId !== "string" || turnId.trim().length === 0)
@@ -2258,32 +2606,38 @@ export class TurnRunner {
         const streamController = new AbortController();
         const abort = () => streamController.abort(controller.signal.reason);
         controller.signal.addEventListener("abort", abort, { once: true });
+        let resumeOutcome: "success" | "error" | "aborted" = "error";
         this.turnControllers.set(agentId, controller);
         this.runningTurns += 1;
+        const turnEntries = this.store.getEntries(agentId, conversationId);
+        const turnUser = turnEntries.find(
+            (entry): entry is Extract<TranscriptEntry, { kind: "message" }> =>
+                entry.kind === "message" && entry.role === "user" && entry.turnId === checkpoint.turnId,
+        );
+        const resumeStartedAtMs = this.nowFn();
         const turn: TurnMetadata = {
             turnId: checkpoint.turnId,
             conversationId,
             provider: checkpoint.provider,
             model: checkpoint.model,
-            modelResolution: this.store.getEntries(agentId, conversationId).find(
-                (entry): entry is Extract<TranscriptEntry, { kind: "message" }> => entry.kind === "message" && entry.role === "user" && entry.turnId === checkpoint.turnId,
-            )?.modelResolution,
-            reasoningEffort: [...this.store.getEntries(agentId, conversationId)].reverse().find(
+            modelResolution: turnUser?.modelResolution,
+            reasoningEffort: [...turnEntries].reverse().find(
                 (entry): entry is Extract<TranscriptEntry, { kind: "message" }> =>
                     entry.kind === "message" && entry.turnId === checkpoint.turnId && entry.reasoningEffort !== undefined,
             )?.reasoningEffort ?? this.resolveProviderFn(agentId, { agentId, prompt }).reasoningEffort,
             phase: "provider-pending",
+            execution: { phase: "awaiting-slot", startedAtMs: resumeStartedAtMs, phaseChangedAtMs: resumeStartedAtMs },
             isResume: true,
-            clientNonce: this.store.getEntries(agentId, conversationId).find(
-                (entry): entry is Extract<TranscriptEntry, { kind: "message" }> =>
-                    entry.kind === "message" && entry.role === "user" && entry.turnId === checkpoint.turnId,
-            )?.clientNonce,
+            clientNonce: turnUser?.clientNonce,
         };
-        const partial = [...this.store.getEntries(agentId, conversationId)].reverse().find((entry) => entry.kind === "message" && entry.role === "assistant" && entry.turnId === checkpoint.turnId && entry.completionState === "interrupted");
+        this.currentTurns.set(agentId, { turnId: turn.turnId, conversationId, execution: turn.execution });
+        this.lastTurns.delete(agentId);
+        const partial = [...turnEntries].reverse().find((entry) => entry.kind === "message" && entry.role === "assistant" && entry.turnId === checkpoint.turnId && entry.completionState === "interrupted");
         if (partial?.kind === "message") {
             this.liveAssistant.set(agentId, {
                 id: partial.id,
                 content: partial.content,
+                byteCount: Buffer.byteLength(partial.content, "utf8"),
                 lastPublishMs: this.nowFn(),
                 lastPersistMs: this.nowFn(),
                 limited: false,
@@ -2296,7 +2650,7 @@ export class TurnRunner {
         turn.streamController = streamController;
         try {
             const selectedScope = { agentId, conversationId, turnId: checkpoint.turnId, provider: checkpoint.provider, model: checkpoint.model };
-            const liveCheckpoint = this.store.findResumeCheckpoint?.(agentId, conversationId, checkpoint.turnId)
+            let liveCheckpoint = this.store.findResumeCheckpoint?.(agentId, conversationId, checkpoint.turnId)
                 ?? this.store.getResumeCheckpoint?.(selectedScope)
                 ?? checkpoint;
             try {
@@ -2319,12 +2673,31 @@ export class TurnRunner {
                 this.finishResumeFailure(agentId, conversationId, checkpoint.turnId, "resume_budget_exhausted", "O budget original do turno foi consumido.");
                 return;
             }
-            this.updateTurnPhase(agentId, turn, "provider-pending");
+            this.setExecutionPhase(agentId, turn, "awaiting-slot");
             const context = this.toProviderMessages(agentId, prompt, "", undefined, liveCheckpoint.turnId, conversationId, "", undefined, 1, liveCheckpoint.model, liveCheckpoint.provider, [], undefined, turn.modelResolution);
+            // Reserve the recovery attempt with a CAS before entering the
+            // provider. A failed/aborted resume therefore consumes its durable
+            // allowance and cannot be retried forever after a process restart.
+            const reserved = this.reserveResumeAttempt(selectedScope, liveCheckpoint);
+            if (reserved === undefined) {
+                const latest = this.store.findResumeCheckpoint?.(agentId, conversationId, checkpoint.turnId)
+                    ?? this.store.getResumeCheckpoint?.(selectedScope);
+                this.finishResumeFailure(
+                    agentId,
+                    conversationId,
+                    checkpoint.turnId,
+                    latest !== undefined && this.resumeBudgetExhausted(latest.budget) ? "resume_budget_exhausted" : "resume_aborted",
+                    latest !== undefined && this.resumeBudgetExhausted(latest.budget)
+                        ? "O budget de recuperação do turno foi consumido."
+                        : "Não foi possível reservar o budget de recuperação com segurança.",
+                );
+                return;
+            }
+            liveCheckpoint = reserved;
             const result = await streamChat(liveCheckpoint.provider, {
                 model: liveCheckpoint.model,
                 modelResolution: turn.modelResolution,
-                purpose: "turn",
+                purpose: "resume",
                 sessionId: createHash("sha256").update(JSON.stringify([agentId, conversationId ?? "legacy"])).digest("hex"),
                 system: this.systemPromptFn(agentId),
                 messages: context.messages,
@@ -2343,29 +2716,34 @@ export class TurnRunner {
                 registry: this.registry,
                 admission: this.admission,
                 agentId,
+                onAdmissionWait: (waiting: boolean) => this.setExecutionPhase(agentId, turn, waiting ? "awaiting-slot" : "awaiting-provider"),
+                onTransportStart: () => {
+                    this.setExecutionPhase(agentId, turn, "awaiting-provider");
+                    this.noteTurnActivity(turn, "provider-request");
+                },
             });
             if (result.error !== undefined || result.aborted) {
+                resumeOutcome = result.aborted ? "aborted" : "error";
                 this.finalizeAssistant(agentId, this.liveAssistant.get(agentId)?.content, { keepPartial: true }, turn);
                 this.finishResumeFailure(agentId, conversationId, checkpoint.turnId, result.error?.code ?? "resume_aborted", "O resume foi interrompido sem replay.");
                 return;
             }
-            if (typeof this.store.advanceResumeCheckpoint === "function") {
-                const scope = { agentId, conversationId, turnId: liveCheckpoint.turnId, provider: liveCheckpoint.provider, model: liveCheckpoint.model };
-                this.store.advanceResumeCheckpoint(scope, liveCheckpoint.version, {
-                    cursor: result.cursor ?? liveCheckpoint.cursor,
-                    safeSequenceId: typeof this.store.getLatestSequenceId === "function" ? this.store.getLatestSequenceId(agentId, conversationId) ?? liveCheckpoint.safeSequenceId : liveCheckpoint.safeSequenceId,
-                    completedEffectIds: liveCheckpoint.completedEffectIds,
-                    expiresAtMs: liveCheckpoint.expiresAtMs,
-                    budget: { ...liveCheckpoint.budget, providerAttemptsUsed: liveCheckpoint.budget.providerAttemptsUsed + 1 },
-                });
-            }
+            resumeOutcome = "success";
         }
         catch {
+            resumeOutcome = "error";
             this.finishResumeFailure(agentId, conversationId, checkpoint.turnId, "resume_aborted", "O resume foi interrompido sem replay.");
         }
         finally {
             controller.signal.removeEventListener("abort", abort);
             this.turnControllers.delete(agentId);
+            this.currentTurns.delete(agentId);
+            this.lastTurns.set(agentId, {
+                turnId: checkpoint.turnId,
+                conversationId,
+                outcome: controller.signal.aborted ? "aborted" : resumeOutcome,
+                finishedAtMs: this.nowFn(),
+            });
             this.runningTurns = Math.max(0, this.runningTurns - 1);
         }
     }
@@ -2398,6 +2776,7 @@ export class TurnRunner {
     cleanupDeletedAgents(agentIds: readonly string[]): void {
         for (const agentId of agentIds) {
             if (this.queues.has(agentId) ||
+                this.preparingCatalog.has(agentId) ||
                 this.pendingCounts.has(agentId) ||
                 this.queuedNonces.has(agentId) ||
                 this.queuedConversationIds.has(agentId) ||
@@ -2437,6 +2816,8 @@ export class TurnRunner {
     ): { outcome: "not-found" | "unknown-durability" } | { outcome: "found"; record: { status: "accepted"; echoEntryId?: string } } {
         if (conversationId !== undefined)
             this.validateAcceptanceConversation(agentId, conversationId);
+        if (conversationId !== undefined && this.store.promptQueue?.get(agentId, conversationId, nonce))
+            return { outcome: "found", record: { status: "accepted" } };
         const resolvedScopes = conversationId !== undefined
             ? [conversationId]
             : this.store.findAcceptedNonceConversations?.(agentId, nonce) ?? (this.store.hasAcceptedNonce(agentId, nonce) ? [undefined] : []);
@@ -2506,7 +2887,7 @@ export class TurnRunner {
         busyAgentIds: string[];
         runningTurns: number;
     } {
-        const busyAgentIds = [...new Set([...this.turnControllers.keys(), ...this.pendingCounts.keys()])];
+        const busyAgentIds = [...new Set([...this.turnControllers.keys(), ...this.pendingCounts.keys(), ...this.preparingCatalog.keys()])];
         return {
             isBusy: busyAgentIds.length > 0,
             activeAgentId: busyAgentIds[0] ?? null,
@@ -2515,9 +2896,13 @@ export class TurnRunner {
         };
     }
     cancelPrompt(agentId?: string): { cancelled: boolean; agentIds: string[] } {
-        const known = new Set([...this.turnControllers.keys(), ...this.pendingCounts.keys()]);
+        const known = new Set([...this.turnControllers.keys(), ...this.pendingCounts.keys(), ...this.preparingCatalog.keys()]);
         const ids = agentId ? (known.has(agentId) ? [agentId] : []) : known.size === 1 ? [...known] : [];
         for (const id of ids) {
+            for (const item of this.store.promptQueue?.list(id) ?? []) {
+                if (this.store.promptQueue!.transition(id, item.args.conversationId!, item.args.clientNonce!, "queued", "cancelled"))
+                    this.releaseDurablePromptSlot(id, item.args.conversationId!, item.args.clientNonce!);
+            }
             this.agentGenerations.set(id, (this.agentGenerations.get(id) ?? 0) + 1);
             for (const nonce of this.queuedNonces.get(id) ?? []) {
                 this.store.forgetAcceptedNonce(id, nonce, this.queuedConversationIds.get(id)?.get(nonce));
@@ -2557,24 +2942,48 @@ export class TurnRunner {
         if (timedOut)
             throw new Error(`turn shutdown timed out after ${timeoutMs}ms`);
     }
-    promptStatus(agentId?: string): { isBusy: boolean; canCancel: boolean; agentId: string | null; cancelRequested?: true } {
+    promptStatus(agentId?: string): { isBusy: boolean; canCancel: boolean; agentId: string | null; cancelRequested?: true; turnId?: string; conversationId?: string;
+        execution?: TurnExecution; lastTurn?: LastTurnOutcome;
+        queued?: Array<{ clientNonce: string; conversationId: string; conversationTitle: string; preview: string }>;
+        recoverable?: Array<{ clientNonce: string; conversationId: string; conversationTitle: string; preview: string; canReview: boolean }>;
+        recoverableTruncated?: boolean } {
         if (agentId !== undefined) {
-            const isBusy = (this.pendingCounts.get(agentId) ?? 0) > 0 || this.turnControllers.has(agentId);
+            const isBusy = (this.pendingCounts.get(agentId) ?? 0) > 0 || this.turnControllers.has(agentId) || this.preparingCatalog.has(agentId);
             const cancelRequested = this.turnControllers.get(agentId)?.signal.aborted === true;
-            return { isBusy, canCancel: isBusy && !cancelRequested, agentId, ...(cancelRequested ? { cancelRequested: true as const } : {}) };
+            const describe = (args: SandSendPromptArgs) => ({ clientNonce: args.clientNonce!, conversationId: args.conversationId!,
+                conversationTitle: this.conversationById(agentId, args.conversationId!)?.title.slice(0, 100) ?? "Conversa indisponível", preview: args.prompt.slice(0, 160) });
+            const interrupted = this.store.promptQueue?.list(agentId, "interrupted", 101) ?? [];
+            return { isBusy, canCancel: isBusy && !cancelRequested, agentId, ...this.liveStatus(agentId),
+                ...(cancelRequested ? { cancelRequested: true as const } : {}),
+                queued: this.store.promptQueue?.list(agentId).map(item => describe(item.args)) ?? [],
+                recoverable: interrupted.slice(0, 100).map(item => ({ ...describe(item.args), canReview: !item.compacted && (!this.conversationStore || this.conversationById(agentId, item.args.conversationId!)?.archivedAtMs === null) &&
+                    !(this.store.findUserEchoByNonce ? this.store.findUserEchoByNonce(agentId, item.args.clientNonce!, item.args.conversationId)
+                        : this.store.getEntries(agentId, item.args.conversationId).find(entry => entry.kind === "message" && entry.role === "user" && entry.clientNonce === item.args.clientNonce)) })),
+                recoverableTruncated: interrupted.length > 100 };
         }
         const status = this.getStatus();
         return { isBusy: status.isBusy, canCancel: status.isBusy, agentId: status.activeAgentId };
     }
+    promptStatuses(agentIds: readonly string[]) {
+        const status = this.getStatus();
+        const ids = [...new Set([...agentIds, ...status.busyAgentIds])];
+        return { isBusy: status.isBusy, canCancel: status.isBusy, agentId: status.activeAgentId,
+            agents: ids.map(id => this.promptStatus(id)) };
+    }
     // ── pipeline do turno ───────────────────────────────────────────────────────
-    async runTurn(args: SandSendPromptArgs, inference: ResolvedProvider, origin: TurnOrigin = { kind: "user" }, acceptance?: { confirm(): void; reject(error: unknown): void }): Promise<void> {
+    async runTurn(args: SandSendPromptArgs, inference: ResolvedProvider, origin: TurnOrigin = { kind: "user" }, acceptance?: { confirm(): void; reject(error: unknown): void }): Promise<{ outcome: "success" | "error" | "aborted"; echoPersisted: boolean }> {
         const { agentId, prompt, attachments, clientNonce, conversationId } = args;
         const turnId = `turn:${randomUUID()}`;
+        const startedAtMs = Date.now();
+        const attemptStartedAtMs = this.nowFn();
+        let outcome: "success" | "error" | "aborted" = "error";
+        const execution: TurnExecution = { phase: "preparing", startedAtMs: attemptStartedAtMs, phaseChangedAtMs: attemptStartedAtMs };
         const turn: TurnMetadata = {
             turnId,
             ...(conversationId === undefined ? {} : { conversationId }),
             ...inference,
             phase: "preparing",
+            execution,
             ...(clientNonce !== undefined ? { clientNonce } : {}),
             ...(args.retryOfClientNonce !== undefined ? { retryOfClientNonce: args.retryOfClientNonce } : {}),
         };
@@ -2598,6 +3007,10 @@ export class TurnRunner {
             lastEntry: previewFromText(prompt),
             lastMessagePreview: prompt,
         });
+        this.currentTurns.set(agentId, { turnId, conversationId, execution });
+        // Um novo turno invalida a confirmação anterior: nunca exibir um
+        // resultado antigo como se fosse o atual.
+        this.lastTurns.delete(agentId);
         let echoPersisted = false;
         try {
             // 1) snapshot no início (reset — contrato transcript, mapa-frontend §3.3)
@@ -2611,6 +3024,8 @@ export class TurnRunner {
                     retry: isRetry,
                 })
                 : [];
+            if (controller.signal.aborted)
+                throw new Error("Envio cancelado antes de ser salvo.");
             if (isRetry && (attachments ?? []).some((_, index) => extracted[index]?.imageDataUrl === undefined)) {
                 throw new Error("Não foi possível recuperar a imagem da mensagem original. Anexe a imagem novamente para continuar.");
             }
@@ -2642,6 +3057,8 @@ export class TurnRunner {
             const resolvedTurnContext: string | TurnContextResolution = this.resolveTurnContextFn
                 ? await this.resolveTurnContextFn(agentId, args, controller.signal)
                 : { source: "other", context: "" };
+            if (controller.signal.aborted)
+                throw new Error("Envio cancelado antes de ser salvo.");
             if (typeof resolvedTurnContext !== "string" && resolvedTurnContext.error !== undefined) {
                 throw new Error(`Skill context unavailable: ${resolvedTurnContext.error}`);
             }
@@ -2721,10 +3138,23 @@ export class TurnRunner {
             if (clientNonce !== undefined)
                 this.store.rememberAcceptedNonce(agentId, clientNonce, conversationId);
             acceptance?.confirm();
-            this.updateTurnPhase(agentId, turn, "provider-pending");
+            this.setExecutionPhase(agentId, turn, "awaiting-slot");
             const { provider, model } = inference;
             const memoryContext = this.resolveMemoryTurnContext(agentId, conversationId);
-            const baseTools = await this.toolsFor(agentId, controller.signal);
+            const listedTools = await this.toolsFor(agentId, controller.signal);
+            const needsStickyHostTools = listedTools?.some((tool) => (
+                tool.function.name === WHATSAPP_TOOL_NAME || BROWSER_TOOL_NAMES.includes(tool.function.name)
+            )) === true;
+            const recentToolNames = needsStickyHostTools
+                ? this.store.getRecentEntries(agentId, { limit: 48, kinds: ["tool-call"] }, conversationId)
+                    .flatMap((entry) => entry.kind === "tool-call" ? [entry.name] : [])
+                : [];
+            const baseTools = listedTools === undefined
+                ? undefined
+                : selectTurnProviderTools(listedTools, {
+                    prompt: [prompt, turnContext, formatAttachmentContext(extracted)].filter((value) => value.trim().length > 0).join("\n"),
+                    recentToolNames,
+                });
             if (controller.signal.aborted) {
                 this.closeOpenToolCalls(agentId, {
                     ok: false,
@@ -2732,7 +3162,7 @@ export class TurnRunner {
                     message: "turn aborted",
                 }, conversationId);
                 this.appendAndPublish(agentId, [retryableTurnNotice(turn, "aborted-after-echo", "O turno foi interrompido depois que sua mensagem foi aceita.")], conversationId);
-                return;
+                return { outcome: "aborted", echoPersisted };
             }
             const toolDiscoveryNotice = this.toolDiscoveryNoticeFn?.(agentId);
             if (toolDiscoveryNotice) {
@@ -2748,6 +3178,7 @@ export class TurnRunner {
             }
             const memoryStore = this.memoryStore();
             const explicitMemoryIntent = origin.kind === "user" && isExplicitMemoryIntent(prompt);
+            const explicitForgetIntent = origin.kind === "user" && isExplicitMemoryForgetIntent(prompt);
             const memorySourceEntryId = isRetry
                 ? [...this.store.getEntries(agentId, conversationId)].reverse().find((entry) => (entry.kind === "message" &&
                     entry.role === "user" &&
@@ -2755,7 +3186,7 @@ export class TurnRunner {
                         (args.retryOfClientNonce !== undefined && entry.clientNonce === args.retryOfClientNonce))))
                     ?.id
                 : userEntry.id;
-            const memoryGuidance = buildMemorySystemGuidance(memoryContext.mode, memoryContext.conversation, explicitMemoryIntent);
+            const memoryGuidance = buildMemorySystemGuidance(memoryContext.mode, memoryContext.conversation, explicitMemoryIntent || explicitForgetIntent);
             const memorySystemPrompt = [this.systemPromptFn(agentId), memoryGuidance].filter((value) => value.length > 0).join("\n\n");
             const memorySearchTool = memoryStore
                 ? createMemorySearchTool({ memoryStore, mode: memoryContext.mode, agentId, conversation: memoryContext.conversation })
@@ -2769,6 +3200,7 @@ export class TurnRunner {
                 conversationId,
                 sourceEntryId: typeof memorySourceEntryId === "string" ? memorySourceEntryId : undefined,
                 explicitIntent: explicitMemoryIntent,
+                explicitForgetIntent,
             };
             const memoryRememberTool = memoryRememberOptions === undefined ? undefined : createMemoryRememberTool(memoryRememberOptions);
             const memoryForgetTool = memoryRememberOptions === undefined ? undefined : createMemoryForgetTool(memoryRememberOptions);
@@ -2812,12 +3244,10 @@ export class TurnRunner {
                     while (playback.length > 0)
                         playback.shift()?.();
                 };
-                const attachmentContext = [formatAttachmentContext(extracted), turnContext]
-                    .filter((value) => value.trim().length > 0)
-                    .join("\n\n");
+                const attachmentContext = formatAttachmentContext(extracted);
                 const toolText = JSON.stringify(providerTools ?? []);
                 const buildContext = (scale: number) => {
-                    const context = this.toProviderMessages(agentId, prompt, attachmentContext, normalizedSkillPrompt === undefined ? undefined : { original: prompt, normalized: normalizedSkillPrompt }, args.retryFailureTurnId, conversationId, toolText, memoryContext, scale, model, provider, imageAttachments, memorySystemPrompt, inference.modelResolution);
+                    const context = this.toProviderMessages(agentId, prompt, attachmentContext, normalizedSkillPrompt === undefined ? undefined : { original: prompt, normalized: normalizedSkillPrompt }, args.retryFailureTurnId, conversationId, toolText, memoryContext, scale, model, provider, imageAttachments, memorySystemPrompt, inference.modelResolution, turnContext);
                     turn.memoryContextSources?.push(...context.memoryContextSources ?? []);
                     return context;
                 };
@@ -2857,6 +3287,7 @@ export class TurnRunner {
                     model,
                     modelResolution: inference.modelResolution,
                     purpose: "turn",
+                    operationId: turnId,
                     sessionId: createHash("sha256").update(JSON.stringify([agentId, conversationId ?? "legacy"])).digest("hex"),
                     acceptsImages: inference.modelResolution?.capabilities.images ?? MODEL_CATALOG.find((entry) => entry.id === model)?.supportsVision === true,
                     system: messages.some((message) => message.role === "user" && typeof message.content === "string" && message.content.includes(OPENBOT_UNTRUSTED_MEMORY_CONTEXT_BEGIN))
@@ -2871,18 +3302,30 @@ export class TurnRunner {
                 const hasToolLoop = (this.executionBroker !== undefined || executeTool !== undefined) && (providerTools?.length ?? 0) > 0;
                 const serializeRequest = requestSerializerFor(this.registry, provider);
                 const capabilities = resolveModelCapabilities(inference.modelResolution?.entry ?? model, provider);
+                // Somente fatos físicos movem o estado ao vivo: entrada/saída da
+                // admissão e a requisição sendo entregue ao transporte.
+                const statusOptions = {
+                    registry: this.registry,
+                    admission: this.admission,
+                    agentId,
+                    onAdmissionWait: (waiting: boolean) => this.setExecutionPhase(agentId, turn, waiting ? "awaiting-slot" : "awaiting-provider"),
+                    onTransportStart: () => {
+                        this.setExecutionPhase(agentId, turn, "awaiting-provider");
+                        this.noteTurnActivity(turn, "provider-request");
+                    },
+                };
                 const initialPrepared = prepareProviderRound(request, {
                     capabilities,
                     maxBytes: capabilities.maxRequestBytes ?? CONTEXT_HARD_LIMIT_BYTES,
                     provider,
                     ...(serializeRequest === undefined ? {} : { serializeRequest }),
                 });
-                logContextTelemetry(provider, model, initialPrepared.telemetry);
+                if (!hasToolLoop) logContextTelemetry(provider, model, initialPrepared.telemetry);
                 if (initialPrepared.exhausted)
                     throw new Error("provider context budget exhausted");
                 request = initialPrepared.request;
                 const onEvent = (event: ProviderStreamEvent) => {
-                    const observable = event.type !== "error";
+                    const observable = event.type !== "error" && event.type !== "usage";
                     if (observable)
                         observableCount += 1;
                     const action = () => this.onStreamEvent(agentId, event, turn, hasToolLoop);
@@ -2890,73 +3333,80 @@ export class TurnRunner {
                 };
                 try {
                     if (hasToolLoop && providerTools) {
+                        const loopResult = await runToolLoop({
+                            agentId,
+                            ...(conversationId === undefined ? {} : { conversationId }),
+                            request,
+                            broker: this.executionBroker,
+                            resolveHostPermission: this.resolveHostPermission,
+                            executeTool,
+                            ...(memoryContext.mode !== "off" && !memoryContext.conversation.temporary
+                                ? { deferTextUntilToolResultFor: [MEMORY_REMEMBER_TOOL_NAME, MEMORY_FORGET_TOOL_NAME] }
+                                : {}),
+                            resumableEffects: this.resumableEffectsFor(agentId, conversationId, turnId, provider, model, turn),
+                            onEvent,
+                            onProviderActivity: (kind) => {
+                                // O texto da rodada fica retido até o fim; a fase ao
+                                // vivo, não: o provedor já está respondendo.
+                                this.setExecutionPhase(agentId, turn, "receiving");
+                                this.noteTurnActivity(turn, kind === "reasoning" ? "reasoning" : "provider-stream");
+                            },
+                            onProgress: ({ entry }) => {
+                                const running = entry.status === "pending" || entry.status === "running";
+                                this.setExecutionPhase(agentId, turn, running ? "tool" : "preparing", running ? entry.summary : undefined);
+                                this.noteTurnActivity(turn, "tool");
+                                observableCount += 1;
+                                const action = () => this.publishToolCall(agentId, entry, conversationId);
+                                queuePlayback(action, true);
+                            },
+                            turnId,
+                            ...(budgetScale < 1 ? {} : {
+                                contextOverflowRetry: {
+                                    isOverflow: isContextOverflowError,
+                                    messages: () => {
+                                        const reduced = buildContext(0.5);
+                                        publishContextNotice(reduced);
+                                        return reduced.messages;
+                                    },
+                                },
+                            }),
+                            stream: (next, emit, metadata) => {
+                                // The bounded tool-free rescue is a provider attempt,
+                                // but it must not consume another tool-round budget.
+                                if (!metadata?.finalization && (turn.providerAttemptsUsed ?? 0) > 0) {
+                                    turn.toolRoundsUsed = (turn.toolRoundsUsed ?? 0) + 1;
+                                }
+                                turn.providerAttemptsUsed = (turn.providerAttemptsUsed ?? 0) + 1;
+                                return streamChat(provider, next, emit, statusOptions);
+                            },
+                            prepareRequest: (nextMessages, requestOverride?: ProviderChatRequest) => {
+                                const capabilities = resolveModelCapabilities(inference.modelResolution?.entry ?? model, provider);
+                                const prepared = prepareProviderRound({ ...(requestOverride ?? request), messages: [...nextMessages] }, {
+                                    capabilities,
+                                    maxBytes: capabilities.maxRequestBytes ?? CONTEXT_HARD_LIMIT_BYTES,
+                                    provider,
+                                    ...(serializeRequest === undefined ? {} : { serializeRequest }),
+                                });
+                                logContextTelemetry(provider, model, prepared.telemetry);
+                                if (prepared.exhausted)
+                                    throw new Error("provider context budget exhausted");
+                                return prepared.request;
+                            },
+                        });
                         return {
                             kind: "tool",
                             playback,
                             observableCount,
-                            result: await runToolLoop({
-                                agentId,
-                                ...(conversationId === undefined ? {} : { conversationId }),
-                                request,
-                                broker: this.executionBroker,
-                                resolveHostPermission: this.resolveHostPermission,
-                                executeTool,
-                                ...(memoryRememberTool === undefined ? {} : { deferTextUntilToolResultFor: [MEMORY_REMEMBER_TOOL_NAME, MEMORY_FORGET_TOOL_NAME] }),
-                                resumableEffects: this.resumableEffectsFor(agentId, conversationId, turnId, provider, model, turn),
-                                onEvent,
-                                onProgress: ({ entry }) => {
-                                    observableCount += 1;
-                                    const action = () => this.publishToolCall(agentId, entry, conversationId);
-                                    queuePlayback(action, true);
-                                },
-                                turnId,
-                                ...(budgetScale < 1 ? {} : {
-                                    contextOverflowRetry: {
-                                        isOverflow: isContextOverflowError,
-                                        messages: () => {
-                                            const reduced = buildContext(0.5);
-                                            publishContextNotice(reduced);
-                                            return reduced.messages;
-                                        },
-                                    },
-                                }),
-                                stream: (next, emit) => {
-                                    if ((turn.providerAttemptsUsed ?? 0) > 0) {
-                                        turn.toolRoundsUsed = (turn.toolRoundsUsed ?? 0) + 1;
-                                    }
-                                    turn.providerAttemptsUsed = (turn.providerAttemptsUsed ?? 0) + 1;
-                                    return streamChat(provider, next, emit, {
-                                        registry: this.registry,
-                                        admission: this.admission,
-                                        agentId,
-                                    });
-                                },
-                                prepareRequest: (nextMessages) => {
-                                    const capabilities = resolveModelCapabilities(inference.modelResolution?.entry ?? model, provider);
-                                    const prepared = prepareProviderRound({ ...request, messages: [...nextMessages] }, {
-                                        capabilities,
-                                        maxBytes: capabilities.maxRequestBytes ?? CONTEXT_HARD_LIMIT_BYTES,
-                                        provider,
-                                        ...(serializeRequest === undefined ? {} : { serializeRequest }),
-                                    });
-                                    logContextTelemetry(provider, model, prepared.telemetry);
-                                    if (prepared.exhausted)
-                                        throw new Error("provider context budget exhausted");
-                                    return prepared.request;
-                                },
-                            }),
+                            result: loopResult,
                         };
                     }
                     turn.providerAttemptsUsed = (turn.providerAttemptsUsed ?? 0) + 1;
+                    const streamResult = await streamChat(provider, request, onEvent, statusOptions);
                     return {
                         kind: "stream",
                         playback,
                         observableCount,
-                        result: await streamChat(provider, request, onEvent, {
-                            registry: this.registry,
-                            admission: this.admission,
-                            agentId,
-                        }),
+                        result: streamResult,
                     };
                 }
                 finally {
@@ -2965,20 +3415,30 @@ export class TurnRunner {
                         delete turn.streamController;
                 }
             };
-            let providerAttempt = await runProviderAttempt(1, true);
-            const retryableOverflow = providerAttempt.kind === "stream"
-                && providerAttempt.observableCount === 0
-                && ! providerAttempt.result.aborted
-                && providerAttempt.result.error !== undefined
-                && isContextOverflowError(providerAttempt.result.error);
-            if (retryableOverflow) {
-                providerAttempt = await runProviderAttempt(0.5, false);
+            // Incremental transcript events publish in order as usual; terminal
+            // tool snapshots coalesce into one resync frame per attempt batch.
+            this.deferTranscriptSnapshots();
+            let providerAttempt: Awaited<ReturnType<typeof runProviderAttempt>>;
+            try {
+                providerAttempt = await runProviderAttempt(1, true);
+                const retryableOverflow = providerAttempt.kind === "stream"
+                    && providerAttempt.observableCount === 0
+                    && ! providerAttempt.result.aborted
+                    && providerAttempt.result.error !== undefined
+                    && isContextOverflowError(providerAttempt.result.error);
+                if (retryableOverflow) {
+                    providerAttempt = await runProviderAttempt(0.5, false);
+                }
+                else {
+                    for (const action of providerAttempt.playback)
+                        action();
+                }
             }
-            else {
-                for (const action of providerAttempt.playback)
-                    action();
+            finally {
+                this.flushTranscriptSnapshots();
             }
             this.persistResumeCheckpoint(agentId, turn, conversationId, providerAttempt.result?.cursor ?? turn.resumeCursor);
+            outcome = providerAttempt.result.aborted ? "aborted" : providerAttempt.result.error || !providerAttempt.result.message?.content.trim() ? "error" : "success";
             const ensureAbortedNotice = () => {
                 // Direct lookup when available; full-scan fallback preserves behavior.
                 const alreadyPublished = this.store.findRetryableErrorNotice !== undefined
@@ -2994,7 +3454,11 @@ export class TurnRunner {
                 if (loopResult.aborted || loopResult.error) {
                     this.closeOpenToolCalls(agentId, {
                         ok: false,
-                        code: loopResult.aborted ? "aborted" : "io_error",
+                        code: loopResult.aborted
+                            ? "aborted"
+                            : ["tool_call_limit", "tool_round_limit", "tool_repetition_limit"].includes(loopResult.error?.code ?? "")
+                                ? "invalid_request"
+                                : "io_error",
                         message: loopResult.error?.message ?? "turn aborted",
                     }, conversationId);
                     if (loopResult.aborted)
@@ -3024,6 +3488,7 @@ export class TurnRunner {
         }
         catch (err) {
             if (!echoPersisted) acceptance?.reject(new RpcError(500, `Envio não salvo: ${err instanceof Error ? err.message : String(err)}`));
+            outcome = "error";
             // streamChat nunca lança (erros viram evento `error`); este catch é a rede
             // de segurança para falhas inesperadas — notifica via notice e segue.
             if (clientNonce !== undefined)
@@ -3049,12 +3514,24 @@ export class TurnRunner {
             this.runningTurns = Math.max(0, this.runningTurns - 1);
             this.turnControllers.delete(agentId);
             const live = this.latestAssistantPreview(agentId, conversationId);
+            this.currentTurns.delete(agentId);
+            this.lastTurns.set(agentId, {
+                turnId,
+                ...(conversationId === undefined ? {} : { conversationId }),
+                outcome: controller.signal.aborted ? "aborted" : outcome,
+                finishedAtMs: this.nowFn(),
+            });
             this.activity?.patch(agentId, {
                 isRunning: (this.pendingCounts.get(agentId) ?? 0) > 1,
                 ...(live ? { lastMessageId: live.id, lastMessagePreview: live.content, lastEntry: previewFromText(live.content) } : {}),
             });
             this.store.finishTurnAttempt(agentId, turnId);
+            if (process.env.NODE_ENV !== "test") console.info(`[openbot][turn-result] ${JSON.stringify({
+                operationId: turnId, provider: inference.provider, model: inference.model, startedAtMs,
+                durationMs: Date.now() - startedAtMs, outcome: controller.signal.aborted ? "aborted" : outcome,
+            })}`);
         }
+        return { outcome: controller.signal.aborted ? "aborted" : outcome, echoPersisted };
     }
     /**
      * P2.3 reply resolution. Resolves the durable persisted entry the reply
@@ -3119,6 +3596,48 @@ export class TurnRunner {
         this.store.updateTurnAttempt(agentId, turn.turnId, phase);
         turn.phase = phase;
     }
+    /**
+     * Avança o estado ao vivo do turno. A fase durável correspondente é derivada
+     * por `durablePhaseFor`, então continua existindo um único sistema de fases.
+     */
+    private setExecutionPhase(agentId: string, turn: TurnMetadata, phase: TurnExecutionPhase, toolName?: string): void {
+        const execution = turn.execution;
+        if (execution !== undefined) {
+            if (execution.phase !== phase) {
+                execution.phase = phase;
+                execution.phaseChangedAtMs = this.nowFn();
+            }
+            if (phase === "tool" && toolName !== undefined)
+                execution.toolName = toolName;
+            else
+                delete execution.toolName;
+        }
+        this.updateTurnPhase(agentId, turn, durablePhaseFor(phase));
+    }
+    /**
+     * Registra um acontecimento REAL do turno. Só provedor e ferramenta chegam
+     * aqui: polling, heartbeat e contador visual nunca provam progresso.
+     */
+    private noteTurnActivity(turn: TurnMetadata, kind: TurnActivityKind): void {
+        const execution = turn.execution;
+        if (execution === undefined)
+            return;
+        execution.lastActivity = kind;
+        execution.lastActivityAtMs = this.nowFn();
+    }
+    /** Estado ao vivo publicado em `promptStatus` para o bot indicado. */
+    private liveStatus(agentId: string): { turnId?: string; conversationId?: string; execution?: TurnExecution; lastTurn?: LastTurnOutcome } {
+        const current = this.currentTurns.get(agentId);
+        const lastTurn = this.lastTurns.get(agentId);
+        return {
+            ...(current === undefined ? {} : {
+                turnId: current.turnId,
+                ...(current.conversationId === undefined ? {} : { conversationId: current.conversationId }),
+            }),
+            ...(current?.execution === undefined ? {} : { execution: { ...current.execution } }),
+            ...(lastTurn === undefined ? {} : { lastTurn }),
+        };
+    }
     private persistResumeCheckpoint(
         agentId: string,
         turn: TurnMetadata,
@@ -3171,17 +3690,75 @@ export class TurnRunner {
         });
     }
     private resumeBudgetSnapshot(turn: TurnMetadata, previous?: ResumeBudgetSnapshot): ResumeBudgetSnapshot {
+        const loopBudget = resolveToolLoopBudget({ modelResolution: turn.modelResolution });
         return {
             maxProviderAttempts: previous?.maxProviderAttempts ?? 3,
             providerAttemptsUsed: Math.max(previous?.providerAttemptsUsed ?? 0, turn.providerAttemptsUsed ?? 1),
-            maxToolRounds: previous?.maxToolRounds ?? MAX_TOOL_ROUNDS,
+            // Persist the effective hard ceiling, not the adaptive soft
+            // checkpoint. The loop may extend its initial soft window on
+            // meaningful progress, but resume must retain the finite hard cap.
+            maxToolRounds: previous?.maxToolRounds ?? loopBudget.maxTotalRounds,
             toolRoundsUsed: Math.max(previous?.toolRoundsUsed ?? 0, turn.toolRoundsUsed ?? 0),
-            maxToolCalls: previous?.maxToolCalls ?? 128,
+            maxToolCalls: previous?.maxToolCalls ?? loopBudget.maxTotalCalls,
             toolCallsUsed: Math.max(previous?.toolCallsUsed ?? 0, turn.toolCallsUsed ?? 0),
         };
     }
+    /**
+     * The persisted provider counter predates cursor recovery and includes the
+     * ordinary model rounds that produced the checkpoint. Keep those rounds out
+     * of the recovery allowance so a long tool turn does not consume its own
+     * retry budget. A production checkpoint always has at least one ordinary
+     * round; the lower bound also makes old/hand-seeded zero snapshots fail
+     * closed when the first recovery reservation is made.
+     */
+    private resumeProviderAttemptsUsed(budget: ResumeBudgetSnapshot): number {
+        if (!this.validResumeBudget(budget))
+            return Number.POSITIVE_INFINITY;
+        const ordinaryRounds = Math.max(1, budget.toolRoundsUsed + 1);
+        return Math.max(0, budget.providerAttemptsUsed - Math.min(budget.providerAttemptsUsed, ordinaryRounds));
+    }
+    private validResumeBudget(budget: ResumeBudgetSnapshot): boolean {
+        return [
+            budget.maxProviderAttempts,
+            budget.providerAttemptsUsed,
+            budget.maxToolRounds,
+            budget.toolRoundsUsed,
+            budget.maxToolCalls,
+            budget.toolCallsUsed,
+        ].every((value) => Number.isSafeInteger(value) && value >= 0);
+    }
+    /** Atomically consumes one recovery attempt before invoking resumeChat. */
+    private reserveResumeAttempt(
+        scope: ResumeCheckpointScope,
+        checkpoint: ResumeCheckpoint,
+    ): ResumeCheckpoint | undefined {
+        if (typeof this.store.advanceResumeCheckpoint !== "function" || !this.validResumeBudget(checkpoint.budget))
+            return undefined;
+        if (this.resumeBudgetExhausted(checkpoint.budget))
+            return undefined;
+        const ordinaryRounds = Math.max(1, checkpoint.budget.toolRoundsUsed + 1);
+        const providerAttemptsUsed = Math.max(checkpoint.budget.providerAttemptsUsed, ordinaryRounds) + 1;
+        if (!Number.isSafeInteger(providerAttemptsUsed))
+            return undefined;
+        try {
+            return this.store.advanceResumeCheckpoint(scope, checkpoint.version, {
+                cursor: checkpoint.cursor,
+                safeSequenceId: checkpoint.safeSequenceId,
+                completedEffectIds: [...checkpoint.completedEffectIds],
+                expiresAtMs: checkpoint.expiresAtMs,
+                budget: { ...checkpoint.budget, providerAttemptsUsed },
+            });
+        }
+        catch {
+            // A concurrent cursor/effect update wins the CAS. Do not call the
+            // provider without a durable reservation; the next resume can retry
+            // from the newer checkpoint if it is still safe.
+            return undefined;
+        }
+    }
     private resumeBudgetExhausted(budget: ResumeBudgetSnapshot): boolean {
-        return budget.providerAttemptsUsed >= budget.maxProviderAttempts
+        return !this.validResumeBudget(budget)
+            || this.resumeProviderAttemptsUsed(budget) >= budget.maxProviderAttempts
             || budget.toolRoundsUsed >= budget.maxToolRounds
             || budget.toolCallsUsed >= budget.maxToolCalls;
     }
@@ -3248,6 +3825,7 @@ export class TurnRunner {
         imageAttachments: readonly { name: string; dataUrl: string }[] = [],
         systemTextOverride?: string,
         modelResolution?: ModelResolution,
+        currentTurnContext = "",
     ): ContextAssemblyResult {
         const anchorEntry = this.store.getEarliestUser(agentId, conversationId);
         const anchorContent = anchorEntry?.content;
@@ -3260,6 +3838,7 @@ export class TurnRunner {
                 conversationId,
                 prompt: currentPromptOverride?.normalized ?? currentPromptOverride?.original ?? promptText,
                 currentAttachmentContext,
+                currentTurnContext,
                 currentPromptOverride,
                 omittedAssistantTurnId,
                 recentStore: this.store,
@@ -3290,7 +3869,7 @@ export class TurnRunner {
                         ...assembled.modelBudget.used,
                         ...classifyProviderMessageTokens(finalMessages, tokenizer),
                     },
-                    truncated: assembled.modelBudget.truncated || anchored.truncated || JSON.stringify(finalMessages) !== JSON.stringify(anchored.messages),
+                    truncated: assembled.modelBudget.truncated || anchored.truncated || !providerMessagesIdentical(finalMessages, anchored.messages),
                 };
             const withImages = this.attachImageParts(finalMessages, imageAttachments);
             return {
@@ -3302,7 +3881,7 @@ export class TurnRunner {
                 ],
                 bytes: Buffer.byteLength(JSON.stringify(withImages), "utf8"),
                 availableBytes: assembled.availableBytes,
-                truncated: assembled.truncated || anchored.truncated || JSON.stringify(withImages) !== JSON.stringify(anchored.messages),
+                truncated: assembled.truncated || anchored.truncated || !providerMessagesIdentical(withImages, anchored.messages),
                 modelBudget: finalBudget,
             };
         }
@@ -3350,12 +3929,17 @@ export class TurnRunner {
                 last.content = `${currentPromptOverride.normalized}${last.content.slice(currentPromptOverride.original.length)}`;
             }
         }
-        if (currentAttachmentContext && messages.length > 0) {
+        if ((currentAttachmentContext || currentTurnContext) && messages.length > 0) {
             const last = messages[messages.length - 1];
-            if (last?.role === "user" && typeof last.content === "string" && !last.content.includes("[[OPENBOT_UNTRUSTED_ATTACHMENT_BEGIN]]")) {
-                last.content = last.content.length > 0
-                    ? `${last.content}\n\n${currentAttachmentContext}`
-                    : currentAttachmentContext;
+            if (last?.role === "user" && typeof last.content === "string") {
+                const parts: string[] = [];
+                if (currentAttachmentContext && !last.content.includes("[[OPENBOT_UNTRUSTED_ATTACHMENT_BEGIN]]")) parts.push(currentAttachmentContext);
+                if (currentTurnContext) parts.push(currentTurnContext);
+                if (parts.length > 0) {
+                    last.content = last.content.length > 0
+                        ? `${last.content}\n\n${parts.join("\n\n")}`
+                        : parts.join("\n\n");
+                }
             }
         }
         const capabilities = model === undefined ? undefined : resolveModelCapabilities(modelResolution?.entry ?? model, provider);
@@ -3390,14 +3974,14 @@ export class TurnRunner {
                 ...tokenBudget.used,
                 ...classifyProviderMessageTokens(finalMessages, tokenizer),
             },
-            truncated: anchored.truncated || JSON.stringify(finalMessages) !== JSON.stringify(anchored.messages),
+            truncated: anchored.truncated || !providerMessagesIdentical(finalMessages, anchored.messages),
         };
         const withImages = this.attachImageParts(finalMessages, imageAttachments);
         return {
             messages: withImages,
             bytes: Buffer.byteLength(JSON.stringify(withImages), "utf8"),
             availableBytes: byteBudget,
-            truncated: anchored.truncated || JSON.stringify(withImages) !== JSON.stringify(anchored.messages),
+            truncated: anchored.truncated || !providerMessagesIdentical(withImages, anchored.messages),
             modelBudget: finalBudget,
         };
     }
@@ -3431,8 +4015,10 @@ export class TurnRunner {
             : [];
         let imageBytes = 0;
         for (const image of imageAttachments) {
-            if (imageBytes >= IMAGE_BYTE_CAP)
-                break;
+            if (imageBytes >= IMAGE_BYTE_CAP) {
+                parts.push({ type: "text", text: `[attachment "${image.name}" omitted: image byte budget exhausted]` });
+                continue;
+            }
             parts.push({ type: "image_url", image_url: { url: image.dataUrl, detail: "auto" } });
             imageBytes += Buffer.byteLength(image.dataUrl, "utf8");
         }
@@ -3445,7 +4031,8 @@ export class TurnRunner {
             return;
         const appended: TranscriptEntry[] = [];
         if (event.type === "delta" || event.type === "tool-call" || event.type === "message") {
-            this.updateTurnPhase(agentId, turn, "streaming");
+            this.setExecutionPhase(agentId, turn, "receiving");
+            this.noteTurnActivity(turn, "provider-stream");
             turn.contentStarted = true;
             if (turn.reasoning) turn.reasoning.seenContent = true;
         }
@@ -3461,6 +4048,7 @@ export class TurnRunner {
                 const startSummary = this.sanitizeReasoningFragment((event).summary, 256);
                 turn.reasoning.open = true;
                 turn.reasoning.bytes = Buffer.byteLength(startSummary || "", "utf8");
+                this.noteTurnActivity(turn, "reasoning");
                 this.publishReasoning(agentId, turn, { type: "start", ...(startSummary ? { summary: startSummary } : {}) });
                 break;
             }
@@ -3471,6 +4059,7 @@ export class TurnRunner {
                 if (!fragment) break;
                 if (turn.reasoning.bytes + Buffer.byteLength(fragment, "utf8") > 4096) break;
                 turn.reasoning.bytes += Buffer.byteLength(fragment, "utf8");
+                this.noteTurnActivity(turn, "reasoning");
                 this.publishReasoning(agentId, turn, { type: "progress", summary: fragment });
                 break;
             }
@@ -3561,9 +4150,10 @@ export class TurnRunner {
             return;
         const now = this.nowFn();
         let live = this.liveAssistant.get(agentId);
-        const currentBytes = live ? Buffer.byteLength(live.content, "utf8") : 0;
+        const currentBytes = live?.byteCount ?? 0;
         const accepted = utf8Prefix(delta, MAX_LIVE_RESPONSE_BYTES - currentBytes);
-        const limited = accepted.length !== delta.length || currentBytes + Buffer.byteLength(accepted, "utf8") >= MAX_LIVE_RESPONSE_BYTES;
+        const acceptedBytes = Buffer.byteLength(accepted, "utf8");
+        const limited = accepted.length !== delta.length || currentBytes + acceptedBytes >= MAX_LIVE_RESPONSE_BYTES;
         if (!live) {
             const id = this.newIdFn("assistant");
             const replicaKey = `transcript:${agentId}`;
@@ -3575,6 +4165,7 @@ export class TurnRunner {
                 // The initial appended entry is deliberately empty.  Its text is
                 // carried exactly once by ordered `transcript.delta` fragments.
                 content: "",
+                byteCount: 0,
                 lastPublishMs: now,
                 lastPersistMs: now,
                 limited,
@@ -3599,8 +4190,10 @@ export class TurnRunner {
                 ordered: baselineOrder,
             });
         }
-        if (accepted)
+        if (accepted) {
             live.content += accepted;
+            live.byteCount += acceptedBytes;
+        }
         if (limited && !live.limited)
             live.limited = true;
         if (limited) {
@@ -3609,10 +4202,11 @@ export class TurnRunner {
         }
         if (!accepted)
             return;
+        const entry = this.assistantMessage(agentId, live.id, live.content, true, turn);
         // Keep one bounded process-local preview for RPC readers.  This is not a
         // SQLite checkpoint and is replaced in place, so it cannot grow without
         // bound or turn each provider fragment into a durable write.
-        this.store.setLiveEntry?.(agentId, this.assistantMessage(agentId, live.id, live.content, true, turn), turn.conversationId);
+        this.store.setLiveEntry?.(agentId, entry, turn.conversationId);
         // Public deltas are cheap append-only transport frames.  Never send the
         // accumulated assistant text once per provider fragment (the old path was
         // O(n²) in both bytes and serialization work).
@@ -3633,7 +4227,6 @@ export class TurnRunner {
         const shouldPublish = now - live.lastPublishMs >= STREAM_UPDATE_MIN_MS
             && live.sequence - live.lastSnapshotSequence >= STREAM_SNAPSHOT_MIN_FRAGMENTS;
         const shouldPersist = now - live.lastPersistMs >= STREAM_PERSIST_INTERVAL_MS;
-        const entry = this.assistantMessage(agentId, live.id, live.content, true, turn);
         if (shouldPublish)
             this.publishStreamSnapshot(agentId, entry, turn.conversationId, live);
         if (shouldPersist)
@@ -3818,8 +4411,14 @@ export class TurnRunner {
         }
     }
     closeOpenToolCalls(agentId: string, result: ToolCallResult, conversationId?: string): void {
-        for (const entry of this.store.getOpenToolCalls(agentId, conversationId)) {
-            this.publishToolCall(agentId, { ...entry, status: "failed", result }, conversationId);
+        this.deferTranscriptSnapshots();
+        try {
+            for (const entry of this.store.getOpenToolCalls(agentId, conversationId)) {
+                this.publishToolCall(agentId, { ...entry, status: "failed", result }, conversationId);
+            }
+        }
+        finally {
+            this.flushTranscriptSnapshots();
         }
     }
     publishToolCall(agentId: string, entry: Extract<TranscriptEntry, { kind: "tool-call" }>, conversationId?: string): void {
@@ -3836,7 +4435,7 @@ export class TurnRunner {
             if (replaced) {
                 this.publishFn("transcript", { type: "updated", agentId, ...(conversationId === undefined ? {} : { conversationId }), entry, ordered: this.nextTranscriptOrder(agentId) });
                 if (entry.status === "completed" || entry.status === "failed") {
-                    this.publishTranscriptSnapshot(agentId, conversationId);
+                    this.publishOrDeferTranscriptSnapshot(agentId, conversationId);
                 }
                 return;
             }
@@ -3847,7 +4446,7 @@ export class TurnRunner {
         if (id.length > 0 && this.store.replace(agentId, id, entry, conversationId)) {
             this.publishFn("transcript", { type: "updated", agentId, ...(conversationId === undefined ? {} : { conversationId }), entry, ordered: this.nextTranscriptOrder(agentId) });
             if (entry.status === "completed" || entry.status === "failed") {
-                this.publishTranscriptSnapshot(agentId, conversationId);
+                this.publishOrDeferTranscriptSnapshot(agentId, conversationId);
             }
             return;
         }
@@ -3962,6 +4561,15 @@ export function registerSendPromptHandler(gateway: Gateway, opts: TurnRunnerOpti
         const agentId = typeof record.agentId === "string" ? record.agentId
             : typeof record.id === "string" ? record.id
                 : undefined;
+        if (record.scope === "current" || record.scope === "queued") {
+            if (!agentId?.trim() || typeof record.conversationId !== "string" || !record.conversationId.trim()) throw new RpcError(400, "Identidade do cancelamento incompleta");
+            if (record.scope === "current" && typeof record.turnId === "string" && record.turnId)
+                return runner.cancelCurrentTurn(agentId, record.conversationId, record.turnId);
+            if (record.scope === "queued" && typeof record.clientNonce === "string" && record.clientNonce)
+                return runner.removeQueuedPrompt(agentId, record.conversationId, record.clientNonce);
+            throw new RpcError(400, "Identificador do cancelamento ausente");
+        }
+        if (record.scope !== undefined) throw new RpcError(400, "Escopo de cancelamento inválido");
         return runner.cancelPrompt(agentId && agentId.trim() ? agentId : undefined);
     };
     gateway.registerHandler("cancelPrompt", cancel);
@@ -3972,7 +4580,10 @@ export function registerSendPromptHandler(gateway: Gateway, opts: TurnRunnerOpti
             : typeof record.id === "string" ? record.id
                 : "";
         const conversationId = typeof record.conversationId === "string" ? record.conversationId : undefined;
-        return runner.retryPrompt(agentId, conversationId);
+        const expectedFailureEntryId = record.expectedFailureEntryId;
+        if (expectedFailureEntryId !== undefined && (typeof expectedFailureEntryId !== "string" || expectedFailureEntryId.trim().length === 0))
+            throw new RpcError(400, "retryPrompt: expectedFailureEntryId inválido");
+        return runner.retryPrompt(agentId, conversationId, expectedFailureEntryId);
     });
     gateway.registerHandler("resumePrompt", (body: unknown) => {
         const record = (body ?? {}) as Record<string, unknown>;
@@ -3983,12 +4594,46 @@ export function registerSendPromptHandler(gateway: Gateway, opts: TurnRunnerOpti
         const conversationId = typeof record.conversationId === "string" ? record.conversationId : undefined;
         return runner.resumePrompt(agentId, turnId, conversationId);
     });
+    const isPromptRpcBody = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
     gateway.registerHandler("getPromptStatus", (body: unknown) => {
-        const record = (body ?? {}) as Record<string, unknown>;
+        if (body !== undefined && body !== null && !isPromptRpcBody(body)) throw new RpcError(400, "getPromptStatus: corpo inválido");
+        const record = body ?? {};
         const agentId = typeof record.agentId === "string" && record.agentId.trim().length > 0
             ? record.agentId
             : undefined;
+        if (record.agentIds !== undefined) {
+            if (!Array.isArray(record.agentIds) || record.agentIds.length > 128)
+                throw new RpcError(400, "getPromptStatus: lista de agentes inválida");
+            const ids = record.agentIds.map((id: unknown) => {
+                if (typeof id !== "string" || !id.trim()) throw new RpcError(400, "getPromptStatus: agente inválido");
+                return id;
+            });
+            return runner.promptStatuses(ids);
+        }
         return runner.promptStatus(agentId);
+    });
+    gateway.registerHandler("getPromptRecovery", (body: unknown) => {
+        if (body !== undefined && body !== null && !isPromptRpcBody(body)) throw new RpcError(400, "getPromptRecovery: corpo inválido");
+        const record = body ?? {};
+        const agentId = typeof record.agentId === "string" && record.agentId.trim().length > 0 ? record.agentId : "";
+        if (!agentId) throw new RpcError(400, "getPromptRecovery: agente inválido");
+        const conversationId = typeof record.conversationId === "string" && record.conversationId.trim().length > 0
+            ? record.conversationId
+            : undefined;
+        return runner.getPromptRecovery(agentId, conversationId);
+    });
+    gateway.registerHandler("getQueuedPrompt", (body: unknown) => {
+        if (!isPromptRpcBody(body)) throw new RpcError(400, "Identidade da mensagem incompleta.");
+        const record = body;
+        if (typeof record.agentId !== "string" || typeof record.conversationId !== "string" || typeof record.clientNonce !== "string")
+            throw new RpcError(400, "Identidade da mensagem incompleta.");
+        return runner.getQueuedPrompt(record.agentId, record.conversationId, record.clientNonce);
+    });
+    gateway.registerHandler("reviseQueuedPrompt", (body: unknown) => {
+        if (!isPromptRpcBody(body)) throw new RpcError(400, "Identidade da revisão incompleta.");
+        const record = body;
+        if (typeof record.originalNonce !== "string") throw new RpcError(400, "Identidade da revisão incompleta.");
+        return runner.reviseQueuedPrompt(normalizeSendPrompt(record), record.originalNonce);
     });
     gateway.registerHandler("promptAcceptanceStatus", (body) => {
         if (typeof body !== "object" || body === null || Array.isArray(body)) {

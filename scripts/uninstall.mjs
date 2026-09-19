@@ -18,7 +18,7 @@ import {
   removeShortcut,
   removeTree,
   randomSuffix,
-  shortcutPaths,
+  shortcutBelongsToInstall,
 } from "./release-common.mjs";
 
 const DEFERRED_ARGUMENTS_FLAG = "--prepare-deferred-args";
@@ -179,7 +179,6 @@ async function uninstallReleaseLocked(options = {}) {
   if (persistedShortcutRoot !== null && explicitShortcutRoot?.toLowerCase() !== persistedShortcutRoot.toLowerCase()) {
     throw new Error("The explicit shortcut root does not match the managed install state");
   }
-  const shortcuts = shortcutPaths(explicitShortcutRoot, options.env ?? process.env);
   await quiesceInstall(root, {
     timeoutMs: options.quiesceTimeoutMs,
     taskkillPath: options.taskkillPath,
@@ -187,6 +186,11 @@ async function uninstallReleaseLocked(options = {}) {
     isPortPresent: options.isPortPresent,
     queryProcessEvidence: options.queryProcessEvidence,
   });
+  const shortcuts = {};
+  for (const name of ["desktop", "startMenu"]) {
+    const path = state.shortcuts?.[name];
+    if (typeof path === "string" && await shortcutBelongsToInstall(path, root)) shortcuts[name] = path;
+  }
   const shortcutSnapshots = await Promise.all(Object.values(shortcuts).map(async (path) => ({
     path,
     content: await readFile(path).catch((error) => {
@@ -205,8 +209,7 @@ async function uninstallReleaseLocked(options = {}) {
   };
   let relocatedRoot = root;
   try {
-    await removeShortcut(shortcuts.desktop);
-    await removeShortcut(shortcuts.startMenu);
+    for (const path of Object.values(shortcuts)) await removeShortcut(path);
     if (process.platform === "win32") {
       relocatedRoot = join(dirname(root), `${basename(root)}.removing-${randomSuffix()}`);
       await rename(root, relocatedRoot);

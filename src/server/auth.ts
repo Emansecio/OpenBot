@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { writeFileExclusiveSync } from "../shared/fs-atomic.js";
 import { homedir } from "node:os";
 import type { IncomingMessage } from "node:http";
 
@@ -36,7 +37,7 @@ export function loadOrCreateGatewayToken(file = defaultGatewayTokenPath()): stri
   mkdirSync(dirname(file), { recursive: true });
   const token = randomBytes(24).toString("base64url");
   try {
-    writeFileSync(file, `${token}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    writeFileExclusiveSync(file, `${token}\n`);
     return token;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;

@@ -515,6 +515,7 @@ function compileHostDownloadHandler(): {
     "fsp",
     "send",
     "PROTOCOL_VERSION",
+    "ACTIVE_DOWNLOADS",
     HOST_SOURCE.slice(start, end + "\n    });".length),
   ) as (...args: unknown[]) => void;
   factory(
@@ -526,6 +527,7 @@ function compileHostDownloadHandler(): {
     { rm: async (target: string) => { cleanupCalls.push(target); } },
     () => undefined,
     1,
+    new Map(),
   );
   if (handler === undefined) throw new Error("browser download handler was not registered");
   return {

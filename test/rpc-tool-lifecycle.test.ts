@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { LocalExecutionBroker } from "../src/execution/broker.js";
 import type { ExecutionBackend } from "../src/execution/contracts.js";
@@ -352,5 +352,93 @@ describe("tool-call lifecycle", () => {
     const cards = store.getEntries("openbot-default").filter((entry) => entry.kind === "tool-call");
     expect(cards).toHaveLength(1);
     expect(cards[0]).toMatchObject({ id: "die", status: "failed", result: { ok: false } });
+  });
+
+  it("records sibling outcomes when one parallel read-only call throws", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "openbot-life-parallel-"));
+    dirs.push(dir);
+    const homes = await AgentHomeStore.create(dir);
+    const home = await homes.ensure("openbot-default");
+    await writeFile(join(home.root, "Documents", "ok.md"), "content");
+    const broker = new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root), () => "always", () => {});
+    const realExecute = broker.execute.bind(broker);
+    vi.spyOn(broker, "execute").mockImplementation(async (agentId, requestId, request, signal, options) => {
+      if ((request as { path?: string }).path === "Documents/fail.md") throw new Error("broker blew up");
+      return realExecute(agentId, requestId, request, signal, options);
+    });
+    const statuses = new Map<string, string>();
+    const toolRead = (id: string, path: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "file", arguments: JSON.stringify({ op: "read", path }) },
+    });
+    await expect(runToolLoop({
+      agentId: "openbot-default",
+      turnId: "turn-parallel",
+      broker,
+      request: { model: "fake", messages: [] },
+      onEvent: () => undefined,
+      onProgress: ({ entry }) => { if (entry.id !== undefined) statuses.set(entry.id, entry.status); },
+      async stream() {
+        return {
+          aborted: false,
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [toolRead("r-ok", "Documents/ok.md"), toolRead("r-boom", "Documents/fail.md")],
+          },
+        };
+      },
+    })).rejects.toThrow("broker blew up");
+    // The failing call must not discard the sibling's recorded outcome.
+    expect(statuses.get("r-ok")).toBe("completed");
+  });
+
+  it("re-executes a read after a write and keeps resumable occurrences distinct", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "openbot-life-rwr-"));
+    dirs.push(dir);
+    const homes = await AgentHomeStore.create(dir);
+    const home = await homes.ensure("openbot-default");
+    await writeFile(join(home.root, "Documents", "estado.md"), "v1");
+    const store = createMemoryTranscriptStore();
+    const scope = { agentId: "openbot-default", conversationId: "conversation-a", turnId: "turn-rwr", provider: "openai-compat", model: "openai-compatible" } as const;
+    const broker = new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root), () => "always", () => {});
+    const toolRead = (id: string, path: string) => ({
+      id,
+      type: "function" as const,
+      function: { name: "file", arguments: JSON.stringify({ op: "read", path }) },
+    });
+    const effectIds: string[] = [];
+    let deliveredToolJson = "";
+    let round = 0;
+    const result = await runToolLoop({
+      agentId: scope.agentId,
+      conversationId: scope.conversationId,
+      turnId: scope.turnId,
+      broker,
+      resumableEffects: {
+        prepare: (effectId, fingerprintHash) => { effectIds.push(effectId); return store.prepareResumeEffect!(scope, effectId, fingerprintHash); },
+        markStarted: (effectId) => store.markResumeEffectStarted!(scope, effectId),
+        markUnsafe: (effectId) => store.markResumeEffectUnsafe!(scope, effectId),
+        complete: (effectId, fingerprintHash, res) => store.completeResumeEffect!(scope, effectId, fingerprintHash, res),
+      },
+      request: { model: "fake", messages: [] },
+      onEvent: () => undefined,
+      async stream(request) {
+        round += 1;
+        deliveredToolJson = JSON.stringify(request.messages.filter((message) => message.role === "tool"));
+        const calls = round === 1 ? [toolRead("r1", "Documents/estado.md")]
+          : round === 2 ? [toolWrite("w1", "Documents/estado.md", "v2")]
+          : round === 3 ? [toolRead("r2", "Documents/estado.md")]
+          : undefined;
+        if (calls === undefined) return { aborted: false, message: { role: "assistant", content: "done" } };
+        return { aborted: false, message: { role: "assistant", content: "", toolCalls: calls } };
+      },
+    });
+    expect(result.error).toBeUndefined();
+    expect(deliveredToolJson).toContain("v2");
+    // read, write, read again — three distinct resumable effects.
+    expect(effectIds).toHaveLength(3);
+    expect(new Set(effectIds).size).toBe(3);
   });
 });

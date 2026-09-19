@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -92,31 +92,27 @@ describe("P2.5 supplement — capability matrix negatives and production boundar
     expect(() => createCliProviderAdapter({ provider: "mystery-cli", executable: "node", args: [], cwd: "." } as never)).toThrow(ProviderError);
   });
 
-  it("persisted optional provider config stores only opaque references, never secret values", () => {
+  it("legacy optionalProviders key is tolerated on load and stripped on persist", () => {
     const root = mkdtempSync(join(tmpdir(), "openbot-p25-config-"));
     roots.push(root);
-    const secret = "sk-fixture-super-secret-value";
-    const store = new ConfigStore({ configPath: join(root, "config.json") });
-    store.update({ optionalProviders: {
-      openrouter: {
-        enabled: true,
-        scope: "agent-a",
-        credentialRef: "openrouter:key:fixture-v1",
-        endpoint: "https://openrouter.example/api/v1",
-        secret,
-      } as never,
-    } });
-    const onDisk = readFileSync(join(root, "config.json"), "utf8");
-    expect(onDisk).not.toContain(secret);
-    expect(onDisk).toContain('"credentialRef": "openrouter:key:fixture-v1"');
-    expect(store.snapshot().optionalProviders?.openrouter).toMatchObject({ enabled: true, credentialRef: "openrouter:key:fixture-v1" });
-    expect(store.snapshot().optionalProviders?.openrouter).not.toHaveProperty("secret");
-    // Only the known optional providers are accepted; an unknown key is rejected.
-    expect(() => store.update({ optionalProviders: { "mystery-provider": { enabled: true } } as never })).toThrow(/config inválida/);
+    const configPath = join(root, "config.json");
+    const store = new ConfigStore({ configPath });
+    const seeded = { ...store.snapshot(), optionalProviders: { openrouter: { enabled: true, credentialRef: "openrouter:key:fixture-v1" } } };
+    writeFileSync(configPath, JSON.stringify(seeded));
     store.close();
+
+    const reloaded = new ConfigStore({ configPath });
+    // The removed surface is not revived: the key loads tolerantly and is
+    // absent from the snapshot and from the next persisted write.
+    expect(reloaded.snapshot()).not.toHaveProperty("optionalProviders");
+    reloaded.update({ flags: {} });
+    const onDisk = readFileSync(configPath, "utf8");
+    expect(onDisk).not.toContain("optionalProviders");
+    expect(onDisk).not.toContain("openrouter:key:fixture-v1");
+    reloaded.close();
   });
 
-  it("bootstrap registers routable optional providers and defers CLI providers without persisted routing", async () => {
+  it("bootstrap never registers optional providers, even from legacy config", async () => {
     const defaultRoot = mkdtempSync(join(tmpdir(), "openbot-p25-boot-default-"));
     roots.push(defaultRoot);
     const defaultHandle = await startServer(0, {
@@ -129,22 +125,20 @@ describe("P2.5 supplement — capability matrix negatives and production boundar
     expect(defaultHandle.registry.names()).not.toContain("codex-cli");
     expect(defaultHandle.registry.names()).not.toContain("claude-code");
 
+    // A legacy config that still carries the removed optionalProviders key
+    // loads tolerantly but never registers the inert providers.
     const configuredRoot = mkdtempSync(join(tmpdir(), "openbot-p25-boot-configured-"));
     roots.push(configuredRoot);
     const configPath = join(configuredRoot, "config.json");
     const config = new ConfigStore({ configPath });
-    config.update({ optionalProviders: {
-      openrouter: { enabled: true, scope: "agent-a", credentialRef: "openrouter:key:fixture-v1" },
-      "codex-cli": {
-        enabled: true,
-        scope: "agent-a",
-        sessionRef: "cli:session:fixture-v1",
-        executable: "node",
-        args: ["-e", "1"],
-        cwd: configuredRoot,
+    writeFileSync(configPath, JSON.stringify({
+      ...config.snapshot(),
+      optionalProviders: {
+        openrouter: { enabled: true, scope: "agent-a", credentialRef: "openrouter:key:fixture-v1" },
+        "codex-cli": { enabled: true, scope: "agent-a", sessionRef: "cli:session:fixture-v1", executable: "node", args: ["-e", "1"], cwd: configuredRoot },
+        "claude-code": { enabled: true, scope: "agent-a" },
       },
-      "claude-code": { enabled: true, scope: "agent-a" },
-    } });
+    }));
     config.close();
     const configuredHandle = await startServer(0, {
       configPath,
@@ -153,7 +147,7 @@ describe("P2.5 supplement — capability matrix negatives and production boundar
       allowUnauthenticatedLocalGateway: true,
     });
     handles.push(configuredHandle);
-    expect(configuredHandle.registry.names()).toContain("openrouter");
+    expect(configuredHandle.registry.names()).not.toContain("openrouter");
     expect(configuredHandle.registry.names()).not.toContain("codex-cli");
     expect(configuredHandle.registry.names()).not.toContain("claude-code");
   });

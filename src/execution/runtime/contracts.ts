@@ -65,6 +65,8 @@ export interface RuntimeDriverLease {
 }
 
 export interface RuntimeDriver {
+  /** Identifies a versioned recovery protocol, including pending leases. */
+  readonly recoveryKind?: "native-job-v1";
   start(signal?: AbortSignal): Promise<RuntimeBoot>;
   health(boot: RuntimeBoot, signal?: AbortSignal): Promise<RuntimeHealth>;
   acquire(request: RuntimeLeaseRequest, signal?: AbortSignal): Promise<RuntimeDriverLease>;
@@ -105,6 +107,9 @@ export interface RuntimeLease {
 }
 
 export interface AgentRuntimeManager {
+  metrics?(): import("./scheduler.js").RuntimeAdmissionMetrics;
+  /** Ref-counted temporary admission fence; releasing it never clears a deletion fence. */
+  fenceAgentMaintenance?(agentId: string): () => void;
   ensure(agentId: string, mode: RuntimeMode, signal?: AbortSignal): Promise<RuntimeStatus>;
   acquire(agentId: string, capability: RuntimeCapability, signal?: AbortSignal): Promise<RuntimeLease>;
   status(agentId: string, requestedMode?: RuntimeMode): Promise<RuntimeStatus>;

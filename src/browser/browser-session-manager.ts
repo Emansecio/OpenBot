@@ -204,7 +204,9 @@ export class BrowserSessionManager {
   private proxyStarting?: Promise<EgressProxyAddress>;
   private leaseSweepTimer?: ReturnType<typeof setTimeout>;
   private readonly agentTeardowns = new Map<string, Promise<void>>();
+  private readonly downloadObservers = new Map<string, Set<Promise<void>>>();
   private closed = false;
+  private closing?: Promise<void>;
 
   constructor(options: BrowserSessionManagerOptions) {
     if ((options.downloadsRoot === undefined || options.downloadsRoot.length === 0) && options.resolveDownloadRoot === undefined) {
@@ -256,10 +258,9 @@ export class BrowserSessionManager {
     const agentId = typeof agentIdOrOptions === "string" ? agentIdOrOptions : agentIdOrOptions.agentId;
     const requested = typeof agentIdOrOptions === "string" ? options : agentIdOrOptions;
     assertAgentId(agentId);
-    const teardown = this.agentTeardowns.get(agentId);
-    if (teardown !== undefined) await teardown;
-    const stopping = this.stopping;
-    if (stopping !== undefined) await stopping;
+    while (this.agentTeardowns.has(agentId) || this.stopping !== undefined) {
+      await (this.agentTeardowns.get(agentId) ?? this.stopping);
+    }
     if (this.closed) throw new BrowserHostError("BROWSER_MANAGER_CLOSED", "browser session manager is closed");
     const ttlMs = clampLeaseTtl(requested.ttlMs ?? this.leaseTtlMs);
     const sessionId = requested.sessionId ?? createRequestId();
@@ -272,10 +273,9 @@ export class BrowserSessionManager {
     // Root resolution can yield while the last old lease starts teardown.
     // Re-check immediately before publishing the new lease so it cannot be
     // returned while the previous host pipe is still closing.
-    const stoppingAfterRoots = this.stopping;
-    if (stoppingAfterRoots !== undefined) await stoppingAfterRoots;
-    const teardownAfterRoots = this.agentTeardowns.get(agentId);
-    if (teardownAfterRoots !== undefined) await teardownAfterRoots;
+    while (this.agentTeardowns.has(agentId) || this.stopping !== undefined) {
+      await (this.agentTeardowns.get(agentId) ?? this.stopping);
+    }
     if (this.closed) throw new BrowserHostError("BROWSER_MANAGER_CLOSED", "browser session manager is closed");
     const state: LeaseState = {
       leaseId,
@@ -350,18 +350,30 @@ export class BrowserSessionManager {
     const leaseId = typeof lease === "string" ? lease : lease.leaseId;
     const state = this.leases.get(leaseId);
     if (state === undefined) return;
-    if (state.released) {
-      if (state.cleanup !== undefined) await state.cleanup;
-      return;
-    }
     await this.beginLeaseCleanup(state);
   }
 
-  async teardownAgent(agentId: string): Promise<void> {
+  /** Drain tabs and downloads without deleting the agent's persistent profile. */
+  teardownAgent(agentId: string): Promise<void> {
+    return this.runAgentCleanup(agentId, false);
+  }
+
+  /** Explicit deletion/reset only. Ordinary backend/home cleanup must not purge. */
+  purgeAgent(agentId: string): Promise<void> {
+    return this.runAgentCleanup(agentId, true);
+  }
+
+  private async runAgentCleanup(agentId: string, purge: boolean): Promise<void> {
     assertAgentId(agentId);
-    const existing = this.agentTeardowns.get(agentId);
-    if (existing !== undefined) return existing;
-    const teardown = this.performAgentTeardown(agentId);
+    const previous = this.agentTeardowns.get(agentId);
+    // Serialize unlike operations too: a purge cannot be lost by joining a drain.
+    const teardown = (async () => {
+      if (previous !== undefined) await previous;
+      const owned = [...this.leases.values()].filter((lease) => lease.agentId === agentId);
+      await Promise.all(owned.map((lease) => this.release(lease)));
+      await Promise.all([...(this.downloadObservers.get(agentId) ?? [])]);
+      if (purge) await this.performAgentPurge(agentId);
+    })();
     this.agentTeardowns.set(agentId, teardown);
     try {
       await teardown;
@@ -378,9 +390,8 @@ export class BrowserSessionManager {
     await rm(target, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
   }
 
-  private async performAgentTeardown(agentId: string): Promise<void> {
-    const owned = [...this.leases.values()].filter((lease) => lease.agentId === agentId);
-    await Promise.all(owned.map((lease) => this.release(lease)));
+  private async performAgentPurge(agentId: string): Promise<void> {
+    if (this.stopping !== undefined) await this.stopping;
     if (this.host !== undefined && this.leases.size === 0) {
       await this.stopHost();
       await this.removePartitionRoot(agentId);
@@ -405,9 +416,14 @@ export class BrowserSessionManager {
     await this.removePartitionRoot(agentId);
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closing !== undefined) return this.closing;
     this.closed = true;
+    this.closing = this.closeManager();
+    return this.closing;
+  }
+
+  private async closeManager(): Promise<void> {
     this.clearLeaseSweepTimer();
     this.startingProcess?.kill("SIGTERM");
     const proxyClosing = this.proxy.close();
@@ -428,6 +444,7 @@ export class BrowserSessionManager {
     }
     if (this.stopping !== undefined) await this.stopping;
     await proxyClosing;
+    await Promise.all([...this.downloadObservers.values()].flatMap((observers) => [...observers]));
     const error = new BrowserHostError("BROWSER_MANAGER_CLOSED", "browser session manager is closed");
     for (const id of this.pending.keys()) {
       this.settlePending(id, error);
@@ -442,10 +459,14 @@ export class BrowserSessionManager {
     homeRoot = state.homeRoot,
   ): Promise<BrowserHostCommandResult> {
     if (signal?.aborted) throw browserAbortError();
+    const cleanup = command.command === "close" || command.command === "reset";
+    if (!cleanup && state.released) throw new BrowserHostError("BROWSER_LEASE_NOT_FOUND", "browser lease is no longer active");
     this.reservePendingSlot(state.agentId);
     try {
       const host = existingHost ?? await raceWithBrowserAbort(this.ensureHost(), signal);
       if (signal?.aborted) throw browserAbortError();
+      // Host startup yields. A drain may have revoked this lease meanwhile.
+      if (!cleanup && state.released) throw new BrowserHostError("BROWSER_LEASE_NOT_FOUND", "browser lease is no longer active");
       const id = createRequestId();
       const request: BrowserHostRequest = {
         protocolVersion: 1,
@@ -743,7 +764,15 @@ export class BrowserSessionManager {
     };
     try {
       const result = this.onDownload?.(event);
-      if (result !== undefined && typeof (result).catch === "function") void (result).catch(() => undefined);
+      if (result !== undefined) {
+        const observers = this.downloadObservers.get(state.agentId) ?? new Set<Promise<void>>();
+        this.downloadObservers.set(state.agentId, observers);
+        const observed = Promise.resolve(result).catch(() => undefined).finally(() => {
+          observers.delete(observed);
+          if (observers.size === 0) this.downloadObservers.delete(state.agentId);
+        });
+        observers.add(observed);
+      }
     } catch {
       // Inventory/quota callbacks are observers; a callback failure cannot
       // corrupt browser lease state or make a completed download unsafe.
@@ -853,14 +882,22 @@ export class BrowserSessionManager {
     if (options.expired) state.expired = true;
     state.cleanup = this.cleanupLease(state, options.signal);
     try {
-      return await state.cleanup;
-    } finally {
+      const result = await state.cleanup;
       this.leases.delete(state.leaseId);
+      return result;
+    } catch (error) {
+      // Keep ownership for a later cleanup attempt; never hide a live tab.
+      state.cleanup = undefined;
+      throw error;
+    } finally {
       this.scheduleLeaseSweep();
     }
   }
 
   private async cleanupLease(state: LeaseState, signal?: AbortSignal): Promise<BrowserHostCommandResult | undefined> {
+    // Include launch reservations, not only commands already written to a pipe.
+    if (this.starting !== undefined) await this.starting.catch(() => undefined);
+    if (this.stopping !== undefined) await this.stopping;
     const host = this.host;
     if (host === undefined) return;
 
@@ -868,19 +905,10 @@ export class BrowserSessionManager {
       return await this.sendCommand(state, { command: "close" }, host, signal);
     } catch (error) {
       const lastLease = this.host === host && !this.hasActiveLeaseExcept(state);
-      // A missing tab is already clean. For a live shared host, reset only
-      // this lease's partition as a bounded fallback; other agents keep
-      // their tabs and the shared host remains available.
+      // A missing tab is already clean. A shared-host close failure must
+      // propagate: resetting here would erase cookies and application data.
       if (error instanceof BrowserHostError && error.code === "BROWSER_TAB_NOT_FOUND") {
         return { command: "close", tabId: state.tabId, visible: false };
-      }
-      if (this.host === host && this.hasActiveLeaseExcept(state)) {
-        try {
-          await this.sendCommand(state, { command: "reset" }, host, signal);
-          return { command: "close", tabId: state.tabId, visible: false };
-        } catch (resetError) {
-          throw resetError instanceof Error ? resetError : error;
-        }
       }
       if (
         lastLease &&
@@ -937,7 +965,7 @@ export class BrowserSessionManager {
       ["DawnCache"],
       ["DawnGraphiteCache"],
       ["DawnWebGPUCache"],
-      ["Service Worker", "CacheStorage"],
+      // Service Worker/CacheStorage is application data, not disposable cache.
     ] as const;
     await Promise.all(children.map(async (child) => {
       if (!child.isDirectory() || child.isSymbolicLink() || !child.name.startsWith("openbot-agent-")) return;
@@ -959,11 +987,14 @@ export class BrowserSessionManager {
     this.host = undefined;
     let resolveStop!: () => void;
     let rejectStop!: (error: Error) => void;
-    const stopping = new Promise<void>((resolve, reject) => {
+    const exited = new Promise<void>((resolve, reject) => {
       resolveStop = resolve;
       rejectStop = reject;
     });
+    // Keep host admission blocked through cache cleanup, not just process exit.
+    const stopping = exited.then(() => this.purgeIdlePartitionCaches().catch(() => undefined));
     this.stopping = stopping;
+    let exitObserved = false;
     try {
       let settled = false;
       let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
@@ -974,7 +1005,12 @@ export class BrowserSessionManager {
       // grace period, then force the process down before resolving.
       const gracefulStopMs = Math.max(100, Math.min(2_000, this.commandTimeoutMs));
       connection.process.onExit(() => {
-        if (settled) return;
+        exitObserved = true;
+        if (settled) {
+          // A timeout must fence profile reuse until a late exit is proven.
+          if (this.stopping === stopping) this.stopping = undefined;
+          return;
+        }
         settled = true;
         if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
         if (hardTimeout !== undefined) clearTimeout(hardTimeout);
@@ -1000,9 +1036,8 @@ export class BrowserSessionManager {
         // command pipe; shutdown must remain bounded.
       }
       await stopping;
-      void this.purgeIdlePartitionCaches().catch(() => undefined);
     } finally {
-      if (this.stopping === stopping) this.stopping = undefined;
+      if (exitObserved && this.stopping === stopping) this.stopping = undefined;
     }
   }
 }

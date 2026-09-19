@@ -547,11 +547,11 @@
   "permittedOverlays": [
     {
       "path": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
-      "sha256": "cd72723d206e139520b91a32bdce1acbd1ba58fdd571d7f959436bdc6d67ae7b"
+      "sha256": "111a4d5c9e3bd3c4cbd180ce11327f44335013c880139dfe8b61fecca4b761e1"
     },
     {
       "path": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
-      "sha256": "4bb3cd8d94a8f0fdf5cd00d84da734e948f2b2b80d928fae02378bc377a2ff15"
+      "sha256": "dd81390ad91a07ed8b23c6bb25601fe837253d2687ad7d4f2431beca26fbc7d0"
     }
   ],
   "permittedMedia": [

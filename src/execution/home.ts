@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -7,7 +7,8 @@ import {
   discardStage,
   exportHomeArchive,
   HomeArchiveError,
-  materializeHomeArchive,
+  readHomeArchiveSummary,
+  stageHomeArchive,
   validateHomeArchive,
   type ExportHomeArchiveOptions,
   type ImportHomeArchiveOptions,
@@ -19,7 +20,7 @@ import {
   type HomeAclResult,
 } from "./home-acl.js";
 import { HomeWorkspaceBackend } from "./home-backend.js";
-import { emptyGrants } from "./home-grants.js";
+import { emptyGrants, writeSharedGrants } from "./home-grants.js";
 import {
   calculateVisibleUsage,
   detectDrift,
@@ -28,6 +29,7 @@ import {
   type DriftReport,
 } from "./home-drift.js";
 import { inventoryHome, type HomeInventory } from "./home-inventory.js";
+import { writeFileExclusive } from "../shared/fs-atomic.js";
 import { WorkspaceError, WorkspaceSandbox } from "./workspace.js";
 
 export const HOME_LAYOUT_VERSION = 2;
@@ -157,7 +159,7 @@ const LAYOUT_MIGRATIONS: readonly LayoutMigrationStep[] = [
 async function seedGrantsFile(sandbox: WorkspaceSandbox): Promise<void> {
   const grantsPath = await sandbox.resolveDestination(".openbot/grants.json");
   try {
-    await writeFile(grantsPath, `${JSON.stringify(emptyGrants(), null, 2)}\n`, { flag: "wx", encoding: "utf8", mode: 0o600 });
+    await writeFileExclusive(grantsPath, `${JSON.stringify(emptyGrants(), null, 2)}\n`);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
@@ -321,7 +323,7 @@ export class AgentHomeStore {
         welcomeHash: WELCOME_HASH,
       };
       try {
-        await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
+        await writeFileExclusive(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
         await seedGrantsFile(sandbox);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -395,7 +397,22 @@ export class AgentHomeStore {
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
       throw new WorkspaceError("outside_workspace", "Agent workspace is unsafe.");
     }
-    await this.readHomeManifest(source, id);
+    try {
+      await this.readHomeManifest(source, id);
+    } catch (error) {
+      if (!(error instanceof HomeLifecycleError) || error.code !== "integrity_error") throw error;
+      // Containment must not depend on a readable manifest: the directory
+      // name is the identity, and quarantine preserves the bytes for manual
+      // recovery. A manifest that parses but names another agent proves the
+      // content is foreign — refuse instead of quarantining it under a wrong
+      // identity.
+      const probe = await readFile(join(source, ".openbot", "home.json"), "utf8")
+        .then((text) => { try { return JSON.parse(text) as { agentId?: unknown }; } catch { return undefined; } })
+        .catch(() => undefined);
+      if (probe !== undefined && typeof probe.agentId === "string" && !sameAgentId(probe.agentId, id)) throw error;
+      // The marker lives under .openbot; a damaged home may lack the directory.
+      await mkdir(join(source, ".openbot"), { recursive: true });
+    }
     if (verifyInventory) await inventoryHome(source, id);
     // Prepare the marker while the home is still active. This makes the
     // rename itself the commit point: once the destination exists, its
@@ -560,7 +577,7 @@ export class AgentHomeStore {
     return join(this.snapshotsRoot, sanitizeAgentId(agentId));
   }
 
-  /** Captures a restorable archive of the active home under snapshots/<id>/<seq>.json. */
+  /** Captures a streamed v2 archive under snapshots/<id>/<seq>.obhome. */
   async snapshot(agentId: string): Promise<{ seq: number; path: string; manifest: import("./home-archive.js").HomeArchiveManifest }> {
     const id = sanitizeAgentId(agentId);
     const home = await this.ensureExisting(id);
@@ -568,7 +585,7 @@ export class AgentHomeStore {
     const directory = this.snapshotDirectory(id);
     await mkdir(directory, { recursive: true });
     const seq = await this.nextSnapshotSeq(directory);
-    const { path, manifest } = await exportHomeArchive(home.root, id, join(directory, `${seq}.json`));
+    const { path, manifest } = await exportHomeArchive(home.root, id, join(directory, `${seq}.obhome`));
     await this.pruneSnapshots(id);
     return { seq, path, manifest };
   }
@@ -581,11 +598,10 @@ export class AgentHomeStore {
       if (isMissing(error)) return [];
       throw error;
     })).sort((left, right) => this.snapshotSeq(left) - this.snapshotSeq(right))) {
+      if (!Number.isSafeInteger(this.snapshotSeq(name))) continue;
       const path = join(directory, name);
       try {
-        const parsed = JSON.parse(await readFile(path, "utf8")) as { manifest?: { exportedAt?: unknown; totalBytes?: unknown; entryCount?: unknown } };
-        const manifest = parsed.manifest;
-        if (typeof manifest?.exportedAt !== "string" || typeof manifest.totalBytes !== "number" || typeof manifest.entryCount !== "number") continue;
+        const manifest = await readHomeArchiveSummary(path, id);
         snapshots.push({ seq: this.snapshotSeq(name), exportedAt: manifest.exportedAt, totalBytes: manifest.totalBytes, entryCount: manifest.entryCount, path });
       } catch {
         // Unreadable snapshot: skip instead of failing the listing.
@@ -601,7 +617,14 @@ export class AgentHomeStore {
   async restoreSnapshot(agentId: string, seq: number): Promise<AgentHome> {
     const id = sanitizeAgentId(agentId);
     if (!Number.isSafeInteger(seq) || seq < 1) throw new HomeLifecycleError("not_found", "Snapshot does not exist.");
-    const snapshotPath = join(this.snapshotDirectory(id), `${seq}.json`);
+    const matches = [];
+    for (const extension of ["obhome", "json"]) {
+      const path = join(this.snapshotDirectory(id), `${seq}.${extension}`);
+      if (await this.exists(path)) matches.push(path);
+    }
+    if (matches.length > 1) throw new HomeLifecycleError("conflict", "More than one snapshot has this sequence.");
+    const snapshotPath = matches[0];
+    if (snapshotPath === undefined) throw new HomeLifecycleError("not_found", "Snapshot does not exist.");
     const snapshotMetadata = await lstat(snapshotPath).catch((error: unknown) => {
       if (isMissing(error)) throw new HomeLifecycleError("not_found", "Snapshot does not exist.");
       throw error;
@@ -609,12 +632,14 @@ export class AgentHomeStore {
     if (snapshotMetadata.isSymbolicLink() || !snapshotMetadata.isFile()) {
       throw new HomeLifecycleError("unsafe_path", "Snapshot is unsafe.");
     }
+    // Reject corruption before moving the active home. Import rechecks while staging.
+    await validateHomeArchive(snapshotPath, id);
     let quarantineName: string | undefined;
     if (await this.exists(join(this.root, id))) {
       quarantineName = await this.moveToQuarantine(id, true);
     }
     try {
-      return await this.importArchive(id, snapshotPath);
+      return await this.importArchive(id, snapshotPath, { preserveGrants: true });
     } catch (error) {
       if (quarantineName !== undefined) {
         try {
@@ -628,7 +653,7 @@ export class AgentHomeStore {
   }
 
   private snapshotSeq(name: string): number {
-    const match = /^(\d+)\.json$/u.exec(name);
+    const match = /^(\d+)\.(?:json|obhome)$/u.exec(name);
     return match === null ? Number.NEGATIVE_INFINITY : Number(match[1]);
   }
 
@@ -660,17 +685,24 @@ export class AgentHomeStore {
     }
   }
 
-  async importArchive(agentId: string, archivePath: string, options: ImportHomeArchiveOptions = {}): Promise<AgentHome> {
+  async importArchive(agentId: string, archivePath: string, options: ImportHomeArchiveOptions & { preserveGrants?: boolean } = {}): Promise<AgentHome> {
     const id = sanitizeAgentId(agentId);
     const target = join(this.root, id);
     if (await this.exists(target)) throw new HomeLifecycleError("conflict", "An active home already exists for this agent.");
-    const archive = await validateHomeArchive(resolve(archivePath), id, options);
     const stage = join(this.stagingRoot, `${id}-${randomUUID()}`);
     let moved = false;
     let primaryFailure: unknown;
     try {
-      await materializeHomeArchive(archive, stage);
+      await stageHomeArchive(resolve(archivePath), id, stage, options);
       await this.validateCompleteHome(stage, id);
+      if (options.preserveGrants !== true) {
+        // Grants are consent, not content: an archive from outside the managed
+        // snapshots root must not arrive carrying pre-approved access to the
+        // user's real folders. Reseed empty so the imported home starts with
+        // no grants and the user grants explicitly on this machine.
+        await writeSharedGrants(stage, emptyGrants());
+      }
+      if (await this.exists(target)) throw new HomeLifecycleError("conflict", "An active home already exists for this agent.");
       try {
         await rename(stage, target);
         moved = true;
@@ -839,7 +871,7 @@ export class AgentHomeStore {
     for (const relative of ["Desktop/Bem-vindo.md", "Projects/Bem-vindo.md"]) {
       const welcome = await sandbox.resolveDestination(relative);
       try {
-        await writeFile(welcome, WELCOME, { flag: "wx" });
+        await writeFileExclusive(welcome, WELCOME);
         created = true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;

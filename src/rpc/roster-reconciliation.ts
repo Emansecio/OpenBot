@@ -26,6 +26,7 @@ const isMissing = (error: unknown): boolean => (
 );
 
 const keyOf = (agentId: string): string => agentId.toLowerCase();
+const ACL_STAMP_NAME = ".openbot-acl-v1.json";
 
 const isLocalHomeError = (error: unknown): error is Error => (
   error instanceof HomeLifecycleError && (error.code === "integrity_error" || error.code === "unsafe_path") ||
@@ -140,6 +141,12 @@ async function scanActiveHomes(
   children.sort((left, right) => left.name.localeCompare(right.name));
   const agentIds: string[] = [];
   for (const child of children) {
+    if (child.name === ACL_STAMP_NAME) {
+      if (child.isSymbolicLink() || !child.isFile()) {
+        throw new HomeLifecycleError("unsafe_path", "Workspace ACL stamp is unsafe.");
+      }
+      continue;
+    }
     if (child.name === ".quarantine" || child.name === ".staging" || child.name === ".snapshots") {
       if (!child.isDirectory() || child.isSymbolicLink()) {
         throw new HomeLifecycleError("unsafe_path", "Workspace lifecycle directory is unsafe.");

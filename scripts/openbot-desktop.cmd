@@ -45,20 +45,29 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem Explorer resolves taskbar name/icon from Start-menu registration, not only HWND metadata.
+node "%CD%\scripts\setup-desktop-shortcut.mjs" --taskbar-only
+if errorlevel 1 (
+  echo Nao foi possivel confirmar a identidade OpenBot na barra de tarefas.
+  exit /b 1
+)
+
 set "GATEWAY_STARTED=0"
 set "GATEWAY_ADOPTED=0"
 set "GATEWAY_PID="
+set "GATEWAY_ERROR_LOG=%CD%\logs\start-gateway-%RANDOM%-%RANDOM%.log"
 rem start-gateway performs the health/adopt/spawn/capture/write/readiness CAS.
 rem The gateway-health.mjs" pid helper remains available for diagnostics.
-for /f "tokens=1,2 delims=|" %%P in ('node "%CD%\scripts\start-gateway.mjs" --root "%OPENBOT_ROOT%" --url "http://127.0.0.1:1340" 2^>nul') do (
+for /f "tokens=1,2 delims=|" %%P in ('node "%CD%\scripts\start-gateway.mjs" --root "%OPENBOT_ROOT%" --url "http://127.0.0.1:1340" 2^>"%GATEWAY_ERROR_LOG%"') do (
   set "GATEWAY_PID=%%P"
   if "%%Q"=="adopted" set "GATEWAY_ADOPTED=1"
   if "%%Q"=="started" set "GATEWAY_STARTED=1"
 )
 if not defined GATEWAY_PID (
-  echo Nao foi possivel iniciar o gateway. Veja logs\gateway-error.log.
+  echo Nao foi possivel iniciar o gateway. Veja "%GATEWAY_ERROR_LOG%".
   exit /b 1
 )
+for %%L in ("%GATEWAY_ERROR_LOG%") do if %%~zL==0 del /q "%%~fL" >nul 2>&1
 
 rem start-gateway returns only after /health and executable/script identity
 rem are verified; failures clean up its own child before returning nonzero.

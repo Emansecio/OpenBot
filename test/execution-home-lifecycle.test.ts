@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AgentHomeStore, HomeLifecycleError } from "../src/execution/home.js";
+import { readSharedGrants, writeSharedGrants } from "../src/execution/home-grants.js";
 import type { HomeAclAdapter } from "../src/execution/home-acl.js";
 import { DEFAULT_HOME_INVENTORY_MAX_ENTRIES } from "../src/execution/home-inventory.js";
 import { DEFAULT_WORKSPACE_QUOTA } from "../src/execution/quota.js";
@@ -52,6 +53,47 @@ describe("AgentHomeStore lifecycle", () => {
     await expect(store.inventory("agent-a")).resolves.toMatchObject({ agentId: "agent-a" });
   });
 
+  it("quarentena home com manifesto corrompido em vez de prender o agente", async () => {
+    const store = await AgentHomeStore.create(await temp());
+    const home = await store.ensure("corrupt-manifest");
+    await writeFile(join(home.root, ".openbot", "home.json"), "{not-json");
+
+    const quarantineId = await store.remove("corrupt-manifest");
+
+    expect(quarantineId).toBeDefined();
+    const entries = await store.listQuarantineMetadata();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.agentId).toBe("corrupt-manifest");
+    // Os dados ficam preservados em quarentena; o restore continua fail-closed
+    // enquanto o manifesto não comprovar a identidade.
+    await expect(store.restore("corrupt-manifest", quarantineId)).rejects.toMatchObject({ code: "integrity_error" });
+  });
+
+  it("quarentena home sem o diretório .openbot", async () => {
+    const store = await AgentHomeStore.create(await temp());
+    const home = await store.ensure("no-openbot-dir");
+    await rm(join(home.root, ".openbot"), { recursive: true, force: true });
+
+    const quarantineId = await store.remove("no-openbot-dir");
+
+    expect(quarantineId).toBeDefined();
+    const entries = await store.listQuarantineMetadata();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.agentId).toBe("no-openbot-dir");
+  });
+
+  it("recusa quarentena quando o manifesto prova conteúdo de outro agente", async () => {
+    const store = await AgentHomeStore.create(await temp());
+    const home = await store.ensure("claimed-id");
+    await writeFile(
+      join(home.root, ".openbot", "home.json"),
+      JSON.stringify({ agentId: "other-agent", createdAt: "2026-01-01T00:00:00.000Z", layoutVersion: 2 }),
+    );
+
+    await expect(store.remove("claimed-id")).rejects.toMatchObject({ code: "integrity_error" });
+    expect(await store.listQuarantineMetadata()).toEqual([]);
+  });
+
   it("publica marker completo sem deixar temporários de preparação", async () => {
     const store = await AgentHomeStore.create(await temp());
     await store.ensure("atomic-marker");
@@ -93,6 +135,34 @@ describe("AgentHomeStore lifecycle", () => {
     await expect(targetStore.importArchive("portable", archivePath)).rejects.toMatchObject({ code: "conflict" });
   });
 
+  it("reseeds grants on foreign import but preserves them on snapshot restore", async () => {
+    const source = await temp();
+    const archiveRoot = await temp();
+    const target = await temp();
+    const sourceStore = await AgentHomeStore.create(source);
+    const sourceHome = await sourceStore.ensure("portable");
+    await writeSharedGrants(sourceHome.root, {
+      version: 1,
+      grants: { Desktop: { access: "write" }, Documents: { access: "read" } },
+    });
+
+    const archivePath = join(archiveRoot, "portable.obhome");
+    await sourceStore.exportArchive("portable", archivePath);
+    const targetStore = await AgentHomeStore.create(target);
+    const imported = await targetStore.importArchive("portable", archivePath);
+    // A foreign archive must not carry pre-approved access to real folders.
+    expect(Object.keys((await readSharedGrants(imported.root)).grants)).toHaveLength(0);
+
+    const snapshotSource = await temp();
+    const snapshotStore = await AgentHomeStore.create(snapshotSource);
+    const snapshotHome = await snapshotStore.ensure("restored");
+    await writeSharedGrants(snapshotHome.root, { version: 1, grants: { Downloads: { access: "write" } } });
+    const snapshot = await snapshotStore.snapshot("restored");
+    // restoreSnapshot quarantines the active home and rolls back on failure.
+    const restored = await snapshotStore.restoreSnapshot("restored", snapshot.seq);
+    expect((await readSharedGrants(restored.root)).grants["Downloads"]?.access).toBe("write");
+  });
+
   it("rejects a tampered archive before creating an active home", async () => {
     const source = await temp();
     const target = await temp();
@@ -101,10 +171,9 @@ describe("AgentHomeStore lifecycle", () => {
     await sourceStore.ensure("tampered");
     const archivePath = join(archiveRoot, "tampered.json");
     await sourceStore.exportArchive("tampered", archivePath);
-    const archive = JSON.parse(await readFile(archivePath, "utf8")) as { manifest: { entries: Array<{ path: string; type: string; size: number; sha256: string; contentBase64?: string }> } };
-    const entry = archive.manifest.entries.find((candidate) => candidate.path === "Desktop/Bem-vindo.md")!;
-    entry.contentBase64 = Buffer.from("tampered").toString("base64");
-    await writeFile(archivePath, JSON.stringify(archive));
+    const archive = await readFile(archivePath);
+    archive[archive.length - 1] = archive[archive.length - 1]! ^ 1;
+    await writeFile(archivePath, archive);
 
     const targetStore = await AgentHomeStore.create(target);
     await expect(targetStore.importArchive("tampered", archivePath)).rejects.toMatchObject({ code: "integrity_error" });
@@ -118,10 +187,9 @@ describe("AgentHomeStore lifecycle", () => {
     const store = await AgentHomeStore.create(source);
     await store.ensure("unsafe");
     const archivePath = join(archiveRoot, "unsafe.json");
-    await store.exportArchive("unsafe", archivePath);
-    const archive = JSON.parse(await readFile(archivePath, "utf8")) as { manifest: { entries: Array<{ path: string }> } };
-    archive.manifest.entries[0]!.path = "../outside.txt";
-    await writeFile(archivePath, JSON.stringify(archive));
+    const { manifest } = await store.exportArchive("unsafe", archivePath);
+    manifest.entries[0]!.path = "../outside.txt";
+    await writeFile(archivePath, JSON.stringify({ format: "openbot-home-archive", version: 1, manifest }));
     const targetStore = await AgentHomeStore.create(target);
     await expect(targetStore.importArchive("unsafe", archivePath)).rejects.toMatchObject({ code: "unsafe_path" });
     expect(await readdir(targetStore.stagingRoot)).toEqual([]);

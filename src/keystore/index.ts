@@ -27,6 +27,7 @@ import path from "node:path";
 import os from "node:os";
 
 import type { BoxSecretsStatus } from "../shared/contracts.js";
+import { writeFileExclusiveSync } from "../shared/fs-atomic.js";
 import type { Gateway, RpcHandler } from "../server/gateway.js";
 import { RpcError } from "../server/gateway.js";
 import {
@@ -445,7 +446,7 @@ function loadOrCreateMasterKey(dir: string): Buffer {
   try {
     // O_EXCL/CREATE_NEW makes first creation atomic between processes. A
     // loser reads the winner's key instead of replacing it.
-    fs.writeFileSync(file, key, { flag: "wx", mode: 0o600 });
+    writeFileExclusiveSync(file, key);
     if (process.platform !== "win32") fs.chmodSync(file, 0o600);
     return key;
   } catch (err) {

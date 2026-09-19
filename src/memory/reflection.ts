@@ -1,5 +1,7 @@
 import { validateReflectionCandidates, MEMORY_POLICY_LIMITS, type PolicyRejection } from "./policy.js";
 import { isExplicitMemoryIntent, type ReflectionExistingMemory, type ReflectionPreviousSummary } from "./context.js";
+import { ProviderError } from "../providers/router.js";
+import { ProviderAdmissionError } from "../providers/admission.js";
 import type {
   ConversationSummaryInput,
   Memory,
@@ -28,6 +30,20 @@ export interface MemoryReflectionInput {
   existingMemories?: readonly ReflectionExistingMemory[];
   userProfile?: readonly { canonicalKey: string; kind: MemoryUpsertInput["kind"]; text: string }[];
   entries: readonly unknown[];
+  /** SequenceIds parallel to `entries`; enables contiguous coverage in the projection. */
+  entrySequenceIds?: readonly number[];
+  /**
+   * Set by the reflect callback to the boundary the sent payload actually
+   * covered (≤ throughSequenceId). The applied summary must land exactly here;
+   * the worker defers the job to re-claim the omitted tail.
+   */
+  coveredThroughSequenceId?: number;
+  /**
+   * Set by the reflect callback to the entry ids actually present in the sent
+   * payload. Source and trust:user evidence validation must use this set —
+   * never the whole loaded batch — so a deferred tail cannot back a memory.
+   */
+  coveredEntryIds?: readonly string[];
 }
 
 export interface ReflectionSummary {
@@ -47,6 +63,8 @@ export interface ReflectionResult {
 }
 
 export type ReflectCallback = (input: MemoryReflectionInput, signal: AbortSignal) => Promise<unknown> | unknown;
+
+type ReflectionCancellationReason = "archived" | "deleted";
 
 const SUMMARY_KEYS = new Set(["throughSequenceId", "summaryJson", "renderedText"]);
 const OP_KEYS = new Set(["op", "type", "memory", "memoryId", "replacement", "reason", "scope"]);
@@ -159,6 +177,20 @@ export function parseReflectionResult(input: string | unknown): ReflectionResult
 }
 
 export const parseReflectionOutput = parseReflectionResult;
+
+/**
+ * Failure taxonomy for job retry: provider/admission errors keep their own
+ * retryability, output-format errors are retryable (next attempt may parse),
+ * and permanent conditions stop the job without burning every attempt.
+ */
+const classifyReflectionFailure = (error: unknown, aborted: boolean): { code: string; retryable: boolean } => {
+  if (aborted) return { code: "timeout", retryable: true };
+  if (error instanceof ProviderError) return { code: `provider_${error.kind}`, retryable: error.retryable };
+  if (error instanceof ProviderAdmissionError) return { code: `admission_${error.code}`, retryable: error.retryable };
+  if (error instanceof Error && error.message.includes("indisponível ou incompatível")) return { code: "reflection_input", retryable: false };
+  if (error instanceof Error && error.message.startsWith("reflection:")) return { code: "reflection_format", retryable: true };
+  return { code: "reflection_failed", retryable: true };
+};
 
 function validateInput(input: MemoryReflectionInput): void {
   if (typeof input.agentId !== "string" || input.agentId.trim().length === 0) throw new Error("reflection: agentId inválido");
@@ -359,6 +391,8 @@ function validateReflectionTarget(
 function validateReplacement(
   replacement: MemoryUpsertInput,
   operationIndex: number,
+  conversationId: string,
+  jobSourceEntryIds: MemoryUpsertInput["sourceEntryIds"],
 ): { replacement?: MemoryUpsertInput; rejection?: PolicyRejection } {
   const checked = validateReflectionCandidates([replacement]);
   const rejected = checked.rejected[0];
@@ -378,7 +412,17 @@ function validateReplacement(
       },
     };
   }
-  return { replacement: accepted };
+  const sources = candidateEvidenceSources(accepted, conversationId, jobSourceEntryIds);
+  if (sources === null || sources.length === 0) {
+    return {
+      rejection: {
+        index: operationIndex,
+        code: sources === null ? "source_invalid" : "source_missing",
+        message: "replacement exige sourceEntryIds específicas do trecho examinado",
+      },
+    };
+  }
+  return { replacement: { ...accepted, sourceEntryIds: sources } };
 }
 
 /** Applies a parsed result in one logical store transaction. */
@@ -392,8 +436,18 @@ export function applyReflectionResult(store: MemoryStore, input: MemoryReflectio
   if (input.summaryRequested === true && parsed.summary === undefined) throw new Error("reflection: summary solicitada não retornada");
   if (input.memoryRequested === false && parsed.operations.length > 0) throw new Error("reflection: operações de memória não solicitadas");
   const requestedSummary = input.summaryRequested === false ? undefined : parsed.summary;
-  const jobSourceEntryIds = deriveJobSourceEntryIds(input.entries, input.conversationId);
-  const explicitEntryIds = explicitUserMemoryEntryIds(input.entries);
+  // Evidence may only come from the entries actually sent to the provider.
+  // When the projection covered a strict prefix, the deferred tail stays
+  // ineligible for sourceEntryIds and trust:user evidence alike.
+  const coveredIds = input.coveredEntryIds === undefined ? undefined : new Set(input.coveredEntryIds);
+  const coveredEntries = coveredIds === undefined
+    ? input.entries
+    : input.entries.filter((entry) => (
+      typeof entry === "object" && entry !== null
+      && coveredIds.has((entry as { id?: unknown }).id as string)
+    ));
+  const jobSourceEntryIds = deriveJobSourceEntryIds(coveredEntries, input.conversationId);
+  const explicitEntryIds = explicitUserMemoryEntryIds(coveredEntries);
   const directlyRememberedKeys = successfulRememberedCanonicalKeys(input.entries);
   const usedExplicitEvidenceIds = new Set<string>();
   const candidates = parsed.operations.flatMap((operation, index) => (
@@ -433,6 +487,20 @@ export function applyReflectionResult(store: MemoryStore, input: MemoryReflectio
         return result;
       }
       scopedCandidate = { ...candidate, sourceEntryIds: sources };
+    } else {
+      // Precise provenance: an automatic memory keeps only the specific
+      // examined entries the model cited — never the whole job batch, so a
+      // forgotten topic cannot suppress unrelated memories later.
+      const sources = candidateEvidenceSources(candidate, input.conversationId, jobSourceEntryIds);
+      if (sources === null || sources.length === 0) {
+        result.rejected.push({
+          index,
+          code: sources === null ? "source_invalid" : "source_missing",
+          message: "upsert automático exige sourceEntryIds específicas do trecho examinado",
+        });
+        return result;
+      }
+      scopedCandidate = { ...candidate, sourceEntryIds: sources };
     }
     const validation = validateReflectionCandidates([scopedCandidate], {
       allowPinned: false,
@@ -447,8 +515,9 @@ export function applyReflectionResult(store: MemoryStore, input: MemoryReflectio
     return result;
   }, { accepted: [], rejected: [] });
   const authority = automaticAuthority(input.conversationId, jobSourceEntryIds);
-  if (requestedSummary !== undefined && requestedSummary.throughSequenceId !== input.throughSequenceId) {
-    throw new Error("reflection: summary solicitada deve alcançar o limite exato do job");
+  const coveredThrough = input.coveredThroughSequenceId ?? input.throughSequenceId;
+  if (requestedSummary !== undefined && requestedSummary.throughSequenceId !== coveredThrough) {
+    throw new Error("reflection: summary solicitada deve alcançar o limite coberto do job");
   }
   if (requestedSummary !== undefined && (requestedSummary.throughSequenceId < input.fromSequenceId || requestedSummary.throughSequenceId > input.throughSequenceId)) {
     throw new Error("reflection: summary fora do intervalo do job");
@@ -485,8 +554,7 @@ export function applyReflectionResult(store: MemoryStore, input: MemoryReflectio
         }
         const targetAgentId = scope === "user" ? USER_PROFILE_AGENT_ID : input.agentId;
         try {
-          const sourceEntryIds = memory.trust === "user" ? memory.sourceEntryIds : jobSourceEntryIds;
-          memories.push(store.upsertMemory(targetAgentId, jobScopedMemory(memory, input.conversationId, sourceEntryIds), authority));
+          memories.push(store.upsertMemory(targetAgentId, jobScopedMemory(memory, input.conversationId, memory.sourceEntryIds), authority));
         } catch (error) {
           const rejection = authorityRejection(error, operationIndex);
           if (rejection === undefined) throw error;
@@ -501,13 +569,13 @@ export function applyReflectionResult(store: MemoryStore, input: MemoryReflectio
         if (operation.op === "supersede") {
           let replacement = operation.replacement;
           if (replacement !== undefined) {
-            const checkedReplacement = validateReplacement(replacement, operationIndex);
+            const checkedReplacement = validateReplacement(replacement, operationIndex, input.conversationId, jobSourceEntryIds);
             if (checkedReplacement.rejection !== undefined) {
               rejected.push(checkedReplacement.rejection);
               continue;
             }
             replacement = {
-              ...jobScopedMemory(checkedReplacement.replacement!, input.conversationId, jobSourceEntryIds),
+              ...jobScopedMemory(checkedReplacement.replacement!, input.conversationId, checkedReplacement.replacement!.sourceEntryIds),
             };
           }
           try {
@@ -544,6 +612,12 @@ export interface MemoryReflectionWorkerOptions {
   backoffMs?: readonly number[];
   /** Foreground turns have priority; false keeps this agent queued. */
   canRunAgent?: (agentId: string) => boolean;
+  /**
+   * Chamado quando um job esgota as tentativas e vira `dead` (ex.: credenciais
+   * do provider inválidas). Superfície de visibilidade — o callback recebe
+   * apenas código e texto de erro já sanitizados, nunca credenciais.
+   */
+  onJobDead?: (notice: { agentId: string; conversationId?: string; jobId: string; provider: string; model: string; error: { code: string; text: string } }) => void;
 }
 
 export interface MemoryReflectionWorkerEnqueueInput extends MemoryReflectionInput {
@@ -561,9 +635,10 @@ export class MemoryReflectionWorker {
   private readonly maxAttempts: number;
   private readonly backoffMs: readonly number[];
   private readonly canRunAgent: (agentId: string) => boolean;
+  private readonly onJobDead?: MemoryReflectionWorkerOptions["onJobDead"];
   private readonly queue: MemoryReflectionWorkerEnqueueInput[] = [];
   private readonly activeAgents = new Map<string, number>();
-  private readonly activeControllers = new Set<AbortController>();
+  private readonly activeControllers = new Map<AbortController, MemoryJob>();
   private active = 0;
   private closed = false;
   private pumping = false;
@@ -580,6 +655,7 @@ export class MemoryReflectionWorker {
     this.maxAttempts = options.maxAttempts ?? 3;
     this.backoffMs = options.backoffMs ?? [5_000, 30_000, 300_000];
     this.canRunAgent = options.canRunAgent ?? (() => true);
+    this.onJobDead = options.onJobDead;
     if (!Number.isInteger(this.globalConcurrency) || this.globalConcurrency < 1) throw new Error("concurrency inválida");
     if (!Number.isInteger(this.perAgentConcurrency) || this.perAgentConcurrency < 1) throw new Error("per-agent concurrency inválida");
   }
@@ -624,6 +700,20 @@ export class MemoryReflectionWorker {
 
   start(): void {
     if (this.closed) throw new Error("memory reflection worker fechado");
+    this.pump();
+  }
+
+  cancelConversation(agentId: string, conversationId: string, reason: ReflectionCancellationReason = "archived"): void {
+    const cancellationReason: ReflectionCancellationReason = reason === "deleted" ? "deleted" : "archived";
+    for (let index = this.queue.length - 1; index >= 0; index -= 1) {
+      const input = this.queue[index]!;
+      if (input.agentId === agentId && input.conversationId === conversationId) this.queue.splice(index, 1);
+    }
+    for (const [controller, job] of this.activeControllers) {
+      if (job.agentId === agentId && job.conversationId === conversationId) {
+        controller.abort(new Error(`reflection conversation ${cancellationReason}`));
+      }
+    }
     this.pump();
   }
 
@@ -700,7 +790,7 @@ export class MemoryReflectionWorker {
 
   private async runClaimed(job: MemoryJob, resolveInput: (signal: AbortSignal) => Promise<MemoryReflectionInput | null>): Promise<void> {
     const controller = new AbortController();
-    this.activeControllers.add(controller);
+    this.activeControllers.set(controller, job);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
@@ -713,6 +803,7 @@ export class MemoryReflectionWorker {
     });
     try {
       const input = await Promise.race([resolveInput(controller.signal), timeout, aborted]);
+      controller.signal.throwIfAborted();
       if (
         input === null ||
         input.agentId !== job.agentId ||
@@ -751,7 +842,17 @@ export class MemoryReflectionWorker {
         } else if (input.summaryRequested === true) {
           applyReflectionResult(this.store, { ...input, memoryRequested: false }, { ...parsed, operations: [] });
         }
-        this.store.completeJob(input.agentId, job.id);
+        // When the request payload could only cover a contiguous prefix of the
+        // job range, the boundary advanced to the last examined entry. The
+        // same job is then deferred to the first unexamined entry so the tail
+        // is claimed again — enqueueing a fresh row would hit the
+        // (agent, conversation, throughSequenceId) unique key and vanish.
+        const coveredThrough = input.coveredThroughSequenceId ?? job.throughSequenceId;
+        if (coveredThrough < job.throughSequenceId) {
+          this.store.deferJob(input.agentId, job.id, Math.max(job.fromSequenceId, coveredThrough + 1));
+        } else {
+          this.store.completeJob(input.agentId, job.id);
+        }
       });
     } catch (error) {
       if (this.closed) {
@@ -771,10 +872,18 @@ export class MemoryReflectionWorker {
         return;
       }
       const text = error instanceof Error ? error.message : String(error);
-      const errorCode = controller.signal.aborted ? "timeout" : "reflection_failed";
+      const failure = classifyReflectionFailure(error, controller.signal.aborted);
+      const errorCode = failure.code;
       const current = this.store.getJob(job.agentId, job.id);
       if (current === null || current.status !== "running" || !this.store.isConversationActive(job.agentId, job.conversationId)) return;
-      if ((current?.attempts ?? job.attempts) >= this.maxAttempts) this.store.deadJob(job.agentId, job.id, { code: errorCode, text });
+      if (!failure.retryable || (current?.attempts ?? job.attempts) >= this.maxAttempts) {
+        this.store.deadJob(job.agentId, job.id, { code: errorCode, text });
+        try {
+          this.onJobDead?.({ agentId: job.agentId, conversationId: job.conversationId, jobId: job.id, provider: job.provider, model: job.model, error: { code: errorCode, text } });
+        } catch {
+          // A notificação é best-effort; o estado `dead` já está persistido.
+        }
+      }
       else this.store.retryJob(job.agentId, job.id, { code: errorCode, text }, undefined, {
         maxAttempts: this.maxAttempts,
         backoffMs: this.backoffMs,
@@ -790,7 +899,7 @@ export class MemoryReflectionWorker {
     if (this.retryTimer !== undefined) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
     this.queue.length = 0;
-    for (const controller of this.activeControllers) controller.abort(new Error("reflection worker fechado"));
+    for (const controller of this.activeControllers.keys()) controller.abort(new Error("reflection worker fechado"));
     if (this.active === 0) return Promise.resolve();
     return new Promise<void>((resolve) => this.pendingClose.push(resolve));
   }
