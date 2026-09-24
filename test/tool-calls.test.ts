@@ -53,6 +53,7 @@ import { OpenAiAdapter } from "../src/providers/openai.js";
 import { XaiAdapter } from "../src/providers/xai.js";
 import { OpenAiCompatAdapter } from "../src/providers/openai-compat.js";
 import { buildChatBody } from "../src/providers/openai-helpers.js";
+import { buildResponsesBody } from "../src/providers/request-bodies.js";
 
 import {
   startMockProviderServer,
@@ -297,7 +298,33 @@ describe("T9 (3) resultado — tool-result injetado no próximo turno", () => {
       ok: false,
       error: "arquivo não encontrado",
     });
-    expect(message).toEqual({ role: "tool", toolCallId: "c1", content: "arquivo não encontrado" });
+    expect(message).toEqual({
+      role: "tool",
+      toolCallId: "c1",
+      content: "arquivo não encontrado",
+      toolResult: { ok: false, error: "arquivo não encontrado" },
+    });
+  });
+
+  it("preserva status, código, operação e saída parcial no wire dos providers OpenAI", () => {
+    const message = toToolResultMessage({
+      toolCallId: "c-partial",
+      name: "file",
+      content: "conteúdo parcial",
+      partialContent: "conteúdo parcial",
+      ok: false,
+      error: "falha ao gravar",
+      result: { ok: false, operation: "file.write", code: "io_error", message: "falha ao gravar" },
+    });
+    const expected = {
+      openbotToolResult: { ok: false, error: "falha ao gravar", code: "io_error", operation: "file.write" },
+      partialOutput: "conteúdo parcial",
+    };
+
+    const chat = buildChatBody({ model: "chat-completions-test", messages: [message] });
+    expect(JSON.parse((chat.messages[0] as { content: string }).content)).toEqual(expected);
+    const responses = buildResponsesBody({ model: "responses-test", messages: [message] });
+    expect(JSON.parse((responses.input as Array<{ output: string }>)[0]!.output)).toEqual(expected);
   });
 
   it("falha sem detalhe usa fallback 'erro desconhecido na execução'", () => {

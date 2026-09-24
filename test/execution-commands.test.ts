@@ -1,13 +1,13 @@
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { win32 as path } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { isSafeSearchRegex, LocalCommandExecutor } from "../src/execution/commands.js";
 import { WorkspaceSandbox } from "../src/execution/workspace.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
-const temp = async (prefix = "openbot-command-") => { const root = await mkdtemp(path.join(tmpdir(), prefix)); roots.push(root); return root; };
-afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
+const tempRoots = new TempRoots();
+const temp = (prefix = "openbot-command-") => tempRoots.makeAsync(prefix);
+afterEach(() => tempRoots.cleanup());
 const files = (params: { paths: string[] }, cwd = ".") => ({ operation: "command.run", command: "search.files", cwd, params } as const);
 const text = (pattern: string, mode: "fixed" | "regex" = "fixed", paths = ["."]) => ({ operation: "command.run", command: "search.text", cwd: ".", params: { pattern, mode, paths } } as const);
 

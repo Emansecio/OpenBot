@@ -1,5 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,13 +6,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SkillCatalog } from "../src/skills/catalog.js";
 import { RpcError } from "../src/server/gateway.js";
 import { registerSkillHandlers, type ResolveSkillPolicy, type SkillRpcHandler } from "../src/rpc/skills.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 type Registered = Map<string, SkillRpcHandler>;
 
-const tempRoots: string[] = [];
+const temp = new TempRoots();
 
-afterEach(() => {
-  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+afterEach(async () => {
+  await temp.cleanup();
 });
 
 function register(catalog: SkillCatalog, resolveSkillPolicy?: ResolveSkillPolicy): Registered {
@@ -25,8 +25,7 @@ function register(catalog: SkillCatalog, resolveSkillPolicy?: ResolveSkillPolicy
 }
 
 function skillRoot(): string {
-  const root = mkdtempSync(join(tmpdir(), "openbot-rpc-skills-"));
-  tempRoots.push(root);
+  const root = temp.make("openbot-rpc-skills-");
   return root;
 }
 

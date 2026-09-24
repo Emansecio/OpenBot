@@ -520,6 +520,48 @@ describe("McpManager", () => {
     await large.close();
   });
 
+  it("waits for session close before reporting an aborted non-cooperative call", async () => {
+    let releaseCall!: (value: CallToolResult) => void;
+    const callGate = new Promise<CallToolResult>((resolve) => { releaseCall = resolve; });
+    let releaseClose!: () => void;
+    const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+    let callStarted!: () => void;
+    const enteredCall = new Promise<void>((resolve) => { callStarted = resolve; });
+    let closeStarted!: () => void;
+    const enteredClose = new Promise<void>((resolve) => { closeStarted = resolve; });
+    const close = vi.fn(async () => { closeStarted(); await closeGate; });
+    const manager = new McpManager({
+      servers: [server],
+      connector: async () => ({
+        async listTools() { return { tools: [tool("slow")] }; },
+        async callTool() { callStarted(); return callGate; },
+        close,
+      }),
+      policies: { bot: { enabled: true, serverAllowlist: ["demo"] } },
+      timeoutMs: 1_000,
+    });
+    const controller = new AbortController();
+    const invocation = manager.callProviderTool("bot", "mcp__demo__slow", {}, { signal: controller.signal });
+    let settled = false;
+    const outcome = invocation.then(
+      (value) => { settled = true; return value; },
+      (error: unknown) => { settled = true; return error; },
+    );
+
+    await enteredCall;
+    controller.abort();
+    await enteredClose;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(close).toHaveBeenCalledOnce();
+
+    releaseClose();
+    await expect(outcome).resolves.toBeInstanceOf(Error);
+    expect(settled).toBe(true);
+    releaseCall(result("late"));
+    await manager.close();
+  });
+
   it("applies one absolute timeout budget across tool listing and invocation", async () => {
     vi.useFakeTimers();
     let calls = 0;

@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { Stats } from "node:fs";
-import { lstat, mkdir, rename, writeFile } from "node:fs/promises";
+import { lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { ProviderTool } from "../providers/router.js";
@@ -211,7 +211,7 @@ export class SkillDispatcher {
     if (args === undefined) return failure(operation, "tool arguments must be a JSON object");
     try {
       if (name === "search_skills") return this.search(context.agentId, args);
-      if (name === "save_skill") return await this.save(context.agentId, args);
+      if (name === "save_skill") return await this.save(context.agentId, args, context.signal);
       return await this.use(context.agentId, args);
     } catch {
       // Do not expose filesystem, parser, or policy internals in provider output.
@@ -298,7 +298,7 @@ export class SkillDispatcher {
     return success("skills.use", content);
   }
 
-  private async save(agentId: string, args: Record<string, unknown>): Promise<ToolExecutionResult> {
+  private async save(agentId: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolExecutionResult> {
     if (this.authoringRoot === undefined) return failure("skills.save", "skill authoring is unavailable", "policy");
     const policy = this.policy(agentId);
     if (policy?.enabled === false) return failure("skills.save", "skills are disabled for this bot", "policy");
@@ -356,15 +356,27 @@ export class SkillDispatcher {
     if (dirPolicy !== undefined) return dirPolicy;
     const filePolicy = await assertWritablePath(skillFile);
     if (filePolicy !== undefined) return filePolicy;
+    if (signal?.aborted) return failure("skills.save", "skill operation aborted", "aborted");
 
     await mkdir(skillDir, { recursive: true });
     // Revalidate after mkdir: the pre-check above races an attacker with
     // write access to the profile root swapping the directory for a symlink.
     const dirPolicyAfterMkdir = await assertWritablePath(skillDir);
     if (dirPolicyAfterMkdir !== undefined) return dirPolicyAfterMkdir;
+    if (signal?.aborted) return failure("skills.save", "skill operation aborted", "aborted");
     const tempFile = join(skillDir, `SKILL.md.tmp-${randomBytes(8).toString("hex")}`);
-    await writeFile(tempFile, text, { encoding: "utf8", flag: "wx" });
-    await rename(tempFile, skillFile);
+    let committed = false;
+    try {
+      await writeFile(tempFile, text, { encoding: "utf8", flag: "wx", signal });
+      if (signal?.aborted) return failure("skills.save", "skill operation aborted", "aborted");
+      await rename(tempFile, skillFile);
+      committed = true;
+    } catch (error) {
+      if (signal?.aborted) return failure("skills.save", "skill operation aborted", "aborted");
+      throw error;
+    } finally {
+      if (!committed) await rm(tempFile, { force: true }).catch(() => undefined);
+    }
 
     this.catalog.refresh();
     if (!this.catalog.list("").some((entry) => entry.id === id)) {

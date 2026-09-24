@@ -47,6 +47,14 @@ export type ProviderUserContentPart =
   | { type: "text"; text: string }
   | { type: "image_url"; image_url: { url: string; detail?: "low" | "high" | "auto" } };
 
+export interface ProviderToolResultMetadata {
+  ok: false;
+  error: string;
+  code?: string;
+  operation?: string;
+  partialContent?: string;
+}
+
 export type ProviderChatMessage = {
   role: "system";
   content: string;
@@ -63,6 +71,7 @@ export type ProviderChatMessage = {
   role: "tool";
   content: string;
   toolCallId?: string;
+  toolResult?: ProviderToolResultMetadata;
 };
 
 /**
@@ -286,10 +295,15 @@ function extractStatus(err: unknown): number | undefined {
 
 /** Retorna o `code` de erro quando presente no objeto. */
 function extractCode(err: unknown): string | undefined {
-  if (typeof err !== "object" || err === null) return undefined;
-  const record = err as Record<string, unknown>;
-  const raw = record["code"];
-  return typeof raw === "string" && raw !== "" ? raw : undefined;
+  const seen = new Set<unknown>();
+  for (let depth = 0; depth < 8 && typeof err === "object" && err !== null && !seen.has(err); depth += 1) {
+    seen.add(err);
+    const record = err as Record<string, unknown>;
+    const raw = record["code"];
+    if (typeof raw === "string" && raw !== "") return raw;
+    err = record["cause"];
+  }
+  return undefined;
 }
 
 const MAX_RETRY_AFTER_MS = 60_000;
@@ -756,7 +770,9 @@ async function streamChatInternal(
           terminalError = classified;
           break;
         }
-        if (!observedOutput && classified.retryable && attempt < maxRetries && !req.signal?.aborted) {
+        // A request that exhausted its deadline stays manually retryable, but
+        // must not consume another full deadline without an explicit user retry.
+        if (!observedOutput && classified.retryable && classified.code !== "ETIMEDOUT" && attempt < maxRetries && !req.signal?.aborted) {
           const backoffMs = 250 * 2 ** attempt;
           // The lease wraps only the provider attempt itself. A backoff sleep
           // must not occupy a global admission slot: release it before waiting

@@ -1,5 +1,5 @@
 import * as fs from "node:fs";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,16 +8,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("node:fs", { spy: true });
 
 import { SkillCatalog } from "../src/skills/catalog.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const tempRoots: string[] = [];
+const temp = new TempRoots();
 
-afterEach(() => {
-  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+afterEach(async () => {
+  await temp.cleanup();
 });
 
 function root(): string {
-  const path = mkdtempSync(join(tmpdir(), "openbot-skills-cache-"));
-  tempRoots.push(path);
+  const path = realpathSync.native(mkdtempSync(join(tmpdir(), "openbot-skills-cache-")));
+  temp.track(path);
   return path;
 }
 
@@ -63,10 +64,27 @@ describe("SkillCatalog cache", () => {
     readSpy.mockClear();
 
     expect((await catalog.readAsync("cached"))?.content).toBe("first body\n");
+    const before = statSync(filePath);
     writeFileSync(filePath, "---\nname: Cached\ndescription: stable\n---\nasync body\n", "utf8");
+    utimesSync(filePath, before.atime, new Date(before.mtimeMs + 2_000));
+    expect(statSync(filePath).size).toBe(before.size);
+    expect(statSync(filePath).mtimeMs).toBeGreaterThan(before.mtimeMs);
     expect((await catalog.readCachedValidated("cached"))?.content).toBe("async body\n");
     expect(openSpy).not.toHaveBeenCalled();
     expect(readSpy).not.toHaveBeenCalled();
+  });
+
+  it("revalidates every cached path component after discovery", async () => {
+    const rootPath = root();
+    skill(rootPath, "retained body");
+    const catalog = new SkillCatalog({ roots: [{ path: rootPath, source: "test" }] });
+    const retainedPath = join(rootPath, "retained");
+    const cachedPath = join(rootPath, "cached");
+    renameSync(join(rootPath, "cached"), retainedPath);
+    symlinkSync(retainedPath, cachedPath, process.platform === "win32" ? "junction" : "dir");
+
+    expect(await catalog.readCachedValidated("cached")).toBeUndefined();
+    expect(await catalog.readAsync("cached")).toBeUndefined();
   });
 
 });

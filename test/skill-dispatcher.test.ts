@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -242,6 +242,41 @@ describe("SkillDispatcher", () => {
       call: call("use_skill", { id: "deploy-checklist" }),
     }));
     expect(use.content).toContain("Run full suite.");
+  });
+
+  it("cancela save_skill antes do commit atômico sem deixar arquivo temporário", async () => {
+    const authoring = root();
+    const catalog = {
+      rootFor: (source: string) => source === OPENBOT_SKILL_ROOT_SOURCE
+        ? { path: authoring, source: OPENBOT_SKILL_ROOT_SOURCE }
+        : undefined,
+      sourceOf: () => undefined,
+      refresh: () => undefined,
+      list: () => [],
+    } as unknown as SkillCatalog;
+    const instance = createSkillDispatcher({ catalog });
+    const controller = new AbortController();
+    const pending = instance.execute({
+      agentId: "bot-a",
+      signal: controller.signal,
+      call: call("save_skill", {
+        id: "cancelled-skill",
+        name: "Cancelled skill",
+        description: "Must not be committed after cancellation.",
+        body: "Do not persist this body.",
+      }),
+    });
+
+    controller.abort();
+
+    await expect(pending).resolves.toMatchObject({
+      handled: true,
+      ok: false,
+      result: { ok: false, operation: "skills.save", code: "aborted" },
+    });
+    const skillDir = join(authoring, "cancelled-skill");
+    expect(existsSync(join(skillDir, "SKILL.md"))).toBe(false);
+    expect(existsSync(skillDir) ? readdirSync(skillDir) : []).toEqual([]);
   });
 
   it("save_skill recusa id pertencente a root somente leitura", async () => {

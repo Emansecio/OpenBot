@@ -1,5 +1,6 @@
 import type { ProviderChatRequest } from "./router.js";
 import { ApiError, buildChatBody } from "./openai-helpers.js";
+import { providerToolResultContent } from "./tool-calls.js";
 
 function responsesUserContent(content: Extract<ProviderChatRequest["messages"][number], { role: "user" }>): unknown {
   if (typeof content.content === "string") return content.content;
@@ -28,7 +29,7 @@ export function buildResponsesBody(req: ProviderChatRequest): Record<string, unk
         break;
       case "tool":
         if (!message.toolCallId) throw new ApiError("openai: tool result sem toolCallId", 400);
-        input.push({ type: "function_call_output", call_id: message.toolCallId, output: message.content });
+        input.push({ type: "function_call_output", call_id: message.toolCallId, output: providerToolResultContent(message) });
         break;
     }
   }

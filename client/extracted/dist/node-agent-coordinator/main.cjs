@@ -3737,6 +3737,8 @@ async function composeCoordinator() {
   const activeConversationByAgent = /* @__PURE__ */ new Map();
   const knownAgentIds = /* @__PURE__ */ new Set();
   const transcriptSnapshotGate = createTranscriptSnapshotGate();
+  const transcriptResyncTimers = /* @__PURE__ */ new Map();
+  let transcriptResyncClosed = false;
   let transcriptAdapter;
   let dispatchGatewayCommand = async () => {
     throw new Error("gateway dispatch is not ready");
@@ -3747,6 +3749,7 @@ async function composeCoordinator() {
     return typeof agentId === "string" && agentId.length > 0 ? agentId : void 0;
   }
   function disposeTranscriptAgent(agentId) {
+    clearTranscriptResync(agentId);
     transcriptAdapter?.disposeAgent(agentId);
     transcriptSnapshotGate.disposeAgent(agentId);
     activeConversationByAgent.delete(agentId);
@@ -3782,7 +3785,17 @@ async function composeCoordinator() {
     }
     return active === conversationId;
   }
+  function clearTranscriptResync(agentId) {
+    const timer = transcriptResyncTimers.get(agentId);
+    if (timer !== void 0) clearTimeout(timer);
+    transcriptResyncTimers.delete(agentId);
+  }
+  function closeTranscriptResync() {
+    transcriptResyncClosed = true;
+    for (const agentId of transcriptResyncTimers.keys()) clearTranscriptResync(agentId);
+  }
   function beginTranscriptSnapshot(agentId, conversationId) {
+    clearTranscriptResync(agentId);
     const request = transcriptSnapshotGate.begin(agentId, conversationId);
     if (typeof conversationId === "string" && conversationId.length > 0) activeConversationByAgent.set(agentId, conversationId);
     return request;
@@ -3794,7 +3807,7 @@ async function composeCoordinator() {
       authoritativeResync: true,
       ...typeof conversationId === "string" && conversationId.length > 0 ? { conversationId } : {}
     });
-    if (!transcriptSnapshotGate.isCurrent(request)) return false;
+    if (transcriptResyncClosed || !transcriptSnapshotGate.isCurrent(request)) return false;
     const active = activeConversationByAgent.get(agentId);
     if (typeof conversationId === "string" && conversationId.length > 0 && active !== void 0 && active !== conversationId) return false;
     const entries = Array.isArray(page?.entries) ? page.entries : [];
@@ -3816,8 +3829,20 @@ async function composeCoordinator() {
     transcriptAdapter?.markResync(payload, payload?.reason ?? "server-resync");
     const conversationId = typeof payload?.conversationId === "string" ? payload.conversationId : activeConversationByAgent.get(agentId);
     const request = beginTranscriptSnapshot(agentId, conversationId);
-    void publishTranscriptSnapshot(agentId, conversationId, request).catch(() => {
-    });
+    const attempt = (failures = 0) => {
+      if (transcriptResyncClosed || !transcriptSnapshotGate.isCurrent(request)) return;
+      void publishTranscriptSnapshot(agentId, conversationId, request).catch(() => {
+        if (transcriptResyncClosed || !transcriptSnapshotGate.isCurrent(request)) return;
+        if (failures === 0) process.stderr.write("node-agent-coordinator: transcript resync failed; retrying\n");
+        const timer = setTimeout(() => {
+          transcriptResyncTimers.delete(agentId);
+          attempt(Math.min(failures + 1, 5));
+        }, Math.min(5_000, 250 * 2 ** failures));
+        timer.unref?.();
+        transcriptResyncTimers.set(agentId, timer);
+      });
+    };
+    attempt();
   }
   transcriptAdapter = createTranscriptAdapter({
     onEmit: (payload) => server.postEvent("transcript", payload),
@@ -4050,6 +4075,7 @@ async function composeCoordinator() {
   function settleProcess(exitCode) {
     if (exitSettled) return;
     exitSettled = true;
+    closeTranscriptResync();
     gatewayClient.close();
     localExecSupervisor.dispose();
     oauthForwarder.dispose();

@@ -1,6 +1,4 @@
 import http from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,10 +7,11 @@ import { A2ARuntime } from "../src/a2a/runtime.js";
 import { A2AStore } from "../src/a2a/store.js";
 import type { A2AEnvelope } from "../src/a2a/contracts.js";
 import { createGateway, SSE_MAX_FRAME_BYTES, type GatewayOptions } from "../src/server/gateway.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const servers: http.Server[] = [];
 const stores = new Set<A2AStore>();
-const roots: string[] = [];
+const temp = new TempRoots();
 const readers = new Set<ReadableStreamDefaultReader<Uint8Array>>();
 const runtimes = new Set<A2ARuntime>();
 const sseReaderBuffers = new WeakMap<ReadableStreamDefaultReader<Uint8Array>, Buffer>();
@@ -24,14 +23,13 @@ afterEach(async () => {
   for (const store of stores) store.close();
   stores.clear();
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 type SendInput = Omit<A2AEnvelope, "senderIncarnation" | "recipientIncarnation">;
 
 async function bootGateway(): Promise<{ gateway: ReturnType<typeof createGateway>; port: number; store: A2AStore }> {
-  const root = mkdtempSync(join(tmpdir(), "openbot-a2a-gateway-"));
-  roots.push(root);
+  const root = temp.make("openbot-a2a-gateway-");
   const store = new A2AStore({ path: join(root, "store.db"), now: () => 1_000, sensitiveValues: () => [] });
   stores.add(store);
   store.syncActiveAgents(["agent-a", "agent-b"]);

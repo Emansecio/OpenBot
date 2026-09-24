@@ -1,12 +1,4 @@
-import {
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -19,17 +11,17 @@ import {
   resolveAgentSkillPolicy,
 } from "../src/config/store.js";
 import { MODEL_CATALOG } from "../src/config/models.js";
-import { MAX_MCP_RESULT_BYTES, MAX_MCP_TIMEOUT_MS } from "../src/mcp/security.js";
+import { MAX_MCP_RESULT_BYTES, MAX_MCP_TIMEOUT_MS } from "../src/mcp/security.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const tempDirs: string[] = [];
+const temp = new TempRoots();
 
-afterEach(() => {
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+afterEach(async () => {
+  await temp.cleanup();
 });
 
 function configPath(): string {
-  const dir = mkdtempSync(join(tmpdir(), "openbot-config-"));
-  tempDirs.push(dir);
+  const dir = temp.make("openbot-config-");
   return join(dir, "openbot-config.json");
 }
 
@@ -309,6 +301,31 @@ describe("ConfigStore", () => {
     for (const [label, update, error] of invalidUpdates) {
       expect(update, label).toThrow(error);
     }
+  });
+
+  it("persiste e valida overrides parciais de quota por bot sem alterar configs legadas", () => {
+    const path = configPath();
+    const store = new ConfigStore({ configPath: path });
+    store.update({ agents: [{
+      id: "quota-bot", name: "Quota", avatarId: "quota", model: "grok-4.6", provider: "xai",
+      workspaceQuota: {
+        maxBytes: 4_096,
+        folders: { Downloads: { maxBytes: 1_024 } },
+      },
+    }] });
+
+    expect(new ConfigStore({ configPath: path }).snapshot().agents[0]?.workspaceQuota).toEqual({
+      maxBytes: 4_096,
+      folders: { downloads: { maxBytes: 1_024 } },
+    });
+    expect(() => store.update({ agents: [{
+      id: "bad-quota", name: "Bad", avatarId: "bad", model: "grok-4.6", provider: "xai",
+      workspaceQuota: { maxBytes: 0 },
+    }] })).toThrow(/workspaceQuota/);
+    expect(() => store.update({ agents: [{
+      id: "bad-folder", name: "Bad", avatarId: "bad", model: "grok-4.6", provider: "xai",
+      workspaceQuota: { folders: { Unknown: { maxBytes: 10 } } },
+    }] })).toThrow(/workspaceQuota/);
   });
 
   it("rejects oversized or NUL-containing agent identity fields", () => {

@@ -472915,31 +472915,38 @@ import_electron50.app.whenReady().then(async () => {
   };
   const sanitizeAsyncTaskRecord = (record) => {
     if (!record || typeof record !== "object") return null;
-    const status = String(record.status || "");
+    const projected = record.nativeProjection && typeof record.nativeProjection === "object" ? record.nativeProjection : null;
+    const source = projected || record;
+    const status = String(source.status || "");
     const terminal = ["completed", "failed", "cancelled", "abandoned"].includes(status);
     const actions = [];
-    if (!terminal) actions.push("abort");
-    if (status === "running") actions.push("steer");
-    const progress = record.progress && typeof record.progress === "object"
-      ? { phase: boundedUiText(record.progress.phase, "", 256), summary: boundedUiText(record.progress.summary, "", 4096), completedUnits: typeof record.progress.completedUnits === "number" ? record.progress.completedUnits : null, totalUnits: typeof record.progress.totalUnits === "number" ? record.progress.totalUnits : null }
+    if (projected && Array.isArray(projected.allowedActions)) {
+      for (const action of projected.allowedActions) {
+        if ((action === "abort" && !terminal) || (action === "steer" && (status === "admitted" || status === "running"))) {
+          if (!actions.includes(action)) actions.push(action);
+        }
+      }
+    } else if (!terminal) actions.push("abort");
+    const progress = source.progress && typeof source.progress === "object"
+      ? { phase: boundedUiText(source.progress.phase, "", 256), summary: boundedUiText(source.progress.summary, "", 4096), completedUnits: typeof source.progress.completedUnits === "number" ? source.progress.completedUnits : null, totalUnits: typeof source.progress.totalUnits === "number" ? source.progress.totalUnits : null }
       : null;
-    const error = record.error && typeof record.error === "object"
-      ? { code: typeof record.error.code === "string" ? record.error.code : "internal_error", message: boundedUiText(record.error.message, "Task failed.", 4096), retryable: record.error.retryable === true }
+    const error = source.error && typeof source.error === "object"
+      ? { code: typeof source.error.code === "string" ? source.error.code : "internal_error", message: boundedUiText(source.error.message, "Task failed.", 4096), retryable: source.error.retryable === true }
       : null;
-    const result = record.result && typeof record.result === "object"
-      ? (record.result.kind === "ref"
-        ? { kind: "ref", resultRef: boundedUiText(record.result.resultRef, "", 2048), bytes: typeof record.result.bytes === "number" ? record.result.bytes : 0, truncated: record.result.truncated === true }
-        : (() => { const text = boundedUiText(record.result.text, "", 4096); return { kind: "inline", text, bytes: Buffer.byteLength(text, "utf8"), truncated: record.result.truncated === true || Buffer.byteLength(text, "utf8") < (typeof record.result.text === "string" ? Buffer.byteLength(record.result.text, "utf8") : 0) }; })())
+    const result = source.result && typeof source.result === "object"
+      ? (source.result.kind === "ref"
+        ? { kind: "ref", resultRef: boundedUiText(source.result.resultRef, "", 2048), bytes: typeof source.result.bytes === "number" ? source.result.bytes : 0, truncated: source.result.truncated === true }
+        : (() => { const text = boundedUiText(source.result.text, "", 4096); return { kind: "inline", text, bytes: Buffer.byteLength(text, "utf8"), truncated: source.result.truncated === true || Buffer.byteLength(text, "utf8") < (typeof source.result.text === "string" ? Buffer.byteLength(source.result.text, "utf8") : 0) }; })())
       : null;
-    const objective = record.input && typeof record.input === "object" ? record.input.objective : "";
+    const objective = projected ? projected.label : record.input && typeof record.input === "object" ? record.input.objective : "";
     const label = boundedUiText(objective, "Tarefa", 512);
-    const detail = status === "completed" && result ? (result.kind === "inline" ? result.text : "Concluída")
+    const detail = projected ? projected.detail : status === "completed" && result ? (result.kind === "inline" ? result.text : "Concluída")
       : status === "running" && progress && progress.summary ? progress.summary
       : status === "failed" && error ? error.message
       : status === "retry_wait" && error ? error.message
       : "Tarefa";
-    const output = { id: typeof record.taskId === "string" ? record.taskId : "", kind: typeof record.kind === "string" ? record.kind : "subagent", status, label, detail: boundedUiText(detail, label, 4096), startedAtMs: typeof record.startedAtMs === "number" ? record.startedAtMs : null };
-    if (typeof record.attempt === "number" && record.attempt > 1) output.attempt = record.attempt;
+    const output = { id: typeof source.id === "string" ? source.id : typeof record.taskId === "string" ? record.taskId : "", kind: typeof source.kind === "string" ? source.kind : "subagent", status, label, detail: boundedUiText(detail, label, 4096), startedAtMs: typeof source.startedAtMs === "number" ? source.startedAtMs : null };
+    if (typeof source.attempt === "number" && source.attempt > 1) output.attempt = source.attempt;
     if (progress) output.progress = progress;
     if (error) output.error = error;
     if (result) output.result = result;

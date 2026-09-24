@@ -79,7 +79,7 @@ async function nativePixels(window: any) {
   return JSON.parse(result.stdout);
 }
 
-describe.skipIf(process.platform !== "win32")("desktop selection and native chrome regressions", () => {
+describe.skipIf(process.platform !== "win32" || process.env.OPENBOT_RUN_LIVE_DESKTOP_TEST !== "1")("desktop selection and native chrome regressions", () => {
   it("deletes the selected bot without stale messages and keeps settings clear of transparent native controls", async () => {
     const root = mkdtempSync(join(tmpdir(), "openbot-ui-regressions-"));
     const config = new ConfigStore({ configPath: join(root, "config.json") });

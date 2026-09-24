@@ -30,6 +30,7 @@ import type {
   ProviderTool,
   ProviderToolCall,
 } from "./router.js";
+import { providerToolResultContent } from "./tool-calls.js";
 
 /** Dado de uma tool call no formato nativo do chat.completions (delta ou completo). */
 export interface OpenAiToolCallChunk {
@@ -190,6 +191,31 @@ export function openAiStreamErrorStatus(error: Record<string, unknown>, fallback
   return fallback;
 }
 
+export type OpenAiFinishDisposition = "success" | "incomplete" | "unknown" | "absent";
+
+/** Fail-closed classification shared by OpenAI-compatible Chat transports. */
+export function classifyOpenAiFinishReason(reason: string | undefined): OpenAiFinishDisposition {
+  if (reason === undefined) return "absent";
+  if (reason === "stop" || reason === "tool_calls" || reason === "function_call") return "success";
+  if (reason === "length" || reason === "content_filter" || reason === "max_tokens") return "incomplete";
+  return "unknown";
+}
+
+/** A completed tool call must carry one JSON object; empty means an empty object. */
+export function normalizeToolCallArguments(argumentsText: string, label: string): string {
+  const normalized = argumentsText.trim().length === 0 ? "{}" : argumentsText;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(normalized);
+  } catch {
+    throw new ApiError(`${label}: argumentos de tool call não formam JSON completo`, 502);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new ApiError(`${label}: argumentos de tool call devem ser um objeto JSON`, 502);
+  }
+  return normalized;
+}
+
 /**
  * Parser de um chunk SSE completo: interpreta cada linha `data:` como um frame
  * (`[DONE]` → `{data: null}`). Heartbeats (`:ping`), linhas vazias e campos
@@ -231,7 +257,7 @@ export function toOpenAiMessage(message: ProviderChatMessage): unknown {
     return {
       role: "tool" as const,
       tool_call_id: message.toolCallId ?? "",
-      content: message.content,
+      content: providerToolResultContent(message),
     };
   }
   const out: Record<string, unknown> = { role: message.role, content: message.content };
@@ -277,8 +303,8 @@ export function buildChatBody(req: ProviderChatRequest): OpenAiChatBody {
  *
  * No streaming da OpenAI cada chunk traz um fragmento da tool call por
  * `index` (id/name no primeiro, `arguments` concatenados nos seguintes). Aqui
- * acumulamos por índice e devolvemos as calls na ordem em que apareceram pela
- * primeira vez. `arguments` é uma STRING (JSON em texto) — o consumidor
+ * acumulamos por índice e devolvemos as calls na ordem numérica declarada.
+ * `arguments` é uma STRING (JSON em texto) — o consumidor
  * (turn runner de T9+) faz o parse quando for executar a tool.
  */
 export class OpenAiToolCallAccumulator {
@@ -287,19 +313,37 @@ export class OpenAiToolCallAccumulator {
 
   /** Registra um delta de tool call (id/name/arguments fragmentados). */
   add(chunk: OpenAiToolCallChunk): void {
-    if (typeof chunk.index !== "number") return;
-    const index = chunk.index;
+    if (!Number.isSafeInteger(chunk.index) || (chunk.index as number) < 0) {
+      throw new ApiError("openai-like: tool call sem índice válido", 502, chunk);
+    }
+    if (chunk.type !== undefined && chunk.type !== "function") {
+      throw new ApiError("openai-like: tipo de tool call não suportado", 502, chunk);
+    }
+    const index = chunk.index as number;
     let call = this.byIndex.get(index);
     if (call === undefined) {
       call = { id: "", type: "function", function: { name: "", arguments: "" } };
       this.byIndex.set(index, call);
       this.order.push(index);
     }
-    if (typeof chunk.id === "string") call.id = chunk.id;
+    if (chunk.id !== undefined) {
+      if (typeof chunk.id !== "string") throw new ApiError("openai-like: id de tool call inválido", 502, chunk);
+      if (call.id.length > 0 && chunk.id.length > 0 && call.id !== chunk.id) {
+        throw new ApiError("openai-like: id de tool call mudou durante o stream", 502, chunk);
+      }
+      if (chunk.id.length > 0) call.id = chunk.id;
+    }
     const fn = chunk.function;
     if (fn !== undefined) {
-      if (typeof fn.name === "string") call.function.name += fn.name;
-      if (typeof fn.arguments === "string") call.function.arguments += fn.arguments;
+      if (typeof fn !== "object" || fn === null || Array.isArray(fn)) throw new ApiError("openai-like: função de tool call inválida", 502, chunk);
+      if (fn.name !== undefined) {
+        if (typeof fn.name !== "string") throw new ApiError("openai-like: nome de tool call inválido", 502, chunk);
+        call.function.name += fn.name;
+      }
+      if (fn.arguments !== undefined) {
+        if (typeof fn.arguments !== "string") throw new ApiError("openai-like: argumentos de tool call inválidos", 502, chunk);
+        call.function.arguments += fn.arguments;
+      }
     }
   }
 
@@ -319,14 +363,31 @@ export class OpenAiToolCallAccumulator {
     );
   }
 
-  /** Devolve as tool calls completas NA ORDEM em que apareceram. */
+  /** Devolve as tool calls pelo índice declarado, não pela ordem de chegada. */
   calls(): ProviderToolCall[] {
     const out: ProviderToolCall[] = [];
-    for (const index of this.order) {
+    for (const index of [...this.order].sort((left, right) => left - right)) {
       const call = this.byIndex.get(index);
       if (call !== undefined) out.push(call);
     }
     return out;
+  }
+
+  /** Valida identidade única e argumentos completos antes de liberar execução. */
+  finalizedCalls(label = "openai-like"): ProviderToolCall[] {
+    if (!this.complete) throw new ApiError(`${label}: tool call incompleta no fim do stream`, 502);
+    const ids = new Set<string>();
+    return this.calls().map((call) => {
+      if (ids.has(call.id)) throw new ApiError(`${label}: id de tool call duplicado`, 502, call);
+      ids.add(call.id);
+      return {
+        ...call,
+        function: {
+          ...call.function,
+          arguments: normalizeToolCallArguments(call.function.arguments, label),
+        },
+      };
+    });
   }
 
   /** Limpa o estado (novo turno). */

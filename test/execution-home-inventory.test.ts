@@ -1,19 +1,18 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { open, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { inventoryHome } from "../src/execution/home-inventory.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const tempRoots = new TempRoots();
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await tempRoots.cleanup();
 });
 
 const temp = async (): Promise<string> => {
-  const root = await mkdtemp(join(tmpdir(), "openbot-home-inventory-"));
-  roots.push(root);
+  const root = await tempRoots.makeAsync("openbot-home-inventory-");
   return root;
 };
 

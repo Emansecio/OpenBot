@@ -6,6 +6,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { LocalExecutionBroker } from "../src/execution/broker.js";
+import { ProviderAdmissionScheduler } from "../src/providers/admission.js";
+import { createProviderRegistry, type ProviderChatRequest } from "../src/providers/router.js";
+import { projectAsyncTaskForRenderer } from "../src/tasks/projection.js";
 import type { ExecutionBackend, ExecutionRequest, ExecutionResult } from "../src/execution/contracts.js";
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
 import type { RpcHandler } from "../src/server/gateway.js";
@@ -84,6 +87,72 @@ function body(agentId: string, parentTurnId: string, objective: string, kind: "p
 }
 
 describe("async task productive capability adapters", () => {
+  it("applies a received steering instruction in the production provider request and charges reported usage", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-async-provider-"));
+    roots.push(root);
+    const admission = new ProviderAdmissionScheduler({ maxActive: 1 });
+    const registry = createProviderRegistry();
+    const requests: ProviderChatRequest[] = [];
+    let releaseInference!: () => void;
+    const inferenceBlocked = new Promise<void>((resolve) => { releaseInference = resolve; });
+    registry.register({
+      name: "xai", tracksTransport: true,
+      async streamChat(request, emit) {
+        request.onTransportStart?.("chat");
+        requests.push(request);
+        await inferenceBlocked;
+        emit({ type: "usage", usage: { inputTokens: 73, outputTokens: 17 } });
+        emit({ type: "delta", delta: "x".repeat(1_500) });
+      },
+    });
+    const handle = await startServer(0, {
+      configPath: join(root, "config.json"), stateRoot: join(root, "state"), runtimeRoot: join(root, "runtime"),
+      browserRoot: join(root, "browser"), keystoreDir: join(root, "keystore"), storePath: join(root, "store.db"),
+      registry, providerAdmission: admission, allowUnauthenticatedLocalGateway: true,
+    });
+    handles.push(handle);
+    await handler(handle, "createAgent")({ id: "agent-a", name: "Agent A" }, context(handle));
+    handle.config.update({ flags: { isAgentNetworkEnabled: true } });
+    const held = await admission.acquire("fixture-holder");
+    try {
+      const taskId = randomUUID();
+      const parentTurnId = "turn-provider-steer";
+      const now = Date.now();
+      await handler(handle, "dispatchAsyncTask")({
+        taskId, agentId: "agent-a", parentTurnId, clientNonce: randomUUID(),
+        input: { version: 1, objective: "Original objective", source: { kind: "parent_turn", agentId: "agent-a" } },
+        grant: {
+          grantId: randomUUID(), taskId, parentAgentId: "agent-a", parentTurnId, childRunId: randomUUID(),
+          kind: "provider", constraints: { adapters: ["xai"], models: ["grok-4.6"], credentialRefs: [{ secretRef: "provider/xai" }], allowNoCredential: false },
+          issuedAt: now - 100, expiresAt: now + 5_000, version: 1, depth: 1,
+        },
+        budget,
+      }, context(handle));
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline && admission.waitingCount === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(admission.waitingCount).toBe(1);
+      const before = handle.asyncTaskStore.getTask(taskId)!;
+      const received = await handler(handle, "steerAsyncTask")({ agentId: "agent-a", taskId, intentId: randomUUID(), expectedSteerVersion: before.steerVersion, message: "Use the revised direction" }, context(handle));
+      expect(received).toMatchObject({ steerIntent: { consumedAtMs: null } });
+      held.release();
+      while (Date.now() < deadline && requests.length === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(requests).toHaveLength(1);
+      const inFlight = handle.asyncTaskStore.getTask(taskId)!;
+      expect(projectAsyncTaskForRenderer(inFlight, handle.asyncTaskStore.canSteer(inFlight)).allowedActions).not.toContain("steer");
+      await expect(Promise.resolve().then(() => handler(handle, "steerAsyncTask")({ agentId: "agent-a", taskId, intentId: randomUUID(), expectedSteerVersion: inFlight.steerVersion, message: "Too late" }, context(handle)))).rejects.toThrow(/already sent its provider request/);
+      releaseInference();
+      while (Date.now() < deadline && handle.asyncTaskStore.getTask(taskId)?.status !== "completed") await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(handle.asyncTaskStore.getTask(taskId)).toMatchObject({ status: "completed", steerIntent: { consumedAtMs: expect.any(Number) } });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.messages.map((message) => message.content)).toEqual(["Original objective", "Additional instruction: Use the revised direction"]);
+      expect(handle.asyncTaskStore.getBudgetState(taskId)?.usage.used).toMatchObject({ inputTokens: 73, outputTokens: 17 });
+      expect(handle.asyncTaskStore.getBudgetState(taskId)?.usage.estimated).toBeUndefined();
+    } finally {
+      held.release();
+      releaseInference();
+    }
+  });
+
   it("executes process and allowed browser commands through the shared broker", async () => {
     const { handle, backend } = await startFixture();
     const home = handle.homes!.pathFor("agent-a");

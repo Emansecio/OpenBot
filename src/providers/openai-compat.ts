@@ -55,6 +55,7 @@ import {
   ApiError,
   OpenAiToolCallAccumulator,
   buildChatBody,
+  classifyOpenAiFinishReason,
   extractOpenAiErrorMessage,
   findSseFrameBoundary,
   normalizeOpenAiError,
@@ -292,9 +293,6 @@ export class OpenAiCompatAdapter implements ProviderAdapter {
     let finishReason: string | undefined;
     let finishPayload: unknown;
 
-    const isIncompleteReason = (reason: string | undefined): reason is "length" | "content_filter" | "max_tokens" =>
-      reason === "length" || reason === "content_filter" || reason === "max_tokens";
-
     const dispatchFrame = (frame: string): boolean => {
       const data = splitSseLines(frame).filter((line) => line.startsWith("data:"))
         .map((line) => line.slice(5).replace(/^ /, "")).join("\n");
@@ -346,27 +344,28 @@ export class OpenAiCompatAdapter implements ProviderAdapter {
         if (done) break;
         onActivity();
         buffer += decoder.decode(value, { stream: true });
-        if (buffer.length > 1_048_576) throw new ApiError("openai-compat: buffer SSE excedeu 1 MiB", 502);
         let boundary = findSseFrameBoundary(buffer);
         while (boundary !== undefined) {
           const frame = buffer.slice(0, boundary.index);
           buffer = buffer.slice(boundary.index + boundary.length);
+          if (Buffer.byteLength(frame, "utf8") > 1_048_576) throw new ApiError("openai-compat: frame SSE excedeu 1 MiB", 502);
           if (dispatchFrame(frame)) { terminated = true; break; }
           boundary = findSseFrameBoundary(buffer);
         }
+        if (!terminated && Buffer.byteLength(buffer, "utf8") > 1_048_576) throw new ApiError("openai-compat: buffer SSE residual excedeu 1 MiB", 502);
       }
       if (!terminated) throw new ApiError("openai-compat: stream terminou antes de [DONE]", 502);
     } finally {
       await reader.cancel().catch(() => undefined);
       reader.releaseLock();
     }
-    if (isIncompleteReason(finishReason)) {
-      throw new ApiError(`openai-compat: geração interrompida (${finishReason})`, 400, finishPayload, { code: finishReason });
+    const finishDisposition = classifyOpenAiFinishReason(finishReason);
+    if (finishDisposition === "incomplete" || finishDisposition === "unknown") {
+      throw new ApiError(`openai-compat: geração interrompida (${finishReason})`, finishDisposition === "incomplete" ? 400 : 502, finishPayload, { code: finishReason });
     }
-    if (toolAccumulator.hasAny && !toolAccumulator.complete) {
-      throw new ApiError("openai-compat: tool call incompleta no fim do stream", 502);
+    if (toolAccumulator.hasAny) {
+      for (const call of toolAccumulator.finalizedCalls("openai-compat")) emit({ type: "tool-call", call });
     }
-    for (const call of toolAccumulator.calls()) emit({ type: "tool-call", call });
   }
 
   async streamChat(

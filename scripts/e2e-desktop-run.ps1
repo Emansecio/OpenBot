@@ -14,7 +14,7 @@ $checkerPath = Join-Path $repoRoot 'test\e2e-desktop\cdp-check.mjs'
 $distMain = Join-Path $repoRoot 'dist\main.js'
 
 if ([string]::IsNullOrWhiteSpace($ElectronPath)) {
-    $ElectronPath = 'C:\Users\User\AppData\Local\hermes\hermes-agent\apps\desktop\node_modules\electron\dist\electron.exe'
+    $ElectronPath = Join-Path $repoRoot 'node_modules\electron\dist\electron.exe'
 }
 $ElectronPath = [IO.Path]::GetFullPath($ElectronPath)
 
@@ -370,7 +370,7 @@ try {
     Remove-Item -LiteralPath 'Env:ELECTRON_RUN_AS_NODE' -ErrorAction SilentlyContinue
 
     $fixtureProcess = Start-Process -FilePath $nodePath -ArgumentList @(
-        $fixturePath, '--root', $fixtureRoot, '--ready-file', $readyFile, '--status-file', $statusFile, '--port', '0'
+        "`"$fixturePath`"", '--root', "`"$fixtureRoot`"", '--ready-file', "`"$readyFile`"", '--status-file', "`"$statusFile`"", '--port', '0'
     ) -WorkingDirectory $repoRoot -RedirectStandardOutput $fixtureOut -RedirectStandardError $fixtureErr -WindowStyle Hidden -PassThru
 
     $fixtureReady = $false
@@ -427,14 +427,14 @@ try {
     ($metadata | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath (Join-Path $runDir 'run.json') -Encoding utf8
 
     $electronArguments = @(
-        "--user-data-dir=$userData",
+        "`"--user-data-dir=$userData`"",
         '--no-sandbox',
         '--disable-gpu',
         '--use-fake-device-for-media-stream',
         '--enable-logging',
-        "--log-file=$electronLog",
+        "`"--log-file=$electronLog`"",
         "--remote-debugging-port=$cdpPort",
-        $electronMain
+        "`"$electronMain`""
     )
     $electronProcess = Start-Process -FilePath $ElectronPath -ArgumentList $electronArguments -WorkingDirectory $repoRoot -RedirectStandardOutput $electronOut -RedirectStandardError $electronErr -WindowStyle Hidden -PassThru
 

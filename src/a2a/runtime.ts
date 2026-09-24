@@ -7,7 +7,10 @@ export interface A2ARuntimeOptions {
   isUserLaneBusy: () => boolean;
   isUserLanePending: () => boolean;
   enqueueBackground?: (agentId: string, priority: "normal" | "high", task: () => Promise<void>) => void;
-  consume: (context: { message: A2AMessageRecord; signal: AbortSignal }) => Promise<{ ackNonce?: string } | void>;
+  consume: (context: { message: A2AMessageRecord; signal: AbortSignal }) => Promise<{
+    ackNonce?: string;
+    outcome?: "success" | "partial" | "error" | "aborted";
+  } | void>;
   publishProjection?: (envelope: A2AProjectionEnvelope) => boolean | Promise<boolean>;
   now?: () => number;
   pollIntervalMs?: number;
@@ -147,7 +150,16 @@ export class A2ARuntime {
       if (result === "stopped") return;
       stopHeartbeat();
       if (stopRequested || leaseLost) return;
-      this.options.store.ack(message.messageId, { ownerId, expectedVersion: leaseVersion, status: "acked", ackNonce: result?.ackNonce });
+      if (result?.outcome !== undefined && result.outcome !== "success") {
+        this.options.store.ack(message.messageId, {
+          ownerId,
+          expectedVersion: leaseVersion,
+          status: "rejected",
+          terminalReason: `turn-${result.outcome}`,
+        });
+      } else {
+        this.options.store.ack(message.messageId, { ownerId, expectedVersion: leaseVersion, status: "acked", ackNonce: result?.ackNonce });
+      }
     } catch {
       stopHeartbeat();
       if (stopRequested || leaseLost) return;

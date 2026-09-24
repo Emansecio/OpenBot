@@ -59,6 +59,7 @@ async function waitFor(store: AsyncTaskStore, ids: readonly string[]): Promise<v
     if (ids.every((id) => ["completed", "failed", "cancelled"].includes(store.getTask(id)?.status ?? ""))) return;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+  throw new Error(`tasks did not reach a terminal status within 3000ms: ${ids.join(", ")}`);
 }
 
 describe("shared async-task capability boundary", () => {

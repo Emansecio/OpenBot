@@ -636,6 +636,8 @@ export function registerRpcHandlers(
     onDeleteAgentsCommitted?: (agentIds: readonly string[]) => void;
     /** Clears bootstrap's per-agent pending-home fence after committed recovery. */
     onAgentHomeReady?: (agentId: string) => void;
+    /** Drops a cached backend after a fenced per-agent workspace config update. */
+    onAgentWorkspaceConfigChanged?: (agentId: string) => void;
     asyncTaskStore?: AsyncTaskStore;
     asyncTaskRuntime?: AsyncTaskRuntime;
     resolveAsyncTaskAuthority?: AsyncTaskAuthorityResolver;
@@ -823,6 +825,11 @@ export function registerRpcHandlers(
         } catch (error) {
           cleanupFailures.push(error);
         }
+        try {
+          opts.onDeleteAgentsCommitted?.(agentIds);
+        } catch (error) {
+          cleanupFailures.push(error);
+        }
         for (const agentId of agentIds) {
           for (const cleanup of [
             () => opts.asyncTaskStore?.purgeAgentTasks(agentId),
@@ -846,11 +853,6 @@ export function registerRpcHandlers(
         await settleCleanup(agentIds.map((agentId) => Promise.resolve().then(() => opts.attachmentStaging?.purgeAgent(agentId))));
         await settleCleanup(agentIds.map((agentId) => Promise.resolve().then(() => opts.keystore?.purgeScope(agentId))));
         await settleCleanup(agentIds.map((agentId) => Promise.resolve().then(() => opts.browserLifecycle?.purgeAgent(agentId))));
-        try {
-          opts.onDeleteAgentsCommitted?.(agentIds);
-        } catch (error) {
-          cleanupFailures.push(error);
-        }
         if (cleanupFailures.length > 0) {
           throw cleanupFailures.length === 1
             ? cleanupFailures[0]
@@ -865,6 +867,7 @@ export function registerRpcHandlers(
       (args) => runner.kickstartAgent(args),
       (agentId) => deletionJournal.hasPendingAgentDeletion?.(agentId) ?? false,
       opts.assertManagedDiskBudget,
+      opts.onAgentWorkspaceConfigChanged,
     );
     activateAgent = roster.activateAgent;
   }

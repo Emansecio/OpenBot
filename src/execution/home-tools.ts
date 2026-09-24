@@ -2,7 +2,7 @@ import type { ProviderTool } from "../providers/router.js";
 
 export const HOME_SYSTEM_PROMPT =
   "Your default home is a private physical Windows workspace. Relative file, search and process paths refer to the same folders there, including Documents, Downloads and Projects. Browser downloads are saved in this home's Downloads. " +
-  "Use workspace_info to discover the absolute home path, granted shared folders and any legacy redirect folders containing older files. Legacy folders are not moved automatically; access their absolute paths when needed. " +
+  "Use workspace_info to discover the absolute home path, effective storage limits, granted shared folders and any legacy redirect folders containing older files. Legacy folders are not moved automatically; access their absolute paths when needed. " +
   "Shared folders are explicit file/search/upload references such as shared://Documents/note.txt and require a folder grant. They never replace private Documents. In process_run, use the absolute shared path reported by workspace_info, not the shared:// reference. " +
   "When you need something outside it, use process_run: it runs Windows tools on the host and may use absolute paths on any mounted drive, including AppData, installed applications, repositories, and skill folders. " +
   "You may use PowerShell, cmd, WSL, or any installed executable to inspect, copy, create, move, or modify host files. Prefer the private workspace for normal work and access host paths only when the task needs them. " +
@@ -16,7 +16,7 @@ const HOME_FILE_TOOLS: ProviderTool[] = [
     type: "function",
     function: {
       name: "workspace_info",
-      description: "Get this bot's physical workspace, granted shared folder paths/access, and existing legacy redirect paths. Call before combining local commands with shared or older files. Does not move or create files.",
+      description: "Get this bot's physical workspace, effective global/per-folder storage limits, granted shared folder paths/access, and existing legacy redirect paths. This configuration-only query does not scan usage, move, or create files.",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -42,6 +42,14 @@ const HOME_FILE_TOOLS: ProviderTool[] = [
           encoding: { type: "string", enum: ["utf8", "base64"] },
         },
         required: ["op"],
+        oneOf: [
+          { properties: { op: { const: "list" }, path: { type: "string" } }, required: ["op"], additionalProperties: false },
+          { properties: { op: { enum: ["stat", "mkdir", "trash"] }, path: { type: "string" } }, required: ["op", "path"], additionalProperties: false },
+          { properties: { op: { const: "read" }, path: { type: "string" }, encoding: { type: "string", enum: ["utf8", "base64"] } }, required: ["op", "path"], additionalProperties: false },
+          { properties: { op: { enum: ["copy", "move"] }, source: { type: "string" }, destination: { type: "string" } }, required: ["op", "source", "destination"], additionalProperties: false },
+          { properties: { op: { const: "restore" }, trashId: { type: "string" } }, required: ["op", "trashId"], additionalProperties: false },
+          { properties: { op: { const: "write" }, path: { type: "string" }, content: { type: "string" }, encoding: { type: "string", enum: ["utf8", "base64"] } }, required: ["op", "path", "content"], additionalProperties: false },
+        ],
         additionalProperties: false,
       },
     },
@@ -57,6 +65,7 @@ const HOME_FILE_TOOLS: ProviderTool[] = [
           paths: { type: "array", items: { type: "string" } },
           cwd: { type: "string" },
         },
+        additionalProperties: false,
       },
     },
   },
@@ -74,6 +83,7 @@ const HOME_FILE_TOOLS: ProviderTool[] = [
           cwd: { type: "string" },
         },
         required: ["pattern"],
+        additionalProperties: false,
       },
     },
   },
@@ -262,6 +272,12 @@ export const WHATSAPP_TOOL: ProviderTool = {
         mediaId: { type: "string", description: "Optional media message id for download." },
       },
       required: ["op"],
+      oneOf: [
+        { properties: { op: { enum: ["doctor", "sweep"] } }, required: ["op"], additionalProperties: false },
+        { properties: { op: { const: "messages_list" }, chat: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: 50 } }, required: ["op", "chat"], additionalProperties: false },
+        { properties: { op: { const: "send" }, chat: { type: "string" }, text: { type: "string" }, etapa: { type: "string" } }, required: ["op", "chat", "text"], additionalProperties: false },
+        { properties: { op: { const: "download" }, chat: { type: "string" }, mediaId: { type: "string" } }, required: ["op", "chat"], additionalProperties: false },
+      ],
       additionalProperties: false,
     },
   },

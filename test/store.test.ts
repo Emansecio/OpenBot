@@ -1,5 +1,3 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,19 +11,19 @@ import {
 } from "../src/store/index.js";
 import { SqliteConversationStore } from "../src/conversations/store.js";
 import { SqliteMemoryStore } from "../src/memory/sqlite-store.js";
-import { normalizeTranscriptEntry, type TranscriptEntry } from "../src/shared/contracts.js";
+import { normalizeTranscriptEntry, type TranscriptEntry } from "../src/shared/contracts.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const openStores: SqliteTranscriptStore[] = [];
-const tempDirs: string[] = [];
+const temp = new TempRoots();
 
-afterEach(() => {
+afterEach(async () => {
   for (const store of openStores.splice(0)) store.close();
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 function createStore(): SqliteTranscriptStore {
-  const dir = mkdtempSync(join(tmpdir(), "openbot-store-"));
-  tempDirs.push(dir);
+  const dir = temp.make("openbot-store-");
   const store = new SqliteTranscriptStore({ path: join(dir, "store.db") });
   openStores.push(store);
   return store;
@@ -41,8 +39,7 @@ function attachment(name: string): TranscriptEntry {
 
 describe("SqliteTranscriptStore", () => {
   it("rejects an injected foreign memory store without closing it", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-store-foreign-memory-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-store-foreign-memory-");
     const dbPath = join(dir, "store.db");
     const foreignMemoryDb = new Database(":memory:");
     const foreignMemory = new SqliteMemoryStore({ path: ":memory:", database: foreignMemoryDb });
@@ -57,8 +54,7 @@ describe("SqliteTranscriptStore", () => {
   });
 
   it("rejects an injected foreign conversation store without closing it", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-store-foreign-conversation-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-store-foreign-conversation-");
     const dbPath = join(dir, "store.db");
     const foreignConversationDb = new Database(":memory:");
     const foreignConversation = new SqliteConversationStore({ path: ":memory:", database: foreignConversationDb });
@@ -73,8 +69,7 @@ describe("SqliteTranscriptStore", () => {
   });
 
   it("accepts injected shared conversation and memory stores on the same SQLite connection", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-store-shared-injected-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-store-shared-injected-");
     const dbPath = join(dir, "store.db");
     const sharedDb = new Database(dbPath);
     const sharedMemory = new SqliteMemoryStore({ path: dbPath, database: sharedDb });
@@ -109,8 +104,7 @@ describe("SqliteTranscriptStore", () => {
   });
 
   it("sobrevive ao fechamento e reabertura do mesmo arquivo", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-reopen-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-reopen-");
     const path = join(dir, "store.db");
     const first = new SqliteTranscriptStore({ path });
     first.append("agent-a", [message("u1", "user", "persistir", 100)]);
@@ -124,8 +118,7 @@ describe("SqliteTranscriptStore", () => {
   });
 
   it("reconcilia nonce aceito sem mensagem após close/reopen, liberando retry", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-orphan-nonce-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-orphan-nonce-");
     const path = join(dir, "store.db");
     const first = new SqliteTranscriptStore({ path });
     expect(first.claimAcceptedNonce("agent-a", "orphan-nonce")).toBe(true);
@@ -141,8 +134,7 @@ describe("SqliteTranscriptStore", () => {
   });
 
   it("preserva nonce aceito quando o echo do usuário sobrevive ao close/reopen", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-committed-nonce-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-committed-nonce-");
     const path = join(dir, "store.db");
     const first = new SqliteTranscriptStore({ path });
     expect(first.claimAcceptedNonce("agent-a", "committed-nonce")).toBe(true);
@@ -163,8 +155,7 @@ describe("SqliteTranscriptStore", () => {
   });
 
   it("preserva nonce aceito quando o marcador durável de retry sobrevive ao restart", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-retry-nonce-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-retry-nonce-");
     const path = join(dir, "store.db");
     const first = new SqliteTranscriptStore({ path });
     expect(first.claimAcceptedNonce("agent-a", "retry:turn-1")).toBe(true);
@@ -186,8 +177,7 @@ describe("SqliteTranscriptStore", () => {
   });
 
   it("reconcilia turno aceito sem resposta em uma falha recuperável única", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-open-turn-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-open-turn-");
     const path = join(dir, "store.db");
     const first = new SqliteTranscriptStore({ path });
     openStores.push(first);
@@ -233,9 +223,56 @@ describe("SqliteTranscriptStore", () => {
     expect(third.getEntries("agent-a").filter((entry) => entry.kind === "notice" && entry.type === "restart-interrupted")).toHaveLength(1);
   });
 
+  it("abre o store com entrada ilegível num turno interrompido, sem descartá-la e sem oferecer retry", () => {
+    const dir = temp.make("openbot-unreadable-entry-");
+    const path = join(dir, "store.db");
+    const first = new SqliteTranscriptStore({ path });
+    first.beginTurnAttempt({
+      turnId: "turn:unreadable",
+      agentId: "agent-a",
+      clientNonce: "nonce:unreadable",
+      provider: "xai",
+      model: "grok-4.6",
+      phase: "preparing",
+      startedAtMs: 100,
+    });
+    first.append("agent-a", [normalizeTranscriptEntry({
+      kind: "message",
+      id: "user-unreadable",
+      role: "user",
+      content: "mensagem aceita antes do crash",
+      timestampMs: 100,
+      streaming: false,
+      clientNonce: "nonce:unreadable",
+      turnId: "turn:unreadable",
+    })]);
+    first.close();
+
+    // Valid JSON the current version cannot read (e.g. written by a newer build before rollback).
+    const unreadable = JSON.stringify({ kind: "message", streaming: true });
+    const raw = new Database(path);
+    const { conversation_id: conversationId } = raw.prepare("SELECT conversation_id FROM transcript_entries WHERE entry_id = ?").get("user-unreadable") as { conversation_id: string };
+    raw.prepare("INSERT INTO transcript_entries (agent_id, conversation_id, entry_id, kind, payload_json, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("agent-a", conversationId, "future-entry", "message", unreadable, 101);
+    raw.close();
+
+    const second = new SqliteTranscriptStore({ path });
+    second.close();
+
+    const check = new Database(path, { readonly: true });
+    try {
+      const notice = check.prepare("SELECT payload_json FROM transcript_entries WHERE entry_id = ?").get("notice:turn:unreadable:restart-interrupted") as { payload_json: string } | undefined;
+      expect(notice).toBeDefined();
+      expect(JSON.parse(notice!.payload_json)).toMatchObject({ type: "restart-interrupted", retryable: false, turnId: "turn:unreadable" });
+      expect(check.prepare("SELECT payload_json FROM transcript_entries WHERE entry_id = ?").get("future-entry")).toEqual({ payload_json: unreadable });
+      expect(check.prepare("SELECT COUNT(*) AS count FROM turn_attempts").get()).toEqual({ count: 0 });
+    } finally {
+      check.close();
+    }
+  });
+
   it("persiste a conclusão do turno junto da remoção da tentativa", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-completed-turn-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-completed-turn-");
     const path = join(dir, "store.db");
     const first = new SqliteTranscriptStore({ path });
     const conversationId = first.conversationStore.ensureDefault("agent-a").id;
@@ -260,20 +297,23 @@ describe("SqliteTranscriptStore", () => {
       turnId: "turn:completed",
     })], conversationId);
     first.rememberAcceptedNonce("agent-a", "nonce:completed", conversationId);
-    first.finishTurnAttempt("agent-a", "turn:completed");
+    first.finishTurnAttempt("agent-a", "turn:completed", "partial");
     expect(first.hasCompletedTurnForNonce("agent-a", "nonce:completed", conversationId)).toBe(true);
+    expect(first.getTurnOutcomeForNonce("agent-a", "nonce:completed", conversationId)).toBe("partial");
     first.close();
 
     const second = new SqliteTranscriptStore({ path });
     openStores.push(second);
     expect(second.hasCompletedTurnForNonce("agent-a", "nonce:completed", conversationId)).toBe(true);
+    expect(second.getTurnOutcomeForNonce("agent-a", "nonce:completed", conversationId)).toBe("partial");
     expect(second.snapshotAgent("agent-a").turnAttemptRows).toEqual([]);
-    expect(second.snapshotAgent("agent-a").turnCompletionRows).toHaveLength(1);
+    expect(second.snapshotAgent("agent-a").turnCompletionRows).toEqual([
+      expect.objectContaining({ turnId: "turn:completed", outcome: "partial" }),
+    ]);
   });
 
   it("marca resposta parcial como interrompida e cria retry após restart", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-partial-turn-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-partial-turn-");
     const path = join(dir, "store.db");
     const first = new SqliteTranscriptStore({ path });
     openStores.push(first);
@@ -360,8 +400,7 @@ describe("SqliteTranscriptStore", () => {
   });
 
   it("replace survives reopen and keeps a single row", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-replace-reopen-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-replace-reopen-");
     const path = join(dir, "store.db");
     const first = new SqliteTranscriptStore({ path });
     first.append("agent-a", [{
@@ -388,8 +427,7 @@ describe("SqliteTranscriptStore", () => {
   });
 
   it("reconcilia mensagens streaming e tools abertas ao reabrir o store", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-reconcile-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-reconcile-");
     const path = join(dir, "store.db");
     const first = new SqliteTranscriptStore({ path });
     first.append("agent-a", [
@@ -426,8 +464,7 @@ describe("SqliteTranscriptStore", () => {
   });
 
   it("não reconcilia trabalho vivo enquanto outra instância possui o store", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-owned-store-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-owned-store-");
     const path = join(dir, "store.db");
     const first = new SqliteTranscriptStore({ path });
     openStores.push(first);
@@ -451,8 +488,7 @@ describe("SqliteTranscriptStore", () => {
   });
 
   it("não confunde PID reutilizado com o owner antigo do store", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-reused-owner-"));
-    tempDirs.push(dir);
+    const dir = temp.make("openbot-reused-owner-");
     const path = join(dir, "store.db");
     const initial = new SqliteTranscriptStore({ path });
     initial.close();

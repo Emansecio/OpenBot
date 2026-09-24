@@ -1,5 +1,5 @@
 import { validateReflectionCandidates, MEMORY_POLICY_LIMITS, type PolicyRejection } from "./policy.js";
-import { isExplicitMemoryIntent, type ReflectionExistingMemory, type ReflectionPreviousSummary } from "./context.js";
+import { isExplicitMemoryIntent, ReflectionRequestTooLargeError, type ReflectionExistingMemory, type ReflectionPreviousSummary } from "./context.js";
 import { ProviderError } from "../providers/router.js";
 import { ProviderAdmissionError } from "../providers/admission.js";
 import type {
@@ -178,6 +178,8 @@ export function parseReflectionResult(input: string | unknown): ReflectionResult
 
 export const parseReflectionOutput = parseReflectionResult;
 
+class ReflectionStaleInputError extends Error {}
+
 /**
  * Failure taxonomy for job retry: provider/admission errors keep their own
  * retryability, output-format errors are retryable (next attempt may parse),
@@ -185,6 +187,7 @@ export const parseReflectionOutput = parseReflectionResult;
  */
 const classifyReflectionFailure = (error: unknown, aborted: boolean): { code: string; retryable: boolean } => {
   if (aborted) return { code: "timeout", retryable: true };
+  if (error instanceof ReflectionRequestTooLargeError) return { code: "reflection_input_too_large", retryable: false };
   if (error instanceof ProviderError) return { code: `provider_${error.kind}`, retryable: error.retryable };
   if (error instanceof ProviderAdmissionError) return { code: `admission_${error.code}`, retryable: error.retryable };
   if (error instanceof Error && error.message.includes("indisponível ou incompatível")) return { code: "reflection_input", retryable: false };
@@ -431,7 +434,7 @@ export function applyReflectionResult(store: MemoryStore, input: MemoryReflectio
   const parsed = parseReflectionResult(result);
   const forgotten = store.getForgottenSourceIds(input.agentId, input.conversationId);
   if (input.entries.some((entry) => forgotten.has((entry as { id: string }).id))) {
-    throw new Error("reflection: entrada contém fonte esquecida; recarregue o contexto");
+    throw new ReflectionStaleInputError("reflection: entrada contém fonte esquecida; recarregue o contexto");
   }
   if (input.summaryRequested === true && parsed.summary === undefined) throw new Error("reflection: summary solicitada não retornada");
   if (input.memoryRequested === false && parsed.operations.length > 0) throw new Error("reflection: operações de memória não solicitadas");
@@ -643,6 +646,9 @@ export class MemoryReflectionWorker {
   private closed = false;
   private pumping = false;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private pumpRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  private pumpFailureCount = 0;
+  private readonly pendingFailures = new Map<string, () => void>();
   private readonly pendingClose: Array<() => void> = [];
 
   constructor(options: MemoryReflectionWorkerOptions) {
@@ -705,20 +711,32 @@ export class MemoryReflectionWorker {
 
   cancelConversation(agentId: string, conversationId: string, reason: ReflectionCancellationReason = "archived"): void {
     const cancellationReason: ReflectionCancellationReason = reason === "deleted" ? "deleted" : "archived";
+    this.cancelWork(agentId, conversationId, cancellationReason);
+  }
+
+  /** Called after the agent's durable jobs have been removed. */
+  cancelAgent(agentId: string): void {
+    this.cancelWork(agentId, undefined, "deleted");
+  }
+
+  private cancelWork(agentId: string, conversationId: string | undefined, reason: ReflectionCancellationReason): void {
+    const matches = (job: { agentId: string; conversationId: string }): boolean => (
+      job.agentId === agentId && (conversationId === undefined || job.conversationId === conversationId)
+    );
     for (let index = this.queue.length - 1; index >= 0; index -= 1) {
       const input = this.queue[index]!;
-      if (input.agentId === agentId && input.conversationId === conversationId) this.queue.splice(index, 1);
+      if (matches(input)) this.queue.splice(index, 1);
     }
     for (const [controller, job] of this.activeControllers) {
-      if (job.agentId === agentId && job.conversationId === conversationId) {
-        controller.abort(new Error(`reflection conversation ${cancellationReason}`));
+      if (matches(job)) {
+        controller.abort(new Error(`reflection conversation ${reason}`));
       }
     }
     this.pump();
   }
 
   private pump(): void {
-    if (this.pumping || this.closed) return;
+    if (this.pumping || this.closed || this.pumpRetryTimer !== undefined) return;
     this.pumping = true;
     queueMicrotask(() => {
       this.pumping = false;
@@ -726,32 +744,59 @@ export class MemoryReflectionWorker {
         if (this.active === 0) this.resolveClose();
         return;
       }
-      while (this.active < this.globalConcurrency) {
-        const index = this.queue.findIndex((item) => (
-          this.canRunAgent(item.agentId) && (this.activeAgents.get(item.agentId) ?? 0) < this.perAgentConcurrency
-        ));
-        const input = index < 0 ? undefined : this.queue.splice(index, 1)[0];
-        const recovered = input === undefined && this.loadInput !== undefined
-          ? this.store.listRunnableJobs(undefined, 100).find((job) => (
-            this.canRunAgent(job.agentId) && (this.activeAgents.get(job.agentId) ?? 0) < this.perAgentConcurrency
-          ))
-          : undefined;
-        if (input === undefined && recovered === undefined) break;
-        const agentId = input?.agentId ?? recovered!.agentId;
-        this.active += 1;
-        this.activeAgents.set(agentId, (this.activeAgents.get(agentId) ?? 0) + 1);
-        const task = input === undefined ? this.runRecovered(recovered!) : this.run(input);
-        void task.finally(() => {
-          this.active -= 1;
-          const count = (this.activeAgents.get(agentId) ?? 1) - 1;
-          if (count <= 0) this.activeAgents.delete(agentId); else this.activeAgents.set(agentId, count);
-          this.pump();
-          if (this.active === 0 && this.queue.length === 0) this.resolveClose();
-        });
+      try {
+        // Retry only the failed state write, never an already-applied reflection.
+        for (const [id, settle] of this.pendingFailures) {
+          settle();
+          this.pendingFailures.delete(id);
+        }
+        while (this.active < this.globalConcurrency) {
+          const index = this.queue.findIndex((item) => (
+            this.canRunAgent(item.agentId) && (this.activeAgents.get(item.agentId) ?? 0) < this.perAgentConcurrency
+          ));
+          const input = index < 0 ? undefined : this.queue.splice(index, 1)[0];
+          const recovered = input === undefined && this.loadInput !== undefined
+            ? this.store.listRunnableJobs(undefined, 100).find((job) => (
+              this.canRunAgent(job.agentId) && (this.activeAgents.get(job.agentId) ?? 0) < this.perAgentConcurrency
+            ))
+            : undefined;
+          if (input === undefined && recovered === undefined) break;
+          const agentId = input?.agentId ?? recovered!.agentId;
+          this.active += 1;
+          this.activeAgents.set(agentId, (this.activeAgents.get(agentId) ?? 0) + 1);
+          const task = input === undefined ? this.runRecovered(recovered!) : this.run(input);
+          void task.catch(() => this.deferPump()).finally(() => {
+            this.active -= 1;
+            const count = (this.activeAgents.get(agentId) ?? 1) - 1;
+            if (count <= 0) this.activeAgents.delete(agentId); else this.activeAgents.set(agentId, count);
+            this.pump();
+            if (this.active === 0 && this.queue.length === 0 && this.pendingFailures.size === 0) this.resolveClose();
+          });
+        }
+        this.scheduleRetryWake();
+        if (this.active === 0 && this.queue.length === 0 && this.pendingFailures.size === 0) {
+          this.pumpFailureCount = 0;
+          this.resolveClose();
+        }
+      } catch {
+        this.deferPump();
       }
-      this.scheduleRetryWake();
-      if (this.active === 0 && this.queue.length === 0) this.resolveClose();
     });
+  }
+
+  private deferPump(): void {
+    if (this.closed || this.pumpRetryTimer !== undefined) return;
+    const delay = Math.min(5_000, 100 * (2 ** this.pumpFailureCount));
+    this.pumpFailureCount = Math.min(this.pumpFailureCount + 1, 6);
+    if (this.retryTimer !== undefined) clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+    // Storage errors can contain private paths or payloads. Log pacing only.
+    console.warn(`[openbot] memory worker storage operation deferred; retry in ${delay}ms`);
+    this.pumpRetryTimer = setTimeout(() => {
+      this.pumpRetryTimer = undefined;
+      this.pump();
+    }, delay);
+    this.pumpRetryTimer.unref?.();
   }
 
   private scheduleRetryWake(): void {
@@ -772,7 +817,17 @@ export class MemoryReflectionWorker {
   }
 
   private async run(input: MemoryReflectionWorkerEnqueueInput): Promise<void> {
-    const job = this.store.claimJob(input.agentId, input.id);
+    let job: MemoryJob | null;
+    try {
+      job = this.store.claimJob(input.agentId, input.id);
+    } catch (error) {
+      // A claim failure has not consumed the queued payload. Preserve any
+      // newer coalesced input instead of replacing it with this older one.
+      if (!this.closed && !this.queue.some(item => item.agentId === input.agentId && item.conversationId === input.conversationId)) {
+        this.queue.unshift(input);
+      }
+      throw error;
+    }
     if (job === null) return;
     await this.runClaimed(job, async () => ({
       ...input,
@@ -788,6 +843,25 @@ export class MemoryReflectionWorker {
     await this.runClaimed(job, async (signal) => this.loadInput!(job, signal));
   }
 
+  private settleJobFailure(job: MemoryJob, error: unknown, aborted: boolean): void {
+    const text = error instanceof Error ? error.message : String(error);
+    const failure = classifyReflectionFailure(error, aborted);
+    const current = this.store.getJob(job.agentId, job.id);
+    if (current === null || current.status !== "running" || !this.store.isConversationActive(job.agentId, job.conversationId)) return;
+    if (!failure.retryable || current.attempts >= this.maxAttempts) {
+      this.store.deadJob(job.agentId, job.id, { code: failure.code, text });
+      try {
+        this.onJobDead?.({ agentId: job.agentId, conversationId: job.conversationId, jobId: job.id, provider: job.provider, model: job.model, error: { code: failure.code, text } });
+      } catch {
+        // Notification is best-effort; the terminal job state is durable.
+      }
+    } else {
+      this.store.retryJob(job.agentId, job.id, { code: failure.code, text }, undefined, {
+        maxAttempts: this.maxAttempts, backoffMs: this.backoffMs,
+      });
+    }
+  }
+
   private async runClaimed(job: MemoryJob, resolveInput: (signal: AbortSignal) => Promise<MemoryReflectionInput | null>): Promise<void> {
     const controller = new AbortController();
     this.activeControllers.set(controller, job);
@@ -801,6 +875,8 @@ export class MemoryReflectionWorker {
     const aborted = new Promise<never>((_, reject) => {
       controller.signal.addEventListener("abort", () => reject(controller.signal.reason ?? new Error("reflection aborted")), { once: true });
     });
+    let persistCompletedResult: (() => void) | undefined;
+    let resultApplied = false;
     try {
       const input = await Promise.race([resolveInput(controller.signal), timeout, aborted]);
       controller.signal.throwIfAborted();
@@ -810,7 +886,11 @@ export class MemoryReflectionWorker {
         input.conversationId !== job.conversationId ||
         input.provider !== job.provider ||
         input.model !== job.model ||
-        input.fromSequenceId !== job.fromSequenceId ||
+        (input.fromSequenceId !== job.fromSequenceId && !(
+          this.loadInput !== undefined && input.summaryRequested === true
+          && input.fromSequenceId < job.fromSequenceId
+          && input.fromSequenceId === (input.previousSummary?.throughSequenceId ?? -1) + 1
+        )) ||
         input.throughSequenceId !== job.throughSequenceId
       ) {
         throw new Error("reflection input indisponível ou incompatível com job");
@@ -827,13 +907,20 @@ export class MemoryReflectionWorker {
           || currentInput.summaryRequested !== input.summaryRequested
           || currentInput.memoryRequested !== input.memoryRequested
         ) {
-          throw new Error("reflection: snapshot de entrada ficou stale");
+          throw new ReflectionStaleInputError("reflection: snapshot de entrada ficou stale");
         }
       }
-      this.store.transaction(() => {
+      // Keep the parsed provider result in memory until the atomic write is
+      // confirmed. A transient write failure must retry this transaction,
+      // never make another provider request for the same completed inference.
+      persistCompletedResult = () => this.store.transaction(() => {
         const current = this.store.getJob(input.agentId, job.id);
         if (current?.status !== "running") return;
         if (!this.store.isConversationActive(input.agentId, input.conversationId)) return;
+        if (input.expectedPreviousRevision !== undefined
+          && input.expectedPreviousRevision !== (this.store.getSummary(input.agentId, input.conversationId)?.revision ?? 0)) {
+          throw new ReflectionStaleInputError("reflection: revisão do resumo mudou antes da gravação");
+        }
         const currentMode = this.store.getSettings(input.agentId).mode;
         const memoryWritesAllowed = currentMode === "automatic"
           || (currentMode === "explicit" && latestHumanUserHasExplicitMemoryIntent(input.entries));
@@ -842,6 +929,7 @@ export class MemoryReflectionWorker {
         } else if (input.summaryRequested === true) {
           applyReflectionResult(this.store, { ...input, memoryRequested: false }, { ...parsed, operations: [] });
         }
+        resultApplied = true;
         // When the request payload could only cover a contiguous prefix of the
         // job range, the boundary advanced to the last examined entry. The
         // same job is then deferred to the first unexamined entry so the tail
@@ -854,6 +942,7 @@ export class MemoryReflectionWorker {
           this.store.completeJob(input.agentId, job.id);
         }
       });
+      persistCompletedResult();
     } catch (error) {
       if (this.closed) {
         // Return the claimed job to the durable queue instead of leaving it
@@ -871,23 +960,30 @@ export class MemoryReflectionWorker {
         }
         return;
       }
-      const text = error instanceof Error ? error.message : String(error);
-      const failure = classifyReflectionFailure(error, controller.signal.aborted);
-      const errorCode = failure.code;
-      const current = this.store.getJob(job.agentId, job.id);
-      if (current === null || current.status !== "running" || !this.store.isConversationActive(job.agentId, job.conversationId)) return;
-      if (!failure.retryable || (current?.attempts ?? job.attempts) >= this.maxAttempts) {
-        this.store.deadJob(job.agentId, job.id, { code: errorCode, text });
-        try {
-          this.onJobDead?.({ agentId: job.agentId, conversationId: job.conversationId, jobId: job.id, provider: job.provider, model: job.model, error: { code: errorCode, text } });
-        } catch {
-          // A notificação é best-effort; o estado `dead` já está persistido.
-        }
+      if (persistCompletedResult !== undefined && resultApplied) {
+        const persist = persistCompletedResult;
+        this.pendingFailures.set(job.id, () => {
+          try {
+            persist();
+          } catch (error) {
+            // A completed inference can become stale while its write waits.
+            // Reload it through the bounded job retry instead of holding the
+            // entire worker queue behind an impossible cached transaction.
+            if (!(error instanceof ReflectionStaleInputError)) throw error;
+            this.settleJobFailure(job, error, false);
+          }
+        });
+        this.deferPump();
+        return;
       }
-      else this.store.retryJob(job.agentId, job.id, { code: errorCode, text }, undefined, {
-        maxAttempts: this.maxAttempts,
-        backoffMs: this.backoffMs,
-      });
+      const wasAborted = controller.signal.aborted;
+      const settleFailure = () => this.settleJobFailure(job, error, wasAborted);
+      try {
+        settleFailure();
+      } catch {
+        this.pendingFailures.set(job.id, settleFailure);
+        this.deferPump();
+      }
     } finally {
       if (timer !== undefined) clearTimeout(timer);
       this.activeControllers.delete(controller);
@@ -898,9 +994,15 @@ export class MemoryReflectionWorker {
     this.closed = true;
     if (this.retryTimer !== undefined) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
+    if (this.pumpRetryTimer !== undefined) clearTimeout(this.pumpRetryTimer);
+    this.pumpRetryTimer = undefined;
+    this.pendingFailures.clear();
     this.queue.length = 0;
     for (const controller of this.activeControllers.keys()) controller.abort(new Error("reflection worker fechado"));
-    if (this.active === 0) return Promise.resolve();
+    if (this.active === 0) {
+      this.resolveClose();
+      return Promise.resolve();
+    }
     return new Promise<void>((resolve) => this.pendingClose.push(resolve));
   }
 
@@ -909,7 +1011,7 @@ export class MemoryReflectionWorker {
   }
 
   waitForIdle(): Promise<void> {
-    if (!this.pumping && this.active === 0 && this.queue.length === 0) return Promise.resolve();
+    if (!this.pumping && this.active === 0 && this.queue.length === 0 && this.pendingFailures.size === 0) return Promise.resolve();
     return new Promise<void>((resolve) => this.pendingClose.push(resolve));
   }
 

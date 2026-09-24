@@ -1,5 +1,6 @@
 import { argv, env, stderr, stdout } from "node:process";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const modeIndex = argv.indexOf("--mode");
 const mode = modeIndex >= 0 ? argv[modeIndex + 1] : "stream";
@@ -27,7 +28,7 @@ if (mode === "malformed") {
   write("session", { sessionId: "claude-fixture-session" });
   write("child-start", { pid: process.pid });
   if (mode === "descendant") {
-    const child = spawn(process.execPath, [new URL(import.meta.url).pathname, "--mode", "sleep"], {
+    const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "--mode", "sleep"], {
       stdio: ["ignore", "ignore", "ignore"],
       windowsHide: true,
     });

@@ -1521,6 +1521,13 @@ async function main() {
     report.status = "GREEN";
   } catch (error) {
     report.error = redact(error, token);
+    report.checks.sseEvents = (events?.history ?? []).map((event) => ({
+      channel: event?.channel,
+      type: event?.payload?.type,
+      kind: event?.payload?.entry?.kind,
+      role: event?.payload?.entry?.role,
+      streaming: event?.payload?.entry?.streaming,
+    }));
     report.checks.runtime = {
       exceptionThrown: [...initialRuntimeExceptions, ...runtimeExceptions],
       consoleErrors: [...initialRuntimeConsoleErrors, ...runtimeConsoleErrors],

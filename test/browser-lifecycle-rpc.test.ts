@@ -1,5 +1,4 @@
-import { existsSync, mkdtempSync, promises as fsp, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, promises as fsp } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -8,19 +7,19 @@ import { registerRpcHandlers, type BrowserAgentLifecycle } from "../src/rpc/inde
 import { ConfigStore } from "../src/config/store.js";
 import { createGateway } from "../src/server/gateway.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const handles: ServerHandle[] = [];
-const dirs: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(handles.splice(0).map((handle) => stopServer(handle)));
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 async function boot(browserLifecycle: BrowserAgentLifecycle) {
-  const dir = mkdtempSync(join(tmpdir(), "openbot-browser-lifecycle-rpc-"));
-  dirs.push(dir);
+  const dir = temp.make("openbot-browser-lifecycle-rpc-");
   const handle = await startServer(0, {
     configPath: join(dir, "config.json"),
     stateRoot: join(dir, "state"),
@@ -97,7 +96,12 @@ describe("deleteAgents browser lifecycle", () => {
     expect(purge).not.toHaveBeenCalled();
     expect(existsSync(home)).toBe(true);
     expect(handle.config.snapshot().agents.map((agent) => agent.id)).toEqual(["blocked-drain"]);
-    expect(released).toHaveBeenCalledOnce();
+    // Failed drainage cannot prove that writers stopped. Keep admission
+    // fenced until recovery rather than reopening a partially stopped bot.
+    expect(released).not.toHaveBeenCalled();
+    await expect(handle.executionBroker!.execute("blocked-drain", "after-failed-drain", {
+      operation: "file.list", path: ".",
+    })).resolves.toMatchObject({ ok: false, message: expect.stringContaining("fenced") });
     expect((await post(handle, "getAgent", { id: "blocked-drain" })).status).toBe(200);
   });
 
@@ -142,8 +146,7 @@ describe("deleteAgents browser lifecycle", () => {
   });
 
   it("mantém o journal pendente quando o purge pós-commit falha e repete no restart", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-browser-delete-reconcile-"));
-    dirs.push(root);
+    const root = temp.make("openbot-browser-delete-reconcile-");
     const purge = vi.fn(async () => {
       if (purge.mock.calls.length === 1) throw new Error("browser purge unavailable");
     });
@@ -191,8 +194,7 @@ describe("deleteAgents browser lifecycle", () => {
   });
 
   it("mantém a referência de staging quando a remoção de bytes falha e a recupera no restart", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-attachment-delete-reconcile-"));
-    dirs.push(root);
+    const root = temp.make("openbot-attachment-delete-reconcile-");
     const purge = vi.fn(async () => undefined);
     const browserLifecycle: BrowserAgentLifecycle = {
       teardownAgent: async () => undefined,
@@ -249,8 +251,7 @@ describe("deleteAgents browser lifecycle", () => {
   });
 
   it("executa a limpeza de caches após commit mesmo quando purge falha", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-delete-callback-"));
-    dirs.push(root);
+    const root = temp.make("openbot-delete-callback-");
     const config = new ConfigStore({ configPath: join(root, "config.json") });
     const store = new SqliteTranscriptStore({ path: join(root, "store.db") });
     const purge = vi.fn(async () => { throw new Error("browser purge failed"); });
@@ -282,8 +283,7 @@ describe("deleteAgents browser lifecycle", () => {
   });
 
   it("preserva callback e journal quando uma purga síncrona falha após commit", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-delete-sync-cleanup-"));
-    dirs.push(root);
+    const root = temp.make("openbot-delete-sync-cleanup-");
     const config = new ConfigStore({ configPath: join(root, "config.json") });
     const store = new SqliteTranscriptStore({ path: join(root, "store.db") });
     const purgeAgentTasks = vi.fn(() => { throw new Error("task purge failed"); });
@@ -322,8 +322,7 @@ describe("deleteAgents browser lifecycle", () => {
   });
 
   it("captura purgas síncronas de anexos e navegador após commit", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-delete-sync-purge-"));
-    dirs.push(root);
+    const root = temp.make("openbot-delete-sync-purge-");
     const config = new ConfigStore({ configPath: join(root, "config.json") });
     const store = new SqliteTranscriptStore({ path: join(root, "store.db") });
     const attachmentPurge = vi.fn(() => { throw new Error("attachment purge failed synchronously"); });

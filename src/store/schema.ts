@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 
-export const OPENBOT_SCHEMA_VERSION = 19;
+export const OPENBOT_SCHEMA_VERSION = 20;
 
 const CONVERSATION_BOUND_TABLES = [
   "transcript_entries",
@@ -125,6 +125,7 @@ function createBaseSchema(db: Database.Database): void {
       conversation_id TEXT,
       client_nonce TEXT NOT NULL,
       turn_id TEXT NOT NULL,
+      outcome TEXT NOT NULL DEFAULT 'success' CHECK(outcome IN ('success','partial','error','aborted')),
       completed_at_ms INTEGER NOT NULL,
       PRIMARY KEY (agent_id, conversation_id, client_nonce),
       UNIQUE (turn_id)
@@ -830,6 +831,58 @@ function createMemoryProvenanceVersionSchema(db: Database.Database): void {
       UPDATE memory_provenance_state SET version = version + 1 WHERE id = 1;
     END;
   `);
+  createMemoryProvenanceTranscriptSchema(db);
+}
+
+/** Lets the forgotten-source walk extend over appended transcript rows
+ * instead of rescanning every turn. `transcript_bumps` counts exactly the
+ * transcript bumps of `memory_provenance_state.version`, so their difference
+ * moves only for memory/revision/conversation changes. `rewrite_epoch` moves
+ * when a row the reader already walked (`walked_through`) is rewritten,
+ * deleted or inserted out of order; either signal forces a full walk.
+ * Additive and idempotent: older builds ignore it without a version bump. */
+function createMemoryProvenanceTranscriptSchema(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_provenance_transcript_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      transcript_bumps INTEGER NOT NULL DEFAULT 0 CHECK (transcript_bumps >= 0),
+      walked_through INTEGER NOT NULL DEFAULT 0 CHECK (walked_through >= 0),
+      rewrite_epoch INTEGER NOT NULL DEFAULT 0 CHECK (rewrite_epoch >= 0)
+    );
+    INSERT OR IGNORE INTO memory_provenance_transcript_state(id) VALUES (1);
+
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_transcript_state_ai
+    AFTER INSERT ON transcript_entries
+    BEGIN
+      UPDATE memory_provenance_transcript_state
+      SET transcript_bumps = transcript_bumps + 1,
+          rewrite_epoch = rewrite_epoch + (NEW.sequence_id <= walked_through)
+      WHERE id = 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_transcript_state_ad
+    AFTER DELETE ON transcript_entries
+    BEGIN
+      UPDATE memory_provenance_transcript_state
+      SET transcript_bumps = transcript_bumps + 1,
+          rewrite_epoch = rewrite_epoch + (OLD.sequence_id <= walked_through)
+      WHERE id = 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_provenance_transcript_state_au
+    AFTER UPDATE ON transcript_entries
+    WHEN OLD.sequence_id IS NOT NEW.sequence_id
+      OR OLD.agent_id IS NOT NEW.agent_id
+      OR OLD.conversation_id IS NOT NEW.conversation_id
+      OR OLD.entry_id IS NOT NEW.entry_id
+      OR OLD.kind IS NOT NEW.kind
+      OR json_extract(OLD.payload_json, '$.role') IS NOT json_extract(NEW.payload_json, '$.role')
+      OR json_extract(OLD.payload_json, '$.memoryContextSources') IS NOT json_extract(NEW.payload_json, '$.memoryContextSources')
+    BEGIN
+      UPDATE memory_provenance_transcript_state
+      SET transcript_bumps = transcript_bumps + 1,
+          rewrite_epoch = rewrite_epoch + (OLD.sequence_id <= walked_through OR NEW.sequence_id <= walked_through)
+      WHERE id = 1;
+    END;
+  `);
 }
 
 function createConversationSummaryHistoryTriggers(db: Database.Database): void {
@@ -1506,6 +1559,10 @@ export function migrateOpenBotSchema(db: Database.Database): void {
   const ownerColumns = tableColumns(db, "runtime_owners");
   if (!ownerColumns.has("process_started_at_ms")) db.exec("ALTER TABLE runtime_owners ADD COLUMN process_started_at_ms REAL");
   if (!ownerColumns.has("executable_path")) db.exec("ALTER TABLE runtime_owners ADD COLUMN executable_path TEXT");
+  const completionColumns = tableColumns(db, "turn_completions");
+  if (!completionColumns.has("outcome")) {
+    db.exec("ALTER TABLE turn_completions ADD COLUMN outcome TEXT NOT NULL DEFAULT 'success' CHECK(outcome IN ('success','partial','error','aborted'))");
+  }
 
     for (const table of CONVERSATION_BOUND_TABLES) ensureConversationColumn(db, table);
     db.exec(`

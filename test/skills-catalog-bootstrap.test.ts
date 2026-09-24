@@ -1,5 +1,5 @@
 import * as fs from "node:fs";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,16 +8,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("node:fs", { spy: true });
 
 import { createSafeSkillCatalog } from "../src/main.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const tempRoots: string[] = [];
+const temp = new TempRoots();
 
-afterEach(() => {
-  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+afterEach(async () => {
+  await temp.cleanup();
 });
 
 function root(prefix = "openbot-skills-bootstrap-"): string {
   const path = mkdtempSync(join(tmpdir(), prefix));
-  tempRoots.push(path);
+  temp.track(path);
   return path;
 }
 

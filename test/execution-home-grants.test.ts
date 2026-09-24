@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -6,16 +6,17 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AgentHomeStore } from "../src/execution/home.js";
 import { HomeWorkspaceBackend } from "../src/execution/home-backend.js";
 import { writeSharedGrants } from "../src/execution/home-grants.js";
-import { agentSharedDirectoryRoot, SHARED_USER_DIRECTORIES } from "../src/execution/user-files.js";
+import { agentSharedDirectoryRoot, SHARED_USER_DIRECTORIES } from "../src/execution/user-files.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((entry) => rm(entry, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 async function tempDir(prefix: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), prefix));
-  roots.push(dir);
+  temp.track(dir);
   return dir;
 }
 

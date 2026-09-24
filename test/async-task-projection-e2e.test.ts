@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,13 +7,14 @@ import { startServer, stopServer, type ServerHandle } from "../src/main.js";
 import type { RpcHandler } from "../src/server/gateway.js";
 import type { DispatchAsyncTaskInput, ProviderCapabilityGrant, SubagentBudget } from "../src/tasks/contracts.js";
 import { AsyncTaskRuntime } from "../src/tasks/runtime.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const handles: ServerHandle[] = [];
-const roots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
   await Promise.all(handles.splice(0).map((handle) => stopServer(handle)));
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 const budget: SubagentBudget = {
@@ -51,8 +50,7 @@ function input(agentId: string, parentTurnId: string): DispatchAsyncTaskInput {
 }
 
 async function harness(): Promise<ServerHandle> {
-  const root = mkdtempSync(join(tmpdir(), "openbot-async-task-projection-"));
-  roots.push(root);
+  const root = temp.make("openbot-async-task-projection-");
   const handle = await startServer(0, {
     configPath: join(root, "config.json"), stateRoot: join(root, "state"), runtimeRoot: join(root, "runtime"),
     browserRoot: join(root, "browser"), keystoreDir: join(root, "keystore"), storePath: join(root, "store.db"),

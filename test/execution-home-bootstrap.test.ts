@@ -1,25 +1,24 @@
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { Server } from "node:http";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ConfigStore } from "../src/config/store.js";
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
 import { createProviderRegistry, type ProviderAdapter, type ProviderChatRequest } from "../src/providers/router.js";
-import { DEFAULT_AGENT_ID } from "../src/rpc/roster.js";
+import { DEFAULT_AGENT_ID } from "../src/rpc/roster.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const dirs: string[] = [];
+const temp = new TempRoots();
 let handles: ServerHandle[] = [];
 afterEach(async () => {
   await Promise.all(handles.splice(0).map((handle) => stopServer(handle)));
-  await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 const tempDir = async () => {
-  const dir = await mkdtemp(join(tmpdir(), "openbot-home-boot-"));
-  dirs.push(dir);
+  const dir = await temp.makeAsync("openbot-home-boot-");
   return dir;
 };
 

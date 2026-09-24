@@ -4,6 +4,7 @@ import {
   type BrowserCommandName,
   type BrowserCommandResult,
 } from "../browser/protocol.js";
+import type { EffectiveWorkspaceQuota } from "./quota.js";
 
 export const MAX_EXECUTION_PATH_BYTES = 4096;
 export const MAX_FILE_BYTES = 1024 * 1024;
@@ -136,7 +137,15 @@ export function boundedProcessOutput(output: ProcessOutput): ProcessOutput {
 }
 
 export type ExecutionResult =
-  | { ok: true; operation: "workspace.info"; homeRoot: string; sharedFolders: { name: string; path: string; access: "read" | "write" }[]; legacyFolders: { name: string; path: string }[] }
+  | {
+      ok: true;
+      operation: "workspace.info";
+      homeRoot: string;
+      sharedFolders: { name: string; path: string; access: "read" | "write" }[];
+      legacyFolders: { name: string; path: string }[];
+      /** Effective limits only; no filesystem scan is performed for this response. */
+      quota: EffectiveWorkspaceQuota;
+    }
   | { ok: true; operation: "file.list"; entries: { name: string; kind: "file" | "directory" | "other" }[] }
   | { ok: true; operation: "file.stat"; kind: "file" | "directory" | "other"; bytes: number }
   | { ok: true; operation: "file.mkdir"; created: boolean }

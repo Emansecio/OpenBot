@@ -1,23 +1,23 @@
 import http from "node:http";
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const execFile = promisify(execFileCallback);
-const projectRoot = new URL("..", import.meta.url).pathname.replace(/^\/(.):/, "$1:");
+const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const scriptPath = join(projectRoot, "scripts", "recovery-center.mjs");
-const temporaryRoots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
-  await Promise.all(temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 async function createInstall(): Promise<{ root: string; dataRoot: string; localDataRoot: string }> {
-  const base = await mkdtemp(join(tmpdir(), "openbot-recovery-center-"));
-  temporaryRoots.push(base);
+  const base = await temp.makeAsync("openbot-recovery-center-");
   const root = join(base, "install");
   const dataRoot = join(base, "roaming");
   const localDataRoot = join(base, "local");

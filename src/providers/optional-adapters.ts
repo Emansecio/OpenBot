@@ -22,9 +22,12 @@ import type { LocalExecutionBroker } from "../execution/broker.js";
 import { DEFAULT_UNKNOWN_MODEL_CAPABILITIES, resolveModelCapabilities, prepareProviderRound } from "../memory/model-context.js";
 import {
   OpenAiToolCallAccumulator,
+  classifyOpenAiFinishReason,
   extractOpenAiErrorMessage,
+  findSseFrameBoundary,
   parseRetryAfterMs,
   raceWithAbort,
+  splitSseLines,
 } from "./openai-helpers.js";
 import { providerRequestBody } from "./request-bodies.js";
 import {
@@ -222,21 +225,10 @@ export class OpenRouterAdapter implements ProviderAdapter {
     if (this.credentialRef === undefined || typeof this.resolveCredential !== "function") {
       throw new ProviderError("openrouter: credencial opaca ausente", { kind: "auth", status: 401, code: "auth" });
     }
-    const secret = await this.resolveCredential(this.credentialRef, { agentId: this.agentId });
-    if (typeof secret !== "string" || secret.length === 0) {
-      throw new ProviderError("openrouter: credencial indisponível", { kind: "auth", status: 401, code: "auth" });
-    }
-
     const serializedBody = this.serializeRequest(prepared.request);
     if (Buffer.byteLength(serializedBody, "utf8") > this.maxRequestBytes) {
       throw new ProviderError("openrouter: pedido acima do orçamento de contexto", { kind: "validation", code: "context_budget_exceeded" });
     }
-    const headers: Record<string, string> = {
-      authorization: `Bearer ${secret}`,
-      "content-type": "application/json",
-      ...(this.httpReferer === undefined ? {} : { "http-referer": this.httpReferer }),
-      ...(this.appTitle === undefined ? {} : { "x-title": this.appTitle }),
-    };
     const controller = new AbortController();
     const onAbort = (): void => {
       if (!controller.signal.aborted) controller.abort(req.signal?.reason);
@@ -262,13 +254,26 @@ export class OpenRouterAdapter implements ProviderAdapter {
     }, this.maxDurationMs);
     const signal = controller.signal;
     let response: Response;
+    let secret = "";
     try {
-      response = await this.fetchImpl(`${this.endpoint}/chat/completions`, {
+      const resolvedSecret = await raceWithAbort(this.resolveCredential(this.credentialRef, { agentId: this.agentId }), signal);
+      if (typeof resolvedSecret !== "string" || resolvedSecret.length === 0) {
+        throw new ProviderError("openrouter: credencial indisponível", { kind: "auth", status: 401, code: "auth" });
+      }
+      secret = resolvedSecret;
+      const headers: Record<string, string> = {
+        authorization: `Bearer ${secret}`,
+        "content-type": "application/json",
+        ...(this.httpReferer === undefined ? {} : { "http-referer": this.httpReferer }),
+        ...(this.appTitle === undefined ? {} : { "x-title": this.appTitle }),
+      };
+      controller.signal.throwIfAborted();
+      response = await raceWithAbort(this.fetchImpl(`${this.endpoint}/chat/completions`, {
         method: "POST",
         headers,
         body: serializedBody,
         signal,
-      });
+      }), signal);
       resetIdleTimer();
 
       if (!response.ok) {
@@ -297,46 +302,86 @@ export class OpenRouterAdapter implements ProviderAdapter {
       const reader = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let terminated = false;
-      try {
-      // Line-oriented strict SSE parser: accepts both canonical frames split by
-      // a blank line and single-newline separated data lines; multi-chunk
-      // protection keeps the buffer bounded. Any non-data, non-comment line is
-      // a protocol error.
-      let buffer = "";
-      // OpenRouter delivers one JSON object per `data:` line (canonical SSE
-      // frames separated by blank lines, or the offline fixture's single-newline
-      // frames). Each data line is dispatched immediately; comments and SSE
-      // metadata lines are ignored; any other line is a protocol error.
-      while (!terminated) {
-        const { done, value } = await raceWithAbort(reader.read(), controller.signal);
-        if (done) break;
-        resetIdleTimer();
-        buffer += decoder.decode(value, { stream: true });
-        if (Buffer.byteLength(buffer, "utf8") > 1_048_576) throw protocolError("openrouter: buffer SSE excedeu 1 MiB");
-        let newline = buffer.indexOf("\n");
-        while (newline >= 0 && !terminated) {
-          const line = newline > 0 && buffer[newline - 1] === "\r" ? buffer.slice(0, newline - 1) : buffer.slice(0, newline);
-          buffer = buffer.slice(newline + 1);
-          if (line.length === 0 || line.startsWith(":") || line.startsWith("event:") || line.startsWith("id:") || line.startsWith("retry:")) {
-            // Frame separator / comment / metadata.
-          } else if (line.startsWith("data:")) {
-            const data = line.slice(5).replace(/^ /, "");
-            if (this.dispatchOpenRouterFrame(data, emit, toolAccumulator, (usage) => { recorded = usage; }, capability)) {
-              terminated = true;
-            }
-          } else {
-            throw protocolError("openrouter: linha SSE inesperada");
-          }
-          newline = buffer.indexOf("\n");
+      let finishReason: string | undefined;
+      const dispatchData = (data: string): void => {
+        const result = this.dispatchOpenRouterFrame(
+          data,
+          emit,
+          toolAccumulator,
+          (usage) => { recorded = usage; },
+          capability,
+          finishReason === undefined,
+        );
+        if (finishReason === undefined && result.finishReason !== undefined) finishReason = result.finishReason;
+        if (result.done) terminated = true;
+      };
+      const dispatchSseFrame = (frame: string): void => {
+        const dataLines: string[] = [];
+        for (const line of splitSseLines(frame)) {
+          if (line.startsWith(":") || line.startsWith("event:") || line.startsWith("id:") || line.startsWith("retry:")) continue;
+          if (!line.startsWith("data:")) throw protocolError("openrouter: linha SSE inesperada");
+          dataLines.push(line.slice(5).replace(/^ /, ""));
         }
-      }
-      if (!terminated) throw protocolError("openrouter: stream terminou antes de [DONE]");
+        if (dataLines.length === 0) return;
+        const joined = dataLines.join("\n");
+        if (joined === "[DONE]") {
+          dispatchData(joined);
+          return;
+        }
+        let canonical = true;
+        try { JSON.parse(joined); } catch { canonical = false; }
+        if (canonical) {
+          dispatchData(joined);
+          return;
+        }
+        // Compatibility with legacy endpoints that emit one complete JSON
+        // object per data line without the canonical blank frame separator.
+        if (dataLines.length < 2) throw protocolError("openrouter: frame SSE inválido");
+        for (const data of dataLines) {
+          if (terminated) break;
+          if (data !== "[DONE]") {
+            try { JSON.parse(data); } catch { throw protocolError("openrouter: frame SSE inválido"); }
+          }
+          dispatchData(data);
+        }
+      };
+      try {
+        let buffer = "";
+        while (!terminated) {
+          const { done, value } = await raceWithAbort(reader.read(), controller.signal);
+          if (done) {
+            buffer += decoder.decode();
+            if (buffer.length > 0) {
+              if (Buffer.byteLength(buffer, "utf8") > 1_048_576) throw protocolError("openrouter: frame SSE excedeu 1 MiB");
+              dispatchSseFrame(buffer);
+              buffer = "";
+            }
+            break;
+          }
+          resetIdleTimer();
+          buffer += decoder.decode(value, { stream: true });
+          let boundary = findSseFrameBoundary(buffer);
+          while (boundary !== undefined && !terminated) {
+            const frame = buffer.slice(0, boundary.index);
+            buffer = buffer.slice(boundary.index + boundary.length);
+            if (Buffer.byteLength(frame, "utf8") > 1_048_576) throw protocolError("openrouter: frame SSE excedeu 1 MiB");
+            dispatchSseFrame(frame);
+            boundary = findSseFrameBoundary(buffer);
+          }
+          if (!terminated && Buffer.byteLength(buffer, "utf8") > 1_048_576) throw protocolError("openrouter: buffer SSE residual excedeu 1 MiB");
+        }
+        if (!terminated) throw protocolError("openrouter: stream terminou antes de [DONE]");
       } finally {
         await reader.cancel().catch(() => undefined);
         reader.releaseLock();
       }
-      if (toolAccumulator.hasAny && !toolAccumulator.complete) throw protocolError("openrouter: tool call incompleta");
-      for (const call of toolAccumulator.calls()) emit({ type: "tool-call", call });
+      const finishDisposition = classifyOpenAiFinishReason(finishReason);
+      if (finishDisposition === "incomplete" || finishDisposition === "unknown") {
+        throw protocolError(`openrouter: geração interrompida (${finishReason})`);
+      }
+      if (toolAccumulator.hasAny) {
+        for (const call of toolAccumulator.finalizedCalls("openrouter")) emit({ type: "tool-call", call });
+      }
       if (this.usageCollector !== undefined && recorded.totalTokens > 0) {
         this.usageCollector.record({ ...recorded, provider: this.name, model: req.model });
       }
@@ -356,9 +401,10 @@ export class OpenRouterAdapter implements ProviderAdapter {
     toolAccumulator: OpenAiToolCallAccumulator,
     recordUsage: (usage: { inputTokens: number; outputTokens: number; totalTokens: number }) => void,
     capability: ReturnType<typeof resolveProviderCapabilities>,
-  ): boolean {
-    if (data.length === 0) return false;
-    if (data === "[DONE]") return true;
+    acceptOutput: boolean,
+  ): { done: boolean; finishReason?: string } {
+    if (data.length === 0) return { done: false };
+    if (data === "[DONE]") return { done: true };
     let parsed: unknown;
     try {
       parsed = JSON.parse(data);
@@ -380,8 +426,9 @@ export class OpenRouterAdapter implements ProviderAdapter {
     const choices = payload.choices;
     if (!Array.isArray(choices)) throw protocolError("openrouter: frame SSE sem choices");
     const choice = choices[0] as Record<string, unknown> | undefined;
+    const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : undefined;
     const delta = choice?.delta;
-    if (typeof delta === "object" && delta !== null) {
+    if (acceptOutput && typeof delta === "object" && delta !== null) {
       const record = delta as Record<string, unknown>;
       if (typeof record.content === "string" && record.content.length > 0) emit({ type: "delta", delta: record.content });
       if (capability.tools && Array.isArray(record.tool_calls)) {
@@ -390,7 +437,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
         }
       }
     }
-    return false;
+    return { done: false, ...(finishReason === undefined ? {} : { finishReason }) };
   }
 
   private async readErrorBody(response: Response, signal: AbortSignal): Promise<string> {
@@ -646,6 +693,20 @@ function boundedString(value: unknown, name: string, maxBytes: number): string {
   return value;
 }
 
+function cliToolArguments(value: unknown, maxBytes: number): string {
+  const raw = boundedString(value, "arguments", maxBytes);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw protocolError("cli: tool arguments não são JSON válido");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw protocolError("cli: tool arguments devem ser um objeto JSON");
+  }
+  return JSON.stringify(parsed);
+}
+
 function parseCliProtocol(options: ParseCliProtocolOptions): void {
   const { stdout, protocol, maxEventBytes, usageCollector, model, providerName, emit } = options;
   const lines = stdout.split(/\r\n|\n|\r/).filter((line) => line.length > 0);
@@ -688,9 +749,14 @@ function parseCliProtocol(options: ParseCliProtocolOptions): void {
       case "delta":
         emit({ type: "delta", delta: boundedString(frame.text, "text", maxEventBytes) });
         break;
-      case "tool-call":
-        emit({ type: "tool-call", call: { id: boundedString(frame.id, "id", 2_048), type: "function", function: { name: boundedString(frame.name, "name", 2_048), arguments: boundedString(frame.arguments, "arguments", maxEventBytes) } } });
+      case "tool-call": {
+        const id = boundedString(frame.id, "id", 2_048);
+        const name = boundedString(frame.name, "name", 2_048);
+        if (id.length === 0) throw protocolError("cli: tool id vazio");
+        if (name.length === 0) throw protocolError("cli: tool name vazio");
+        emit({ type: "tool-call", call: { id, type: "function", function: { name, arguments: cliToolArguments(frame.arguments, maxEventBytes) } } });
         break;
+      }
       case "usage":
         usage = {
           inputTokens: nonNegativeInteger(frame.inputTokens, "inputTokens"),

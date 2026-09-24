@@ -5,6 +5,7 @@ import { prepareProviderRound, resolveModelCapabilities } from "../src/memory/mo
 import type { ExecutionRequest, ExecutionResult } from "../src/execution/contracts.js";
 import type { LocalExecutionBroker } from "../src/execution/broker.js";
 import { describe, expect, it, vi } from "vitest";
+import { fileURLToPath } from "node:url";
 
 type Usage = { inputTokens: number; outputTokens: number; totalTokens: number; provider: string; model: string };
 type Adapter = {
@@ -63,7 +64,7 @@ function openRouterResolution(
 }
 
 function fixturePath(name: "codex-cli-v1.mjs" | "claude-code-v1.mjs"): string {
-  return new URL(`./fixtures/${name}`, import.meta.url).pathname;
+  return fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
 }
 
 function processResult(stdout: string, stderr = "", exitCode = 0): ExecutionResult {
@@ -79,6 +80,9 @@ function protocolOutput(provider: "codex-cli" | "claude-code", mode = "stream"):
   if (mode === "duplicate-terminal") return frames([{ type: "session", sessionId: `${prefix}-session` }, { type: "done", cursor: `${prefix}-cursor` }, { type: "done", cursor: `${prefix}-duplicate` }]);
   if (mode === "oversized") return frames([{ type: "session", sessionId: `${prefix}-session` }, { type: "delta", text: "x".repeat(32_768) }]);
   if (mode === "tools") return frames([{ type: "session", sessionId: `${prefix}-session` }, { type: "tool-call", id: `${prefix}-call-1`, name: "fixture_tool", arguments: "{}" }, { type: "done", cursor: `${prefix}-cursor` }]);
+  if (mode === "tool-empty-id") return frames([{ type: "session", sessionId: `${prefix}-session` }, { type: "tool-call", id: "", name: "fixture_tool", arguments: "{}" }, { type: "done", cursor: `${prefix}-cursor` }]);
+  if (mode === "tool-empty-name") return frames([{ type: "session", sessionId: `${prefix}-session` }, { type: "tool-call", id: `${prefix}-call-1`, name: "", arguments: "{}" }, { type: "done", cursor: `${prefix}-cursor` }]);
+  if (mode === "tool-array-arguments") return frames([{ type: "session", sessionId: `${prefix}-session` }, { type: "tool-call", id: `${prefix}-call-1`, name: "fixture_tool", arguments: "[]" }, { type: "done", cursor: `${prefix}-cursor` }]);
   return frames([
     { type: "session", sessionId: `${prefix}-session` },
     { type: "child-start", pid: 1234 },
@@ -153,6 +157,67 @@ describe("P2.5 RED — OpenRouter and bounded CLI adapters", () => {
     expect(resolveCredential).toHaveBeenCalledTimes(1);
     expect(usageCollector.record).toHaveBeenCalledWith(expect.objectContaining({ inputTokens: 3, outputTokens: 1, totalTokens: 4, provider: "openrouter", model: "openrouter-small" }));
     expect(JSON.stringify(events)).not.toContain("fixture-openrouter-key");
+  });
+
+  it("parses OpenRouter SSE multiline, CR-only e frame final sem newline", async () => {
+    const module = await loadOptionalAdapters();
+    expect(module).not.toBeNull();
+    if (module === null) return;
+
+    const fetchImpl = vi.fn(async () => new Response(
+      'data: {"choices":[\rdata: {"delta":{"content":"ok"},"finish_reason":"stop"}]}\r\rdata: [DONE]',
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ));
+    const adapter = new module.OpenRouterAdapter({
+      agentId: "agent-a",
+      credentialRef: "openrouter:key:fixture-v1",
+      resolveCredential: async () => "fixture-key",
+      fetchImpl,
+    });
+    const events: ProviderStreamEvent[] = [];
+
+    await expect(adapter.streamChat(request(), event => events.push(event))).resolves.toBeUndefined();
+    expect(events).toContainEqual({ type: "delta", delta: "ok" });
+  });
+
+  it("rejeita finish_reason desconhecido no OpenRouter", async () => {
+    const module = await loadOptionalAdapters();
+    expect(module).not.toBeNull();
+    if (module === null) return;
+
+    const payload = JSON.stringify({ choices: [{ delta: { content: "partial" }, finish_reason: "future_reason" }] });
+    const adapter = new module.OpenRouterAdapter({
+      agentId: "agent-a",
+      credentialRef: "openrouter:key:fixture-v1",
+      resolveCredential: async () => "fixture-key",
+      fetchImpl: vi.fn(async () => new Response(`data: ${payload}\n\ndata: [DONE]\n\n`)),
+    });
+
+    await expect(adapter.streamChat(request(), () => undefined)).rejects.toMatchObject({ code: "protocol_error" });
+  });
+
+  it("interrompe resolução pendente da credencial OpenRouter", async () => {
+    const module = await loadOptionalAdapters();
+    expect(module).not.toBeNull();
+    if (module === null) return;
+
+    const controller = new AbortController();
+    const resolveCredential = vi.fn(() => new Promise<string>(() => undefined));
+    const fetchImpl = vi.fn();
+    const adapter = new module.OpenRouterAdapter({
+      agentId: "agent-a",
+      credentialRef: "openrouter:key:fixture-v1",
+      resolveCredential,
+      fetchImpl,
+    });
+    const registry = createProviderRegistry();
+    registry.register(adapter);
+    const pending = streamChat(adapter.name, { ...request(), signal: controller.signal }, undefined, { registry, maxRetries: 0 });
+    await vi.waitFor(() => expect(resolveCredential).toHaveBeenCalledOnce());
+    controller.abort();
+
+    await expect(pending).resolves.toMatchObject({ aborted: true, error: { kind: "aborted" } });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it("fails closed before fetch when the model window is too small or the model is unknown", async () => {
@@ -293,19 +358,27 @@ describe("P2.5 RED — OpenRouter and bounded CLI adapters", () => {
       maxBytes: 8_192,
       provider: "openrouter",
     });
-    const genericBodyBytes = Buffer.byteLength(JSON.stringify(providerRequestBody("openrouter", prepared.request)), "utf8");
-    const fetchImpl = vi.fn(async () => new Response("data: [DONE]\n\n", { status: 200 }));
-    const adapter = new module.OpenRouterAdapter({
+    const wireBody = providerRequestBody("openrouter", prepared.request);
+    expect(wireBody.stream_options).toEqual({ include_usage: true });
+    const wireBodyBytes = Buffer.byteLength(JSON.stringify(wireBody), "utf8");
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response("data: [DONE]\n\n", { status: 200 }));
+    const resolveCredential = vi.fn(async () => "fixture-key");
+    const options = {
       agentId: "agent-a",
       credentialRef: "openrouter:key:fixture-v1",
-      resolveCredential: async () => "fixture-key",
+      resolveCredential,
       modelCatalog: smallCatalog,
-      maxRequestBytes: genericBodyBytes,
       fetchImpl,
-    });
+    };
+    const adapter = new module.OpenRouterAdapter({ ...options, maxRequestBytes: wireBodyBytes - 1 });
 
     await expect(adapter.streamChat(req, () => undefined)).rejects.toMatchObject({ code: "context_budget_exceeded" });
     expect(fetchImpl).not.toHaveBeenCalled();
+    expect(resolveCredential).not.toHaveBeenCalled();
+    const exact = new module.OpenRouterAdapter({ ...options, maxRequestBytes: wireBodyBytes });
+    await expect(exact.streamChat(req, () => undefined)).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(Buffer.byteLength(String(fetchImpl.mock.calls[0]?.[1]?.body), "utf8")).toBe(wireBodyBytes);
   });
 
   it.each([401, 429, 503])("classifies OpenRouter %s with stable kind/retryability, retryAfter and sanitized error", async (status) => {
@@ -482,7 +555,7 @@ describe("P2.5 RED — OpenRouter and bounded CLI adapters", () => {
     expect(JSON.stringify(events)).not.toContain("must-not-be-read");
   });
 
-  it.each(["malformed", "eof", "unknown", "duplicate-terminal"])("rejects %s protocol violations instead of guessing", async (mode) => {
+  it.each(["malformed", "eof", "unknown", "duplicate-terminal", "tool-empty-id", "tool-empty-name", "tool-array-arguments"])("rejects %s protocol violations instead of guessing", async (mode) => {
     const module = await loadOptionalAdapters();
     expect(module, "P2.5 RED: optional adapters module is missing").not.toBeNull();
     if (module === null) return;

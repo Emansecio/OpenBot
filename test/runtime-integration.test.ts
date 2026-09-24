@@ -1,5 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -12,12 +11,13 @@ import type {
   StopReason,
 } from "../src/execution/runtime/contracts.js";
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const dirs: string[] = [];
+const temp = new TempRoots();
 const handles: ServerHandle[] = [];
 afterEach(async () => {
   await Promise.all(handles.splice(0).map((handle) => stopServer(handle)));
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 class FakeRuntimeManager implements AgentRuntimeManager {
@@ -78,8 +78,7 @@ class FakeRuntimeManager implements AgentRuntimeManager {
 }
 
 async function boot(runtimeManager: FakeRuntimeManager): Promise<ServerHandle> {
-  const root = mkdtempSync(join(tmpdir(), "openbot-runtime-integration-"));
-  dirs.push(root);
+  const root = temp.make("openbot-runtime-integration-");
   const handle = await startServer(0, {
     workspacesRoot: join(root, "workspaces"),
     storePath: join(root, "store.db"),

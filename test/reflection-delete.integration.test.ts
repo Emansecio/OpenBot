@@ -1,7 +1,3 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
@@ -9,17 +5,18 @@ import { MemoryReflectionWorker } from "../src/memory/reflection.js";
 import { createProviderRegistry } from "../src/providers/router.js";
 import { OpenAiAdapter } from "../src/providers/openai.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const handles: ServerHandle[] = [];
 const workers: MemoryReflectionWorker[] = [];
 const stores: SqliteTranscriptStore[] = [];
-const roots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
   await Promise.all(handles.splice(0).map((handle) => stopServer(handle)));
   await Promise.all(workers.splice(0).map((worker) => worker.close()));
   for (const store of stores.splice(0)) store.close();
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 async function waitFor<T>(read: () => T, predicate: (value: T) => boolean, timeoutMs = 2_000): Promise<T> {
@@ -41,8 +38,7 @@ function rpcContext(handle: ServerHandle) {
 }
 
 async function bootBlockedResponses() {
-  const root = mkdtempSync(join(tmpdir(), "openbot-reflection-delete-"));
-  roots.push(root);
+  const root = temp.make("openbot-reflection-delete-");
   let signal: AbortSignal | undefined;
   let bodyCancelled = false;
   let calls = 0;

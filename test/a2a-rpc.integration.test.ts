@@ -1,22 +1,20 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
 import type { BrowserAgentLifecycle } from "../src/rpc/index.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const handles: ServerHandle[] = [];
-const roots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
   await Promise.all(handles.splice(0).map((handle) => stopServer(handle)));
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 async function boot(browserLifecycle?: BrowserAgentLifecycle): Promise<ServerHandle> {
-  const root = mkdtempSync(join(tmpdir(), "openbot-a2a-rpc-"));
-  roots.push(root);
+  const root = temp.make("openbot-a2a-rpc-");
   const handle = await startServer(0, {
     configPath: join(root, "config.json"), stateRoot: join(root, "state"), runtimeRoot: join(root, "runtime"),
     browserRoot: join(root, "browser"), keystoreDir: join(root, "keystore"), storePath: join(root, "store.db"),

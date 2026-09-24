@@ -6,6 +6,7 @@ import { RpcError, type Gateway } from "../server/gateway.js";
 import { parseDelegatedCapabilityGrant, parseTaskInputV1, type AsyncTaskRecord, type DelegatedCapabilityGrant, type DispatchAsyncTaskInput, type ProviderCapabilityGrant, type SubagentBudget } from "../tasks/contracts.js";
 import { deriveEffectiveBudget, deriveEffectiveGrant } from "../tasks/state-machine.js";
 import { AsyncTaskStore } from "../tasks/store.js";
+import { projectAsyncTaskForRenderer } from "../tasks/projection.js";
 
 function record(body: unknown, method: string): Record<string, unknown> {
   if (typeof body !== "object" || body === null || Array.isArray(body)) throw new RpcError(400, `${method}: corpo deve ser um objeto`);
@@ -105,14 +106,18 @@ export function registerAsyncTaskHandlers(gateway: Gateway, options: AsyncTaskRp
     const agentId = scopedReadAgent(options.config, b, method);
     const rawLimit = b.limit === undefined ? 100 : b.limit;
     if (!Number.isInteger(rawLimit) || Number(rawLimit) < 1 || Number(rawLimit) > 200) throw new RpcError(400, `${method}: limit deve ser um inteiro entre 1 e 200`);
-    return options.store.listTasks(agentId, { limit: Number(rawLimit) });
+    return options.store.listTasks(agentId, { limit: Number(rawLimit) }).map((task) => ({
+      ...task,
+      nativeProjection: projectAsyncTaskForRenderer(task, options.store.canSteer(task)),
+    }));
   };
   gateway.registerHandler("getAsyncTasks", (body) => list(body, "getAsyncTasks"));
   gateway.registerHandler("getSubagents", (body) => list(body, "getSubagents"));
   gateway.registerHandler("listAsyncTasks", (body) => list(body, "listAsyncTasks"));
   gateway.registerHandler("getAsyncTask", (body) => {
     const b = record(body, "getAsyncTask");
-    return scopedTask(options.store, scopedAgent(options.config, b, "getAsyncTask"), requiredString(b, "taskId", "getAsyncTask"), "getAsyncTask");
+    const task = scopedTask(options.store, scopedAgent(options.config, b, "getAsyncTask"), requiredString(b, "taskId", "getAsyncTask"), "getAsyncTask");
+    return { ...task, nativeProjection: projectAsyncTaskForRenderer(task, options.store.canSteer(task)) };
   });
   gateway.registerHandler("dispatchAsyncTask", async (body) => {
     const b = record(body, "dispatchAsyncTask");

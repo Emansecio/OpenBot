@@ -17,6 +17,33 @@ afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: 
 const connection = connectionFingerprint("fixture-connection");
 
 describe("model catalog", () => {
+  it("initialize degrades a provider whose connection cannot be read instead of rejecting boot", async () => {
+    let unreadable = true;
+    const catalog = new ModelCatalogService({ sources: {
+      openai: {
+        connectionKey: async () => {
+          if (unreadable) throw new Error("keystore: falha ao decifrar \"openai\": fixture");
+          return connection;
+        },
+        discover: async () => [],
+      },
+      xai: { connectionKey: async () => connection, discover: async () => [] },
+    } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(catalog.initialize()).resolves.toBeUndefined();
+      const degraded = catalog.peek("openai");
+      expect(degraded.error).toMatch(/Reconecte a conta/);
+      expect(JSON.stringify(degraded)).not.toContain("fixture");
+      expect(degraded.models.some(model => model.id === "gpt-6-astra")).toBe(true);
+      expect(catalog.peek("xai").error).toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(1);
+      unreadable = false;
+      await catalog.synchronize("openai");
+      expect(catalog.peek("openai").error).toBeUndefined();
+    } finally { warn.mockRestore(); catalog.close(); }
+  });
+
   it("persists Fast per bot and pins it across tool rounds while recording actual tiers", async () => {
     const directory = root();
     const configPath = join(directory, "config.json");

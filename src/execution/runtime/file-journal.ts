@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
+import { renameWithRetry } from "../../shared/fs-atomic.js";
 import {
   cloneRuntimeLeaseRecord,
   parseRuntimeLeaseRecord,
@@ -198,7 +199,7 @@ export class FileRuntimeLeaseJournal implements RuntimeLeaseJournal, RuntimeLeas
     let quarantinePath: string | undefined;
     try {
       quarantinePath = await this.newQuarantinePath("corrupt");
-      await rename(this.filePath, quarantinePath);
+      await renameWithRetry(this.filePath, quarantinePath);
     } catch {
       // Keep the report even if the filesystem cannot move the artifact. The
       // active file is never overwritten in this failure path.
@@ -250,7 +251,7 @@ export class FileRuntimeLeaseJournal implements RuntimeLeaseJournal, RuntimeLeas
       await handle.sync();
       await handle.close();
       handle = undefined;
-      await rename(temporary, target);
+      await renameWithRetry(temporary, target);
     } finally {
       if (handle) await handle.close().catch(() => undefined);
       await unlink(temporary).catch(() => undefined);

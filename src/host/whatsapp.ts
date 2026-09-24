@@ -23,6 +23,9 @@ export interface WhatsappRunResult {
   exitCode: number | null;
   durationMs: number;
   outputLimitExceeded: boolean;
+  aborted?: boolean;
+  timedOut?: boolean;
+  exitConfirmed?: boolean;
 }
 
 export interface WhatsappProcessRunner {
@@ -97,7 +100,7 @@ export function spawnWhatsappProcess(spec: WhatsappRunSpec, signal?: AbortSignal
   return new Promise((resolve, reject) => {
     const started = Date.now();
     if (signal?.aborted) {
-      resolve({ stdout: "", stderr: "", exitCode: null, durationMs: 0, outputLimitExceeded: false });
+      resolve({ stdout: "", stderr: "", exitCode: null, durationMs: 0, outputLimitExceeded: false, aborted: true, exitConfirmed: true });
       return;
     }
     const child = spawn(spec.executable, spec.argv, {
@@ -111,25 +114,39 @@ export function spawnWhatsappProcess(spec: WhatsappRunSpec, signal?: AbortSignal
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let outputLimitExceeded = false;
+    let abortRequested = false;
+    let timeoutRequested = false;
+    let terminationRequested = false;
     let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    let escalationTimer: NodeJS.Timeout | undefined;
+    const terminate = () => {
+      if (terminationRequested) return;
+      terminationRequested = true;
+      child.kill();
+      escalationTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
+      escalationTimer.unref();
+    };
     const finish = (result: WhatsappRunResult) => {
       if (settled) return;
       settled = true;
       signal?.removeEventListener("abort", onAbort);
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
+      if (escalationTimer !== undefined) clearTimeout(escalationTimer);
       resolve(result);
     };
     const onAbort = () => {
-      child.kill();
-      finish({ stdout, stderr, exitCode: null, durationMs: Date.now() - started, outputLimitExceeded });
+      abortRequested = true;
+      terminate();
     };
     if (signal?.aborted) {
       onAbort();
-      return;
+    } else {
+      signal?.addEventListener("abort", onAbort, { once: true });
     }
-    signal?.addEventListener("abort", onAbort, { once: true });
-    const timer = setTimeout(() => {
-      child.kill();
+    timer = setTimeout(() => {
+      timeoutRequested = true;
+      terminate();
     }, spec.timeoutMs);
     timer.unref();
     child.stdout?.setEncoding("utf8");
@@ -138,7 +155,7 @@ export function spawnWhatsappProcess(spec: WhatsappRunSpec, signal?: AbortSignal
       stdoutBytes += Buffer.byteLength(chunk, "utf8");
       if (stdoutBytes > MAX_WHATSAPP_OUTPUT_BYTES) {
         outputLimitExceeded = true;
-        child.kill();
+        terminate();
         return;
       }
       stdout += chunk;
@@ -147,21 +164,31 @@ export function spawnWhatsappProcess(spec: WhatsappRunSpec, signal?: AbortSignal
       stderrBytes += Buffer.byteLength(chunk, "utf8");
       if (stderrBytes > MAX_WHATSAPP_OUTPUT_BYTES) {
         outputLimitExceeded = true;
-        child.kill();
+        terminate();
         return;
       }
       stderr += chunk;
     });
     child.on("error", (error) => {
       signal?.removeEventListener("abort", onAbort);
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
+      if (escalationTimer !== undefined) clearTimeout(escalationTimer);
       if (!settled) {
         settled = true;
         reject(error);
       }
     });
     child.on("close", (code) => {
-      finish({ stdout, stderr, exitCode: code, durationMs: Date.now() - started, outputLimitExceeded });
+      finish({
+        stdout,
+        stderr,
+        exitCode: code,
+        durationMs: Date.now() - started,
+        outputLimitExceeded,
+        aborted: abortRequested,
+        timedOut: timeoutRequested,
+        exitConfirmed: true,
+      });
     });
   });
 }
@@ -202,8 +229,10 @@ export class WhatsappHostBackend implements ExecutionBackend {
       const stdout = truncate(ran.stdout);
       const stderr = truncate(ran.stderr);
       if (ran.outputLimitExceeded) return failure("output_limit", "WhatsApp host output exceeded the limit.");
-      if (signal?.aborted) return failure("aborted", "WhatsApp host request was aborted.");
-      if (ran.durationMs >= spec.timeoutMs && ran.exitCode === null) {
+      if (ran.aborted === true || (signal?.aborted === true && ran.exitCode === null)) {
+        return failure("aborted", "WhatsApp host request was aborted.");
+      }
+      if (ran.timedOut === true || (ran.durationMs >= spec.timeoutMs && ran.exitCode === null)) {
         return failure("timed_out", "WhatsApp host request timed out.");
       }
       if (ran.exitCode !== 0) {

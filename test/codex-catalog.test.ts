@@ -1,13 +1,13 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createCodexCatalogSource, resolveCodexExecutable } from "../src/providers/codex-catalog.js";
 import { ModelCatalogService } from "../src/providers/model-catalog.js";
 import { connectionFingerprint } from "../src/providers/model-discovery.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 const children: ChildProcessWithoutNullStreams[] = [];
 afterEach(async () => {
   vi.unstubAllEnvs();
@@ -17,12 +17,11 @@ afterEach(async () => {
       await new Promise<void>(resolve => child.once("exit", () => resolve()));
     }
   }
-  for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 it.each(["bin", "codex"])("finds an npm Codex executable in the %s layout", folder => {
-  const directory = mkdtempSync(join(tmpdir(), "openbot-codex-path-"));
-  roots.push(directory);
+  const directory = temp.make("openbot-codex-path-");
   const binaryDir = join(directory, "node_modules", "@openai", "codex", "node_modules", "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", folder);
   mkdirSync(binaryDir, { recursive: true });
   const executable = join(binaryDir, process.platform === "win32" ? "codex.exe" : "codex");
@@ -32,8 +31,7 @@ it.each(["bin", "codex"])("finds an npm Codex executable in the %s layout", fold
 });
 
 function fixture(mode = "success") {
-  const directory = mkdtempSync(join(tmpdir(), "openbot-codex-catalog-"));
-  roots.push(directory);
+  const directory = temp.make("openbot-codex-catalog-");
   const methods = join(directory, "methods.jsonl");
   const script = join(directory, "fixture.cjs");
   writeFileSync(script, `

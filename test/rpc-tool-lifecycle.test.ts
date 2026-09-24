@@ -1,5 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -13,11 +12,14 @@ import type { RuntimeLease } from "../src/execution/runtime/contracts.js";
 import { createProviderRegistry, type ProviderAdapter } from "../src/providers/router.js";
 import { createMemoryTranscriptStore, createTurnRunner } from "../src/rpc/send.js";
 import type { TranscriptEntry } from "../src/shared/contracts.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const dirs: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
-  await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  await temp.cleanup();
 });
+
+const fileProviderTool = { type: "function" as const, function: { name: "file", parameters: { type: "object" } } };
 
 const toolWrite = (id: string, path: string, content: string) => ({
   id,
@@ -26,8 +28,7 @@ const toolWrite = (id: string, path: string, content: string) => ({
 });
 
 async function bootHome() {
-  const dir = await mkdtemp(join(tmpdir(), "openbot-life-"));
-  dirs.push(dir);
+  const dir = await temp.makeAsync("openbot-life-");
   const homes = await AgentHomeStore.create(dir);
   const home = await homes.ensure("openbot-default");
   const backend = await HomeWorkspaceBackend.create(home.root);
@@ -61,8 +62,7 @@ describe("tool-call lifecycle", () => {
     { kind: "exit", tail: "process.exitCode=7", timeoutMs: 3000, code: "process_failed" },
     { kind: "timeout", tail: "setInterval(()=>{},1000)", timeoutMs: 600, code: "timed_out" },
   ])("reports native $kind failure and redacts partial output before provider delivery", async ({ kind, tail, timeoutMs, code }) => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-life-process-"));
-    dirs.push(root);
+    const root = await temp.makeAsync("openbot-life-process-");
     const native = new LocalProcessRunner("openbot-default", root);
     const lease = { agentId: "openbot-default", capability: { networkProfile: "host" } } as RuntimeLease;
     const broker = new LocalExecutionBroker({ execute: (request, signal) => {
@@ -123,8 +123,7 @@ describe("tool-call lifecycle", () => {
   });
 
   it("marks escape as a single failed card and leaves the outside file", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "openbot-life-fail-"));
-    dirs.push(dir);
+    const dir = await temp.makeAsync("openbot-life-fail-");
     const outside = join(dir, "outside.txt");
     await writeFile(outside, "safe");
     const homes = await AgentHomeStore.create(dir);
@@ -166,8 +165,7 @@ describe("tool-call lifecycle", () => {
   });
 
   it("upserts a duplicate tool-call emit into a single card", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "openbot-life-dup-"));
-    dirs.push(dir);
+    const dir = await temp.makeAsync("openbot-life-dup-");
     const homes = await AgentHomeStore.create(dir);
     const home = await homes.ensure("openbot-default");
     const store = createMemoryTranscriptStore();
@@ -202,8 +200,7 @@ describe("tool-call lifecycle", () => {
   });
 
   it("preserves a prior card when the provider reuses an id in a later turn", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "openbot-life-reused-id-"));
-    dirs.push(dir);
+    const dir = await temp.makeAsync("openbot-life-reused-id-");
     const homes = await AgentHomeStore.create(dir);
     const home = await homes.ensure("openbot-default");
     const store = createMemoryTranscriptStore();
@@ -242,8 +239,7 @@ describe("tool-call lifecycle", () => {
   });
 
   it("usa identidade de aprovação diferente quando o provider reutiliza o id em outro turno", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "openbot-life-approval-id-"));
-    dirs.push(dir);
+    const dir = await temp.makeAsync("openbot-life-approval-id-");
     const homes = await AgentHomeStore.create(dir);
     const home = await homes.ensure("openbot-default");
     const approvals: string[] = [];
@@ -287,8 +283,7 @@ describe("tool-call lifecycle", () => {
   });
 
   it("persiste completed quando cancelamento ocorre depois do commit da ação", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "openbot-life-post-commit-abort-"));
-    dirs.push(dir);
+    const dir = await temp.makeAsync("openbot-life-post-commit-abort-");
     const homes = await AgentHomeStore.create(dir);
     const home = await homes.ensure("openbot-default");
     const actual = await HomeWorkspaceBackend.create(home.root);
@@ -307,7 +302,7 @@ describe("tool-call lifecycle", () => {
       agentId: "openbot-default",
       turnId: "turn-commit",
       broker: new LocalExecutionBroker(backend, () => "always"),
-      request: { model: "fake", messages: [], signal: controller.signal },
+      request: { model: "fake", messages: [], tools: [fileProviderTool], signal: controller.signal },
       onEvent: () => undefined,
       onProgress: ({ entry }) => statuses.push(entry.status),
       async stream() {
@@ -326,8 +321,7 @@ describe("tool-call lifecycle", () => {
   });
 
   it("fails open cards when the provider stream dies after pending", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "openbot-life-abort-"));
-    dirs.push(dir);
+    const dir = await temp.makeAsync("openbot-life-abort-");
     const homes = await AgentHomeStore.create(dir);
     const home = await homes.ensure("openbot-default");
     const store = createMemoryTranscriptStore();
@@ -355,8 +349,7 @@ describe("tool-call lifecycle", () => {
   });
 
   it("records sibling outcomes when one parallel read-only call throws", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "openbot-life-parallel-"));
-    dirs.push(dir);
+    const dir = await temp.makeAsync("openbot-life-parallel-");
     const homes = await AgentHomeStore.create(dir);
     const home = await homes.ensure("openbot-default");
     await writeFile(join(home.root, "Documents", "ok.md"), "content");
@@ -376,7 +369,7 @@ describe("tool-call lifecycle", () => {
       agentId: "openbot-default",
       turnId: "turn-parallel",
       broker,
-      request: { model: "fake", messages: [] },
+      request: { model: "fake", messages: [], tools: [fileProviderTool] },
       onEvent: () => undefined,
       onProgress: ({ entry }) => { if (entry.id !== undefined) statuses.set(entry.id, entry.status); },
       async stream() {
@@ -395,8 +388,7 @@ describe("tool-call lifecycle", () => {
   });
 
   it("re-executes a read after a write and keeps resumable occurrences distinct", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "openbot-life-rwr-"));
-    dirs.push(dir);
+    const dir = await temp.makeAsync("openbot-life-rwr-");
     const homes = await AgentHomeStore.create(dir);
     const home = await homes.ensure("openbot-default");
     await writeFile(join(home.root, "Documents", "estado.md"), "v1");
@@ -422,7 +414,7 @@ describe("tool-call lifecycle", () => {
         markUnsafe: (effectId) => store.markResumeEffectUnsafe!(scope, effectId),
         complete: (effectId, fingerprintHash, res) => store.completeResumeEffect!(scope, effectId, fingerprintHash, res),
       },
-      request: { model: "fake", messages: [] },
+      request: { model: "fake", messages: [], tools: [fileProviderTool] },
       onEvent: () => undefined,
       async stream(request) {
         round += 1;

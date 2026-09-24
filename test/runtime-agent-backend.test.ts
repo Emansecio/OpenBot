@@ -1,5 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -7,10 +6,11 @@ import { AgentHomeStore } from "../src/execution/home.js";
 import type { AgentRuntimeManager, RuntimeLease } from "../src/execution/runtime/contracts.js";
 import type { RuntimeProcessRunner } from "../src/execution/runtime/wsl/process-backend.js";
 import { AgentRuntimeBackend } from "../src/execution/runtime/agent-backend.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 const lease = (): RuntimeLease => ({
@@ -26,8 +26,7 @@ const lease = (): RuntimeLease => ({
 
 describe("AgentRuntimeBackend", () => {
   it("propaga o override de quota para a home do agente", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-agent-backend-quota-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-agent-backend-quota-");
     await mkdir(join(root, "Documents"));
 
     const backend = await AgentRuntimeBackend.create({
@@ -54,8 +53,7 @@ describe("AgentRuntimeBackend", () => {
   });
 
   it("roteia arquivos para a home e process.run para o sandbox do mesmo agente", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-agent-backend-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-agent-backend-");
     const homes = await AgentHomeStore.create(root);
     const home = await homes.ensure("agent-a");
     const activeLease = lease();
@@ -86,19 +84,52 @@ describe("AgentRuntimeBackend", () => {
 
     await expect(backend.execute({ operation: "file.write", path: "Documents/note.txt", content: "home", encoding: "utf8" })).resolves.toMatchObject({ ok: true });
     await expect(readFile(join(home.root, "Documents", "note.txt"), "utf8")).resolves.toBe("home");
-    const hostDirectory = await mkdtemp(join(tmpdir(), "openbot-agent-host-"));
-    roots.push(hostDirectory);
+    const hostDirectory = await temp.makeAsync("openbot-agent-host-");
     const hostFile = join(hostDirectory, "note.txt");
     await expect(backend.execute({ operation: "file.write", path: hostFile, content: "host", encoding: "utf8" })).resolves.toMatchObject({ ok: true });
+    await expect(readFile(hostFile, "utf8")).resolves.toBe("host");
+    await expect(backend.execute({ operation: "file.trash", path: hostFile })).resolves.toMatchObject({
+      ok: false, operation: "file.trash", code: "unsupported",
+    });
+    await expect(backend.execute({ operation: "file.copy", source: hostFile, destination: "Documents/host-copy.txt" }))
+      .resolves.toMatchObject({ ok: false, operation: "file.copy", code: "invalid_path" });
     await expect(readFile(hostFile, "utf8")).resolves.toBe("host");
     await expect(backend.execute({ operation: "process.run", executable: "node", argv: [], cwd: ".", timeoutMs: 1_000, networkProfile: "host" })).resolves.toMatchObject({ ok: true, stdout: "ok" });
     expect(manager.acquire).toHaveBeenCalledTimes(1);
     expect(runner.run).toHaveBeenCalledTimes(1);
   });
 
+  it("trata caminhos relativos, absolutos e mistos dentro da mesma home de forma equivalente", async () => {
+    const root = await temp.makeAsync("openbot-agent-absolute-home-");
+    const homes = await AgentHomeStore.create(root);
+    const home = await homes.ensure("agent-a");
+    const manager: AgentRuntimeManager = {
+      ensure: vi.fn(), acquire: vi.fn(async () => lease()), status: vi.fn(), stop: vi.fn(), repair: vi.fn(), close: vi.fn(),
+    };
+    const backend = await AgentRuntimeBackend.create({ agentId: "agent-a", homeRoot: home.root, manager, runner: { run: vi.fn() } });
+    const source = join(home.root, "Documents", "source.txt");
+    await writeFile(source, "inside");
+
+    await expect(backend.execute({ operation: "file.copy", source, destination: "Projects/copied.txt" }))
+      .resolves.toMatchObject({ ok: true, operation: "file.copy" });
+    await expect(backend.execute({ operation: "file.read", path: join(home.root, "Projects", "copied.txt"), encoding: "utf8" }))
+      .resolves.toMatchObject({ ok: true, content: "inside" });
+    await expect(backend.execute({ operation: "file.move", source: "Projects/copied.txt", destination: join(home.root, "Documents", "moved.txt") }))
+      .resolves.toMatchObject({ ok: true, operation: "file.move" });
+    const trashed = await backend.execute({ operation: "file.trash", path: join(home.root, "Documents", "moved.txt") });
+    expect(trashed).toMatchObject({ ok: true, operation: "file.trash" });
+    if (!trashed.ok || trashed.operation !== "file.trash") throw new Error("trash fixture failed");
+    await expect(backend.execute({ operation: "file.restore", trashId: trashed.trashId, path: join(home.root, "Projects", "restored.txt") }))
+      .resolves.toMatchObject({ ok: true, operation: "file.restore" });
+    await expect(backend.execute({ operation: "file.write", path: join(home.root, "Documents", "absolute.txt"), content: "write", encoding: "utf8" }))
+      .resolves.toMatchObject({ ok: true });
+    await expect(backend.execute({ operation: "file.read", path: `${home.root}\\Documents\\..\\Documents\\absolute.txt`, encoding: "utf8" }))
+      .resolves.toMatchObject({ ok: false, code: "outside_workspace" });
+    await expect(readFile(join(home.root, "Projects", "restored.txt"), "utf8")).resolves.toBe("inside");
+  });
+
   it("mantém caminho relativo privado e exige shared:// para alcançar o perfil real", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-agent-overlay-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-agent-overlay-");
     const profile = join(root, "profile");
     await mkdir(join(profile, "Documents"), { recursive: true });
     const homes = await AgentHomeStore.create(join(root, "homes"));
@@ -138,7 +169,6 @@ describe("AgentRuntimeBackend", () => {
     })).resolves.toMatchObject({ ok: false, code: "access_denied" });
 
     // Com grant de escrita, somente a referência shared:// monta a pasta real.
-    const { writeFile } = await import("node:fs/promises");
     await writeFile(join(home.root, ".openbot", "grants.json"), `${JSON.stringify({
       version: 1,
       grants: { Documents: { access: "write" } },

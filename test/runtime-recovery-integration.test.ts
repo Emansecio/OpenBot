@@ -1,5 +1,4 @@
-import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { cpSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -23,16 +22,17 @@ import type { WslCommandRunner } from "../src/execution/runtime/wsl/provisioner.
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
 import { createProviderRegistry } from "../src/providers/router.js";
 import { createFakeAdapter } from "./mocks/fake-provider-adapter.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 
 beforeEach(() => {
   vi.stubEnv("OPENBOT_RUNTIME_DRIVER", "wsl");
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.unstubAllEnvs();
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 class FakeDriver implements RuntimeDriver {
@@ -140,8 +140,7 @@ async function post(handle: ServerHandle, method: string, body: unknown) {
 
 describe("runtime recovery integration", () => {
   it("injeta o reconciliador WSL quando esse runtime de teste é selecionado", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-runtime-default-recovery-"));
-    roots.push(root);
+    const root = temp.make("openbot-runtime-default-recovery-");
     const stateRoot = join(root, "runtime", "state");
     const journal = new FileRuntimeLeaseJournal(stateRoot);
     await journal.put(wslStaleRecord);
@@ -168,8 +167,7 @@ describe("runtime recovery integration", () => {
   });
 
   it("abre o gateway e compensa pending sem sandboxId pelo leaseId persistido", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-runtime-pending-recovery-"));
-    roots.push(root);
+    const root = temp.make("openbot-runtime-pending-recovery-");
     const journal = new FileRuntimeLeaseJournal(join(root, "runtime", "state"));
     await journal.put(wslPendingRecord);
     const runner = new FakeWslCommandRunner();
@@ -190,8 +188,7 @@ describe("runtime recovery integration", () => {
   });
 
   it("mantém gateway e chat ativos, mas fecha Developer quando a prova guest não passa", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-runtime-default-recovery-red-"));
-    roots.push(root);
+    const root = temp.make("openbot-runtime-default-recovery-red-");
     const journal = new FileRuntimeLeaseJournal(join(root, "runtime", "state"));
     await journal.put(wslStaleRecord);
     const runner = new FakeWslCommandRunner();
@@ -244,8 +241,7 @@ describe("runtime recovery integration", () => {
   });
 
   it("mantém gateway ativo quando a infraestrutura WSL não pode provar o teardown", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-runtime-default-recovery-infra-red-"));
-    roots.push(root);
+    const root = temp.make("openbot-runtime-default-recovery-infra-red-");
     const journal = new FileRuntimeLeaseJournal(join(root, "runtime", "state"));
     await journal.put(wslStaleRecord);
     const runner = new FakeWslCommandRunner();
@@ -268,8 +264,7 @@ describe("runtime recovery integration", () => {
   });
 
   it("recupera o lease órfão novamente após restart do bootstrap", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-runtime-default-restart-"));
-    roots.push(root);
+    const root = temp.make("openbot-runtime-default-restart-");
     const journal = new FileRuntimeLeaseJournal(join(root, "runtime", "state"));
     const runner = new FakeWslCommandRunner();
     await journal.put(wslStaleRecord);
@@ -300,8 +295,7 @@ describe("runtime recovery integration", () => {
   });
 
   it("reconcilia o journal antes do listen e não inicia WSL nem toca workspace", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-runtime-recovery-"));
-    roots.push(root);
+    const root = temp.make("openbot-runtime-recovery-");
     const stateRoot = join(root, "runtime", "state");
     const journal = new FileRuntimeLeaseJournal(stateRoot);
     await journal.put(staleRecord);
@@ -330,8 +324,7 @@ describe("runtime recovery integration", () => {
   });
 
   it("sobe como repair-required sem reconciliador e preserva o journal", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-runtime-repair-"));
-    roots.push(root);
+    const root = temp.make("openbot-runtime-repair-");
     const journal = new FileRuntimeLeaseJournal(join(root, "runtime", "state"));
     await journal.put(staleRecord);
     const driver = new FakeDriver();
@@ -355,8 +348,7 @@ describe("runtime recovery integration", () => {
   });
 
   it("mantém home pendente isolada e preserva os dados enquanto outra home segue utilizável", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-home-pending-"));
-    roots.push(root);
+    const root = temp.make("openbot-home-pending-");
     const config = new ConfigStore({ configPath: join(root, "config.json") });
     const now = Date.now();
     config.update({ agents: [
@@ -403,8 +395,7 @@ describe("runtime recovery integration", () => {
   });
 
   it("bloqueia file e browser para múltiplas quarantines sem materializar home vazia", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-home-multiple-quarantines-"));
-    roots.push(root);
+    const root = temp.make("openbot-home-multiple-quarantines-");
     const config = new ConfigStore({ configPath: join(root, "config.json") });
     const now = Date.now();
     config.update({ agents: [
@@ -456,8 +447,7 @@ describe("runtime recovery integration", () => {
   });
 
   it("reconcilia novamente no primeiro boot real do manager", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-runtime-manager-recovery-"));
-    roots.push(root);
+    const root = temp.make("openbot-runtime-manager-recovery-");
     const journal = new FileRuntimeLeaseJournal(join(root, "state"));
     await journal.put(staleRecord);
     const driver = new FakeDriver();

@@ -8,6 +8,30 @@ import { createProviderRegistry } from "../src/providers/router.js";
 import { AttachmentStagingStore } from "../src/attachments/staging.js";
 
 describe("durable prompt queue", () => {
+  it("opens the store when a terminal row cannot be decoded and still compacts the readable ones", () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-queue-unreadable-"));
+    const path = join(root, "store.db");
+    try {
+      const first = new SqliteTranscriptStore({ path });
+      const conversationId = first.conversationStore.ensureDefault("a").id;
+      for (const nonce of ["broken", "readable"]) {
+        first.promptQueue.put({ agentId: "a", conversationId, prompt: `prompt ${nonce}`, clientNonce: nonce }, { provider: "xai", model: "grok-4.6" });
+      }
+      const db = first.databaseForSharedStores();
+      db.prepare("UPDATE prompt_queue SET state='completed'").run();
+      db.prepare("UPDATE prompt_queue SET args_json='{\"prompt\":' WHERE nonce='broken'").run();
+      first.close();
+
+      const second = new SqliteTranscriptStore({ path });
+      try {
+        const rows = second.databaseForSharedStores().prepare("SELECT nonce, payload_compacted, args_json FROM prompt_queue ORDER BY sequence").all();
+        expect(rows).toEqual([
+          { nonce: "broken", payload_compacted: 0, args_json: "{\"prompt\":" },
+          expect.objectContaining({ nonce: "readable", payload_compacted: 1 }),
+        ]);
+      } finally { second.close(); }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it("pins staged attachments until the pending request is removed and restores queue snapshots", async () => {
     const root = mkdtempSync(join(tmpdir(), "openbot-queue-attachment-"));
     const store = new SqliteTranscriptStore({ path: join(root, "store.db") });

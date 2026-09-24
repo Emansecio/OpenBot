@@ -1,5 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -8,15 +7,15 @@ import {
   DEFAULT_KEYSTORE_SCOPE,
   normalizeKeystoreScope,
 } from "../src/keystore/index.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const dirs: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
-  await Promise.all(dirs.splice(0).map((entry) => rm(entry, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 const makeDir = async (): Promise<string> => {
-  const dir = await mkdtemp(join(tmpdir(), "openbot-keystore-scope-"));
-  dirs.push(dir);
+  const dir = await temp.makeAsync("openbot-keystore-scope-");
   return dir;
 };
 

@@ -89,3 +89,22 @@ immutable renderer files and their aggregate baseline remain unchanged. The
 overlay no longer infers recovery actions from displayed error text. These local
 changes do not grant redistribution rights to the surrounding extracted
 artifacts.
+
+## Async task bridge projection — 2026-09-20
+
+The local Electron main-process task bridge now uses the backend's bounded
+`nativeProjection` for task actions and detail text in list/detail RPC reads.
+The changed main artifact hash is recorded in the client manifest and
+`patches/client-artifacts.json`. The renderer boundary and its immutable
+baseline are unchanged.
+
+The same bridge accepts the backend's `steer` action for provider tasks in the
+`admitted` state, while retaining the backend's grant and unsafe-effect checks.
+
+## Transcript resync recovery — 2026-09-22
+
+The local coordinator transcript seam retries failed snapshot reads with capped
+backoff. Snapshot generations reject obsolete responses; conversation changes,
+agent disposal and shutdown cancel pending retries. The coordinator artifact's
+hash and version are recorded in the client manifest and patch metadata. No
+renderer artifact or renderer-boundary baseline changes in this correction.

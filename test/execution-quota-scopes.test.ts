@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,15 +9,16 @@ import { detectDrift, readUsageBaseline, writeUsageBaseline } from "../src/execu
 import { LocalFileExecutor } from "../src/execution/files.js";
 import { WorkspaceQuota, WorkspaceQuotaError } from "../src/execution/quota.js";
 import { WorkspaceSandbox } from "../src/execution/workspace.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((entry) => rm(entry, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 const tempDir = async (prefix: string): Promise<string> => {
   const dir = await mkdtemp(join(tmpdir(), prefix));
-  roots.push(dir);
+  temp.track(dir);
   return dir;
 };
 

@@ -1,19 +1,19 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AgentHomeStore, defaultWorkspacesRoot, sanitizeAgentId } from "../src/execution/home.js";
+import { WORKSPACE_ACL_STAMP_NAME } from "../src/execution/home-inventory.js";
 import type { HomeAclAdapter, HomeAclResult } from "../src/execution/home-acl.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const tempRoots = new TempRoots();
 const temp = async () => {
-  const root = await mkdtemp(join(tmpdir(), "openbot-home-"));
-  roots.push(root);
+  const root = await tempRoots.makeAsync("openbot-home-");
   return root;
 };
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((entry) => rm(entry, { recursive: true, force: true })));
+  await tempRoots.cleanup();
 });
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -40,6 +40,29 @@ describe("sanitizeAgentId", () => {
 });
 
 describe("AgentHomeStore", () => {
+  it("ignora somente o marcador ACL regular no inventário geral vazio e com vários bots", async () => {
+    const store = await AgentHomeStore.create(await temp());
+    await writeFile(join(store.root, WORKSPACE_ACL_STAMP_NAME), "fixture");
+
+    await expect(store.inventory()).resolves.toEqual([]);
+    const first = await store.ensure("agent-a");
+    await store.ensure("agent-b");
+    await writeFile(join(first.root, "Documents", "note.txt"), "ok");
+
+    const all = await store.inventory();
+    expect(all.map((entry) => entry.agentId)).toEqual(["agent-a", "agent-b"]);
+    await expect(store.inventory("agent-a")).resolves.toMatchObject({ agentId: "agent-a", files: expect.any(Number) });
+  });
+
+  it("não generaliza a exceção do marcador ACL para entradas ocultas ou tipos inesperados", async () => {
+    const store = await AgentHomeStore.create(await temp());
+    await writeFile(join(store.root, ".unknown"), "user-data");
+    await expect(store.inventory()).rejects.toMatchObject({ code: "unsafe_path" });
+    await rm(join(store.root, ".unknown"));
+    await mkdir(join(store.root, WORKSPACE_ACL_STAMP_NAME));
+    await expect(store.inventory()).rejects.toMatchObject({ code: "unsafe_path" });
+  });
+
   it("seeds layout once and keeps user files on the second ensure", async () => {
     const store = await AgentHomeStore.create(await temp());
     const first = await store.ensure("openbot-default");
@@ -95,6 +118,29 @@ describe("AgentHomeStore", () => {
     await expect(store.ensure("openbot-default")).rejects.toThrow(/corromp/i);
   });
 
+  it("recusa arquivo comum no lugar de pasta obrigatória sem sobrescrever o conteúdo", async () => {
+    const store = await AgentHomeStore.create(await temp());
+    const home = await store.ensure("blocked-layout");
+    await rm(join(home.root, "Documents"), { recursive: true, force: true });
+    await writeFile(join(home.root, "Documents"), "user-data");
+
+    await expect(store.ensure("blocked-layout")).rejects.toMatchObject({ code: "integrity_error" });
+    await expect(store.repair("blocked-layout")).rejects.toMatchObject({ code: "integrity_error" });
+    await expect(readFile(join(home.root, "Documents"), "utf8")).resolves.toBe("user-data");
+  });
+
+  it("aplica a mesma validação de campos obrigatórios do manifesto em ensure e repair", async () => {
+    const store = await AgentHomeStore.create(await temp());
+    const home = await store.ensure("manifest-fields");
+    await writeFile(join(home.root, ".openbot", "home.json"), JSON.stringify({
+      agentId: "manifest-fields",
+      layoutVersion: 2,
+    }));
+
+    await expect(store.ensure("manifest-fields")).rejects.toMatchObject({ code: "integrity_error" });
+    await expect(store.repair("manifest-fields")).rejects.toMatchObject({ code: "integrity_error" });
+  });
+
   it("rejects a home manifest with an unsupported layout version", async () => {
     const store = await AgentHomeStore.create(await temp());
     const home = await store.ensure("unsupported-layout");
@@ -119,6 +165,24 @@ describe("AgentHomeStore", () => {
     const quarantined = await readdir(store.quarantineRoot);
     expect(quarantined).toHaveLength(1);
     await expect(readFile(join(store.quarantineRoot, quarantined[0]!, "Documents", "preserve.txt"), "utf8")).resolves.toBe("recoverable");
+  });
+
+  it("serializa a criação da mesma home entre stores sem duplicar a autoria da criação", async () => {
+    const root = await temp();
+    const firstStore = await AgentHomeStore.create(root);
+    const secondStore = await AgentHomeStore.create(root);
+    const pending = [
+      firstStore.ensure("same-home"),
+      secondStore.ensure("same-home"),
+    ];
+    const results = await Promise.allSettled(pending);
+    expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+    const homes = await Promise.all(pending);
+    expect(homes[0]!.root).toBe(homes[1]!.root);
+    expect(homes.filter((home) => home.created)).toHaveLength(1);
+    expect(await readdir(firstStore.stagingRoot)).toEqual([]);
+    expect(await firstStore.listQuarantineMetadata()).toEqual([]);
+    await expect(firstStore.inventory("same-home")).resolves.toMatchObject({ agentId: "same-home" });
   });
 
   it("serializa ACLs do workspace entre backendFor/ensure concorrentes de bots diferentes", async () => {
@@ -187,6 +251,7 @@ describe("AgentHomeStore", () => {
 
   it("continua processando a próxima ACL de workspace após uma falha anterior", async () => {
     const root = await temp();
+    const canonicalRoot = await realpath(root);
     const firstWorkspaceFailed = deferred();
     let workspaceRootCalls = 0;
     let firstWorkspaceFailureReleased = false;
@@ -194,7 +259,7 @@ describe("AgentHomeStore", () => {
     const acl: HomeAclAdapter = {
       async apply(target, context) {
         if (context.agentId !== "workspace") return verifiedWinAcl();
-        if (target === root) {
+        if (target === canonicalRoot) {
           workspaceRootCalls += 1;
           if (workspaceRootCalls === 1) {
             return verifiedWinAcl();

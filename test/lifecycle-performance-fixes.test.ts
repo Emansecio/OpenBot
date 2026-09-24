@@ -1,5 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -16,8 +15,9 @@ import { SkillCatalog } from "../src/skills/catalog.js";
 import type { TranscriptEntry } from "../src/shared/contracts.js";
 import type { StateAclCommandRunner } from "../src/state-acl.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const dirs: string[] = [];
+const temp = new TempRoots();
 const STATE_ACL_SDDL = "D:P(A;OICI;FA;;;CONTOSO\\alice)(A;;FA;;;CONTOSO\\alice)(A;OICI;FA;;;SY)(A;;FA;;;SY)(A;OICI;FA;;;BA)(A;;FA;;;BA)";
 
 function stateAclFixture(calls: string[], onCall?: () => void): StateAclCommandRunner {
@@ -33,8 +33,8 @@ function stateAclFixture(calls: string[], onCall?: () => void): StateAclCommandR
   };
 }
 
-afterEach(() => {
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+afterEach(async () => {
+  await temp.cleanup();
 });
 
 describe("lifecycle/performance fixes", () => {
@@ -60,8 +60,7 @@ describe("lifecycle/performance fixes", () => {
   });
 
   it("cleans generation state after committed delete but preserves it on rollback", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-delete-lifecycle-"));
-    dirs.push(root);
+    const root = temp.make("openbot-delete-lifecycle-");
     const config = new ConfigStore({ configPath: join(root, "config.json") });
     config.update({ agents: [
       { id: "committed-agent", name: "Committed", avatarId: "committed-agent" },
@@ -227,8 +226,7 @@ describe("lifecycle/performance fixes", () => {
   });
 
   it("passes the TurnRunner AbortSignal through the bootstrap provider-tools resolver", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-bootstrap-signal-"));
-    dirs.push(root);
+    const root = temp.make("openbot-bootstrap-signal-");
     const config = new ConfigStore({ configPath: join(root, "config.json") });
     config.update({ agents: [{ id: "signal-agent", name: "Signal agent", avatarId: "signal-agent" }] });
     const registry = createProviderRegistry();
@@ -265,8 +263,7 @@ describe("lifecycle/performance fixes", () => {
   });
 
   it("protects an injected state root before creating standalone state files", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-state-acl-"));
-    dirs.push(root);
+    const root = temp.make("openbot-state-acl-");
     const calls: string[] = [];
     const tokenPath = join(root, "gateway.token");
     const storePath = join(root, "store.db");
@@ -290,8 +287,7 @@ describe("lifecycle/performance fixes", () => {
   });
 
   it("uses verification-only ACL work on a recurring boot with a valid protected stamp", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-state-acl-recurring-"));
-    dirs.push(root);
+    const root = temp.make("openbot-state-acl-recurring-");
     const calls: string[] = [];
     const runner = stateAclFixture(calls);
     const options = {
@@ -312,8 +308,7 @@ describe("lifecycle/performance fixes", () => {
   });
 
   it("reapplies the ACL and replaces a corrupted recurring-boot stamp", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-state-acl-corrupt-stamp-"));
-    dirs.push(root);
+    const root = temp.make("openbot-state-acl-corrupt-stamp-");
     const calls: string[] = [];
     const runner = stateAclFixture(calls);
     const options = {
@@ -333,8 +328,7 @@ describe("lifecycle/performance fixes", () => {
   });
 
   it("fails closed before opening config/store when state ACL setup fails", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-state-acl-fail-"));
-    dirs.push(root);
+    const root = temp.make("openbot-state-acl-fail-");
     const configPath = join(root, "config.json");
     const storePath = join(root, "store.db");
     const tokenPath = join(root, "gateway.token");
@@ -352,8 +346,7 @@ describe("lifecycle/performance fixes", () => {
   });
 
   it("rejects partially injected test state without touching the default AppData root", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-state-partial-"));
-    dirs.push(root);
+    const root = temp.make("openbot-state-partial-");
     await expect(startServer(0, {
       configPath: join(root, "config.json"),
       storePath: join(root, "store.db"),

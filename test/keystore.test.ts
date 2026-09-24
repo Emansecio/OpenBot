@@ -207,6 +207,14 @@ describe("T4 keystore — persistência criptografada (safeStorage/DPAPI injetad
     expect(ks2.sensitiveValues()).toContain("sk-hydrate-777");
   });
 
+  it("hidratação recusa arquivo de segredos corrompido com erro claro e sem sobrescrevê-lo", () => {
+    const file = path.join(dir, "sand-secrets.json");
+    fs.writeFileSync(file, "{\"version\":2,\"scopes\":{", "utf8");
+    const ks2 = createKeystore({ dir });
+    expect(() => ks2.hydrateSensitiveValues()).toThrow(/sand-secrets\.json não é um objeto JSON válido/);
+    expect(fs.readFileSync(file, "utf8")).toBe("{\"version\":2,\"scopes\":{");
+  });
+
   it("delete remove do disco; instância nova não vê mais a chave", async () => {
     await ks.upsert("openai", "sk-para-deletar");
     expect(await ks.delete("openai")).toBe(true);

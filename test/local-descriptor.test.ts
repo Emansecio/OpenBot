@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 describe("local gateway descriptor", () => {
   it("writes a loopback descriptor with the gateway token", () => {
@@ -13,7 +14,7 @@ describe("local gateway descriptor", () => {
       mkdirSync(join(dir, "OpenBot"));
       writeFileSync(join(dir, "OpenBot", "gateway.token"), `${token}\n`);
       execFileSync(process.execPath, ["scripts/local-descriptor.mjs", file], {
-        cwd: new URL("..", import.meta.url).pathname.replace(/^\/(.):/, "$1:"),
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
         env: { ...process.env, APPDATA: dir, SAND_HOST_GATEWAY_TOKEN: "", OPENBOT_GATEWAY_TOKEN: "", OPENBOT_GATEWAY_PORT: "1340" },
       });
       const descriptor = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
@@ -39,7 +40,7 @@ describe("local gateway descriptor", () => {
     try {
       const file = join(dir, "descriptor.json");
       expect(() => execFileSync(process.execPath, ["scripts/local-descriptor.mjs", file], {
-        cwd: new URL("..", import.meta.url).pathname.replace(/^\/(.):/, "$1:"),
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
         env: { ...process.env, APPDATA: dir, SAND_HOST_GATEWAY_TOKEN: "", OPENBOT_GATEWAY_TOKEN: "" },
         stdio: "pipe",
       })).toThrow();
@@ -58,7 +59,7 @@ describe("local gateway descriptor", () => {
       mkdirSync(dataRoot);
       writeFileSync(join(dataRoot, "gateway.token"), `${token}\n`);
       execFileSync(process.execPath, ["scripts/local-descriptor.mjs", file], {
-        cwd: new URL("..", import.meta.url).pathname.replace(/^\/(.):/, "$1:"),
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
         env: {
           ...process.env,
           APPDATA: join(dir, "unused-appdata"),
@@ -85,7 +86,7 @@ describe("local gateway descriptor", () => {
       writeFileSync(tokenFile, `${token}\n`);
       writeFileSync(join(dir, "data-root", "gateway.token"), "stale-data-root-token-123456789\n");
       execFileSync(process.execPath, ["scripts/local-descriptor.mjs", file], {
-        cwd: new URL("..", import.meta.url).pathname.replace(/^\/(.):/, "$1:"),
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
         env: {
           ...process.env,
           OPENBOT_GATEWAY_TOKEN_PATH: tokenFile,
@@ -110,7 +111,7 @@ describe("local gateway descriptor", () => {
       mkdirSync(join(dir, "tokens"), { recursive: true });
       writeFileSync(tokenFile, `${token}\n`);
       execFileSync(process.execPath, ["scripts/local-descriptor.mjs", file], {
-        cwd: new URL("..", import.meta.url).pathname.replace(/^\/(.):/, "$1:"),
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
         env: {
           ...process.env,
           OPENBOT_GATEWAY_TOKEN_PATH: tokenFile,

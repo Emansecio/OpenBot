@@ -151,8 +151,11 @@ export function createPromptQueue(db?: Database.Database): PromptQueueStore {
     },
     compactTerminal(limit = 100) {
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error("Invalid compaction limit");
+      // Runs while the store opens: an undecodable terminal row is left as-is instead of failing boot.
       const candidates = db
-        ? db.prepare<unknown[], QueueRow>("SELECT * FROM prompt_queue WHERE payload_compacted=0 AND state IN ('completed','cancelled') ORDER BY sequence LIMIT ?").all(limit).map(row => decode(row)!)
+        ? db.prepare<unknown[], QueueRow>("SELECT * FROM prompt_queue WHERE payload_compacted=0 AND state IN ('completed','cancelled') ORDER BY sequence LIMIT ?").all(limit).flatMap((row) => {
+          try { return [decode(row)!]; } catch { return []; }
+        })
         : [...rows.values()].filter(row => !row.compacted && (row.state === "completed" || row.state === "cancelled")).slice(0, limit);
       const apply = () => { for (const row of candidates) compact(row); return candidates.length; };
       return db ? db.transaction(apply)() : apply();

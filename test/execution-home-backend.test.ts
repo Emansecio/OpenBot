@@ -1,5 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -7,16 +6,16 @@ import { createAgentHomeBroker } from "../src/execution/broker.js";
 import { AgentHomeStore } from "../src/execution/home.js";
 import { HomeWorkspaceBackend } from "../src/execution/home-backend.js";
 import { DEFAULT_WORKSPACE_QUOTA, DEFAULT_WORKSPACE_QUOTA_SCOPES, type WorkspaceQuotaOptions } from "../src/execution/quota.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((entry) => rm(entry, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 describe("HomeWorkspaceBackend", () => {
   it("preserva a quota e os escopos padrão quando não há override", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-home-default-quota-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-home-default-quota-");
 
     const backend = await HomeWorkspaceBackend.create(root);
     const configured = (backend.quota as unknown as { options: WorkspaceQuotaOptions }).options;
@@ -24,9 +23,30 @@ describe("HomeWorkspaceBackend", () => {
     expect(configured).toEqual({ ...DEFAULT_WORKSPACE_QUOTA, scopes: DEFAULT_WORKSPACE_QUOTA_SCOPES });
   });
 
+  it("expõe limites efetivos em workspace_info sem medir o consumo", async () => {
+    const root = await temp.makeAsync("openbot-home-quota-info-");
+    const backend = await HomeWorkspaceBackend.create(root, {
+      quota: {
+        maxBytes: 1_000,
+        maxFiles: 20,
+        maxEntries: 30,
+        scopes: { downloads: { maxBytes: 100, maxFiles: 2, maxEntries: 3 } },
+      },
+    });
+
+    expect(backend.quota.metrics().scans).toBe(0);
+    await expect(backend.execute({ operation: "workspace.info" })).resolves.toMatchObject({
+      ok: true,
+      quota: {
+        global: { maxBytes: 1_000, maxFiles: 20, maxEntries: 30 },
+        folders: { downloads: { maxBytes: 100, maxFiles: 2, maxEntries: 3 } },
+      },
+    });
+    expect(backend.quota.metrics().scans).toBe(0);
+  });
+
   it("aplica um override pequeno e retorna quota_exceeded no backend de arquivos", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-home-quota-override-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-home-quota-override-");
     await mkdir(join(root, "Documents"));
 
     const backend = await HomeWorkspaceBackend.create(root, {
@@ -42,8 +62,7 @@ describe("HomeWorkspaceBackend", () => {
   });
 
   it("writes and searches inside one home and refuses escape", async () => {
-    const parent = await mkdtemp(join(tmpdir(), "openbot-home-be-"));
-    roots.push(parent);
+    const parent = await temp.makeAsync("openbot-home-be-");
     const store = await AgentHomeStore.create(parent);
     const home = await store.ensure("agent-a");
     const outside = join(parent, "outside.txt");
@@ -80,8 +99,7 @@ describe("HomeWorkspaceBackend", () => {
   });
 
   it("backendFor caches per agent and does not leak files", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "openbot-home-cache-"));
-    roots.push(dir);
+    const dir = await temp.makeAsync("openbot-home-cache-");
     const store = await AgentHomeStore.create(dir);
     const a = await store.backendFor("agent-a");
     const b = await store.backendFor("agent-b");
@@ -96,8 +114,7 @@ describe("HomeWorkspaceBackend", () => {
   });
 
   it("keeps administrative metadata private from the agent backend", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "openbot-home-admin-"));
-    roots.push(dir);
+    const dir = await temp.makeAsync("openbot-home-admin-");
     const store = await AgentHomeStore.create(dir);
     const home = await store.ensure("agent-a");
     const backend = await HomeWorkspaceBackend.create(home.root);
@@ -122,8 +139,7 @@ describe("HomeWorkspaceBackend", () => {
   });
 
   it("production broker refuses an unregistered agent without creating a home", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "openbot-home-allow-"));
-    roots.push(dir);
+    const dir = await temp.makeAsync("openbot-home-allow-");
     const store = await AgentHomeStore.create(dir);
     await store.ensure("openbot-default");
     const broker = createAgentHomeBroker(store, { allowedAgentIds: ["openbot-default"] });
@@ -135,8 +151,7 @@ describe("HomeWorkspaceBackend", () => {
   });
 
   it("reads and writes drive-absolute host paths outside the home", async () => {
-    const parent = await mkdtemp(join(tmpdir(), "openbot-home-host-"));
-    roots.push(parent);
+    const parent = await temp.makeAsync("openbot-home-host-");
     const store = await AgentHomeStore.create(parent);
     const home = await store.ensure("agent-a");
     const backend = await HomeWorkspaceBackend.create(home.root, { userProfile: parent, agentId: "agent-a" });
@@ -162,8 +177,7 @@ describe("HomeWorkspaceBackend", () => {
   });
 
   it("rejects drive-absolute host paths containing ..", async () => {
-    const parent = await mkdtemp(join(tmpdir(), "openbot-home-host-dotdot-"));
-    roots.push(parent);
+    const parent = await temp.makeAsync("openbot-home-host-dotdot-");
     const store = await AgentHomeStore.create(parent);
     const home = await store.ensure("agent-a");
     const backend = await HomeWorkspaceBackend.create(home.root, { userProfile: parent, agentId: "agent-a" });

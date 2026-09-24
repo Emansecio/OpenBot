@@ -1,21 +1,22 @@
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { win32 as path } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { MAX_EXECUTION_PATH_BYTES } from "../src/execution/contracts.js";
 import { WorkspaceError, WorkspaceSandbox } from "../src/execution/workspace.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const temporaryPaths: string[] = [];
+const temp = new TempRoots();
 
 async function temporaryDirectory(prefix: string): Promise<string> {
   const directory = await mkdtemp(path.join(tmpdir(), prefix));
-  temporaryPaths.push(directory);
+  temp.track(directory);
   return directory;
 }
 
 afterEach(async () => {
-  await Promise.all(temporaryPaths.splice(0).map((entry) => rm(entry, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 describe("WorkspaceSandbox", () => {
@@ -82,7 +83,7 @@ describe("WorkspaceSandbox", () => {
     const linked = path.join(parent, "linked");
     await symlink(actual, linked, "junction");
     const home = path.join(linked, "openbot-default");
-    await mkdir(home);
+    await mkdir(path.join(actual, "openbot-default"));
 
     const workspace = await WorkspaceSandbox.create(home, { allowAncestorLinks: true });
     expect(workspace.root.toLowerCase()).toBe(path.join(actual, "openbot-default").toLowerCase());

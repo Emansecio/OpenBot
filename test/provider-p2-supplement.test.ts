@@ -1,5 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { fileURLToPath } from "node:url";
@@ -11,12 +10,13 @@ import { resolveProviderCapabilities, registerOptionalProviders } from "../src/p
 import { OpenRouterAdapter, createCliProviderAdapter } from "../src/providers/optional-adapters.js";
 import { ProviderError, type ProviderAdapter,createProviderRegistry } from "../src/providers/router.js";
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 const handles: ServerHandle[] = [];
 afterEach(async () => {
   await Promise.all(handles.splice(0).map((handle) => stopServer(handle)));
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 function processResult(stdout: string, stderr = "", exitCode = 0) {
@@ -93,8 +93,7 @@ describe("P2.5 supplement — capability matrix negatives and production boundar
   });
 
   it("legacy optionalProviders key is tolerated on load and stripped on persist", () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-p25-config-"));
-    roots.push(root);
+    const root = temp.make("openbot-p25-config-");
     const configPath = join(root, "config.json");
     const store = new ConfigStore({ configPath });
     const seeded = { ...store.snapshot(), optionalProviders: { openrouter: { enabled: true, credentialRef: "openrouter:key:fixture-v1" } } };
@@ -113,8 +112,7 @@ describe("P2.5 supplement — capability matrix negatives and production boundar
   });
 
   it("bootstrap never registers optional providers, even from legacy config", async () => {
-    const defaultRoot = mkdtempSync(join(tmpdir(), "openbot-p25-boot-default-"));
-    roots.push(defaultRoot);
+    const defaultRoot = temp.make("openbot-p25-boot-default-");
     const defaultHandle = await startServer(0, {
       configPath: join(defaultRoot, "config.json"), stateRoot: join(defaultRoot, "state"), runtimeRoot: join(defaultRoot, "runtime"),
       browserRoot: join(defaultRoot, "browser"), keystoreDir: join(defaultRoot, "keystore"), storePath: join(defaultRoot, "store.db"),
@@ -127,8 +125,7 @@ describe("P2.5 supplement — capability matrix negatives and production boundar
 
     // A legacy config that still carries the removed optionalProviders key
     // loads tolerantly but never registers the inert providers.
-    const configuredRoot = mkdtempSync(join(tmpdir(), "openbot-p25-boot-configured-"));
-    roots.push(configuredRoot);
+    const configuredRoot = temp.make("openbot-p25-boot-configured-");
     const configPath = join(configuredRoot, "config.json");
     const config = new ConfigStore({ configPath });
     writeFileSync(configPath, JSON.stringify({

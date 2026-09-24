@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,16 +17,17 @@ import {
 } from "../src/rpc/roster.js";
 import type { Gateway } from "../src/server/gateway.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const temporaryRoots: string[] = [];
+const temp = new TempRoots();
 
-afterEach(() => {
-  for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+afterEach(async () => {
+  await temp.cleanup();
 });
 
 function temporaryRoot(prefix: string): string {
   const root = mkdtempSync(join(tmpdir(), prefix));
-  temporaryRoots.push(root);
+  temp.track(root);
   return root;
 }
 

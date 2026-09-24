@@ -1,6 +1,5 @@
 import { createServer } from "node:http";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,18 +14,18 @@ import { classifyProviderError, defaultRegistry,createProviderRegistry } from ".
 import { MAX_PROVIDER_TRANSCRIPT_MESSAGES, MAX_SEND_QUEUE_PER_AGENT, createTurnRunner } from "../src/rpc/send.js";
 import { createGateway } from "../src/server/gateway.js";
 import { createFakeAdapter } from "./mocks/fake-provider-adapter.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const dirs: string[] = [];
+const temp = new TempRoots();
 const handles: ServerHandle[] = [];
 
 afterEach(async () => {
   await Promise.all(handles.splice(0).map((handle) => stopServer(handle)));
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 function tempDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), "openbot-audit-"));
-  dirs.push(dir);
+  const dir = temp.make("openbot-audit-");
   return dir;
 }
 

@@ -422,7 +422,14 @@ async function main() {
       })()`);
       await waitForEval("document.querySelector('#openbot-queue-recovery .ob-recovery-files')?.textContent.includes('replacement.txt') && document.getElementById('openbot-queue-recovery')?.getAttribute('aria-busy')==='false'",10000);
       await evalExpr("document.querySelector('#openbot-queue-recovery [data-recovery=send]').click()");
-      await waitForEval("!document.getElementById('openbot-queue-recovery')",10000);
+      try { await waitForEval("!document.getElementById('openbot-queue-recovery')",10000); }
+      catch (error) {
+        console.log('QUEUE_REVIEW_DIAGNOSTIC', JSON.stringify(await evalExpr(`(async () => ({
+          status: document.querySelector('#openbot-queue-recovery .ob-recovery-status')?.textContent,
+          state: await window.desktop.agent.getPromptStatus({agentIds:[window.__queueRecoveryFixture.agentId]})
+        }))()`)));
+        throw error;
+      }
       await waitGatewayStatus(status => status.instantResponses === 1);
       await waitForEval("!document.querySelector('#openbot-prompt-queue .ob-queued-row')",10000);
       const finalStatus = await evalExpr("window.desktop.agent.getPromptStatus({agentIds:[window.__queueRecoveryFixture.agentId]})");

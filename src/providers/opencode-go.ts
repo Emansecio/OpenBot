@@ -1,10 +1,12 @@
 import type { Keystore } from "../keystore/index.js";
 import { parseProviderUsage } from "./usage.js";
+import { providerToolResultContent } from "./tool-calls.js";
 import type { ProviderAdapter, ProviderChatMessage, ProviderChatRequest, ProviderStreamEvent } from "./router.js";
 import {
   ApiError,
   findSseFrameBoundary,
   normalizeOpenAiError,
+  normalizeToolCallArguments,
   openAiStreamErrorStatus,
   providerTimeoutError,
   raceWithAbort,
@@ -59,7 +61,12 @@ function anthropicContent(message: ProviderChatMessage): unknown[] {
   }
   if (message.role === "tool") {
     if (!message.toolCallId) throw new ApiError("opencode-go: tool result sem toolCallId", 400);
-    return [{ type: "tool_result", tool_use_id: message.toolCallId, content: message.content }];
+    return [{
+      type: "tool_result",
+      tool_use_id: message.toolCallId,
+      content: providerToolResultContent(message),
+      ...(message.toolResult !== undefined ? { is_error: true } : {}),
+    }];
   }
   return [{ type: "text", text: message.content }];
 }
@@ -282,8 +289,12 @@ export class OpenCodeGoAdapter implements ProviderAdapter {
     let stopReason: string | undefined;
     let stopPayload: unknown;
 
-    const isIncompleteReason = (reason: string | undefined): boolean =>
-      reason === "max_tokens" || reason === "length" || reason === "content_filter";
+    const stopDisposition = (reason: string | undefined): "success" | "incomplete" | "unknown" | "absent" => {
+      if (reason === undefined) return "absent";
+      if (reason === "end_turn" || reason === "tool_use" || reason === "stop_sequence" || reason === "refusal") return "success";
+      if (reason === "max_tokens" || reason === "length" || reason === "content_filter" || reason === "pause_turn" || reason === "model_context_window_exceeded") return "incomplete";
+      return "unknown";
+    };
 
     const dispatch = (frame: string): void => {
       const data = splitSseLines(frame).filter((line) => line.startsWith("data:"))
@@ -301,7 +312,9 @@ export class OpenCodeGoAdapter implements ProviderAdapter {
           code: typeof error?.type === "string" ? error.type : undefined,
         });
       }
-      const index = typeof event.index === "number" ? event.index : undefined;
+      const index = typeof event.index === "number" && Number.isSafeInteger(event.index) && event.index >= 0
+        ? event.index
+        : undefined;
       const block = record(event.content_block);
       const delta = record(event.delta);
       const currentStopReason = typeof delta?.stop_reason === "string" ? delta.stop_reason : undefined;
@@ -309,12 +322,14 @@ export class OpenCodeGoAdapter implements ProviderAdapter {
         stopReason = currentStopReason;
         stopPayload = parsed;
       }
-      if (event.type === "content_block_start" && index !== undefined && block?.type === "tool_use" && stopReason === undefined) {
+      if (event.type === "content_block_start" && block?.type === "tool_use" && stopReason === undefined) {
+        if (index === undefined) throw new ApiError("opencode-go: tool call sem index", 502, parsed);
         if (typeof block.id !== "string" || typeof block.name !== "string") throw new ApiError("opencode-go: tool call inválida", 502);
         tools.set(index, { id: block.id, name: block.name, arguments: Object.keys(record(block.input) ?? {}).length ? JSON.stringify(block.input) : "", streaming: false, stopped: false });
       } else if (event.type === "content_block_delta" && stopReason === undefined && delta?.type === "text_delta" && typeof delta.text === "string") {
         emit({ type: "delta", delta: delta.text });
-      } else if (event.type === "content_block_delta" && stopReason === undefined && index !== undefined && delta?.type === "input_json_delta" && typeof delta.partial_json === "string") {
+      } else if (event.type === "content_block_delta" && stopReason === undefined && delta?.type === "input_json_delta" && typeof delta.partial_json === "string") {
+        if (index === undefined) throw new ApiError("opencode-go: argumentos de tool call sem index", 502, parsed);
         const tool = tools.get(index);
         if (!tool) throw new ApiError("opencode-go: argumentos chegaram antes da tool call", 502);
         if (!tool.streaming) {
@@ -335,25 +350,29 @@ export class OpenCodeGoAdapter implements ProviderAdapter {
         if (done) break;
         onActivity();
         buffer += decoder.decode(value, { stream: true });
-        if (buffer.length > 1_048_576) throw new ApiError("opencode-go: buffer SSE excedeu 1 MiB", 502);
         let boundary = findSseFrameBoundary(buffer);
-        while (boundary) {
-          dispatch(buffer.slice(0, boundary.index));
+        while (boundary && !completed) {
+          const frame = buffer.slice(0, boundary.index);
           buffer = buffer.slice(boundary.index + boundary.length);
+          if (Buffer.byteLength(frame, "utf8") > 1_048_576) throw new ApiError("opencode-go: frame SSE excedeu 1 MiB", 502);
+          dispatch(frame);
           boundary = findSseFrameBoundary(buffer);
         }
+        if (!completed && Buffer.byteLength(buffer, "utf8") > 1_048_576) throw new ApiError("opencode-go: buffer SSE residual excedeu 1 MiB", 502);
       }
       if (!completed) throw new ApiError("opencode-go: stream terminou antes de message_stop", 502);
     } finally {
       await reader.cancel().catch(() => undefined);
       reader.releaseLock();
     }
-    if (isIncompleteReason(stopReason)) {
-      throw new ApiError(`opencode-go: geração interrompida (${stopReason})`, 400, stopPayload, { code: stopReason });
+    const disposition = stopDisposition(stopReason);
+    if (disposition === "incomplete" || disposition === "unknown") {
+      throw new ApiError(`opencode-go: geração interrompida (${stopReason})`, disposition === "incomplete" ? 400 : 502, stopPayload, { code: stopReason });
     }
     for (const tool of tools.values()) {
-      if (!tool.stopped) continue;
-      emit({ type: "tool-call", call: { id: tool.id, type: "function", function: { name: tool.name, arguments: tool.arguments || "{}" } } });
+      if (!tool.stopped) throw new ApiError("opencode-go: tool call não terminou antes de message_stop", 502);
+      const argumentsText = normalizeToolCallArguments(tool.arguments, "opencode-go");
+      emit({ type: "tool-call", call: { id: tool.id, type: "function", function: { name: tool.name, arguments: argumentsText } } });
     }
   }
 }

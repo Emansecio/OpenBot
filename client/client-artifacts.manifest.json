@@ -13,7 +13,7 @@
     "main": {
       "path": "client/extracted/dist/electron-main/main.cjs",
       "version": "0.16.0",
-      "sha256": "9ebd56c8b5c323d3f0975bcd5c2d95fa0c19d97c1b629bc5809f05e95ed7c02f",
+      "sha256": "f9af158d1525c1f0cf42ac0266de27b023ee80c682c50e1bd4ec5b409f50b71a",
       "sourceMap": {
         "path": "client/extracted/dist/electron-main/main.cjs.map",
         "status": "removed",
@@ -32,16 +32,16 @@
     },
     "coordinatorTranscriptAdapter": {
       "path": "client/extracted/dist/node-agent-coordinator/openbot-transcript-adapter.cjs",
-      "version": "openbot-transcript-adapter-v6-quiet-tools",
-      "sha256": "a701fc4dd63e59895a0127cb998631f433a7b777a407a441284b6a85015f1a67",
+      "version": "openbot-transcript-adapter-v7-tool-outcomes",
+      "sha256": "4be7d1018e690e485e2032810f923c3c469ebcac010985237f2089bc5d94f2ac",
       "sourceMap": {
         "status": "not-applicable"
       }
     },
     "rendererInjected": {
       "path": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
-      "version": "openbot-local-settings-v58-execution-recovery",
-      "sha256": "111a4d5c9e3bd3c4cbd180ce11327f44335013c880139dfe8b61fecca4b761e1",
+      "version": "openbot-local-settings-v59-conversation-status",
+      "sha256": "8ec6f1d39580e0e74558115662c87f2cf0e5063334a01d0adef30bc03fb66f82",
       "sourceMap": {
         "status": "not-applicable"
       }
@@ -56,8 +56,8 @@
     },
     "coordinatorMain": {
       "path": "client/extracted/dist/node-agent-coordinator/main.cjs",
-      "version": "openbot-ui-contract-v2-local-user-echo",
-      "sha256": "1fa446a6f3c5ffb174cc616d9982e545f8da36257d64ee0bb50af87e5b3476bf",
+      "version": "openbot-ui-contract-v3-resync-retry",
+      "sha256": "15d32914cc0b676a4bd0a59b562c10f716f979b787f99db3f2ce7a33c3d4cada",
       "sourceMap": {
         "path": "client/extracted/dist/node-agent-coordinator/main.cjs.map",
         "reference": "main.cjs.map",
@@ -85,7 +85,7 @@
       },
       {
         "path": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
-        "sha256": "111a4d5c9e3bd3c4cbd180ce11327f44335013c880139dfe8b61fecca4b761e1",
+        "sha256": "8ec6f1d39580e0e74558115662c87f2cf0e5063334a01d0adef30bc03fb66f82",
         "role": "injected"
       },
       {

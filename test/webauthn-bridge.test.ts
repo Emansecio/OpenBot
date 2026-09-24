@@ -1,6 +1,5 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import type { EventEmitter as EventEmitterType } from "node:events";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PassThrough as PassThroughType } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -45,8 +44,9 @@ vi.mock("node:child_process", async () => {
 });
 
 import { createWebauthnBridge } from "../src/server/webauthn-bridge.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
   vi.useRealTimers();
   spawnState.options.splice(0);
@@ -56,12 +56,11 @@ afterEach(async () => {
   spawnState.emitClose = true;
   spawnState.killCalls = 0;
   vi.unstubAllEnvs();
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 async function fixtureBridge() {
-  const root = await mkdtemp(join(tmpdir(), "openbot-webauthn-"));
-  roots.push(root);
+  const root = await temp.makeAsync("openbot-webauthn-");
   const signer = join(root, "signer.exe");
   await writeFile(signer, "fixture");
   return createWebauthnBridge(signer);
@@ -75,8 +74,7 @@ const ceremony = {
 
 describe("WebAuthn signer bridge", () => {
   it("does not pass gateway secrets to the native signer environment", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-webauthn-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-webauthn-");
     const signer = join(root, "signer.exe");
     await writeFile(signer, "fixture");
     const allowedKeys = ["COMSPEC", "PATH", "PATHEXT", "SYSTEMROOT", "TEMP", "TMP", "WINDIR"];

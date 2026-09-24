@@ -1,6 +1,5 @@
 import { PassThrough, Writable } from "node:stream";
-import { mkdtemp, rm, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { stat } from "node:fs/promises";
 import { isAbsolute, join, relative } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -16,6 +15,7 @@ import type {
   StopReason,
 } from "../src/execution/runtime/contracts.js";
 import { defaultBrowserRoot, startServer, stopServer, type ServerHandle } from "../src/main.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 class FakeBrowserHost implements BrowserHostProcess {
   readonly stdout = new PassThrough();
@@ -101,19 +101,18 @@ class FakeRuntimeManager implements AgentRuntimeManager {
   async close(): Promise<void> {}
 }
 
-const dirs: string[] = [];
+const temp = new TempRoots();
 const handles: ServerHandle[] = [];
 const managers: BrowserSessionManager[] = [];
 
 afterEach(async () => {
   await Promise.all(handles.splice(0).map((handle) => stopServer(handle)));
   await Promise.all(managers.splice(0).map((manager) => manager.close()));
-  await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 async function fixture(): Promise<{ root: string; configPath: string; workspacesRoot: string }> {
-  const root = await mkdtemp(join(tmpdir(), "openbot-browser-runtime-"));
-  dirs.push(root);
+  const root = await temp.makeAsync("openbot-browser-runtime-");
   const configPath = join(root, "config.json");
   const config = new ConfigStore({ configPath });
   config.update({ agents: [{ id: "browser-agent", name: "Browser Agent", avatarId: "browser-agent" }] });

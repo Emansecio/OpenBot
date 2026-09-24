@@ -82,20 +82,44 @@ function byteLength(value) {
   return Buffer.byteLength(value, "utf8");
 }
 
+function projectToolCallForRenderer(entry) {
+  const status = entry.status === "failed"
+    ? "falhou"
+    : entry.status === "completed"
+      ? "concluída"
+      : entry.status === "running"
+        ? "em execução"
+        : "aguardando execução";
+  const result = entry.result && typeof entry.result === "object" ? entry.result : {};
+  const details = [];
+  if (typeof result.code === "string" && result.code.trim()) details.push(`código ${result.code.trim()}`);
+  if (Number.isInteger(result.exitCode)) details.push(`saída ${result.exitCode}`);
+  if (Number.isFinite(result.bytes)) details.push(`${Math.max(0, Math.trunc(result.bytes))} bytes`);
+  if (Number.isFinite(result.count)) details.push(`${Math.max(0, Math.trunc(result.count))} itens`);
+  const summary = typeof entry.summary === "string" && entry.summary.trim()
+    ? entry.summary.trim()
+    : typeof entry.name === "string" && entry.name.trim()
+      ? entry.name.trim()
+      : "Ferramenta";
+  const text = `${summary} — ${status}${details.length > 0 ? ` (${details.join(", ")})` : ""}`;
+  return {
+    kind: "notice",
+    ...(typeof entry.id === "string" ? { id: entry.id } : {}),
+    ...(typeof entry.turnId === "string" ? { turnId: entry.turnId } : {}),
+    level: entry.status === "failed" ? "error" : "info",
+    text: [...text].slice(0, 500).join(""),
+  };
+}
+
 function projectTranscriptForRenderer(payload) {
   if (!payload || typeof payload !== "object") return payload;
   // The immutable renderer reserves fromUser for another human and will not
   // acknowledge its nonce. Keep OpenBot's local-user provenance in the backend.
   const localUserEntry = (entry) => {
-    // Keep tool-call entries as non-rendered records. The immutable chat
-    // renderer intentionally does not render them, so projecting them as
-    // notices would turn every internal tool transition into transcript noise.
-    // Do not carry execution results across the renderer boundary: they can
-    // contain process output even though the entry itself is not rendered.
-    if (entry?.kind === "tool-call") {
-      const { result: _result, ...toolCall } = entry;
-      return toolCall;
-    }
+    // The immutable renderer does not render tool-call rows. Project a bounded
+    // lifecycle notice so confirmed completion/failure is visible without
+    // crossing raw process output or arbitrary tool payloads into the client.
+    if (entry?.kind === "tool-call") return projectToolCallForRenderer(entry);
     if (entry?.kind !== "message" || entry.role !== "user" || !entry.fromUser
       || entry.fromAgent || entry.toAgent || typeof entry.clientNonce !== "string") return entry;
     const { fromUser: _provenance, ...localUser } = entry;

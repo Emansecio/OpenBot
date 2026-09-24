@@ -824,6 +824,7 @@ export class AsyncTaskStore {
   private readonly sensitiveValuesFn: () => readonly string[];
   readonly path: string;
   private closed = false;
+  private projectionCursor = 0;
 
   constructor(opts: AsyncTaskStoreOptions) {
     if (typeof opts.path !== "string" || opts.path.length === 0) invalid("Async task store path is required.");
@@ -1286,7 +1287,12 @@ export class AsyncTaskStore {
     if (!usage.reservations.some((reservation) => reservation.reservationId === task.taskId)) return;
     const child = this.getBudgetState(task.taskId);
     const actual = child === null ? emptyBudgetUsage().used : usageIncludingReservations(child.usage);
-    const nextUsage = reconcileBudgetReservation(usage, task.taskId, actual);
+    const estimated = child === null || (child.usage.estimated === undefined && child.usage.reserved.inputTokens === 0 && child.usage.reserved.outputTokens === 0)
+      ? undefined : {
+        inputTokens: (child.usage.estimated?.inputTokens ?? 0) + child.usage.reserved.inputTokens,
+        outputTokens: (child.usage.estimated?.outputTokens ?? 0) + child.usage.reserved.outputTokens,
+      };
+    const nextUsage = reconcileBudgetReservation(usage, task.taskId, actual, estimated);
     const wallReservations = parentWallReservations(parseJson(row.wall_reservations_json, "parent wall reservations"));
     const reservedWall = wallReservations[task.taskId] ?? 0;
     delete wallReservations[task.taskId];
@@ -1423,7 +1429,26 @@ export class AsyncTaskStore {
       .map((row) => this.attemptFromRow(row));
   }
 
-  claimNext(agentIdValue: string, input: ClaimAsyncTaskInput): ClaimAsyncTaskResult | null {
+  /** Read-only hint for the worker; claimNext still owns admission and fencing. */
+  runnableAgentIds(nowMsValue = this.now()): readonly string[] {
+    this.ensureOpen();
+    const nowMs = nonNegativeInteger(nowMsValue, "nowMs");
+    return this.db.prepare<[number], { agent_id: string }>(`
+      SELECT DISTINCT agent_id FROM async_tasks
+      WHERE status = 'queued' OR (status = 'retry_wait' AND next_attempt_at_ms <= ?)
+    `).all(nowMs).map((row) => row.agent_id);
+  }
+
+  canSteer(task: AsyncTaskRecord): boolean {
+    this.ensureOpen();
+    if ((task.status !== "admitted" && task.status !== "running") || task.steerIntent !== null) return false;
+    if (this.getGrant(task.taskId)?.kind !== "provider") return false;
+    const row = this.db.prepare<unknown[], AttemptRow>("SELECT * FROM async_task_attempts WHERE task_id = ? AND attempt = ?")
+      .get(task.taskId, task.attempt);
+    return row !== undefined && !this.attemptFromRow(row).unsafeEffectStarted;
+  }
+
+  claimNext(agentIdValue: string, input: ClaimAsyncTaskInput, sweepExpired = true): ClaimAsyncTaskResult | null {
     this.ensureOpen();
     const agentId = identifier(agentIdValue, "agentId");
     const ownerId = identifier(input.ownerId, "ownerId");
@@ -1433,7 +1458,7 @@ export class AsyncTaskStore {
     const leaseDurationMs = positiveInteger(input.leaseDurationMs, "leaseDurationMs");
     const claim = this.db.transaction((): ClaimAsyncTaskResult | null => {
       const operationNow = this.operationNow(nowMs, "Claim");
-      this.expireBudgetExhaustedTasksInTransaction(operationNow);
+      if (sweepExpired) this.expireBudgetExhaustedTasksInTransaction(operationNow);
       const listCandidates = this.db.prepare<unknown[], TaskRow>(`
         SELECT * FROM async_tasks
         WHERE agent_id = ?
@@ -1810,6 +1835,12 @@ export class AsyncTaskStore {
       }
       if (current.steerVersion !== expectedSteerVersion) casRejected("Steer version is stale.");
       if (current.status !== "admitted" && current.status !== "running") invalid("Only an admitted or running task can be steered.");
+      if (this.getGrant(taskId)?.kind !== "provider") invalid("Only provider tasks can incorporate an instruction.");
+      if (current.steerIntent?.consumedAtMs === null) invalid("The previous instruction has not been applied yet.");
+      const attemptRow = this.db.prepare<unknown[], AttemptRow>("SELECT * FROM async_task_attempts WHERE task_id = ? AND attempt = ?").get(taskId, current.attempt);
+      if (attemptRow === undefined || this.attemptFromRow(attemptRow).unsafeEffectStarted) {
+        invalid("This one-call task has already sent its provider request; further instructions cannot be applied.");
+      }
       this.assertTimestampAtOrAfterCurrentAttempt(current, requestedAtMs, "Steer");
       if (current.lease === null || current.lease.expiresAtMs <= operationNow) casRejected("Steer lost its live lease fence.");
       const steerVersion = current.steerVersion + 1;
@@ -2106,6 +2137,7 @@ export class AsyncTaskStore {
       used: validatedUsage.used,
       reserved: validatedUsage.reserved,
       reservations: validatedUsage.reservations.filter((entry) => entry.reservationId !== validationReservation.reservationId),
+      ...(validatedUsage.estimated === undefined ? {} : { estimated: validatedUsage.estimated }),
     };
     const state = { budget, usage, version: positiveInteger(row.version, "budget version") };
     assertNoKnownSensitiveValue(state, this.sensitiveValues(), "Persisted budget state");
@@ -2166,6 +2198,7 @@ export class AsyncTaskStore {
     actual: SubagentBudgetUsage["used"],
     fenceValue: AsyncTaskBudgetLeaseFence,
     updatedAtMsValue = this.now(),
+    estimatedValue?: { readonly inputTokens?: number; readonly outputTokens?: number },
   ): AsyncTaskBudgetState {
     this.ensureOpen();
     const taskId = identifier(taskIdValue, "taskId");
@@ -2180,7 +2213,7 @@ export class AsyncTaskStore {
       const current = this.getBudgetState(taskId);
       if (current === null) invalid("Task budget state does not exist.");
       if (current.version !== expectedVersion) casRejected("Budget version is stale.");
-      const usage = reconcileBudgetReservation(current.usage, reservationId, actual);
+      const usage = reconcileBudgetReservation(current.usage, reservationId, actual, estimatedValue);
       const nextVersion = expectedVersion + 1;
       const changed = this.db.prepare(`
         UPDATE async_task_budget_usage SET usage_json = ?, version = ?, updated_at_ms = ?
@@ -2210,12 +2243,35 @@ export class AsyncTaskStore {
     this.ensureOpen();
     const parsedLimit = positiveInteger(limit, "projection limit");
     const operation = this.db.transaction(() => {
-      const events = this.db.prepare<unknown[], OutboxRow & { agent_id: string }>(`SELECT o.*, t.agent_id FROM async_task_outbox o JOIN async_tasks t ON t.task_id = o.task_id
-        WHERE o.delivered_at_ms IS NULL ORDER BY o.created_at_ms, o.task_id, o.transition_version, o.outbox_id LIMIT ?`).all(parsedLimit);
+      // Share the source batch across agent/channel streams. An unavailable
+      // subscriber leaves its projection pending; its source events must not
+      // keep another channel or agent behind the same first N outbox rows.
+      const events = this.db.prepare<unknown[], OutboxRow & { agent_id: string; channel: "async-tasks" | "subagents" }>(`WITH pending AS (
+          SELECT o.*, t.agent_id, channels.channel,
+            ROW_NUMBER() OVER (
+              PARTITION BY t.agent_id, channels.channel
+              ORDER BY o.created_at_ms, o.task_id, o.transition_version, o.outbox_id
+            ) AS stream_rank
+          FROM async_task_outbox o
+          JOIN async_tasks t ON t.task_id = o.task_id
+          CROSS JOIN (SELECT 'async-tasks' AS channel UNION ALL SELECT 'subagents') channels
+          LEFT JOIN async_task_projection_outbox p ON p.source_outbox_id = o.outbox_id AND p.channel = channels.channel
+          WHERE o.delivered_at_ms IS NULL AND (p.projection_id IS NULL OR p.delivered_at_ms IS NULL)
+        ), stream_count AS (
+          SELECT COUNT(*) AS count FROM (SELECT 1 FROM pending GROUP BY agent_id, channel)
+        ), ordered AS (
+          SELECT pending.*, ROW_NUMBER() OVER (PARTITION BY stream_rank ORDER BY agent_id, channel) - 1 AS stream_index
+          FROM pending
+        )
+        SELECT ordered.* FROM ordered, stream_count
+        ORDER BY ordered.stream_rank,
+          ((ordered.stream_index + MAX(1, stream_count.count) - (? % MAX(1, stream_count.count))) % MAX(1, stream_count.count))
+        LIMIT ?`).all(this.projectionCursor, parsedLimit);
+      this.projectionCursor = (this.projectionCursor + parsedLimit) % 1_000_000_007;
       const output: AsyncTaskProjectionEnvelope[] = [];
       for (const event of events) {
         const parsed = this.validateOutboxAgainstTask(this.outboxFromRow(event));
-        for (const channel of ["async-tasks", "subagents"] as const) {
+        const channel = event.channel;
           const existing = this.db.prepare<unknown[], ProjectionRow>("SELECT * FROM async_task_projection_outbox WHERE source_outbox_id = ? AND channel = ?").get(event.outbox_id, channel);
           if (existing !== undefined) {
             if (existing.delivered_at_ms === null) output.push(this.projectionFromRow(existing));
@@ -2230,7 +2286,6 @@ export class AsyncTaskStore {
           this.db.prepare(`INSERT INTO async_task_projection_outbox(projection_id, source_outbox_id, agent_id, channel, epoch, sequence, task_id, snapshot_version, kind, payload_json, created_at_ms, delivered_at_ms)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`).run(projectionId, event.outbox_id, event.agent_id, channel, epoch, sequence, event.task_id, event.transition_version, event.wake_kind, event.payload_json, event.created_at_ms);
           output.push({ projectionId, epoch, sequence, agentId: event.agent_id, taskId: event.task_id, snapshotVersion: event.transition_version, channel, kind: parsed.wakeKind, payload: parsed.payload });
-        }
       }
       return output;
     });
@@ -2355,6 +2410,9 @@ export class AsyncTaskStore {
       if (changed.changes !== 1) casRejected("Steer consumption lost its compare-and-swap fence.");
       const attemptChanged = this.db.prepare("UPDATE async_task_attempts SET version = version + 1, lease_version = ? WHERE task_id = ? AND attempt = ? AND lease_owner = ?").run(nextVersion, taskId, attempt, owner);
       if (attemptChanged.changes !== 1) casRejected("Steer consumption could not fence the attempt.");
+      this.insertOutbox(taskId, nextVersion, "task_steer", {
+        status: current.status, attempt, summary: "Instruction included in provider request.", code: null, resultRef: null,
+      }, now);
       return this.requireTask(taskId);
     });
     return operation.immediate();

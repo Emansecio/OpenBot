@@ -29,6 +29,28 @@ export interface WorkspaceQuotaOptions {
   scopes?: Record<string, WorkspaceQuotaOptions>;
 }
 
+export interface WorkspaceQuotaLimit {
+  maxBytes: number;
+  maxFiles: number;
+  maxEntries: number;
+}
+
+export interface WorkspaceQuotaLimitOverride {
+  maxBytes?: number;
+  maxFiles?: number;
+  maxEntries?: number;
+}
+
+/** Persisted, partial per-bot override. Omitted fields retain product defaults. */
+export interface WorkspaceQuotaConfig extends WorkspaceQuotaLimitOverride {
+  folders?: Record<string, WorkspaceQuotaLimitOverride>;
+}
+
+export interface EffectiveWorkspaceQuota {
+  global: WorkspaceQuotaLimit;
+  folders: Record<string, WorkspaceQuotaLimit>;
+}
+
 export interface QuotaReservation {
   commit(): void;
   cancel(): void;
@@ -115,6 +137,22 @@ export class WorkspaceQuota {
   metrics(): Readonly<typeof this.counters> & { activeObservers: number; activeProcesses: number } {
     return { ...this.counters, activeObservers: this.observation === undefined ? 0 : 1,
       activeProcesses: this.observation?.listeners.size ?? 0 };
+  }
+
+  /** Configuration-only snapshot. This never scans the workspace. */
+  limits(): EffectiveWorkspaceQuota {
+    return {
+      global: {
+        maxBytes: this.options.maxBytes,
+        maxFiles: this.options.maxFiles,
+        maxEntries: this.options.maxEntries ?? this.options.maxFiles,
+      },
+      folders: Object.fromEntries(Object.entries(this.scopes).map(([name, limits]) => [name, {
+        maxBytes: limits.maxBytes,
+        maxFiles: limits.maxFiles,
+        maxEntries: limits.maxEntries ?? limits.maxFiles,
+      }])),
+    };
   }
 
   /** One authority per quota, shared by overlapping managed processes. */
@@ -751,3 +789,74 @@ export const DEFAULT_WORKSPACE_QUOTA_SCOPES: Record<string, WorkspaceQuotaOption
   projects: { maxBytes: 1536 * 1024 * 1024, maxFiles: 80_000, maxEntries: 160_000 },
   ".openbot": { maxBytes: 64 * 1024 * 1024, maxFiles: 10_000, maxEntries: 20_000 },
 };
+
+const CONFIGURABLE_QUOTA_FOLDERS = new Set(Object.keys(DEFAULT_WORKSPACE_QUOTA_SCOPES));
+
+const quotaInteger = (value: unknown, field: string): number | undefined => {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error(`config inválida: ${field}`);
+  return value as number;
+};
+
+const normalizeLimitOverride = (value: unknown, field: string): WorkspaceQuotaLimitOverride => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`config inválida: ${field}`);
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !["maxBytes", "maxFiles", "maxEntries"].includes(key))) {
+    throw new Error(`config inválida: ${field}`);
+  }
+  const normalized: WorkspaceQuotaLimitOverride = {};
+  const maxBytes = quotaInteger(record.maxBytes, `${field}.maxBytes`);
+  const maxFiles = quotaInteger(record.maxFiles, `${field}.maxFiles`);
+  const maxEntries = quotaInteger(record.maxEntries, `${field}.maxEntries`);
+  if (maxBytes !== undefined) normalized.maxBytes = maxBytes;
+  if (maxFiles !== undefined) normalized.maxFiles = maxFiles;
+  if (maxEntries !== undefined) normalized.maxEntries = maxEntries;
+  return normalized;
+};
+
+export function normalizeWorkspaceQuotaConfig(value: unknown): WorkspaceQuotaConfig | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("config inválida: agent.workspaceQuota");
+  }
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !["maxBytes", "maxFiles", "maxEntries", "folders"].includes(key))) {
+    throw new Error("config inválida: agent.workspaceQuota");
+  }
+  const normalized = normalizeLimitOverride({
+    ...(record.maxBytes === undefined ? {} : { maxBytes: record.maxBytes }),
+    ...(record.maxFiles === undefined ? {} : { maxFiles: record.maxFiles }),
+    ...(record.maxEntries === undefined ? {} : { maxEntries: record.maxEntries }),
+  }, "agent.workspaceQuota") as WorkspaceQuotaConfig;
+  if (record.folders !== undefined) {
+    if (typeof record.folders !== "object" || record.folders === null || Array.isArray(record.folders)) {
+      throw new Error("config inválida: agent.workspaceQuota.folders");
+    }
+    const folders: Record<string, WorkspaceQuotaLimitOverride> = {};
+    for (const [rawName, limits] of Object.entries(record.folders as Record<string, unknown>)) {
+      const name = rawName.toLowerCase();
+      if (!CONFIGURABLE_QUOTA_FOLDERS.has(name) || folders[name] !== undefined) {
+        throw new Error(`config inválida: agent.workspaceQuota.folders.${rawName}`);
+      }
+      folders[name] = normalizeLimitOverride(limits, `agent.workspaceQuota.folders.${rawName}`);
+    }
+    normalized.folders = folders;
+  }
+  return normalized;
+}
+
+/** Resolves a persisted override into the one complete authority used by files and processes. */
+export function resolveWorkspaceQuota(config?: WorkspaceQuotaConfig): WorkspaceQuotaOptions {
+  const normalized = normalizeWorkspaceQuotaConfig(config);
+  const scopes = Object.fromEntries(Object.entries(DEFAULT_WORKSPACE_QUOTA_SCOPES).map(([name, defaults]) => [name, {
+    ...defaults,
+    ...(normalized?.folders?.[name] ?? {}),
+  }]));
+  return {
+    ...DEFAULT_WORKSPACE_QUOTA,
+    ...(normalized?.maxBytes === undefined ? {} : { maxBytes: normalized.maxBytes }),
+    ...(normalized?.maxFiles === undefined ? {} : { maxFiles: normalized.maxFiles }),
+    ...(normalized?.maxEntries === undefined ? {} : { maxEntries: normalized.maxEntries }),
+    scopes,
+  };
+}

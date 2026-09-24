@@ -112,6 +112,19 @@ const finiteNonNegative = (value: unknown): value is number => (
 );
 const stringValue = (value: unknown): value is string => typeof value === "string";
 const nullableExitCode = (value: unknown): value is number | null => value === null || Number.isInteger(value);
+const validQuotaLimit = (value: unknown): boolean => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const limit = value as Record<string, unknown>;
+  return Number.isSafeInteger(limit.maxBytes) && (limit.maxBytes as number) >= 1 &&
+    Number.isSafeInteger(limit.maxFiles) && (limit.maxFiles as number) >= 1 &&
+    Number.isSafeInteger(limit.maxEntries) && (limit.maxEntries as number) >= 1;
+};
+const validWorkspaceQuota = (value: unknown): boolean => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const quota = value as Record<string, unknown>;
+  if (!validQuotaLimit(quota.global) || typeof quota.folders !== "object" || quota.folders === null || Array.isArray(quota.folders)) return false;
+  return Object.values(quota.folders as Record<string, unknown>).every(validQuotaLimit);
+};
 const validProcessOutput = (value: unknown): boolean => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const result = value as Record<string, unknown>;
@@ -148,7 +161,8 @@ const validSuccess = (result: Record<string, unknown>, request: ExecutionRequest
     return stringValue(result.homeRoot) && Array.isArray(result.sharedFolders) && Array.isArray(result.legacyFolders) &&
       result.sharedFolders.every((entry) => entry !== null && typeof entry === "object" &&
         stringValue(entry.name) && stringValue(entry.path) && ["read", "write"].includes(entry.access)) &&
-      result.legacyFolders.every((entry) => entry !== null && typeof entry === "object" && stringValue(entry.name) && stringValue(entry.path));
+      result.legacyFolders.every((entry) => entry !== null && typeof entry === "object" && stringValue(entry.name) && stringValue(entry.path)) &&
+      validWorkspaceQuota(result.quota);
   case "file.list":
     return Array.isArray(result.entries) && result.entries.every((entry) => (
       typeof entry === "object" && entry !== null && !Array.isArray(entry) &&

@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -21,12 +21,13 @@ vi.mock("node:child_process", async (importOriginal) => {
 
 import { MAX_WHATSAPP_OUTPUT_BYTES, type ExecutionRequest } from "../src/execution/contracts.js";
 import { WhatsappHostBackend, composeWhatsappHostBackend, defaultWacliPath, hostWhatsappEnv, hostWhatsappPath, spawnWhatsappProcess } from "../src/host/whatsapp.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const tempRoots: string[] = [];
+const temp = new TempRoots();
 
-afterEach(() => {
+afterEach(async () => {
   spawnState.calls.splice(0);
-  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 describe("WhatsappHostBackend", () => {
@@ -43,8 +44,7 @@ describe("WhatsappHostBackend", () => {
   });
 
   it("passes the exact doctor spec to the injected runner and disables the host shell", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-wacli-"));
-    tempRoots.push(dir);
+    const dir = temp.make("openbot-wacli-");
     const exe = join(dir, "wacli.exe");
     writeFileSync(exe, "stub");
     const seen: string[][] = [];
@@ -71,7 +71,7 @@ describe("WhatsappHostBackend", () => {
       argv: ["-e", "process.stdout.write('host-runner-ok')"],
       cwd: dir,
       timeoutMs: 2_000,
-    })).resolves.toMatchObject({ stdout: "host-runner-ok", stderr: "", exitCode: 0 });
+    })).resolves.toMatchObject({ stdout: "host-runner-ok", stderr: "", exitCode: 0, exitConfirmed: true });
     expect(spawnState.calls).toHaveLength(1);
     expect(spawnState.calls[0]).toMatchObject({
       executable: process.execPath,
@@ -113,9 +113,49 @@ describe("WhatsappHostBackend", () => {
     expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(MAX_WHATSAPP_OUTPUT_BYTES);
   });
 
+  it("waits for process exit after abort and reports the confirmed terminal state", async () => {
+    const controller = new AbortController();
+    const pending = spawnWhatsappProcess({
+      executable: process.execPath,
+      argv: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: tmpdir(),
+      timeoutMs: 2_000,
+    }, controller.signal);
+    await vi.waitFor(() => expect(spawnState.calls).toHaveLength(1));
+
+    controller.abort();
+
+    await expect(pending).resolves.toMatchObject({
+      aborted: true,
+      exitConfirmed: true,
+    });
+  });
+
+  it("does not rewrite a confirmed successful exit as aborted by a late signal", async () => {
+    const dir = temp.make("openbot-wacli-late-abort-");
+    const exe = join(dir, "wacli.exe");
+    writeFileSync(exe, "stub");
+    const controller = new AbortController();
+    const backend = new WhatsappHostBackend({
+      wacliPath: exe,
+      scriptsDir: dir,
+      runner: {
+        async run() {
+          controller.abort();
+          return { stdout: "ok", stderr: "", exitCode: 0, durationMs: 1, outputLimitExceeded: false, exitConfirmed: true };
+        },
+      },
+    });
+
+    await expect(backend.execute({ operation: "whatsapp", op: "doctor" }, controller.signal)).resolves.toMatchObject({
+      ok: true,
+      operation: "whatsapp",
+      exitCode: 0,
+    });
+  });
+
   it("maps runner output overflow to the stable output_limit error", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-wacli-limit-"));
-    tempRoots.push(dir);
+    const dir = temp.make("openbot-wacli-limit-");
     const exe = join(dir, "wacli.exe");
     writeFileSync(exe, "stub");
     const backend = new WhatsappHostBackend({

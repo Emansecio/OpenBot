@@ -1,25 +1,23 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 
 import { A2AStore, type A2AStoreOptions } from "../src/a2a/store.js";
 import type { A2AEnvelope } from "../src/a2a/contracts.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 type SendInput = Omit<A2AEnvelope, "senderIncarnation" | "recipientIncarnation">;
 
-const roots: string[] = [];
+const temp = new TempRoots();
 const stores = new Set<A2AStore>();
-afterEach(() => {
+afterEach(async () => {
   for (const store of stores) store.close();
   stores.clear();
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 function dbPath(): string {
-  const root = mkdtempSync(join(tmpdir(), "openbot-a2a-store-"));
-  roots.push(root);
+  const root = temp.make("openbot-a2a-store-");
   return join(root, "store.db");
 }
 

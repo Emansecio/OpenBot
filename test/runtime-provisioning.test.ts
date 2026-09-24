@@ -1,6 +1,5 @@
-import { mkdtemp, readFile, readdir, writeFile, rm } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
@@ -22,10 +21,11 @@ import {
   type WslCommandRunner,
 } from "../src/execution/runtime/wsl/provisioner.js";
 import type { RuntimeGuestPackageManifest,RuntimeActivationManifest } from "../src/execution/runtime/wsl/installer.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 class FakeRunner implements WslCommandRunner {
@@ -63,8 +63,7 @@ class AbortDuringImportRunner implements WslCommandRunner {
 
 describe("WSL provisioning boundary", () => {
   it("recovery de ativação restaura archives junto com os manifests", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-provision-activation-archives-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-provision-activation-archives-");
     const layout = await createManagedRuntimeLayout(root);
     const oldCurrent: RuntimeActivationManifest = {
       schemaVersion: 1,
@@ -173,8 +172,7 @@ describe("WSL provisioning boundary", () => {
   });
 
   it("inspeciona WSL e não importa nem inicia a distro pessoal", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-provision-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-provision-");
     const layout = await createManagedRuntimeLayout(root);
     const runner = new FakeRunner();
     runner.responses = [
@@ -189,8 +187,7 @@ describe("WSL provisioning boundary", () => {
   });
 
   it("limpa uma candidata parcial mesmo quando o sinal do chamador foi abortado", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-provision-abort-cleanup-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-provision-abort-cleanup-");
     const layout = await createManagedRuntimeLayout(root);
     const archive = join(layout.staging, "runtime-package.tar");
     await writeFile(archive, "archive");
@@ -214,8 +211,7 @@ describe("WSL provisioning boundary", () => {
   });
 
   it("valida o manifesto do guest antes de importar e verifica o binário no guest", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-provision-guest-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-provision-guest-");
     const layout = await createManagedRuntimeLayout(root);
     const archive = join(layout.staging, "runtime-package.tar");
     await writeFile(archive, "archive");
@@ -261,8 +257,7 @@ describe("WSL provisioning boundary", () => {
   });
 
   it("recusa guest bootado com runtime ou rootfs divergente do manifesto", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-provision-boot-mismatch-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-provision-boot-mismatch-");
     const layout = await createManagedRuntimeLayout(root);
     const archive = join(layout.staging, "runtime-package.tar");
     await writeFile(archive, "archive");
@@ -287,8 +282,7 @@ describe("WSL provisioning boundary", () => {
   });
 
   it("importa somente OpenBotRuntime com archive dentro do staging administrado", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-provision-import-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-provision-import-");
     const layout = await createManagedRuntimeLayout(root);
     const archive = join(layout.staging, "runtime.tar");
     await writeFile(archive, "archive");
@@ -303,8 +297,7 @@ describe("WSL provisioning boundary", () => {
   });
 
   it("recusa digest externo divergente antes de chamar qualquer comando WSL", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-provision-digest-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-provision-digest-");
     const layout = await createManagedRuntimeLayout(root);
     const archive = join(layout.staging, "runtime.tar");
     await writeFile(archive, "archive");
@@ -325,8 +318,7 @@ describe("WSL provisioning boundary", () => {
 
   it("permite override live somente para uma distro OpenBotRuntimeLive e nunca cria candidata separada", async () => {
     vi.stubEnv("OPENBOT_RUNTIME_WSL_LIVE_TEST", "1");
-    const root = await mkdtemp(join(tmpdir(), "openbot-provision-live-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-provision-live-");
     const layout = await createManagedRuntimeLayout(root);
     const archive = join(layout.staging, "runtime.tar");
     await writeFile(archive, "archive");
@@ -364,8 +356,7 @@ describe("WSL provisioning boundary", () => {
   });
 
   it("mantém distro ativa intacta quando a candidata falha no health", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-provision-candidate-failure-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-provision-candidate-failure-");
     const layout = await createManagedRuntimeLayout(root);
     const archive = join(layout.staging, "runtime.tar");
     await writeFile(archive, "archive");
@@ -403,8 +394,7 @@ describe("WSL provisioning boundary", () => {
   });
 
   it("tenta rollback mesmo quando a limpeza da candidata falha", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-provision-candidate-cleanup-failure-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-provision-candidate-cleanup-failure-");
     const layout = await createManagedRuntimeLayout(root);
     const archive = join(layout.staging, "runtime-package.tar");
     await writeFile(archive, "archive");
@@ -444,8 +434,7 @@ describe("WSL provisioning boundary", () => {
   });
 
   it("restaura a versão anterior quando a ativação final falha", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-provision-rollback-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-provision-rollback-");
     const layout = await createManagedRuntimeLayout(root);
     const archive = join(layout.staging, "runtime.tar");
     await writeFile(archive, "new-runtime");
@@ -502,8 +491,7 @@ describe("WSL provisioning boundary", () => {
   });
 
   it("preserva artefatos e journal quando promoção e rollback falham", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-provision-rollback-preserve-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-provision-rollback-preserve-");
     const layout = await createManagedRuntimeLayout(root);
     const archive = join(layout.staging, "runtime.tar");
     await writeFile(archive, "new-runtime");

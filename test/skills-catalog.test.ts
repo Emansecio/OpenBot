@@ -12,16 +12,17 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { SkillCatalog } from "../src/skills/catalog.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const tempRoots: string[] = [];
+const temp = new TempRoots();
 
-afterEach(() => {
-  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+afterEach(async () => {
+  await temp.cleanup();
 });
 
 function root(prefix = "openbot-skills-"): string {
   const path = mkdtempSync(join(tmpdir(), prefix));
-  tempRoots.push(path);
+  temp.track(path);
   return path;
 }
 
@@ -208,7 +209,7 @@ describe("SkillCatalog", () => {
     const rootPath = root();
     skill(rootPath, "safe-id", frontmatter("Safe", "valid"));
     const escaped = join(rootPath, "..", "escape");
-    tempRoots.push(escaped);
+    temp.track(escaped);
     mkdirSync(escaped, { recursive: true });
     const catalog = new SkillCatalog({ roots: [{ path: rootPath, source: "user" }] });
 

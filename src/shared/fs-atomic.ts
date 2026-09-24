@@ -15,6 +15,51 @@ import { mkdir, open, rename, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 
+// Antivírus/indexador do Windows seguram arquivos recém-escritos por instantes;
+// só esses códigos são repetidos, com espera total limitada (~310 ms).
+const TRANSIENT_RENAME_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+const RENAME_RETRY_DELAYS_MS = [10, 20, 40, 80, 160] as const;
+
+function isTransientRenameError(error: unknown, platform: NodeJS.Platform): boolean {
+  return platform === "win32" && TRANSIENT_RENAME_CODES.has((error as NodeJS.ErrnoException | undefined)?.code ?? "");
+}
+
+export async function renameWithRetry(
+  from: string,
+  to: string,
+  options: { rename?: (from: string, to: string) => Promise<void>; platform?: NodeJS.Platform } = {},
+): Promise<void> {
+  const renameFn = options.rename ?? rename;
+  const platform = options.platform ?? process.platform;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await renameFn(from, to);
+      return;
+    } catch (error) {
+      if (attempt >= RENAME_RETRY_DELAYS_MS.length || !isTransientRenameError(error, platform)) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, RENAME_RETRY_DELAYS_MS[attempt]));
+    }
+  }
+}
+
+export function renameWithRetrySync(
+  from: string,
+  to: string,
+  options: { rename?: (from: string, to: string) => void; platform?: NodeJS.Platform } = {},
+): void {
+  const renameFn = options.rename ?? renameSync;
+  const platform = options.platform ?? process.platform;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      renameFn(from, to);
+      return;
+    } catch (error) {
+      if (attempt >= RENAME_RETRY_DELAYS_MS.length || !isTransientRenameError(error, platform)) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RENAME_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
 function fsyncDir(dir: string): void {
   try {
     const fd = openSync(dir, "r");
@@ -46,7 +91,7 @@ export function writeFileAtomicSync(path: string, data: string | Buffer, mode = 
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
-    renameSync(tmp, path);
+    renameWithRetrySync(tmp, path);
     fsyncDir(dirname(path));
   } finally {
     if (fd !== undefined) {
@@ -107,7 +152,7 @@ export async function writeFileAtomic(path: string, data: string | Buffer, mode 
     await handle.sync();
     await handle.close();
     handle = undefined;
-    await rename(tmp, path);
+    await renameWithRetry(tmp, path);
     renamed = true;
     await fsyncDirAsync(dirname(path));
   } finally {

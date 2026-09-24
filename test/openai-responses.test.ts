@@ -142,6 +142,40 @@ describe("OpenAI Responses API — GPT-5.6", () => {
     expect(out.result.message?.toolCalls).toHaveLength(1);
   });
 
+  it("emite function calls por output_index mesmo quando terminam fora de ordem", async () => {
+    const out = await run([
+      { type: "response.output_item.added", output_index: 0, item: { type: "function_call", call_id: "call_first", name: "first", arguments: "" } },
+      { type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: "call_second", name: "second", arguments: "" } },
+      { type: "response.output_item.done", output_index: 1, item: { type: "function_call", call_id: "call_second", name: "second", arguments: "{}" } },
+      { type: "response.output_item.done", output_index: 0, item: { type: "function_call", call_id: "call_first", name: "first", arguments: "{}" } },
+      { type: "response.completed", response: { status: "completed" } },
+    ]);
+
+    expect(out.result.message?.toolCalls?.map((call) => call.id)).toEqual(["call_first", "call_second"]);
+  });
+
+  it("rejeita início de function call sem output_index", async () => {
+    const { result } = await run([
+      { type: "response.output_item.added", item: { type: "function_call", call_id: "call_missing_index", name: "clock", arguments: "{}" } },
+      { type: "response.completed", response: { status: "completed" } },
+    ]);
+
+    expect(result.error).toMatchObject({ status: 502 });
+  });
+
+  it("rejeita function call sem output_item.done mesmo quando a response completa", async () => {
+    const out = await run([
+      { type: "response.output_item.added", output_index: 0, item: { type: "function_call", call_id: "call_weather", name: "weather", arguments: "" } },
+      { type: "response.function_call_arguments.delta", output_index: 0, delta: "{\"city\":\"SP\"}" },
+      { type: "response.function_call_arguments.done", output_index: 0, arguments: "{\"city\":\"SP\"}" },
+      { type: "response.completed", response: { status: "completed" } },
+    ]);
+
+    expect(out.result.error).toMatchObject({ kind: "server", status: 502 });
+    expect(out.result.message).toBeUndefined();
+    expect(out.events.some(event => event.type === "tool-call")).toBe(false);
+  });
+
   it("propaga falha terminal e rejeita EOF sem response.completed", async () => {
     const failed = await run([
       { type: "response.failed", response: { status: "failed", error: { message: "boom" } } },

@@ -507,7 +507,13 @@ export class A2AStore {
     return recover.immediate();
   }
 
-  ack(messageId: string, options: { ownerId: string; expectedVersion: number; status: "acked" | "dead"; ackNonce?: string }): A2AMessageRecord {
+  ack(messageId: string, options: {
+    ownerId: string;
+    expectedVersion: number;
+    status: "acked" | "rejected" | "dead";
+    ackNonce?: string;
+    terminalReason?: string;
+  }): A2AMessageRecord {
     this.assertOpen();
     const operation = this.db.transaction(() => {
       const current = this.row(messageId);
@@ -515,7 +521,8 @@ export class A2AStore {
       if (current.status === "acked" && options.status === "acked" && current.ack_nonce === (options.ackNonce ?? null)) return this.toRecord(current);
       if (current.status !== "delivering" || current.lease_owner !== options.ownerId || current.version !== options.expectedVersion) throw new Error("a2a: stale ACK");
       const now = nowValue(this.now);
-      const changed = this.db.prepare("UPDATE a2a_messages SET status = ?, version = version + 1, ack_nonce = ?, ack_at_ms = ?, lease_owner = NULL, lease_expires_at_ms = NULL, terminal_reason = ? WHERE message_id = ? AND status = 'delivering' AND lease_owner = ? AND version = ?").run(options.status, options.ackNonce ?? null, now, options.status === "dead" ? "consumer-dead" : null, messageId, options.ownerId, options.expectedVersion);
+      const terminalReason = options.status === "acked" ? null : (options.terminalReason ?? (options.status === "dead" ? "consumer-dead" : "consumer-rejected"));
+      const changed = this.db.prepare("UPDATE a2a_messages SET status = ?, version = version + 1, ack_nonce = ?, ack_at_ms = ?, lease_owner = NULL, lease_expires_at_ms = NULL, terminal_reason = ? WHERE message_id = ? AND status = 'delivering' AND lease_owner = ? AND version = ?").run(options.status, options.status === "acked" ? options.ackNonce ?? null : null, now, terminalReason, messageId, options.ownerId, options.expectedVersion);
       if (changed.changes !== 1) throw new Error("a2a: stale ACK");
       this.appendTransition(messageId, options.status, now);
       return this.toRecord(this.row(messageId)!);

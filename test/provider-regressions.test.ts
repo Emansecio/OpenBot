@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createServer } from "node:http";
 
 import type { Keystore } from "../src/keystore/index.js";
 import { testCompatConnection } from "../src/providers/local-discover.js";
 import { OpenAiCompatAdapter, validateCompatBaseUrl } from "../src/providers/openai-compat.js";
+import { OpenAiToolCallAccumulator } from "../src/providers/openai-helpers.js";
 import { OpenAiAdapter } from "../src/providers/openai.js";
 import { defaultRegistry, streamChat } from "../src/providers/router.js";
 
@@ -129,6 +131,51 @@ describe("regressões do transporte OpenAI-like", () => {
     expect(result.message).toBeUndefined();
   });
 
+  it.each(["openai", "compat"] as const)("rejeita finish_reason desconhecido em %s", async kind => {
+    const fetchImpl = vi.fn(async () => chunkedResponse([
+      `data: ${JSON.stringify({ choices: [{ delta: { content: "parcial" }, finish_reason: "future_reason" }] })}\n\n`,
+      "data: [DONE]\n\n",
+    ])) as unknown as typeof fetch;
+    const adapter = kind === "openai"
+      ? new OpenAiAdapter({ apiKey: "sk-test", fetchImpl })
+      : new OpenAiCompatAdapter({ baseUrl: "http://127.0.0.1:1234/v1", fetchImpl });
+    defaultRegistry.register(adapter);
+
+    const result = await streamChat(adapter.name, request, undefined, { maxRetries: 0 });
+
+    expect(result.error).toMatchObject({ kind: "server", status: 502, code: "future_reason" });
+    expect(result.message).toBeUndefined();
+  });
+
+  it("valida índice, tipo, ordem, identidade e JSON das tool calls OpenAI-like", () => {
+    const invalid = new OpenAiToolCallAccumulator();
+    expect(() => invalid.add({ function: { name: "clock" } } as never)).toThrow(/índice válido/);
+    expect(() => invalid.add({ index: 0, type: "custom" } as never)).toThrow(/tipo de tool call/);
+
+    const ordered = new OpenAiToolCallAccumulator();
+    ordered.add({ index: 2, id: "call-2", type: "function", function: { name: "second", arguments: "{}" } });
+    ordered.add({ index: 0, id: "call-0", type: "function", function: { name: "first", arguments: "{}" } });
+    expect(ordered.finalizedCalls().map(call => call.id)).toEqual(["call-0", "call-2"]);
+
+    const duplicate = new OpenAiToolCallAccumulator();
+    duplicate.add({ index: 0, id: "same", function: { name: "first", arguments: "{}" } });
+    duplicate.add({ index: 1, id: "same", function: { name: "second", arguments: "{}" } });
+    expect(() => duplicate.finalizedCalls()).toThrow(/duplicado/);
+
+    const openJson = new OpenAiToolCallAccumulator();
+    openJson.add({ index: 0, id: "call", function: { name: "clock", arguments: "{\"tz\":" } });
+    expect(() => openJson.finalizedCalls()).toThrow(/JSON completo/);
+  });
+
+  it("drena frames completos antes de aplicar o limite ao residual SSE", async () => {
+    const padding = "x".repeat(600 * 1024);
+    const frame = `data: ${JSON.stringify({ choices: [], padding })}\n\n`;
+    const fetchImpl = vi.fn(async () => chunkedResponse([frame + frame + "data: [DONE]\n\n"])) as unknown as typeof fetch;
+    const adapter = new OpenAiAdapter({ apiKey: "sk-test", fetchImpl });
+
+    await expect(adapter.streamChat(request, () => undefined)).resolves.toBeUndefined();
+  });
+
   it("propaga Retry-After do HTTP para a política do router", async () => {
     const fetchImpl = vi.fn(async () => new Response(
       JSON.stringify({ error: { message: "rate limit" } }),
@@ -188,20 +235,80 @@ describe("regressões do transporte OpenAI-like", () => {
     expect(cancel).toHaveBeenCalledTimes(1);
   });
 
-  it("classifica timeout interno como network/ETIMEDOUT retryable", async () => {
+  it.each(["openai", "compat"] as const)("timeout de %s continua recuperável manualmente sem repetição automática", async (kind) => {
     const fetchImpl = vi.fn((_input: FetchInput, init?: RequestInit) =>
       new Promise<Response>((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
       })) as unknown as typeof fetch;
-    const adapter = new OpenAiAdapter({ apiKey: "sk-test", fetchImpl, timeoutMs: 10 });
+    const adapter = kind === "openai"
+      ? new OpenAiAdapter({ apiKey: "sk-test", fetchImpl, timeoutMs: 10 })
+      : new OpenAiCompatAdapter({ baseUrl: "http://127.0.0.1:1234/v1", fetchImpl, timeoutMs: 10 });
     defaultRegistry.register(adapter);
 
-    const result = await streamChat(adapter.name, request, undefined, { maxRetries: 0 });
+    const sleep = vi.fn(async () => {});
+    const result = await streamChat(adapter.name, request, undefined, { sleep });
 
     expect(result.aborted).toBe(false);
     expect(result.error).toMatchObject({ kind: "network", code: "ETIMEDOUT", retryable: true });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
   });
+
+  it.each(["openai", "compat"] as const)("não repete %s ao esgotar o prazo absoluto apesar dos heartbeats", async (kind) => {
+    vi.useFakeTimers();
+    const fetchImpl = vi.fn(async () => delayedChunkedResponse(Array(30).fill(": ping\n\n"), 5)) as unknown as typeof fetch;
+    const adapter = kind === "openai"
+      ? new OpenAiAdapter({ apiKey: "sk-test", fetchImpl, timeoutMs: 20, maxDurationMs: 40 })
+      : new OpenAiCompatAdapter({ baseUrl: "http://127.0.0.1:1234/v1", fetchImpl, timeoutMs: 20, maxDurationMs: 40 });
+    defaultRegistry.register(adapter);
+    const sleep = vi.fn(async () => {});
+    try {
+      const pending = streamChat(adapter.name, request, undefined, { sleep });
+      await vi.advanceTimersByTimeAsync(150);
+      expect((await pending).error).toMatchObject({ kind: "network", code: "ETIMEDOUT", retryable: true });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([["openai", false], ["compat", false], ["openai", true], ["compat", true]] as const)(
+    "classifica queda real de socket em %s (texto parcial: %s)", async (kind, partial) => {
+      let calls = 0;
+      const server = createServer((req, res) => {
+        req.resume();
+        calls += 1;
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        if (calls > 1) {
+          res.end('data: {"choices":[{"delta":{"content":"recuperado"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+          return;
+        }
+        res.write(partial ? 'data: {"choices":[{"delta":{"content":"parcial"}}]}\n\n' : ": ping\n\n");
+        setTimeout(() => res.destroy(), 30);
+      });
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("fixture address missing");
+        const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+        const adapter = kind === "openai" ? new OpenAiAdapter({ baseUrl, apiKey: "fixture-only" }) : new OpenAiCompatAdapter({ baseUrl });
+        defaultRegistry.register(adapter);
+        const events: string[] = [];
+        const result = await streamChat(adapter.name, request, event => events.push(event.type), { sleep: async () => {} });
+        if (partial) {
+          expect(calls).toBe(1);
+          expect(events).toEqual(["delta", "error"]);
+          expect(result.error).toMatchObject({ kind: "network", code: "UND_ERR_SOCKET", retryable: true });
+        } else {
+          expect(calls).toBe(2);
+          expect(result.error).toBeUndefined();
+          expect(result.message?.content).toBe("recuperado");
+        }
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>(resolve => server.close(() => resolve()));
+      }
+    },
+  );
 
   it.each(["openai", "compat"] as const)("reseta idle timeout a cada chunk no adapter %s", async (kind) => {
     vi.useFakeTimers();

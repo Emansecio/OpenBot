@@ -201,6 +201,7 @@ export const RPC_METHOD_TABLE = new Set<string>([
   "setAgentNotifyOnUpdates",
   "setAgentRuntimeMode",
   "listQuarantinedAgents",
+  "purgeDeletedAgentData",
   "restoreAgentHome",
   "exportAgentHome",
   "importAgentHome",

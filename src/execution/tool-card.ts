@@ -64,6 +64,14 @@ export function stableToolCallId(id: string, name: string, rawArgs: string): str
   return `anon:${(hash >>> 0).toString(16)}`;
 }
 
+/** Deterministic local identity for the nth occurrence of a provider call id. */
+export function occurrenceToolCallId(id: string, name: string, rawArgs: string, occurrence: number): string {
+  const providerId = stableToolCallId(id, name, rawArgs);
+  return occurrence === 0
+    ? providerId
+    : stableToolCallId("", `${name}\0duplicate:${providerId}:${occurrence - 1}`, rawArgs);
+}
+
 /** Local transcript identity; raw provider ids may repeat across turns. */
 export function toolCallLocalId(turnId: string, toolCallId: string): string {
   return `${turnId}\0${toolCallId}`;

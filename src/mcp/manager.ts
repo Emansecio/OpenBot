@@ -190,6 +190,7 @@ interface CachedSession {
   readonly controller: AbortController;
   pending: boolean;
   waiters: number;
+  closing?: Promise<void>;
 }
 
 interface CachedToolList {
@@ -458,7 +459,8 @@ export class McpManager {
       if (entry.agentKey !== key) continue;
       this.sessions.delete(cacheKey);
       entry.controller.abort(new McpAbortedError());
-      void entry.promise.then((session) => this.closeSession(session)).catch(() => {});
+      entry.closing ??= entry.promise.then((session) => this.closeSession(session));
+      void entry.closing.catch(() => {});
     }
     for (const [cacheKey, entry] of this.toolLists) {
       if (entry.agentKey !== key) continue;
@@ -480,7 +482,8 @@ export class McpManager {
       if (entry.serverKey !== key) continue;
       this.sessions.delete(cacheKey);
       entry.controller.abort(new McpAbortedError());
-      void entry.promise.then((session) => this.closeSession(session)).catch(() => {});
+      entry.closing ??= entry.promise.then((session) => this.closeSession(session));
+      void entry.closing.catch(() => {});
     }
   }
 
@@ -642,12 +645,14 @@ export class McpManager {
     }
   }
 
-  private invalidateSession(entry: CachedSession, session: McpClientSession): void {
+  private async invalidateSession(entry: CachedSession, session: McpClientSession): Promise<void> {
     // A replacement/removal may have installed a newer entry while this
-    // operation was in flight. Never evict or close that newer session.
-    if (this.sessions.get(entry.cacheKey) !== entry) return;
-    this.sessions.delete(entry.cacheKey);
-    void this.closeSession(session).catch(() => {});
+    // operation was in flight. Only evict this entry, but require a confirmed
+    // close before an aborted mutating call is reported as drained.
+    if (this.sessions.get(entry.cacheKey) === entry) this.sessions.delete(entry.cacheKey);
+    entry.controller.abort(new McpAbortedError());
+    entry.closing ??= this.closeSession(session);
+    await entry.closing;
   }
 
   private serverFor(serverId: string): McpServerConfig {
@@ -716,7 +721,7 @@ export class McpManager {
           { signal, timeout: pageTimeoutMs, maxTotalTimeout: pageTimeoutMs },
         ), pageTimeoutMs, sourceSignal);
       } catch (error) {
-        if (entry !== undefined && isSessionTransportFailure(error)) this.invalidateSession(entry, session);
+        if (entry !== undefined && isSessionTransportFailure(error)) await this.invalidateSession(entry, session);
         throw sanitizeExternalError(error, "MCP tool listing failed");
       }
       pageCount += 1;
@@ -948,7 +953,9 @@ export class McpManager {
       // still hold the orphaned call; the next caller reconnects instead of
       // reusing the wedged transport. invalidateSession never evicts a newer
       // entry installed concurrently.
-      if (isSessionTransportFailure(error) || error instanceof McpTimeoutError) this.invalidateSession(entry, session);
+      if (isSessionTransportFailure(error) || error instanceof McpTimeoutError || limits.signal?.aborted === true) {
+        await this.invalidateSession(entry, session);
+      }
       throw sanitizeExternalError(error, "MCP tool call failed");
     }
     if (jsonBytes(result) > limits.maxResultBytes) throw new McpResultLimitError();
@@ -1072,10 +1079,11 @@ export class McpManager {
   private async closeSession(session: McpClientSession): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await Promise.race([
-        session.close().catch(() => {}),
-        new Promise<void>((resolve) => { timer = setTimeout(resolve, this.closeTimeoutMs); }),
+      const closed = await Promise.race([
+        session.close().then(() => true, () => false),
+        new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), this.closeTimeoutMs); }),
       ]);
+      if (!closed) throw new McpTimeoutError("MCP session shutdown was not confirmed");
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }

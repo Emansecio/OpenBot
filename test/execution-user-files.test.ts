@@ -38,7 +38,14 @@ describe("classifyAgentPath", () => {
     expect(classifyAgentPath("shared://Documents")).toEqual({ kind: "shared", mount: "Documents", relative: "." });
     expect(classifyAgentPath("shared://documents/note.md")).toEqual({ kind: "shared", mount: "Documents", relative: "note.md" });
     expect(classifyAgentPath("Projects/secret.md")).toEqual({ kind: "home", relative: "Projects\\secret.md" });
+    expect(classifyAgentPath("\\\\server\\share\\folder\\file.txt")).toEqual({
+      kind: "host",
+      root: "\\\\server\\share\\",
+      relative: "folder\\file.txt",
+    });
     expect(() => classifyAgentPath("shared://Documents/../Windows")).toThrow(/outside/i);
+    expect(() => classifyAgentPath("\\\\?\\C:\\Windows")).toThrow(/device paths/i);
+    expect(() => classifyAgentPath("\\\\.\\PhysicalDrive0")).toThrow(/device paths/i);
     expect(isReservedHomeRelative(".openbot/home.json")).toBe(true);
     expect(isReservedHomeRelative("Projects/note.md")).toBe(false);
     expect(agentSharedDownloadRoot("C:\\Users\\User", "agent-a").toLowerCase().endsWith("\\downloads\\openbot\\agent-a\\downloads")).toBe(true);

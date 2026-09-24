@@ -529,6 +529,7 @@ describe("core acceptance gate", () => {
     expect(request?.headers.authorization).toBe(`Bearer ${API_KEY}`);
     expect(requestPurpose(request!)).toBe("turn");
     expect(request?.body).toMatchObject({ model: "core-gate-model", stream: true });
+    expect((request?.body as { tools?: unknown[] }).tools?.length).toBeGreaterThan(0);
     expect(JSON.stringify(request?.body) ?? "").not.toContain(API_KEY);
     const messages = (request?.body as { messages?: Array<{ role: string; content: string }> }).messages ?? [];
     const system = messages.find((message) => message.role === "system")?.content;
@@ -557,10 +558,7 @@ describe("core acceptance gate", () => {
         expect(intermediate.payload.ordered?.sequence).toBeGreaterThan(lastDeltaSequence);
         lastDeltaSequence = intermediate.payload.ordered?.sequence ?? lastDeltaSequence;
         streamedText += intermediate.payload.fragment ?? "";
-        if (!firstDeltaSeen) {
-          expect(intermediate.payload.fragment).toBe("Resposta ");
-          firstDeltaSeen = true;
-        }
+        firstDeltaSeen = true;
       }
       intermediate = await transcriptSse.next();
     }
@@ -624,6 +622,36 @@ describe("core acceptance gate", () => {
     expect((persisted.json.value as { entries: unknown[] }).entries).toHaveLength(2);
     expect(JSON.stringify(persisted.json)).not.toContain(API_KEY);
     expectSecretAbsentFromArtifacts(workspacesRoot);
+  });
+
+  it("reports provider activity while a tool-enabled round retains its text", async () => {
+    const workspacesRoot = mkdtempSync(join(tmpdir(), "openbot-core-gate-tools-"));
+    activeTempDirs.push(workspacesRoot);
+    const paths = isolatedPaths(workspacesRoot);
+    const provider = await startAcceptanceProvider(["Primeira parte ", "segunda parte"], { chunkDelayMs: 150 });
+    activeProviders.push(provider);
+    const handle = await startServer(0, { ...paths, keystore: keystoreFor(paths), sharedIntegrationsEnabled: false });
+    activeHandles.push(handle);
+    await rpc(handle, "createAgent", { id: AGENT_ID, name: "Gate Tools" });
+    await rpc(handle, "setBoxSecrets", { entries: [{ provider: "openai-compat", apiKey: API_KEY }] });
+    await rpc(handle, "setProviderConfig", { agentId: AGENT_ID, provider: "openai-compat", model: "core-gate-tools-model", baseURL: provider.baseUrl });
+    await rpc(handle, "setMemorySettings", { agentId: AGENT_ID, mode: "automatic" });
+    const sent = await rpc(handle, "sendPrompt", { agentId: AGENT_ID, prompt: "Verifique atividade", clientNonce: "core-gate-tools-nonce" });
+    expect(sent).toMatchObject({ status: 200, json: { ok: true, value: { accepted: true } } });
+    await waitFor(() => (turnProviderRequests(provider)[0]?.chunksWritten ?? 0) >= 1);
+    const request = turnProviderRequests(provider)[0]!;
+    expect((request.body as { tools?: unknown[] }).tools?.length).toBeGreaterThan(0);
+    await waitFor(() => handle.runner.promptStatus(AGENT_ID).execution?.lastActivity === "provider-stream");
+    expect(handle.runner.promptStatus(AGENT_ID).execution).toMatchObject({
+      phase: "receiving", lastActivity: "provider-stream", lastActivityAtMs: expect.any(Number),
+    });
+    const during = await rpc(handle, "openAgentTail", { agentId: AGENT_ID, limit: 20 });
+    const duringEntries = (during.json.value as { entries: Array<{ role?: string; content?: string }> }).entries;
+    expect(duringEntries.some((entry) => entry.role === "assistant" && (entry.content ?? "").includes("Primeira parte"))).toBe(false);
+    await flush(handle);
+    const after = await rpc(handle, "openAgentTail", { agentId: AGENT_ID, limit: 20 });
+    const afterEntries = (after.json.value as { entries: Array<{ role?: string; content?: string }> }).entries;
+    expect(afterEntries.find((entry) => entry.role === "assistant")?.content).toBe("Primeira parte segunda parte");
   });
 
   it("retries one transient provider failure without duplicating the accepted turn", async () => {

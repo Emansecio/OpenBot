@@ -3,6 +3,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import net from "node:net";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 
 import {
   defaultDataRoot,
@@ -328,7 +329,7 @@ export async function main(argv = process.argv.slice(2)) {
   return result;
 }
 
-if (resolve(process.argv[1] ?? "") === resolve(new URL(import.meta.url).pathname.replace(/^\/(.):/, "$1:"))) {
+if (resolve(process.argv[1] ?? "") === resolve(fileURLToPath(import.meta.url))) {
   main().catch((error) => {
     console.error(`[shutdown] ${error.message}`);
     process.exitCode = 1;

@@ -84,6 +84,17 @@ describe("file tool translation", () => {
   });
 });
 
+describe("search tools translation", () => {
+  it.each([
+    ["search_files", { paths: ["Documents"], extra: true }],
+    ["search_text", { pattern: "needle", extra: true }],
+  ] as const)("recusa campos extras em %s", (name, args) => {
+    const result = toolCallToExecutionRequest(call(name, args));
+    expect(result.request).toBeUndefined();
+    expect(result.error).toMatch(/unsupported fields.*extra/i);
+  });
+});
+
 describe("browser tools translation", () => {
   it.each([
     ["browser_open", { url: "https://example.com/" }, "browser.open"],

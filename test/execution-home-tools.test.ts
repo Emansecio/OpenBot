@@ -33,7 +33,22 @@ describe("SAFE_HOME_TOOLS", () => {
     });
     expect(file?.function.parameters).toMatchObject({
       properties: { op: { enum: ["list", "stat", "mkdir", "copy", "move", "trash", "restore", "read", "write"] } },
+      oneOf: expect.arrayContaining([
+        expect.objectContaining({ properties: expect.objectContaining({ op: { const: "write" } }), required: ["op", "path", "content"] }),
+        expect.objectContaining({ properties: expect.objectContaining({ op: { const: "restore" } }), required: ["op", "trashId"] }),
+      ]),
     });
+    const whatsapp = SAFE_HOME_TOOLS.find((tool) => tool.function.name === "whatsapp");
+    expect(whatsapp?.function.parameters).toMatchObject({
+      oneOf: expect.arrayContaining([
+        expect.objectContaining({ properties: expect.objectContaining({ op: { const: "send" } }), required: ["op", "chat", "text"] }),
+        expect.objectContaining({ properties: expect.objectContaining({ op: { const: "messages_list" } }), required: ["op", "chat"] }),
+      ]),
+    });
+    for (const name of ["search_files", "search_text"]) {
+      expect(SAFE_HOME_TOOLS.find((tool) => tool.function.name === name)?.function.parameters)
+        .toMatchObject({ additionalProperties: false });
+    }
   });
 
   it("keeps the same browser surface for Developer and adds only process_run", () => {

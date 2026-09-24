@@ -61,7 +61,11 @@ const normalizeFile = (args: Record<string, unknown>): unknown => {
 };
 
 const normalizeSearch = (name: string, args: Record<string, unknown>): unknown => {
-  if (name === "search_files") return { operation: "command.run", command: "search.files", cwd: args.cwd, params: { paths: args.paths } };
+  if (name === "search_files") {
+    exactArgs(args, ["paths", "cwd"]);
+    return { operation: "command.run", command: "search.files", cwd: args.cwd, params: { paths: args.paths } };
+  }
+  exactArgs(args, ["pattern", "mode", "paths", "cwd"]);
   return { operation: "command.run", command: "search.text", cwd: args.cwd, params: { pattern: args.pattern, mode: args.mode, paths: args.paths } };
 };
 

@@ -38,6 +38,7 @@
  * escopo de T9 — não modifica router.ts).
  */
 
+import type { ToolCallResult } from "../shared/contracts.js";
 import type { ProviderAssistantMessage, ProviderChatMessage, ProviderTool, ProviderToolCall } from "./router.js";
 
 /** Categoria da tool do host (subset MVP: "shell" | "file"; outras entram na Fase 2+). */
@@ -257,6 +258,10 @@ export interface ToolResultInput {
   ok: boolean;
   /** Detalhe de erro quando !ok (vira o content do tool-result). */
   error?: string;
+  /** Saída parcial distinta do erro; pode representar efeitos já ocorridos. */
+  partialContent?: string;
+  /** Resultado estruturado preservado para código e operação. */
+  result?: ToolCallResult;
   /** Optional browser frame carried outside the textual tool-result JSON. */
   visual?: { mimeType: "image/png"; dataBase64: string; width: number; height: number };
 }
@@ -267,11 +272,37 @@ export interface ToolResultInput {
  * `{role:"tool", tool_call_id, content}` — o tool-result do próximo turno).
  */
 export function toToolResultMessage(result: ToolResultInput): ProviderChatMessage {
-  let content = result.content;
-  if (!result.ok) {
-    content = result.error !== undefined ? result.error : "erro desconhecido na execução";
-  }
-  return { role: "tool", toolCallId: result.toolCallId, content };
+  if (result.ok) return { role: "tool", toolCallId: result.toolCallId, content: result.content };
+  const error = result.error !== undefined ? result.error : "erro desconhecido na execução";
+  const partialContent = result.partialContent
+    ?? (result.content.length > 0 && result.content !== error ? result.content : undefined);
+  return {
+    role: "tool",
+    toolCallId: result.toolCallId,
+    content: error,
+    toolResult: {
+      ok: false,
+      error,
+      ...(result.result?.code !== undefined ? { code: result.result.code } : {}),
+      ...(result.result?.operation !== undefined ? { operation: result.result.operation } : {}),
+      ...(partialContent !== undefined ? { partialContent } : {}),
+    },
+  };
+}
+
+/** Provider-safe envelope retaining failure status and partial output. */
+export function providerToolResultContent(message: Extract<ProviderChatMessage, { role: "tool" }>): string {
+  const metadata = message.toolResult;
+  if (metadata === undefined) return message.content;
+  return JSON.stringify({
+    openbotToolResult: {
+      ok: false,
+      error: metadata.error,
+      ...(metadata.code !== undefined ? { code: metadata.code } : {}),
+      ...(metadata.operation !== undefined ? { operation: metadata.operation } : {}),
+    },
+    ...(metadata.partialContent !== undefined ? { partialOutput: metadata.partialContent } : {}),
+  });
 }
 
 /** Marker text identifying a browser-capture user message (vs a real user attachment). */

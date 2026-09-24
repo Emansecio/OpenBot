@@ -81,20 +81,22 @@ const pathWithin = (base: string, target: string): boolean => {
 };
 
 async function assertNoLinkInParent(path: string): Promise<void> {
-  const parent = dirname(path);
-  let metadata;
-  try {
-    metadata = await lstat(parent);
-  } catch (error) {
-    if (isMissing(error)) throw new HomeArchiveError("not_found", "Archive parent does not exist.");
-    throw error;
-  }
-  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new HomeArchiveError("unsafe_path", "Archive parent is unsafe.");
-  // A junction/symlink in an ancestor is also rejected. This keeps an
-  // apparently in-root path from redirecting to another volume.
-  const canonical = await import("node:fs/promises").then(({ realpath }) => realpath(parent));
-  if (resolve(canonical).toLowerCase() !== resolve(parent).toLowerCase()) {
-    throw new HomeArchiveError("unsafe_path", "Archive parent contains a symbolic link or junction.");
+  // Inspect every component instead of comparing spellings: Windows 8.3
+  // aliases and long names can identify the same ordinary directory.
+  for (let parent = dirname(resolve(path));;) {
+    let metadata;
+    try {
+      metadata = await lstat(parent);
+    } catch (error) {
+      if (isMissing(error)) throw new HomeArchiveError("not_found", "Archive parent does not exist.");
+      throw error;
+    }
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new HomeArchiveError("unsafe_path", "Archive parent contains a symbolic link or junction.");
+    }
+    const ancestor = dirname(parent);
+    if (ancestor === parent) break;
+    parent = ancestor;
   }
 }
 

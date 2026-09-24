@@ -15,6 +15,7 @@ import type {
   TranscriptStore,
   TurnAttemptPhase,
   TurnAttemptRecord,
+  TurnOutcome,
 } from "../rpc/send.js";
 import { ensureDefaultConversation, migrateOpenBotSchema } from "./schema.js";
 import { SqliteConversationStore } from "../conversations/store.js";
@@ -154,6 +155,7 @@ export interface SqliteTurnCompletionRowSnapshot {
   conversationId: string | null;
   clientNonce: string;
   turnId: string;
+  outcome?: TurnOutcome;
   completedAtMs: number;
 }
 
@@ -183,6 +185,7 @@ type PageRow = EntryRow & {
 };
 
 type PresenceRow = { present?: number };
+type TurnCompletionOutcomeRow = { outcome: TurnOutcome };
 type NonceRow = { nonce: string };
 type ConversationIdRow = { conversation_id: string };
 type InteractionDecisionRow = {
@@ -227,7 +230,7 @@ interface StoreStatements {
   deleteTurnAttempt: Database.Statement;
   deleteAgentTurnAttempts: Database.Statement;
   insertTurnCompletion: Database.Statement;
-  hasTurnCompletion: Database.Statement<unknown[], PresenceRow>;
+  hasTurnCompletion: Database.Statement<unknown[], TurnCompletionOutcomeRow>;
   deleteTurnCompletion: Database.Statement;
   deleteAgentTurnCompletions: Database.Statement;
 }
@@ -319,6 +322,7 @@ type TurnCompletionRow = {
   conversation_id: string | null;
   client_nonce: string;
   turn_id: string;
+  outcome: TurnOutcome;
   completed_at_ms: number;
 };
 
@@ -549,6 +553,15 @@ function parseEntry(payload: string): TranscriptEntry {
     throw new Error("store: transcript entry inválida");
   }
   return normalizeTranscriptEntry(value);
+}
+
+/** Boot reconciliation must not refuse to open over one unreadable row; the row is left untouched. */
+function tryParseEntry(payload: string): TranscriptEntry | undefined {
+  try {
+    return parseEntry(payload);
+  } catch {
+    return undefined;
+  }
 }
 
 function parseMessageEntry(payload: string): Extract<TranscriptEntry, { kind: "message" }> {
@@ -802,11 +815,18 @@ export class SqliteTranscriptStore implements TranscriptStore {
     const entries = this.db.prepare<unknown[], { kind: string; payload_json: string }>("SELECT kind, payload_json FROM transcript_entries WHERE agent_id = ? AND conversation_id = ? ORDER BY sequence_id ASC");
     const insert = this.db.prepare("INSERT INTO transcript_entries (agent_id, conversation_id, entry_id, kind, payload_json, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)");
     const remove = this.db.prepare("DELETE FROM turn_attempts WHERE turn_id = ?");
+    let unreadable = 0;
     this.db.transaction(() => {
       for (const attempt of attempts) {
         const conversationId = conversationIds.get(attempt.turn_id)!;
         const current = entries.all(attempt.agent_id, conversationId);
-        const parsed = current.map((row) => parseEntry(row.payload_json));
+        const parsed: TranscriptEntry[] = [];
+        for (const row of current) {
+          const entry = tryParseEntry(row.payload_json);
+          if (entry === undefined) unreadable += 1;
+          else parsed.push(entry);
+        }
+        const skippedEntries = parsed.length !== current.length;
         const durableEcho = parsed.some((entry) => (
           (entry.kind === "message" && entry.role === "user" && (entry.turnId === attempt.turn_id || entry.clientNonce === attempt.client_nonce)) ||
           (entry.kind === "notice" && entry.type === "retry-attempt" && entry.clientNonce === attempt.client_nonce)
@@ -814,7 +834,8 @@ export class SqliteTranscriptStore implements TranscriptStore {
         const alreadyNoticed = parsed.some((entry) => entry.kind === "notice" && entry.type === "restart-interrupted" && entry.turnId === attempt.turn_id);
         if (durableEcho && !alreadyNoticed) {
           // Failed I/O and process limits do not establish that earlier effects rolled back.
-          const possibleEffects = parsed.some((entry) => entry.kind === "tool-call"
+          // An unreadable row may be a tool call, so its effects cannot be ruled out.
+          const possibleEffects = skippedEntries || parsed.some((entry) => entry.kind === "tool-call"
             && typeof entry.localToolCallId === "string" && entry.localToolCallId.startsWith(`${attempt.turn_id}\0`)
             && (entry.status === "completed" || entry.status === "running"
               || (entry.result?.ok === false && ["aborted", "process_aborted", "process_failed", "io_error", "timed_out", "output_limit", "process_timeout", "process_output_limit"].includes(entry.result.code ?? ""))));
@@ -839,6 +860,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
         remove.run(attempt.turn_id);
       }
     })();
+    if (unreadable > 0) console.warn(`[openbot] store: ${unreadable} transcript entries ilegíveis ignoradas na reconciliação de turnos interrompidos`);
   }
 
   private reconcileInterruptedEntries(): void {
@@ -853,9 +875,14 @@ export class SqliteTranscriptStore implements TranscriptStore {
     `).all();
     if (rows.length === 0) return;
     const update = this.db.prepare("UPDATE transcript_entries SET payload_json = ? WHERE sequence_id = ?");
+    let unreadable = 0;
     this.db.transaction(() => {
       for (const row of rows) {
-        const entry = parseEntry(row.payload_json);
+        const entry = tryParseEntry(row.payload_json);
+        if (entry === undefined) {
+          unreadable += 1;
+          continue;
+        }
         let reconciled: TranscriptEntry;
         if (entry.kind === "message") {
           reconciled = { ...entry, streaming: false, isStreaming: false, completionState: "interrupted" };
@@ -875,6 +902,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
         update.run(JSON.stringify(reconciled), row.sequence_id);
       }
     })();
+    if (unreadable > 0) console.warn(`[openbot] store: ${unreadable} transcript entries ilegíveis mantidas sem reconciliação`);
   }
 
   /**
@@ -1112,8 +1140,8 @@ export class SqliteTranscriptStore implements TranscriptStore {
       deleteTurnAttempt: this.db.prepare("DELETE FROM turn_attempts WHERE agent_id = ? AND turn_id = ?"),
       deleteAgentTurnAttempts: this.db.prepare("DELETE FROM turn_attempts WHERE agent_id = ?"),
       insertTurnCompletion: this.db.prepare(`
-        INSERT OR IGNORE INTO turn_completions (agent_id, conversation_id, client_nonce, turn_id, completed_at_ms)
-        SELECT attempt.agent_id, attempt.conversation_id, attempt.client_nonce, attempt.turn_id, ?
+        INSERT OR IGNORE INTO turn_completions (agent_id, conversation_id, client_nonce, turn_id, outcome, completed_at_ms)
+        SELECT attempt.agent_id, attempt.conversation_id, attempt.client_nonce, attempt.turn_id, ?, ?
         FROM turn_attempts AS attempt
         JOIN accepted_nonces AS accepted
           ON accepted.agent_id = attempt.agent_id
@@ -1122,7 +1150,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
         WHERE attempt.agent_id = ? AND attempt.turn_id = ? AND attempt.client_nonce IS NOT NULL
       `),
       hasTurnCompletion: this.db.prepare(
-        "SELECT 1 AS present FROM turn_completions WHERE agent_id = ? AND conversation_id = ? AND client_nonce = ? LIMIT 1",
+        "SELECT outcome FROM turn_completions WHERE agent_id = ? AND conversation_id = ? AND client_nonce = ? LIMIT 1",
       ),
       deleteTurnCompletion: this.db.prepare(
         "DELETE FROM turn_completions WHERE agent_id = ? AND conversation_id = ? AND client_nonce = ?",
@@ -1137,6 +1165,28 @@ export class SqliteTranscriptStore implements TranscriptStore {
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
     const rows = this.statements.getEntries.all(agentId, resolvedConversationId);
     return this.mergeLive(agentId, resolvedConversationId, rows.map((row) => parseEntry(row.payload_json)));
+  }
+
+  /** Uses idx_transcript_agent_entry; only identity is read, never transcript bodies. */
+  findEntryConversationIds(agentId: string, entryId: string, conversationId?: string): readonly string[] {
+    validateAgentId(agentId);
+    this.ensureOpen();
+    if (!entryId) return [];
+    const rows = this.db.prepare(conversationId === undefined
+      ? "SELECT DISTINCT conversation_id FROM transcript_entries WHERE agent_id = ? AND entry_id = ? AND conversation_id IS NOT NULL LIMIT 2"
+      : "SELECT DISTINCT conversation_id FROM transcript_entries WHERE agent_id = ? AND entry_id = ? AND conversation_id = ? LIMIT 1")
+      .all(...(conversationId === undefined ? [agentId, entryId] : [agentId, entryId, conversationId])) as Array<{ conversation_id: string | null }>;
+    const matches = new Set(rows.map((row) => row.conversation_id).filter((id): id is string => typeof id === "string"));
+    const live = this.liveEntries.get(agentId);
+    if (conversationId === undefined) {
+      for (const [id, entries] of live ?? []) {
+        if (entries.has(entryId)) matches.add(id);
+        if (matches.size > 1) break;
+      }
+    } else if (live?.get(conversationId)?.has(entryId)) {
+      matches.add(conversationId);
+    }
+    return Array.from(matches).slice(0, 2);
   }
 
   append(agentId: string, entries: readonly TranscriptEntry[], conversationId?: string, consumeStagedAttachments = false): void {
@@ -1223,7 +1273,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
   hasPendingAgentDeletion(agentId: string): boolean {
     validateAgentId(agentId);
     this.ensureOpen();
-    return this.db.prepare("SELECT 1 AS present FROM agent_deletion_journal WHERE agent_id = ?")
+    return this.db.prepare("SELECT 1 AS present FROM agent_deletion_journal WHERE agent_id = ? COLLATE NOCASE")
       .get(agentId) !== undefined;
   }
 
@@ -1290,7 +1340,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
         FROM turn_attempts WHERE agent_id = ? ORDER BY started_at_ms ASC, turn_id ASC
       `).all(agentId);
       const turnCompletionRows = this.db.prepare<unknown[], TurnCompletionRow>(`
-        SELECT agent_id, conversation_id, client_nonce, turn_id, completed_at_ms
+        SELECT agent_id, conversation_id, client_nonce, turn_id, outcome, completed_at_ms
         FROM turn_completions WHERE agent_id = ? ORDER BY completed_at_ms ASC, turn_id ASC
       `).all(agentId);
       const resumeCheckpointRows = this.db.prepare<unknown[], ResumeCheckpointRow & { updated_at_ms: number }>(`
@@ -1327,6 +1377,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
           nonce: row.client_nonce,
           ...(row.conversation_id === null ? {} : { conversationId: row.conversation_id }),
           turnId: row.turn_id,
+          outcome: row.outcome,
           completedAtMs: row.completed_at_ms,
         })),
         interactionDecisions,
@@ -1390,6 +1441,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
           conversationId: row.conversation_id,
           clientNonce: row.client_nonce,
           turnId: row.turn_id,
+          outcome: row.outcome,
           completedAtMs: row.completed_at_ms,
         })),
         resumeCheckpoints: resumeCheckpointRows,
@@ -1465,6 +1517,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
       const conversationId = validateBoundConversationId(conversationIds, row.conversationId, "conclusão");
       const nonceKey = `${conversationId}\u0000${row.clientNonce}`;
       if (completionNonces.has(nonceKey) || completionTurnIds.has(row.turnId)) throw new Error("snapshot contém conclusão duplicada");
+      if (row.outcome !== undefined && !["success", "partial", "error", "aborted"].includes(row.outcome)) throw new Error("snapshot contém desfecho inválido");
       completionNonces.add(nonceKey);
       completionTurnIds.add(row.turnId);
     }
@@ -1571,8 +1624,8 @@ export class SqliteTranscriptStore implements TranscriptStore {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertTurnCompletionRow = this.db.prepare(`
-      INSERT INTO turn_completions(agent_id, conversation_id, client_nonce, turn_id, completed_at_ms)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO turn_completions(agent_id, conversation_id, client_nonce, turn_id, outcome, completed_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?)
     `);
     const insertResumeCheckpoint = this.db.prepare(`
       INSERT INTO turn_checkpoints
@@ -1595,8 +1648,8 @@ export class SqliteTranscriptStore implements TranscriptStore {
       VALUES (?, ?, ?, 'kickstart', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertCompletionBinding = this.db.prepare(`
-      INSERT OR IGNORE INTO turn_completions(agent_id, conversation_id, client_nonce, turn_id, completed_at_ms)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO turn_completions(agent_id, conversation_id, client_nonce, turn_id, outcome, completed_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?)
     `);
     const transaction = this.db.transaction((state: TranscriptAgentSnapshot | SqliteTranscriptAgentSnapshot) => {
       const complete = isSqliteTranscriptAgentSnapshot(state);
@@ -1648,7 +1701,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
           insertTurnAttemptRow.run(row.turnId, agentId, row.conversationId, row.clientNonce, row.retryOfClientNonce, row.retryFailureTurnId, row.provider, row.model, row.phase, row.startedAtMs);
         }
         for (const row of state.turnCompletionRows) {
-          insertTurnCompletionRow.run(agentId, row.conversationId, row.clientNonce, row.turnId, row.completedAtMs);
+          insertTurnCompletionRow.run(agentId, row.conversationId, row.clientNonce, row.turnId, row.outcome ?? "success", row.completedAtMs);
         }
         for (const checkpoint of state.resumeCheckpoints) {
           insertResumeCheckpoint.run(
@@ -1725,7 +1778,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
       const now = Date.now();
       for (const nonce of state.acceptedNonces) this.statements.insertNonce.run(agentId, conversationId, nonce, now);
       for (const completion of state.completedNonceBindings ?? []) {
-        insertCompletionBinding.run(agentId, conversationId, completion.nonce, completion.turnId, completion.completedAtMs);
+        insertCompletionBinding.run(agentId, conversationId, completion.nonce, completion.turnId, completion.outcome ?? "success", completion.completedAtMs);
       }
       for (const decision of state.interactionDecisions) {
         this.statements.insertInteractionDecision.run(
@@ -1889,11 +1942,11 @@ export class SqliteTranscriptStore implements TranscriptStore {
     this.statements.updateTurnAttempt.run(phase, agentId, turnId);
   }
 
-  finishTurnAttempt(agentId: string, turnId: string): void {
+  finishTurnAttempt(agentId: string, turnId: string, outcome: TurnOutcome = "success"): void {
     validateAgentId(agentId);
     this.ensureOpen();
     const finish = this.db.transaction(() => {
-      this.statements.insertTurnCompletion.run(Date.now(), agentId, turnId);
+      this.statements.insertTurnCompletion.run(outcome, Date.now(), agentId, turnId);
       this.statements.deleteTurnAttempt.run(agentId, turnId);
     });
     finish();
@@ -2273,7 +2326,14 @@ export class SqliteTranscriptStore implements TranscriptStore {
     this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
     const row = this.statements.hasTurnCompletion.get(agentId, resolvedConversationId, nonce);
-    return row?.present === 1;
+    return row !== undefined;
+  }
+
+  getTurnOutcomeForNonce(agentId: string, nonce: string, conversationId?: string): TurnOutcome | undefined {
+    validateAgentId(agentId);
+    this.ensureOpen();
+    const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
+    return (this.statements.hasTurnCompletion.get(agentId, resolvedConversationId, nonce) as { outcome?: TurnOutcome } | undefined)?.outcome;
   }
 
   forgetAcceptedNonce(agentId: string, nonce: string, conversationId?: string): void {

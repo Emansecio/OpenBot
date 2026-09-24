@@ -1,22 +1,26 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import * as fsp from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ConfigStore } from "../src/config/store.js";
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, rm: vi.fn(actual.rm) };
+});
+import { DEFAULT_WORKSPACE_QUOTA, measureManagedDiskBytes } from "../src/execution/quota.js";
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
-import { AgentLifecycleFence, waitForDeletionDrain } from "../src/rpc/agent-lifecycle.js";
-import { reconcileAgentDeletions } from "../src/rpc/agent-deletion-reconciliation.js";
 import type { RpcHandler } from "../src/server/gateway.js";
-import { SqliteTranscriptStore } from "../src/store/index.js";
+import * as atomic from "../src/shared/fs-atomic.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const handles: ServerHandle[] = [];
-const roots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(handles.splice(0).map((handle) => stopServer(handle)));
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 function rpc(handle: ServerHandle, method: string): RpcHandler {
@@ -41,195 +45,180 @@ function paths(root: string) {
   } as const;
 }
 
-describe("agent lifecycle fence", () => {
-  it("bounds deletion waiting without releasing pending writers", async () => {
-    const fence = new AgentLifecycleFence();
-    let release!: () => void;
-    const pending = new Promise<void>((resolve) => { release = resolve; });
-    const active = fence.run(["pending"], () => pending);
-    const drain = fence.beginDeletion(["pending"]);
-    try {
-      await expect(waitForDeletionDrain(drain, 20)).rejects.toMatchObject({ status: 503 });
-      expect(fence.isDeleting("pending")).toBe(true);
-      expect(() => fence.run(["pending"], () => undefined)).toThrow(/excluído/);
-    } finally {
-      release();
-      await active;
-      await drain;
-      fence.endDeletion(["pending"]);
-    }
-    expect(fence.run(["pending"], () => "ready")).toBe("ready");
+
+describe("agent creation and explicit cleanup", () => {
+  it("discards partial creation before publishing an active home and permits a fresh retry", async () => {
+    const root = temp.make("openbot-create-write-failure-");
+    const handle = await startServer(0, paths(root));
+    handles.push(handle);
+    const write = vi.spyOn(atomic, "writeFileExclusive").mockRejectedValueOnce(
+      Object.assign(new Error("fixture disk full"), { code: "ENOSPC" }),
+    );
+    await expect(rpc(handle, "createAgent")({ id: "partial", name: "Partial" }, context(handle)))
+      .rejects.toThrow("fixture disk full");
+    write.mockRestore();
+    expect(handle.config.snapshot().agents).toEqual([]);
+    expect(existsSync(handle.homes!.pathFor("partial"))).toBe(false);
+    expect(await handle.homes!.listQuarantineMetadata()).toEqual([]);
+    expect(await fsp.readdir(handle.homes!.stagingRoot)).toEqual([]);
+
+    await expect(rpc(handle, "createAgent")({ id: "partial", name: "Retry" }, context(handle)))
+      .resolves.toMatchObject({ agent: { id: "partial", name: "Retry" } });
+    const active = handle.homes!.pathFor("partial");
+    writeFileSync(join(active, "Documents", "keep.txt"), "existing data");
+    vi.spyOn(atomic, "writeFileExclusive").mockRejectedValueOnce(new Error("existing welcome unavailable"));
+    await expect(handle.homes!.ensure("partial")).rejects.toThrow("existing welcome unavailable");
+    expect(readFileSync(join(active, "Documents", "keep.txt"), "utf8")).toBe("existing data");
+    expect(await handle.homes!.listQuarantineMetadata()).toEqual([]);
   });
-  it("closes admission before draining an already-running mutation", async () => {
-    const fence = new AgentLifecycleFence();
+
+  it("deletes and rolls back a home above the default inventory quota", async () => {
+    const root = temp.make("openbot-delete-large-home-");
+    const handle = await startServer(0, paths(root));
+    handles.push(handle);
+    // Scale the production 2 GiB default down without allocating a large file.
+    const originalLimit = DEFAULT_WORKSPACE_QUOTA.maxBytes;
+    DEFAULT_WORKSPACE_QUOTA.maxBytes = 128 * 1024;
+    try {
+      await rpc(handle, "createAgent")({ id: "large-home", name: "Large", workspaceQuota: { maxBytes: 512 * 1024 } }, context(handle));
+      const file = join(handle.homes!.pathFor("large-home"), "Documents", "data.bin");
+      const bytes = Buffer.alloc(256 * 1024, 42);
+      writeFileSync(file, bytes);
+      const clear = handle.store.clear.bind(handle.store);
+      vi.spyOn(handle.store, "clear").mockImplementationOnce((id) => { clear(id); throw new Error("fixture cleanup failure"); });
+      await expect(rpc(handle, "deleteAgents")({ ids: ["large-home"] }, context(handle))).rejects.toThrow("fixture cleanup failure");
+      expect(handle.config.snapshot().agents.map((agent) => agent.id)).toEqual(["large-home"]);
+      expect(readFileSync(file)).toEqual(bytes);
+      expect(await handle.homes!.listQuarantineMetadata()).toEqual([]);
+
+      await expect(rpc(handle, "deleteAgents")({ ids: ["large-home"] }, context(handle))).resolves.toMatchObject({ ok: true });
+      expect(existsSync(file)).toBe(false);
+      const listed = await rpc(handle, "listQuarantinedAgents")({ includeInventory: false }, context(handle));
+      expect(listed).toEqual([expect.objectContaining({ agentId: "large-home" })]);
+      await expect(rpc(handle, "purgeDeletedAgentData")({ agentId: "large-home", confirm: true }, context(handle)))
+        .resolves.toMatchObject({ ok: true, quarantinesRemoved: 1 });
+    } finally {
+      DEFAULT_WORKSPACE_QUOTA.maxBytes = originalLimit;
+    }
+  });
+
+  it("requires explicit confirmation and preserves live bots and pending recovery", async () => {
+    const root = temp.make("openbot-purge-deleted-");
+    const handle = await startServer(0, paths(root));
+    handles.push(handle);
+    for (const id of ["purge-victim", "purge-survivor"]) {
+      await rpc(handle, "createAgent")({ id, name: id }, context(handle));
+      writeFileSync(join(handle.homes!.pathFor(id), "Documents", "data.bin"), Buffer.alloc(64 * 1024, 42));
+    }
+    const snapshot = await handle.homes!.snapshot("purge-victim");
+    const survivorSnapshot = await handle.homes!.snapshot("purge-survivor");
+    await rpc(handle, "deleteAgents")({ ids: ["purge-victim"] }, context(handle));
+    const bytesBefore = await measureManagedDiskBytes([handle.homes!.root]);
+    const purge = rpc(handle, "purgeDeletedAgentData");
+    await expect(purge({ agentId: "purge-victim" }, context(handle))).rejects.toMatchObject({ status: 400 });
+    await expect(purge({ agentId: "purge-survivor", confirm: true }, context(handle))).rejects.toMatchObject({ status: 409 });
+    handle.store.beginAgentDeletion(["purge-victim"]);
+    await expect(purge({ agentId: "PURGE-VICTIM", confirm: true }, context(handle))).rejects.toMatchObject({ status: 409 });
+    handle.store.completeAgentDeletion(["purge-victim"]);
+
+    await expect(purge({ agentId: "purge-victim", confirm: true }, context(handle)))
+      .resolves.toEqual({ ok: true, agentId: "purge-victim", quarantinesRemoved: 1, snapshotsRemoved: 1 });
+    expect(await handle.homes!.listQuarantineMetadata()).toEqual([]);
+    expect(existsSync(snapshot.path)).toBe(false);
+    expect(existsSync(survivorSnapshot.path)).toBe(true);
+    expect(existsSync(join(handle.homes!.pathFor("purge-survivor"), "Documents", "data.bin"))).toBe(true);
+    expect(await measureManagedDiskBytes([handle.homes!.root])).toBeLessThan(bytesBefore - 128 * 1024);
+    await expect(purge({ agentId: "purge-victim", confirm: true }, context(handle)))
+      .resolves.toMatchObject({ quarantinesRemoved: 0, snapshotsRemoved: 0 });
+  });
+
+  it("retains quarantine identity after partial cleanup and serializes recreation with retry", async () => {
+    const root = temp.make("openbot-purge-retry-");
+    const handle = await startServer(0, paths(root));
+    handles.push(handle);
+    await rpc(handle, "createAgent")({ id: "purge-retry", name: "Purge retry" }, context(handle));
+    await rpc(handle, "deleteAgents")({ ids: ["purge-retry"] }, context(handle));
+    const quarantined = (await handle.homes!.listQuarantineMetadata())[0]!;
+    const realRm = fsp.rm.bind(fsp);
+    const removal = vi.spyOn(fsp, "rm").mockImplementationOnce(async (target) => {
+      expect(String(target)).toBe(quarantined.root);
+      await fsp.unlink(join(quarantined.root, ".openbot", "quarantine.json"));
+      throw Object.assign(new Error("fixture busy directory"), { code: "EPERM" });
+    });
+    const purge = () => rpc(handle, "purgeDeletedAgentData")({ agentId: "purge-retry", confirm: true }, context(handle));
+    await expect(purge()).rejects.toThrow("fixture busy directory");
+    expect(await handle.homes!.listQuarantineMetadata()).toEqual([quarantined]);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    const running = fence.run(["Agent-A"], async () => gate);
-    let deletionSettled = false;
-    const deleting = fence.beginDeletion(["agent-a"]).then(() => { deletionSettled = true; });
-
-    await Promise.resolve();
-    expect(deletionSettled).toBe(false);
-    expect(() => fence.run(["AGENT-A"], () => "late")).toThrow(/sendo excluído/);
-
-    release();
-    await running;
-    await deleting;
-    fence.endDeletion(["agent-a"]);
-    expect(fence.run(["agent-a"], () => "allowed")).toBe("allowed");
-  });
-});
-
-describe("durable agent deletion reconciliation", () => {
-  it("returns a bounded deletion error and preserves the bot while its queue is pending", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-delete-pending-"));
-    roots.push(root);
-    const handle = await startServer(0, paths(root));
-    handles.push(handle);
-    await rpc(handle, "createAgent")({ id: "pending-victim", name: "Pending" }, context(handle));
-    const conversation = handle.conversationStore.ensureDefault("pending-victim");
-    handle.store.append("pending-victim", [{ kind: "message", id: "preserved", role: "user", content: "keep", timestampMs: 1 }], conversation.id);
-    let release!: () => void;
-    const pending = new Promise<void>((resolve) => { release = resolve; });
-    const flush = vi.spyOn(handle.runner, "flush").mockImplementation((id) => id === "pending-victim" ? pending : Promise.resolve());
-    const cancel = vi.spyOn(handle.runner, "cancelPrompt");
+    let removing = false;
+    removal.mockImplementation(async (target, options) => {
+      if (String(target) === quarantined.root) { removing = true; await gate; }
+      return realRm(target, options);
+    });
+    const retry = purge();
+    let recreation: Promise<unknown> | undefined;
     try {
-      await expect(rpc(handle, "deleteAgents")({ ids: ["pending-victim"] }, context(handle))).rejects.toMatchObject({ status: 503 });
-      expect(cancel).toHaveBeenCalledWith("pending-victim");
-      expect(handle.config.snapshot().agents.some(agent => agent.id === "pending-victim")).toBe(true);
-      expect(handle.store.getEntries("pending-victim", conversation.id)).toContainEqual(expect.objectContaining({ id: "preserved" }));
-      expect(() => rpc(handle, "updateAgent")({ agentId: "pending-victim", name: "late" }, context(handle))).toThrow(/excluído/);
-      await expect(rpc(handle, "deleteAgents")({ ids: ["pending-victim"] }, context(handle))).rejects.toMatchObject({ status: 409 });
-      expect(() => rpc(handle, "updateAgent")({ agentId: "pending-victim", name: "late" }, context(handle))).toThrow(/excluído/);
+      await vi.waitFor(() => expect(removing).toBe(true));
+      recreation = Promise.resolve(rpc(handle, "createAgent")({ id: "purge-retry", name: "Fresh" }, context(handle)));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(handle.config.snapshot().agents).toEqual([]);
       release();
-      await vi.waitFor(() => expect(handle.store.pendingAgentDeletions()).toEqual([]));
-      flush.mockRestore();
-      await expect(rpc(handle, "deleteAgents")({ ids: ["pending-victim"] }, context(handle))).resolves.toMatchObject({ ok: true });
+      await expect(retry).resolves.toMatchObject({ quarantinesRemoved: 1 });
+      await expect(recreation).resolves.toMatchObject({ agent: { id: "purge-retry", name: "Fresh" } });
+      expect(existsSync(join(handle.homes!.pathFor("purge-retry"), ".openbot", "home.json"))).toBe(true);
     } finally {
       release();
-      flush.mockRestore();
-      cancel.mockRestore();
-    }
-  }, 15_000);
-  it("mantém journal legado pendente sem capacidade browser e conclui quando ela retorna", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-delete-browser-capability-"));
-    roots.push(root);
-    const config = new ConfigStore({ configPath: join(root, "config.json") });
-    const store = new SqliteTranscriptStore({ path: join(root, "store.db") });
-    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    try {
-      config.update({ agents: [{ id: "legacy-browser-victim", name: "Legacy browser victim", avatarId: "legacy-browser-victim" }] });
-      store.beginAgentDeletion(["legacy-browser-victim"], 10);
-      config.update({ agents: [] });
-
-      const pending = await reconcileAgentDeletions({ config, store });
-
-      expect(pending.completed).toEqual([]);
-      expect(store.pendingAgentDeletions()).toEqual([
-        { agentId: "legacy-browser-victim", startedAtMs: 10 },
-      ]);
-      expect(warning).toHaveBeenCalledWith(expect.stringContaining("browser purge capability unavailable"));
-
-      const purge = vi.fn(async () => undefined);
-      const completed = await reconcileAgentDeletions({
-        config,
-        store,
-        browserLifecycle: { purgeAgent: purge },
-      });
-
-      expect(completed.completed).toEqual(["legacy-browser-victim"]);
-      expect(purge).toHaveBeenCalledOnce();
-      expect(store.pendingAgentDeletions()).toEqual([]);
-    } finally {
-      warning.mockRestore();
-      store.close();
-      config.close();
+      await Promise.allSettled([retry, recreation]);
+      removal.mockRestore();
     }
   });
 
-  it("completes normal deletion only after scoped secrets and staging are purged", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-delete-commit-"));
-    roots.push(root);
-    const handle = await startServer(0, paths(root));
+  it("aborts deleted bots' reflection requests before post-commit purges finish", async () => {
+    const root = temp.make("openbot-delete-reflection-");
+    let releasePurge!: () => void;
+    const purgeGate = new Promise<void>((resolve) => { releasePurge = resolve; });
+    const handle = await startServer(0, { ...paths(root), browserLifecycle: {
+      teardownAgent: async () => undefined, purgeAgent: async () => purgeGate,
+    } });
     handles.push(handle);
-    await rpc(handle, "createAgent")({ id: "delete-victim", name: "Delete Victim" }, context(handle));
-    await handle.keystore.upsert("xai", "delete-secret", "delete-victim");
-    const staged = await handle.attachmentStaging.stageBytes("delete-victim", {
-      filename: "delete.txt",
-      bytes: Buffer.from("delete bytes"),
+    const signals: AbortSignal[] = [];
+    let nextStarted = false;
+    handle.registry.register({
+      name: "xai",
+      async streamChat(request, emit) {
+        const input = JSON.parse(request.messages[0]!.content as string) as { agentId: string };
+        if (input.agentId === "reflection-next") nextStarted = true;
+        else {
+          const signal = request.signal!;
+          signals.push(signal);
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        }
+        emit({ type: "delta", delta: '{"operations":[]}' });
+      },
     });
-
-    await expect(rpc(handle, "deleteAgents")({ ids: ["delete-victim"] }, context(handle)))
-      .resolves.toEqual({ ok: true, ids: ["delete-victim"] });
-
-    expect(handle.store.pendingAgentDeletions()).toEqual([]);
-    await expect(handle.keystore.reveal("xai", "delete-victim")).resolves.toBeNull();
-    expect(handle.attachmentStaging.get("delete-victim", staged.id)).toBeNull();
-    expect(existsSync(staged.storedPath)).toBe(false);
-  });
-
-  it("purges transcript, staged bytes, and scoped secrets before allowing id reuse", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-delete-reconcile-"));
-    roots.push(root);
-    const options = paths(root);
-    const first = await startServer(0, options);
-    handles.push(first);
-    await rpc(first, "createAgent")({ id: "crash-victim", name: "Crash Victim" }, context(first));
-    const conversation = first.conversationStore.ensureDefault("crash-victim");
-    first.store.append("crash-victim", [{
-      kind: "message",
-      id: "before-crash",
-      role: "user",
-      content: "must not be inherited",
-      timestampMs: 1,
-    }], conversation.id);
-    await first.keystore.upsert("xai", "agent-secret", "crash-victim");
-    const staged = await first.attachmentStaging.stageBytes("crash-victim", {
-      filename: "secret.txt",
-      bytes: Buffer.from("staged secret"),
+    for (const id of ["reflection-a", "reflection-b", "reflection-next"]) {
+      await rpc(handle, "createAgent")({ id, name: id, provider: "xai" }, context(handle));
+    }
+    const enqueue = (id: string) => handle.reflectionWorker!.enqueue({
+      agentId: id, conversationId: handle.conversationStore.ensureDefault(id).id,
+      provider: "xai", model: handle.config.snapshot().agents.find((agent) => agent.id === id)!.model!,
+      fromSequenceId: 0, throughSequenceId: 1, entries: [], summaryRequested: false, memoryRequested: true,
     });
-
-    first.store.beginAgentDeletion(["crash-victim"], 10);
-    first.config.update({
-      agents: first.config.snapshot().agents.filter((agent) => agent.id !== "crash-victim"),
-    });
-    handles.pop();
-    await stopServer(first);
-
-    const restarted = await startServer(0, options);
-    handles.push(restarted);
-    expect(restarted.store.pendingAgentDeletions()).toEqual([]);
-    expect(restarted.store.getEntries("crash-victim")).toEqual([]);
-    await expect(restarted.keystore.reveal("xai", "crash-victim")).resolves.toBeNull();
-    expect(restarted.attachmentStaging.get("crash-victim", staged.id)).toBeNull();
-    expect(existsSync(staged.storedPath)).toBe(false);
-
-    await expect(rpc(restarted, "createAgent")(
-      { id: "crash-victim", name: "Fresh Victim" },
-      context(restarted),
-    )).resolves.toMatchObject({ agent: { id: "crash-victim" } });
-    expect(restarted.store.getEntries("crash-victim")).toEqual([]);
-  });
-
-  it("cancels an uncommitted journal when roster still owns the agent", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-delete-rollback-"));
-    roots.push(root);
-    const options = paths(root);
-    const first = await startServer(0, options);
-    handles.push(first);
-    await rpc(first, "createAgent")({ id: "rollback-victim", name: "Rollback Victim" }, context(first));
-    const conversation = first.conversationStore.ensureDefault("rollback-victim");
-    first.store.append("rollback-victim", [{
-      kind: "message", id: "preserved", role: "user", content: "preserve me", timestampMs: 1,
-    }], conversation.id);
-    first.store.beginAgentDeletion(["rollback-victim"], 20);
-    handles.pop();
-    await stopServer(first);
-
-    const restarted = await startServer(0, options);
-    handles.push(restarted);
-    expect(restarted.store.pendingAgentDeletions()).toEqual([]);
-    expect(restarted.store.getEntries("rollback-victim", conversation.id))
-      .toContainEqual(expect.objectContaining({ id: "preserved", content: "preserve me" }));
+    enqueue("reflection-a"); enqueue("reflection-b");
+    let deletion: Promise<unknown> | undefined;
+    try {
+      await vi.waitFor(() => expect(signals).toHaveLength(2));
+      deletion = Promise.resolve(rpc(handle, "deleteAgents")({ ids: ["reflection-a", "reflection-b"] }, context(handle)));
+      await vi.waitFor(() => expect(signals.every((signal) => signal.aborted)).toBe(true));
+      enqueue("reflection-next");
+      await vi.waitFor(() => expect(nextStarted).toBe(true));
+      expect(handle.store.memoryStore.listJobs("reflection-a")).toEqual([]);
+      expect(handle.store.memoryStore.listJobs("reflection-b")).toEqual([]);
+      releasePurge();
+      await expect(deletion).resolves.toMatchObject({ ok: true });
+    } finally {
+      releasePurge();
+      await deletion?.catch(() => undefined);
+    }
   });
 });

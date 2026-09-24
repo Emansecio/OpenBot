@@ -1,4 +1,3 @@
-import { rm } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { WslGuestClient } from "../src/execution/runtime/wsl/guest-runner.js";
@@ -9,12 +8,13 @@ import {
 } from "../src/execution/runtime/wsl/guest-users.js";
 import type { RuntimeLease, RuntimeBoot } from "../src/execution/runtime/contracts.js";
 import type { WslCommandResult, WslCommandRunner } from "../src/execution/runtime/wsl/provisioner.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const ok = (stdout = ""): WslCommandResult => ({ exitCode: 0, stdout: Buffer.from(stdout), stderr: Buffer.alloc(0) });
-const managedRoots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
-  await Promise.all(managedRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 describe("linuxUserNameFor", () => {
@@ -201,8 +201,7 @@ describe("WslGuestClient.runProcess guest identity", () => {
     const { mkdtemp, mkdir } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const managedRoot = await mkdtemp(join(tmpdir(), "openbot-guest-ws-"));
-    managedRoots.push(managedRoot);
+    const managedRoot = await temp.makeAsync("openbot-guest-ws-");
     await mkdir(join(managedRoot, "agent-x"), { recursive: true });
     const frames: Array<Record<string, unknown>> = [];
     const runner: WslCommandRunner = {
@@ -265,8 +264,7 @@ describe("WslGuestClient.runProcess guest identity", () => {
     const { mkdtemp, mkdir } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const managedRoot = await mkdtemp(join(tmpdir(), "openbot-guest-ws-fail-"));
-    managedRoots.push(managedRoot);
+    const managedRoot = await temp.makeAsync("openbot-guest-ws-fail-");
     await mkdir(join(managedRoot, "agent-y"), { recursive: true });
     const runner: WslCommandRunner = {
       async run(args) {

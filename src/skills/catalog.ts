@@ -194,6 +194,23 @@ function assertNoLinkComponents(absolutePath: string): string {
   return lastRealPath;
 }
 
+async function assertNoLinkComponentsAsync(absolutePath: string): Promise<string> {
+  let lastRealPath = "";
+  for (const component of pathComponents(absolutePath)) {
+    let stats: Stats;
+    try {
+      stats = await lstatAsync(component);
+      lastRealPath = await realpathAsync(component);
+    } catch {
+      throw new InvalidSkillError("skill path is unavailable");
+    }
+    if (stats.isSymbolicLink() || isReparsePoint(stats) || !samePath(lastRealPath, component)) {
+      throw new InvalidSkillError("skill path contains a symlink, junction, or reparse point");
+    }
+  }
+  return lastRealPath;
+}
+
 function normalizeId(value: string): string | undefined {
   if (!ID_PATTERN.test(value)) return undefined;
   return value.toLowerCase();
@@ -815,7 +832,7 @@ export class SkillCatalog {
       try {
         const [stats, resolved] = await Promise.all([
           lstatAsync(record.absoluteFilePath),
-          realpathAsync(record.absoluteFilePath),
+          assertNoLinkComponentsAsync(record.absoluteFilePath),
         ]);
         if (
           !stats.isSymbolicLink() &&

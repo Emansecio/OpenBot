@@ -236,6 +236,8 @@ export interface SubagentBudgetUsage {
   readonly used: BudgetCounters;
   readonly reserved: BudgetCounters;
   readonly reservations: readonly BudgetReservation[];
+  /** Subset of used token counters charged from estimates, never provider measurements. */
+  readonly estimated?: { readonly inputTokens: number; readonly outputTokens: number };
 }
 
 export interface LimitedTaskResult {

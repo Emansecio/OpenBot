@@ -22,6 +22,7 @@
  */
 
 import http from "node:http";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { lstat, mkdir, readFile, unlink } from "node:fs/promises";
@@ -37,7 +38,8 @@ import { ExecutionDiagnostics } from "./server/execution-diagnostics.js";
 import { ConfigStore, defaultConfigPath, resolveAgentMcpPolicy, resolveAgentSkillPolicy } from "./config/store.js";
 import { createAgentHomeBroker, type LocalExecutionBroker } from "./execution/broker.js";
 import { AgentHomeStore, defaultWorkspacesRoot } from "./execution/home.js";
-import { assertGlobalDiskBudget, measureManagedDiskBytes, type WorkspaceQuotaOptions } from "./execution/quota.js";
+import { WORKSPACE_ACL_STAMP_NAME } from "./execution/home-inventory.js";
+import { assertGlobalDiskBudget, measureManagedDiskBytes, resolveWorkspaceQuota, type WorkspaceQuotaOptions } from "./execution/quota.js";
 import { AgentRuntimeBackend } from "./execution/runtime/agent-backend.js";
 import type { AgentRuntimeManager } from "./execution/runtime/contracts.js";
 import { RuntimeManager } from "./execution/runtime/manager.js";
@@ -261,8 +263,6 @@ function localStateUsesDefaultPath(opts: {
   return usesDefaultWorkspaces || usesDefaultBrowser;
 }
 
-const STATE_ACL_STAMP = ".openbot-acl-v1.json";
-
 async function aclStampKey(root: string, options: OpenBotStateAclOptions | undefined): Promise<string> {
   const configured = typeof options?.currentUser === "function"
     ? await options.currentUser()
@@ -273,7 +273,7 @@ async function aclStampKey(root: string, options: OpenBotStateAclOptions | undef
 }
 
 async function hasValidAclStamp(root: string, expected: string): Promise<boolean> {
-  const path = join(root, STATE_ACL_STAMP);
+  const path = join(root, WORKSPACE_ACL_STAMP_NAME);
   try {
     const metadata = await lstat(path);
     return metadata.isFile() && !metadata.isSymbolicLink() && await readFile(path, "utf8") === expected;
@@ -283,7 +283,7 @@ async function hasValidAclStamp(root: string, expected: string): Promise<boolean
 }
 
 async function replaceAclStamp(root: string, contents: string): Promise<void> {
-  const path = join(root, STATE_ACL_STAMP);
+  const path = join(root, WORKSPACE_ACL_STAMP_NAME);
   try {
     const metadata = await lstat(path);
     if (!metadata.isFile() || metadata.isSymbolicLink()) {
@@ -635,6 +635,7 @@ export async function startServer(
             const cached = backends.get(agentId);
             if (cached) return cached;
             const pending = homes!.ensure(agentId).then(async (home) => {
+              const configuredQuota = config.snapshot().agents.find((agent) => agent.id === agentId)?.workspaceQuota;
               const runtimeBackend = await AgentRuntimeBackend.create({
                 agentId,
                 homeRoot: home.root,
@@ -642,7 +643,7 @@ export async function startServer(
                 runner: runtimeProcessRunnerFor(agentId, home.root),
                 shareUserFiles,
                 ...(userProfile === undefined ? {} : { userProfile }),
-                ...(opts.workspaceQuota === undefined ? {} : { quota: opts.workspaceQuota }),
+                quota: opts.workspaceQuota ?? resolveWorkspaceQuota(configuredQuota),
               });
               workspaceMetrics.set(agentId, () => runtimeBackend.quotaMetrics());
               const withBrowser = browserSessionManager
@@ -925,7 +926,7 @@ export async function startServer(
         epoch: snapshot.epoch,
         sequence: snapshot.sequence,
         parentAgentId: snapshot.items[0]?.lineage.parentAgentId ?? agentId,
-        items: projectAsyncTaskListForRenderer(snapshot.items),
+        items: projectAsyncTaskListForRenderer(snapshot.items, (record) => asyncTaskStore.canSteer(record)),
         truncated: snapshot.truncated,
       };
     });
@@ -933,7 +934,7 @@ export async function startServer(
       store: asyncTaskStore,
       agentIds: () => config.snapshot().agents.map((agent) => agent.id),
       providerAdmission,
-      execute: async ({ task, objective, grant, signal, runProvider, runEffect, authorize }) => {
+      execute: async ({ task, objective, grant, signal, runProvider, runEffect, authorize, consumeSteer }) => {
         if (grant.kind !== "provider") {
           const command = parseAsyncTaskCommandV1(objective, grant.kind);
           const resolveGrantPath = (value: string): string => {
@@ -1043,16 +1044,32 @@ export async function startServer(
         const outputRemaining = budgetState === null
           ? undefined
           : Math.max(1, budgetState.budget.maxOutputTokens - budgetState.usage.used.outputTokens - budgetState.usage.reserved.outputTokens);
+        const system = "You are a bounded depth-1 OpenBot subagent.";
+        let providerRequestText = `${system}\n${objective}`;
         // The grant binds the logical provider; its adapter resolves the actual
         // OAuth or API-key credential, just as it does for foreground turns.
         const streamed = await runProvider(
           { kind: "provider", adapter: inference.provider, model: inference.model, credential },
-          () => streamChat(inference.provider, {
-            model: inference.model, reasoningEffort: inference.reasoningEffort, purpose: "async-task", system: "You are a bounded depth-1 OpenBot subagent.",
-            modelResolution: inference.modelResolution,
-            sessionId: createHash("sha256").update(JSON.stringify([task.agentId, task.taskId])).digest("hex"),
-            messages: [{ role: "user", content: objective }], signal, maxTokens: outputRemaining,
-          }, undefined, { registry, maxRetries: 0, agentId: task.agentId }),
+          () => {
+            const steer = consumeSteer();
+            const messages = steer === null
+              ? [{ role: "user" as const, content: objective }]
+              : [{ role: "user" as const, content: objective }, { role: "user" as const, content: `Additional instruction: ${steer}` }];
+            providerRequestText = `${system}\n${messages.map((message) => message.content).join("\n")}`;
+            return streamChat(inference.provider, {
+              model: inference.model, reasoningEffort: inference.reasoningEffort, purpose: "async-task", system,
+              modelResolution: inference.modelResolution,
+              sessionId: createHash("sha256").update(JSON.stringify([task.agentId, task.taskId])).digest("hex"),
+              messages, signal, maxTokens: outputRemaining,
+            }, undefined, { registry, maxRetries: 0, agentId: task.agentId });
+          },
+          {
+            requestText: () => providerRequestText,
+            usage: (result) => {
+              const reported = result.attempts?.at(-1)?.usage;
+              return { inputTokens: reported?.inputTokens, outputTokens: reported?.outputTokens };
+            },
+          },
         );
         if (streamed.aborted || streamed.error || streamed.message === undefined) throw streamed.error ?? new Error("Subagent provider returned no message.");
         return { result: streamed.message.content };
@@ -1075,7 +1092,9 @@ export async function startServer(
           kind: "notice" as const,
           id: `memory-reflection-dead:${notice.jobId}`,
           type: "memory-reflection-failed",
-          text: `A gravação de memória desta conversa falhou após várias tentativas (provedor ${notice.provider}, modelo ${notice.model}). Verifique a conexão da conta nas configurações.`,
+          text: notice.error.code === "reflection_input_too_large"
+            ? "Uma entrada excede o limite de compactação. O histórico foi preservado, mas este trecho não pôde ser resumido."
+            : `A gravação de memória desta conversa falhou após várias tentativas (provedor ${notice.provider}, modelo ${notice.model}). Verifique a conexão da conta nas configurações.`,
           level: "error" as const,
           retryable: false,
         };
@@ -1107,7 +1126,11 @@ export async function startServer(
         const storedSummary = store.memoryStore.getSummary(job.agentId, job.conversationId);
         const currentSummary = store.memoryStore.getSummary(job.agentId, job.conversationId, true);
         const forgotten = store.memoryStore.getForgottenSourceIds(job.agentId, job.conversationId);
-        const rangeFrom = storedSummary && !currentSummary ? 0 : job.fromSequenceId;
+        // A rebuild can start before the job cursor. Once its first batch is
+        // saved, continue from that summary instead of rereading the prefix.
+        const rangeFrom = job.summaryRequested
+          ? Math.min(job.fromSequenceId, (currentSummary?.throughSequenceId ?? -1) + 1)
+          : job.fromSequenceId;
         const rows = (readRangeWithSeq !== undefined
           ? readRangeWithSeq(job.agentId, rangeFrom, job.throughSequenceId, job.conversationId)
           : readRange!(job.agentId, rangeFrom, job.throughSequenceId, job.conversationId).map((entry) => ({ sequenceId: null, entry })))
@@ -1124,7 +1147,7 @@ export async function startServer(
           reasoningEffort: job.reasoningEffort,
           modelResolution: [...entries].reverse().map(entry => entry as { kind?: string; role?: string; provider?: string; model?: string; modelResolution?: ModelResolution })
             .find(entry => entry.kind === "message" && entry.role === "user" && entry.provider === job.provider && entry.model === job.model)?.modelResolution,
-          fromSequenceId: job.fromSequenceId,
+          fromSequenceId: rangeFrom,
           throughSequenceId: job.throughSequenceId,
           summaryRequested: job.summaryRequested,
           memoryRequested: job.memoryRequested,
@@ -1344,27 +1367,18 @@ export async function startServer(
     const reactionStore = new ReactionStore({
       db: store.databaseForSharedStores(),
       resolveEntry: (agentId, entryId, conversationId) => {
-        let conversation: string | undefined = conversationId;
-        if (conversation === undefined) {
-          conversation = conversationStore?.getActive(agentId)?.id;
-        }
-        const target = conversation ?? (conversationStore ? conversationStore.ensureDefault(agentId).id : undefined);
-        if (target === undefined) return false;
+        if (!conversationStore) return false;
+        const matches = store.findEntryConversationIds(agentId, entryId, conversationId);
+        if (matches.length !== 1) return false;
+        const target = matches[0]!;
+        let conversation: { temporary: boolean } | null;
         try {
-          store.validateConversation(agentId, target);
+          conversation = conversationStore.get(agentId, target);
         } catch {
           return false;
         }
-        let temporary = false;
-        try {
-          const items = conversationStore?.list(agentId, { limit: 200 }).items ?? [];
-          temporary = items.some((c) => c.id === target &&  c.temporary);
-        } catch {
-          temporary = false;
-        }
-        if (temporary) return "temporary";
-        const entries = store.getEntries(agentId, target);
-        return entries.some((e) => (e as { id?: string }).id === entryId);
+        if (conversation === null) return false;
+        return conversation.temporary ? "temporary" : { conversationId: target };
       },
     });
     const attachmentStaging = new AttachmentStagingStore({
@@ -1472,6 +1486,7 @@ export async function startServer(
         });
       },
       onDeleteAgentsCommitted: (agentIds) => {
+        for (const agentId of agentIds) reflectionWorker.cancelAgent(agentId);
         disposeAgentBackends?.(agentIds);
         for (const agentId of agentIds) workspaceMetrics.delete(agentId);
         sharedTools?.cleanupDeletedAgents(agentIds);
@@ -1482,6 +1497,10 @@ export async function startServer(
         disposeAgentBackends?.([agentId]);
         workspaceMetrics.delete(agentId);
         pendingAgentHomes.delete(agentId.toLowerCase());
+      },
+      onAgentWorkspaceConfigChanged: (agentId) => {
+        disposeAgentBackends?.([agentId]);
+        workspaceMetrics.delete(agentId);
       },
       assertManagedDiskBudget: homes
         ? async (extraBytes) => {
@@ -1891,6 +1910,26 @@ async function performStopServer(handle: ServerHandle, options: StopServerOption
   if (failures.length > 1) throw new AggregateError(failures, shutdownFailureMessage(failures));
 }
 
+/**
+ * A failed stopServer deliberately leaves dependencies open for the launcher's
+ * tree-kill fallback, but that fallback only reaches descendants while this
+ * process is alive. Browser hosts and MCP stdio servers are not in Job Objects,
+ * so exiting first would orphan them; terminate the whole tree instead.
+ */
+export function terminateOwnProcessTree(
+  run: typeof spawnSync = spawnSync,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (platform !== "win32") return;
+  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? "C:\\Windows";
+  const result = run(join(systemRoot, "System32", "taskkill.exe"), ["/PID", String(process.pid), "/T", "/F"], {
+    stdio: "ignore",
+    windowsHide: true,
+    timeout: 10_000,
+  });
+  if (result.error) console.error("[openbot] falha ao encerrar a árvore de processos:", result.error);
+}
+
 /** Executado apenas quando este arquivo é o entry point (npm start). */
 function main(): void {
   let handle: ServerHandle | null = null;
@@ -1908,6 +1947,7 @@ function main(): void {
         process.exit(0);
       } catch (err) {
         console.error("[openbot] erro ao encerrar:", err);
+        terminateOwnProcessTree();
         process.exit(1);
       }
     })();

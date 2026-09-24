@@ -551,11 +551,30 @@ function activeConversationExistsClause(jobTable = "memory_jobs"): string {
   )`;
 }
 
+interface ProvenanceWalk {
+  /** Highest transcript sequence_id already folded into the taint maps. */
+  through: number;
+  /** False when walked_through could not be published, so appends cannot be trusted. */
+  incremental: boolean;
+  unrestricted: boolean;
+  agents: string[];
+  turns: Map<string, number>;
+  latestForgotten: number;
+}
+
+interface ProvenanceRow { sequence_id: number; conversation_id: string; entry_id: string; kind: string; role: string | null; sources: string | null }
+
+const provenanceKey = (conversation: string, entry: string) => `${conversation}\0${entry}`;
+
 export class SqliteMemoryStore implements MemoryStore {
   private forgottenSourceCache?: {
-    stamp: string;
+    version: number;
+    dataVersion: number;
+    base: number;
+    rewriteEpoch: number;
     entries: Map<string, { conversationId: string; entryId: string; sequenceId: number; at: number }>;
     sourceTime: (source: MemoryContextSource) => number;
+    walk?: ProvenanceWalk;
   };
   private readonly db: Database.Database;
   private readonly ownsDatabase: boolean;
@@ -1152,30 +1171,59 @@ export class SqliteMemoryStore implements MemoryStore {
     // connection. data_version still catches writes from another connection.
     const marker = this.db.prepare<[], { version: number }>("SELECT version FROM memory_provenance_state WHERE id = 1").get();
     if (marker === undefined) throw new Error("memory provenance marker ausente");
-    const stamp = `${marker.version}:${String(this.db.pragma('data_version', { simple: true }))}`;
-    if (this.forgottenSourceCache?.stamp === stamp) return this.forgottenSourceCache;
+    const transcriptState = this.db.prepare<[], { transcript_bumps: number; rewrite_epoch: number }>("SELECT transcript_bumps, rewrite_epoch FROM memory_provenance_transcript_state WHERE id = 1").get();
+    if (transcriptState === undefined) throw new Error("memory provenance transcript marker ausente");
+    const dataVersion = Number(this.db.pragma("data_version", { simple: true }));
+    const cached = this.forgottenSourceCache;
+    if (cached?.version === marker.version && cached.dataVersion === dataVersion) return cached;
+    const base = marker.version - transcriptState.transcript_bumps;
+    if (cached !== undefined && cached.base === base && cached.rewriteEpoch === transcriptState.rewrite_epoch) {
+      // Only rows after the walked range changed. Without forgotten memories
+      // nothing can be tainted; otherwise fold in just the appended rows.
+      if (cached.walk === undefined) {
+        cached.version = marker.version;
+        cached.dataVersion = dataVersion;
+        return cached;
+      }
+      if (cached.walk.incremental) {
+        // Publish before reading: a rewrite of a row up to `through` that
+        // commits after this point bumps the epoch and forces the next walk.
+        const through = this.publishProvenanceWalk();
+        if (through !== undefined && this.provenanceRewriteEpoch() === cached.rewriteEpoch) {
+          this.walkProvenance(cached.walk, cached.entries, cached.sourceTime, this.provenanceRows(cached.walk, cached.walk.through, through));
+          cached.walk.through = through;
+          cached.version = marker.version;
+          cached.dataVersion = dataVersion;
+          return cached;
+        }
+      }
+    }
     const memories = new Map<string, number>();
     const entries = new Map<string, { conversationId: string; entryId: string; sequenceId: number; at: number }>();
-    const key = (conversation: string, entry: string) => `${conversation}\0${entry}`;
-    const rows = this.db.prepare<unknown[], { snapshot_json: string; forgotten_at: number; agent_id: string }>(`
+    const key = provenanceKey;
+    let walk: ProvenanceWalk | undefined;
+    const rows = this.db.prepare<unknown[], { memory_id: string; snapshot_json: string; forgotten_at: number; agent_id: string }>(`
       WITH RECURSIVE forgotten(id, forgotten_at, agent_id) AS (
         SELECT id, updated_at_ms, agent_id FROM agent_memories
         WHERE status = 'forgotten'
         UNION
         SELECT m.id, f.forgotten_at, m.agent_id FROM agent_memories m JOIN forgotten f ON m.superseded_by = f.id
       )
-      SELECT r.snapshot_json, f.forgotten_at, f.agent_id FROM forgotten f JOIN memory_revisions r ON r.memory_id = f.id
+      SELECT r.memory_id, r.snapshot_json, f.forgotten_at, f.agent_id FROM forgotten f JOIN memory_revisions r ON r.memory_id = f.id
     `).all();
     // A memory can only be cited in context by its owner agent; a shared-profile
     // memory may appear in any agent's context, so it taints every transcript.
     const taintAgents = new Set<string>();
     for (const row of rows) taintAgents.add(row.agent_id);
     for (const row of rows) {
-      const snapshot = JSON.parse(row.snapshot_json) as Memory;
-      memories.set(snapshot.id, Math.max(memories.get(snapshot.id) ?? -1, row.forgotten_at));
+      memories.set(row.memory_id, Math.max(memories.get(row.memory_id) ?? -1, row.forgotten_at));
+      // An unreadable revision still keeps its memory forgotten; only its
+      // source refs are unknown, and other revisions usually carry them too.
+      const snapshot = parseJson(row.snapshot_json) as Partial<Memory> | null;
+      if (snapshot === null || !Array.isArray(snapshot.sourceEntryIds)) continue;
       for (const source of snapshot.sourceEntryIds) {
-        const ref = typeof source === 'string' ? { conversationId: snapshot.sourceConversationId, entryId: source } : source;
-        if (ref.conversationId === null) continue;
+        const ref = typeof source === 'string' ? { conversationId: snapshot.sourceConversationId ?? null, entryId: source } : source;
+        if (ref === null || typeof ref !== "object" || typeof ref.conversationId !== "string" || typeof ref.entryId !== "string") continue;
         entries.set(key(ref.conversationId, ref.entryId), { ...ref, conversationId: ref.conversationId, sequenceId: 0, at: Math.max(entries.get(key(ref.conversationId, ref.entryId))?.at ?? -1, row.forgotten_at) });
       }
     }
@@ -1224,37 +1272,77 @@ export class SqliteMemoryStore implements MemoryStore {
           if (unrestricted) break;
         }
       }
-      const transcript = unrestricted
-        ? this.db.prepare<unknown[], { sequence_id: number; conversation_id: string; entry_id: string; kind: string; role: string | null; sources: string | null }>(`
-          SELECT sequence_id, conversation_id, entry_id, kind, json_extract(payload_json, '$.role') AS role,
-            json_extract(payload_json, '$.memoryContextSources') AS sources
-          FROM transcript_entries WHERE conversation_id IS NOT NULL ORDER BY sequence_id
-        `).all()
-        : this.db.prepare<string[], { sequence_id: number; conversation_id: string; entry_id: string; kind: string; role: string | null; sources: string | null }>(`
-          SELECT sequence_id, conversation_id, entry_id, kind, json_extract(payload_json, '$.role') AS role,
-            json_extract(payload_json, '$.memoryContextSources') AS sources
-          FROM transcript_entries WHERE conversation_id IS NOT NULL
-            AND agent_id IN (${[...taintAgents].map(() => "?").join(",")})
-          ORDER BY sequence_id
-        `).all(...taintAgents);
-      for (const entry of transcript) {
-        const direct = entries.get(key(entry.conversation_id, entry.entry_id));
-        if (direct) direct.sequenceId = entry.sequence_id;
-      }
-      const turns = new Map<string, number>();
-      for (const entry of transcript) {
-        const entryKey = key(entry.conversation_id, entry.entry_id);
-        const direct = entries.get(entryKey)?.at ?? -1;
-        if (entry.kind === "message" && entry.role === "user") turns.set(entry.conversation_id, direct);
-        const sources = entry.sources === null ? [] : JSON.parse(entry.sources) as MemoryContextSource[];
-        const at = Math.max(direct, turns.get(entry.conversation_id) ?? -1, ...sources.map(sourceTime));
-        if (at < 0) continue;
-        entries.set(entryKey, { conversationId: entry.conversation_id, entryId: entry.entry_id, sequenceId: entry.sequence_id, at });
-        turns.set(entry.conversation_id, at);
-      }
+      walk = {
+        through: 0,
+        incremental: false,
+        unrestricted,
+        agents: [...taintAgents],
+        turns: new Map(),
+        latestForgotten: Math.max(...memories.values()),
+      };
+      const published = this.publishProvenanceWalk();
+      walk.incremental = published !== undefined;
+      walk.through = published ?? this.maxTranscriptSequence();
     }
-    this.forgottenSourceCache = { stamp, entries, sourceTime };
+    const rewriteEpoch = this.provenanceRewriteEpoch();
+    if (walk !== undefined) this.walkProvenance(walk, entries, sourceTime, this.provenanceRows(walk, 0, walk.through));
+    this.forgottenSourceCache = { version: marker.version, dataVersion, base, rewriteEpoch, entries, sourceTime, ...(walk === undefined ? {} : { walk }) };
     return this.forgottenSourceCache;
+  }
+
+  private maxTranscriptSequence(): number {
+    return this.db.prepare<[], { through: number }>("SELECT COALESCE(MAX(sequence_id), 0) AS through FROM transcript_entries").get()!.through;
+  }
+
+  /** Records the walked range so triggers can flag rewrites inside it; undefined when the connection cannot write. */
+  private publishProvenanceWalk(): number | undefined {
+    const through = this.maxTranscriptSequence();
+    try {
+      this.db.prepare("UPDATE memory_provenance_transcript_state SET walked_through = MAX(walked_through, ?) WHERE id = 1").run(through);
+      return through;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private provenanceRewriteEpoch(): number {
+    return this.db.prepare<[], { rewrite_epoch: number }>("SELECT rewrite_epoch FROM memory_provenance_transcript_state WHERE id = 1").get()!.rewrite_epoch;
+  }
+
+  private provenanceRows(walk: ProvenanceWalk, after: number, through: number): ProvenanceRow[] {
+    const select = `
+      SELECT sequence_id, conversation_id, entry_id, kind, json_extract(payload_json, '$.role') AS role,
+        json_extract(payload_json, '$.memoryContextSources') AS sources
+      FROM transcript_entries WHERE conversation_id IS NOT NULL AND sequence_id > ? AND sequence_id <= ?`;
+    return walk.unrestricted
+      ? this.db.prepare<unknown[], ProvenanceRow>(`${select} ORDER BY sequence_id`).all(after, through)
+      : this.db.prepare<unknown[], ProvenanceRow>(`${select} AND agent_id IN (${walk.agents.map(() => "?").join(",")}) ORDER BY sequence_id`).all(after, through, ...walk.agents);
+  }
+
+  /** Dependencies always precede their generated reply, so rows are folded in sequence order. */
+  private walkProvenance(
+    walk: ProvenanceWalk,
+    entries: Map<string, { conversationId: string; entryId: string; sequenceId: number; at: number }>,
+    sourceTime: (source: MemoryContextSource) => number,
+    rows: readonly ProvenanceRow[],
+  ): void {
+    for (const entry of rows) {
+      const direct = entries.get(provenanceKey(entry.conversation_id, entry.entry_id));
+      if (direct) direct.sequenceId = entry.sequence_id;
+    }
+    for (const entry of rows) {
+      const entryKey = provenanceKey(entry.conversation_id, entry.entry_id);
+      const direct = entries.get(entryKey)?.at ?? -1;
+      if (entry.kind === "message" && entry.role === "user") walk.turns.set(entry.conversation_id, direct);
+      // Unreadable provenance cannot prove the entry is clean, so it is tainted as of the latest forget.
+      const parsed = entry.sources === null ? [] : parseJson(entry.sources);
+      const readable = Array.isArray(parsed) && parsed.every((source) => source !== null && typeof source === "object");
+      const sourceAt = readable ? (parsed as MemoryContextSource[]).map(sourceTime) : [walk.latestForgotten];
+      const at = Math.max(direct, walk.turns.get(entry.conversation_id) ?? -1, ...sourceAt);
+      if (at < 0) continue;
+      entries.set(entryKey, { conversationId: entry.conversation_id, entryId: entry.entry_id, sequenceId: entry.sequence_id, at });
+      walk.turns.set(entry.conversation_id, at);
+    }
   }
 
   getForgottenSourceIds(agentId: string, conversationId: string): ReadonlySet<string> {
@@ -1302,7 +1390,12 @@ export class SqliteMemoryStore implements MemoryStore {
         .get(agentId, input.conversationId);
       // A delayed/retried reflection must not overwrite a newer summary with
       // an earlier transcript boundary.
-      if (old !== undefined && input.throughSequenceId < old.through_sequence_id) {
+      // An invalidated summary has no usable coverage. Its first rebuilt batch
+      // may end earlier, but must still match the revision that was examined.
+      const rebuilding = old !== undefined
+        && input.expectedPreviousRevision === old.revision
+        && this.getSummary(agentId!, input.conversationId, true) === null;
+      if (old !== undefined && input.throughSequenceId < old.through_sequence_id && !rebuilding) {
         return this.getSummary(agentId!, input.conversationId)!;
       }
       const actualPreviousRevision = old?.revision ?? 0;
@@ -1909,6 +2002,15 @@ export class SqliteMemoryStore implements MemoryStore {
 
   resetRunningJobs(at = this.nowFn()): number {
     this.ensureOpen();
+    // A second process can open the same SQLite file while the first one is
+    // still alive. Its boot must not steal that process's in-flight jobs.
+    // Store ownership is registered before the memory worker starts; stale
+    // owners are removed during the next store boot, so more than one row is
+    // enough to conservatively defer recovery.
+    const owners = this.db.prepare<unknown[], { count: number }>(
+      "SELECT COUNT(*) AS count FROM runtime_owners",
+    ).get()?.count ?? 0;
+    if (owners > 1) return 0;
     return this.db.prepare("UPDATE memory_jobs SET status = 'pending', next_attempt_at_ms = ?, updated_at_ms = ? WHERE status = 'running'").run(at, at).changes;
   }
 

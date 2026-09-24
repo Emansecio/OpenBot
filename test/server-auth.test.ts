@@ -1,6 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -24,20 +23,20 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 
 import { loadOrCreateGatewayToken, resolveGatewayTokenPath, tokenFromRequest } from "../src/server/auth.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const dirs: string[] = [];
-afterEach(() => {
+const temp = new TempRoots();
+afterEach(async () => {
   fsRace.file = null;
   fsRace.mode = undefined;
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 const request = (headers: IncomingMessage["headers"]): IncomingMessage => ({ headers }) as IncomingMessage;
 
 describe("gateway auth", () => {
   it("cria uma vez e relê o token vencedor", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-auth-"));
-    dirs.push(dir);
+    const dir = temp.make("openbot-auth-");
     const file = join(dir, "gateway.token");
     fsRace.file = file;
     fsRace.winningToken = "token-created-by-competing-process";
@@ -54,8 +53,7 @@ describe("gateway auth", () => {
   });
 
   it("falha quando o arquivo de token existente é vazio", () => {
-    const dir = mkdtempSync(join(tmpdir(), "openbot-auth-empty-"));
-    dirs.push(dir);
+    const dir = temp.make("openbot-auth-empty-");
     const file = join(dir, "gateway.token");
     writeFileSync(file, "\n", "utf8");
     expect(() => loadOrCreateGatewayToken(file)).toThrow(/invalid/i);

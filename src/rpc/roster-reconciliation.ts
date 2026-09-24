@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import type { ConfigStore } from "../config/store.js";
 import { HomeLifecycleError, sanitizeAgentId, type AgentHomeStore, type QuarantineEntryMetadata } from "../execution/home.js";
+import { WORKSPACE_ACL_STAMP_NAME } from "../execution/home-inventory.js";
 
 export interface RosterHomeReconciliationResult {
   /** Homes moved back from quarantine for agents still present in the roster. */
@@ -26,7 +27,6 @@ const isMissing = (error: unknown): boolean => (
 );
 
 const keyOf = (agentId: string): string => agentId.toLowerCase();
-const ACL_STAMP_NAME = ".openbot-acl-v1.json";
 
 const isLocalHomeError = (error: unknown): error is Error => (
   error instanceof HomeLifecycleError && (error.code === "integrity_error" || error.code === "unsafe_path") ||
@@ -141,7 +141,7 @@ async function scanActiveHomes(
   children.sort((left, right) => left.name.localeCompare(right.name));
   const agentIds: string[] = [];
   for (const child of children) {
-    if (child.name === ACL_STAMP_NAME) {
+    if (child.name === WORKSPACE_ACL_STAMP_NAME) {
       if (child.isSymbolicLink() || !child.isFile()) {
         throw new HomeLifecycleError("unsafe_path", "Workspace ACL stamp is unsafe.");
       }

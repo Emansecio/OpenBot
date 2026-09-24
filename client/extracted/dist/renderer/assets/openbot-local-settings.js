@@ -3144,10 +3144,12 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   let cachedComposer = null;
   let optimisticGeneration = false;
   let optimisticAgentId = null;
+  let optimisticConversationId = null;
   let optimisticNonce = null;
   let lastSubmitAction = null;
   let promptStatusRevision = 0;
   let activePromptAgentId = null;
+  let activePromptConversationId = null;
   const busyAgentIds = new Set();
   const cancellingAgentIds = new Set();
   const unknownAgentIds = new Set();
@@ -3155,7 +3157,9 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   let stopAnchorRect = null;
 
   function syncGenerating() {
-    generating = activePromptAgentId !== null && ((optimisticGeneration && optimisticAgentId === activePromptAgentId) || busyAgentIds.has(activePromptAgentId));
+    generating = activePromptAgentId !== null && ((optimisticGeneration && optimisticAgentId === activePromptAgentId
+      && optimisticConversationId !== null && optimisticConversationId === activePromptConversationId)
+      || (busyAgentIds.has(activePromptAgentId) && promptStateForActiveConversation(activePromptAgentId) !== undefined));
   }
 
   function selectedAgentRow() {
@@ -3165,13 +3169,30 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
 
   async function refreshActivePromptAgent() {
     activePromptAgentId = selectedAgentRow()?.getAttribute("data-agent-id") || null;
+    activePromptConversationId = null;
+    if (activePromptAgentId) {
+      try {
+        const active = await desktop()?.agent?.getActiveConversation?.({ agentId: activePromptAgentId });
+        activePromptConversationId = typeof active?.id === "string" && active.id.trim() ? active.id : null;
+      } catch {
+        activePromptConversationId = null;
+      }
+    }
     return activePromptAgentId;
+  }
+
+  function promptStateForActiveConversation(agentId) {
+    const state = promptStates.get(agentId);
+    if (!state || !activePromptConversationId) return undefined;
+    const conversationId = state.conversationId || state.lastTurn?.conversationId;
+    return conversationId === activePromptConversationId ? state : undefined;
   }
 
   function handleAgentSelectionClick(event) {
     const row = event.target?.closest?.(".sand-agent-item[data-agent-id]");
     if (!(row instanceof Element)) return;
     activePromptAgentId = row.getAttribute("data-agent-id") || null;
+    activePromptConversationId = null;
     ensureStop(cachedSendAction);
     // Trocar de bot não pode misturar estados: cada bot mantém o seu próprio
     // estado confirmado e a sua própria consulta de recuperação.
@@ -3218,7 +3239,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     "tool": "ferramenta",
     "reasoning": "raciocínio",
   };
-  const TURN_TERMINAL_LABELS = { success: "Resposta concluída.", aborted: "Turno interrompido.", error: "Falha confirmada." };
+  const TURN_TERMINAL_LABELS = { success: "Resposta concluída.", partial: "Resposta parcial — a tarefa não foi concluída.", aborted: "Turno interrompido.", error: "Falha confirmada." };
   const TURN_STALE_AFTER_MS = 20000;
   let turnStatusTicker = 0;
 
@@ -3231,6 +3252,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   function describeTurnStatus(agentId, state, now) {
     if (!agentId) return "";
     if (unknownAgentIds.has(agentId)) return "Conexão indisponível — o estado pode estar desatualizado.";
+    if (state === undefined) return "";
     if (busyAgentIds.has(agentId)) {
       if (cancellingAgentIds.has(agentId)) return "Cancelamento solicitado — aguardando confirmação do término.";
       const execution = state?.execution;
@@ -3338,7 +3360,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
         if (button.disabled) return;
         button.disabled = true;
         const agentId = await refreshActivePromptAgent();
-        const current = promptStates.get(agentId);
+        const current = promptStateForActiveConversation(agentId);
         try {
           if (!agentId || !current?.turnId || !current?.conversationId) throw new Error("Turno da geração indisponível");
           promptStatusRevision += 1;
@@ -3371,7 +3393,8 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     button.dataset.openbotActiveAgent = activePromptAgentId ?? "";
     button.dataset.openbotBusyAgents = [...busyAgentIds].join(",");
     button.dataset.openbotOptimistic = optimisticGeneration ? "1" : "0";
-    const currentState = promptStates.get(activePromptAgentId);
+    const rawState = promptStates.get(activePromptAgentId);
+    const currentState = promptStateForActiveConversation(activePromptAgentId);
     const shouldHide = !busyAgentIds.has(activePromptAgentId) || !stopAnchorRect || !currentState?.turnId;
     button.hidden = shouldHide;
     button.disabled = cancellingAgentIds.has(activePromptAgentId) || !currentState?.canCancel;
@@ -3394,7 +3417,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     const dock = (liveAction || fallbackComposer)?.closest(".sand-chat-input-dock");
     if (dock && status.parentElement !== dock) dock.prepend(status);
     status.hidden = !status.textContent;
-    renderPromptQueue(dock, activePromptAgentId, currentState);
+    renderPromptQueue(dock, activePromptAgentId, rawState);
   }
 
   async function openQueueRecovery(agentId, item, trigger) {
@@ -3839,6 +3862,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     promptStatusRevision += 1;
     activePromptAgentId = selectedAgentRow()?.getAttribute("data-agent-id") || null;
     optimisticAgentId = activePromptAgentId;
+    optimisticConversationId = activePromptConversationId;
     optimisticNonce = null;
     optimisticGeneration = true;
     lastSendAt = Date.now();

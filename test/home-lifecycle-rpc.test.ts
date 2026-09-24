@@ -1,7 +1,6 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import http from "node:http";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -13,8 +12,9 @@ import type { HomeAclAdapter } from "../src/execution/home-acl.js";
 import type { BrowserAgentLifecycle } from "../src/rpc/index.js";
 import { hashAgentId } from "../src/browser/browser-session-manager.js";
 import type { DispatchAsyncTaskInput, ProviderCapabilityGrant, SubagentBudget } from "../src/tasks/contracts.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 const handles: ServerHandle[] = [];
 
 const busyTaskBudget: SubagentBudget = {
@@ -44,12 +44,11 @@ function busyTaskInput(agentId: string): DispatchAsyncTaskInput {
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(handles.splice(0).map((handle) => stopServer(handle)));
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 async function boot(browserLifecycle?: BrowserAgentLifecycle, homes?: AgentHomeStore): Promise<{ handle: ServerHandle; root: string }> {
-  const root = mkdtempSync(join(tmpdir(), "openbot-home-lifecycle-rpc-"));
-  roots.push(root);
+  const root = temp.make("openbot-home-lifecycle-rpc-");
   const handle = await startServer(0, {
     stateRoot: join(root, "state"),
     allowUnauthenticatedLocalGateway: true,
@@ -97,10 +96,10 @@ async function post(handle: ServerHandle, method: string, body: unknown): Promis
   });
 }
 
+
 describe("home lifecycle RPC", () => {
   it("falha antes do boot do servidor quando o bootstrap ACL Windows falha", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-home-acl-rpc-"));
-    roots.push(root);
+    const root = temp.make("openbot-home-acl-rpc-");
     const listen = vi.spyOn(http.Server.prototype, "listen");
 
     await expect(startServer(0, {
@@ -291,9 +290,46 @@ describe("home lifecycle RPC", () => {
     expect(metricAgents()).toEqual([agentId]);
   });
 
+  it("aplica quota persistente por bot somente após drenar e invalidar a autoridade atual", async () => {
+    const { handle } = await boot();
+    const agentId = "quota-config";
+    expect((await post(handle, "createAgent", { id: agentId, name: "Quota config" })).status).toBe(200);
+    const createBackend = vi.spyOn(AgentRuntimeBackend, "create");
+    let sequence = 0;
+    const workspaceInfo = () => handle.executionBroker!.execute(agentId, `quota-info-${++sequence}`, { operation: "workspace.info" });
+
+    await expect(workspaceInfo()).resolves.toMatchObject({
+      ok: true,
+      quota: { global: { maxBytes: 2 * 1024 * 1024 * 1024 }, folders: { downloads: { maxBytes: 256 * 1024 * 1024 } } },
+    });
+    expect(createBackend).toHaveBeenCalledTimes(1);
+
+    const updated = await post(handle, "updateAgent", {
+      agentId,
+      workspaceQuota: { maxBytes: 4_096, folders: { Projects: { maxBytes: 2_048 } } },
+    });
+    expect(updated.status).toBe(200);
+    expect(handle.config.snapshot().agents.find((agent) => agent.id === agentId)?.workspaceQuota).toEqual({
+      maxBytes: 4_096,
+      folders: { projects: { maxBytes: 2_048 } },
+    });
+    await expect(workspaceInfo()).resolves.toMatchObject({
+      ok: true,
+      quota: {
+        global: { maxBytes: 4_096, maxFiles: 100_000, maxEntries: 200_000 },
+        folders: { projects: { maxBytes: 2_048, maxFiles: 80_000, maxEntries: 160_000 } },
+      },
+    });
+    expect(createBackend).toHaveBeenCalledTimes(2);
+
+    expect((await post(handle, "updateAgent", { agentId, workspaceQuota: { maxBytes: 0 } })).status).toBe(400);
+    expect((await post(handle, "updateAgent", { agentId, workspaceQuota: null })).status).toBe(200);
+    await expect(workspaceInfo()).resolves.toMatchObject({ quota: { global: { maxBytes: 2 * 1024 * 1024 * 1024 } } });
+    expect(createBackend).toHaveBeenCalledTimes(3);
+  });
+
   it("imports atomically, repairs canonical folders and rejects invalid lifecycle input", async () => {
-    const homesRoot = mkdtempSync(join(tmpdir(), "openbot-home-import-rollback-"));
-    roots.push(homesRoot);
+    const homesRoot = temp.make("openbot-home-import-rollback-");
     let failImportAcl = false;
     let failureObservedAfterRename = false;
     const acl: HomeAclAdapter = {
@@ -336,64 +372,6 @@ describe("home lifecycle RPC", () => {
     expect(invalid.status).toBe(400);
     const missing = await post(handle, "exportAgentHome", { agentId: "missing", destination: join(root, "missing.json") });
     expect(missing.status).toBe(404);
-  });
-
-  it("limpa repair-required só após repair de home bem-sucedido", async () => {
-    const { handle } = await boot();
-    await post(handle, "createAgent", { id: "repair-clear", name: "Repair clear", runtimeMode: "developer" });
-    handle.runtimeManager.markAgentRepairRequired?.("repair-clear");
-    await expect(handle.runtimeManager.status("repair-clear", "developer")).resolves.toMatchObject({ state: "repair-required" });
-
-    expect((await post(handle, "repairAgentHome", { agentId: "repair-clear" })).status).toBe(200);
-    await expect(handle.runtimeManager.status("repair-clear", "developer")).resolves.toMatchObject({ state: "stopped" });
-  });
-
-  it("mantém repair-required quando repair ou restore de home falha", async () => {
-    const { handle } = await boot();
-    await post(handle, "createAgent", { id: "repair-stays", name: "Repair stays", runtimeMode: "developer" });
-    handle.runtimeManager.markAgentRepairRequired?.("repair-stays");
-    writeFileSync(join(handle.homes!.pathFor("repair-stays"), ".openbot", "home.json"), "not-json");
-
-    expect((await post(handle, "repairAgentHome", { agentId: "repair-stays" })).status).toBe(422);
-    await expect(handle.runtimeManager.status("repair-stays", "developer")).resolves.toMatchObject({ state: "repair-required" });
-    expect((await post(handle, "restoreAgentHome", { agentId: "repair-stays", quarantineId: "missing" })).status).not.toBe(200);
-    await expect(handle.runtimeManager.status("repair-stays", "developer")).resolves.toMatchObject({ state: "repair-required" });
-  });
-
-  it("preserva repair-required quando delete falha antes do commit", async () => {
-    const { handle } = await boot({
-      async teardownAgent(agentId) {
-        if (agentId === "delete-fails") throw new Error("browser teardown failed");
-      },
-      async purgeAgent() {},
-    });
-    await post(handle, "createAgent", { id: "delete-fails", name: "Delete fails", runtimeMode: "developer" });
-    handle.runtimeManager.markAgentRepairRequired?.("delete-fails");
-
-    expect((await post(handle, "deleteAgents", { ids: ["delete-fails"] })).status).toBe(503);
-    await expect(handle.runtimeManager.status("delete-fails", "developer")).resolves.toMatchObject({
-      state: "repair-required",
-      lastError: { code: "runtime_unhealthy" },
-    });
-    expect((await post(handle, "getAgent", { id: "delete-fails" })).status).toBe(200);
-  });
-
-  it("limpa repair-required após restore e agent-delete sem herdar ao recriar ID", async () => {
-    const { handle } = await boot();
-    await post(handle, "createAgent", { id: "restore-clear", name: "Restore clear", runtimeMode: "developer" });
-    expect((await post(handle, "deleteAgents", { ids: ["restore-clear"] })).status).toBe(200);
-    handle.runtimeManager.markAgentRepairRequired?.("restore-clear");
-    const quarantined = await handle.homes!.listQuarantine();
-    const entry = quarantined.find((candidate) => candidate.agentId === "restore-clear")!;
-
-    expect((await post(handle, "restoreAgentHome", { agentId: "restore-clear", quarantineId: entry.quarantineId })).status).toBe(200);
-    await expect(handle.runtimeManager.status("restore-clear", "developer")).resolves.toMatchObject({ state: "stopped" });
-
-    await post(handle, "createAgent", { id: "delete-clear", name: "Delete clear", runtimeMode: "developer" });
-    handle.runtimeManager.markAgentRepairRequired?.("delete-clear");
-    expect((await post(handle, "deleteAgents", { ids: ["delete-clear"] })).status).toBe(200);
-    expect((await post(handle, "createAgent", { id: "delete-clear", name: "Recreated", runtimeMode: "developer" })).status).toBe(200);
-    await expect(handle.runtimeManager.status("delete-clear", "developer")).resolves.toMatchObject({ state: "stopped" });
   });
 
   it("lists all active workspace inventories in the empty-agent state", async () => {

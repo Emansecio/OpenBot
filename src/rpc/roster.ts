@@ -20,7 +20,7 @@ import {
 import type { AgentHomeStore } from "../execution/home.js";
 import { sanitizeAgentId } from "../execution/home.js";
 import { writeFileAtomic } from "../shared/fs-atomic.js";
-import { WorkspaceQuotaError } from "../execution/quota.js";
+import { normalizeWorkspaceQuotaConfig, WorkspaceQuotaError, type WorkspaceQuotaConfig } from "../execution/quota.js";
 import type { AgentRuntimeManager } from "../execution/runtime/contracts.js";
 import type { Keystore } from "../keystore/index.js";
 import { compatPresetEndpoints, wrapKeystoreForCompat } from "../providers/compat-presets.js";
@@ -67,6 +67,22 @@ function titleFrom(value: Record<string, unknown>, operation: string): string | 
   return value.title.trim();
 }
 
+function workspaceQuotaFrom(
+  value: Record<string, unknown>,
+  profile: Record<string, unknown>,
+  operation: string,
+): { specified: boolean; value?: WorkspaceQuotaConfig } {
+  const specified = Object.hasOwn(value, "workspaceQuota") || Object.hasOwn(profile, "workspaceQuota");
+  if (!specified) return { specified: false };
+  const raw = Object.hasOwn(value, "workspaceQuota") ? value.workspaceQuota : profile.workspaceQuota;
+  if (raw === null) return { specified: true };
+  try {
+    return { specified: true, value: normalizeWorkspaceQuotaConfig(raw) };
+  } catch {
+    return bad(`${operation}: workspaceQuota inválida`);
+  }
+}
+
 function summarize(agent: LocalAgent, model: string, activeId?: string, activity?: AgentActivityStore) {
   const createdAt = agent.createdAt ?? Date.now();
   const updatedAt = agent.updatedAt ?? createdAt;
@@ -100,6 +116,7 @@ function summarize(agent: LocalAgent, model: string, activeId?: string, activity
     hasCustomPicture: agent.hasCustomAvatar === true || Boolean(agent.avatarPngBase64),
     model,
     runtimeMode: agent.runtimeMode ?? "developer",
+    workspaceQuota: agent.workspaceQuota ?? null,
     isActive: activeId === agent.id,
     profile: {
       name: agent.name,
@@ -548,6 +565,8 @@ export function registerRosterHandlers(
   kickstartAgent?: (args: KickstartAgentArgs) => Promise<KickstartAgentResult>,
   isAgentDeletionPending?: (agentId: string) => boolean,
   assertManagedDiskBudget?: (extraBytes?: number) => Promise<void>,
+  /** Invalidates the cached shared quota authority after a fenced config change. */
+  onAgentWorkspaceConfigChanged?: (agentId: string) => void,
 ): { activateAgent: (agentId: string) => void } {
   const modelCatalog = config.modelCatalog;
   const catalogModels = () => modelCatalog?.available() ?? MODEL_CATALOG;
@@ -558,21 +577,22 @@ export function registerRosterHandlers(
     runtimeManager?.clearAgentRepairRequired?.(agentId);
   };
   const agentLifecycleLocks = new Map<string, Promise<void>>();
+  const homeLifecycleLocks = new Map<string, Promise<void>>();
   const reservedAgentSlots = new Set<string>();
   let recentImplicitCreate: { key: string; agentId: string; expiresAt: number } | undefined;
-  const withAgentLifecycleLock = async <T>(agentId: string, task: () => Promise<T>): Promise<T> => {
+  const withAgentLifecycleLock = async <T>(agentId: string, task: () => Promise<T>, locks = agentLifecycleLocks): Promise<T> => {
     const key = agentId.toLowerCase();
-    const previous = agentLifecycleLocks.get(key) ?? Promise.resolve();
+    const previous = locks.get(key) ?? Promise.resolve();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const tail = previous.then(() => gate);
-    agentLifecycleLocks.set(key, tail);
+    locks.set(key, tail);
     await previous;
     try {
       return await task();
     } finally {
       release();
-      if (agentLifecycleLocks.get(key) === tail) agentLifecycleLocks.delete(key);
+      if (locks.get(key) === tail) locks.delete(key);
     }
   };
   const withAgentLifecycleLocks = async <T>(agentIds: readonly string[], task: () => Promise<T>): Promise<T> => {
@@ -787,9 +807,10 @@ export function registerRosterHandlers(
     const origin = typeof b.origin === "string" ? b.origin : "user";
     const avatarShape = typeof b.avatarShape === "string" ? b.avatarShape : undefined;
     const avatarColor = typeof b.avatarColor === "string" ? b.avatarColor : undefined;
+    const workspaceQuota = workspaceQuotaFrom(b, profile, "createAgent").value;
     await modelCatalog?.initialize();
     const inference = resolveCreateInference(b, config.snapshot(), catalogModels());
-    const implicitKey = JSON.stringify([name, title, description, origin, runtimeMode ?? null, avatarShape ?? null, avatarColor ?? null, inference.provider, inference.model, inference.reasoningEffort]);
+    const implicitKey = JSON.stringify([name, title, description, origin, runtimeMode ?? null, avatarShape ?? null, avatarColor ?? null, inference.provider, inference.model, inference.reasoningEffort, workspaceQuota ?? null]);
     const create = async () => {
       if (!explicitId && recentImplicitCreate?.key === implicitKey && recentImplicitCreate.expiresAt >= Date.now()) {
         const existing = agents().find((entry) => entry.id === recentImplicitCreate?.agentId);
@@ -824,6 +845,7 @@ export function registerRosterHandlers(
         model: inference.model,
         provider: inference.provider,
         reasoningEffort: inference.reasoningEffort,
+        ...(workspaceQuota === undefined ? {} : { workspaceQuota }),
         createdAt: now,
         updatedAt: now,
       };
@@ -880,6 +902,7 @@ export function registerRosterHandlers(
     const b = record(body);
     const current = requireAgent(b);
     const profile = isRecord(b.profile) ? b.profile : {};
+    const quotaUpdate = workspaceQuotaFrom(b, profile, "updateAgent");
     const name = typeof b.name === "string" ? b.name : typeof profile.name === "string" ? profile.name : current.name;
     const title = titleFrom(b, "updateAgent") ?? titleFrom(profile, "updateAgent") ?? current.title;
     const avatarId = typeof b.avatarId === "string" ? b.avatarId : typeof profile.avatarId === "string" ? profile.avatarId : current.avatarId;
@@ -887,17 +910,33 @@ export function registerRosterHandlers(
     const avatarShape = typeof b.avatarShape === "string" ? b.avatarShape : typeof profile.avatarShape === "string" ? profile.avatarShape : current.avatarShape;
     const avatarColor = typeof b.avatarColor === "string" ? b.avatarColor : typeof profile.avatarColor === "string" ? profile.avatarColor : current.avatarColor;
     if (!name.trim()) return bad("updateAgent: name inválido");
-    const committed = config.mutate((state) => ({
-      agents: state.agents.map((entry) => entry.id === current.id
-        ? { ...entry, name: name.trim(), title, avatarId, description, avatarShape, avatarColor, updatedAt: Date.now() }
-        : entry),
-      ...(current.id === DEFAULT_AGENT_ID ? { profile: { name: name.trim(), avatarId } } : {}),
-    }));
-    const updated = committed.agents.find((entry) => entry.id === current.id)!;
-    const wrapped = wrapAgent(updated, modelOf(updated), current.id, activity);
-    gateway.publish("agent-upserted", { ...wrapped, activeAgentId });
-    publishRoster();
-    return wrapped.agent;
+    const commit = () => {
+      const committed = config.mutate((state) => ({
+        agents: state.agents.map((entry) => entry.id === current.id
+          ? {
+              ...entry,
+              name: name.trim(), title, avatarId, description, avatarShape, avatarColor,
+              ...(quotaUpdate.specified ? { workspaceQuota: quotaUpdate.value } : {}),
+              updatedAt: Date.now(),
+            }
+          : entry),
+        ...(current.id === DEFAULT_AGENT_ID ? { profile: { name: name.trim(), avatarId } } : {}),
+      }));
+      const updated = committed.agents.find((entry) => entry.id === current.id)!;
+      const wrapped = wrapAgent(updated, modelOf(updated), current.id, activity);
+      gateway.publish("agent-upserted", { ...wrapped, activeAgentId });
+      publishRoster();
+      return wrapped.agent;
+    };
+    if (!quotaUpdate.specified) return commit();
+    return withAgentLifecycleLock(current.id, async () => {
+      const update = async () => {
+        const result = commit();
+        onAgentWorkspaceConfigChanged?.(current.id);
+        return result;
+      };
+      return homeLifecycleFence ? homeLifecycleFence(current.id, update) : update();
+    });
   });
   gateway.registerHandler("setAgentAvatarBytes", async (body) => {
     const b = record(body);
@@ -970,16 +1009,40 @@ export function registerRosterHandlers(
         return toHomeRpcError(method, error);
       }
     };
-    return homeLifecycleFence ? homeLifecycleFence(agentId, task) : task();
+    // Keep home operations serialized without making admitted recovery wait
+    // on the roster lock held by deleteAgents while it drains admitted work.
+    return withAgentLifecycleLock(agentId, () => homeLifecycleFence ? homeLifecycleFence(agentId, task) : task(), homeLifecycleLocks);
   };
 
-  gateway.registerHandler("listQuarantinedAgents", async () => {
+  gateway.registerHandler("listQuarantinedAgents", async (body) => {
     if (!homes) throw new RpcError(503, "listQuarantinedAgents: workspace local indisponível");
+    const includeInventory = body == null ? undefined : record(body).includeInventory;
+    if (includeInventory !== undefined && typeof includeInventory !== "boolean") return bad("listQuarantinedAgents: includeInventory inválido");
     try {
-      return await homes.listQuarantine();
+      return await (includeInventory === false ? homes.listQuarantineMetadata() : homes.listQuarantine());
     } catch (error) {
       return toHomeRpcError("listQuarantinedAgents", error);
     }
+  });
+
+  gateway.registerHandler("purgeDeletedAgentData", async (body) => {
+    const method = "purgeDeletedAgentData";
+    if (!homes) throw new RpcError(503, `${method}: workspace local indisponível`);
+    const agentId = requiredHomeAgentId(body, method);
+    if (record(body).confirm !== true) return bad(`${method}: confirme a remoção definitiva com confirm: true`);
+    const assertDeleted = (): void => {
+      if (agents().some((entry) => entry.id.toLowerCase() === agentId.toLowerCase())) {
+        throw new RpcError(409, `${method}: exclua o bot antes de limpar seus dados`);
+      }
+      if (isAgentDeletionPending?.(agentId)) {
+        throw new RpcError(409, `${method}: exclusão ainda pendente de reconciliação`);
+      }
+    };
+    assertDeleted();
+    return withAgentLifecycleLock(agentId, () => {
+      assertDeleted();
+      return runHomeLifecycle(method, agentId, async () => ({ ok: true, agentId, ...await homes.purgeDeletedAgentData(agentId) }));
+    });
   });
 
   gateway.registerHandler("restoreAgentHome", async (body) => {

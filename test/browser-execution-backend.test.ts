@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -8,6 +8,7 @@ import { BrowserExecutionBackend } from "../src/browser/execution-backend.js";
 import { BrowserSessionManager, type BrowserHostProcess } from "../src/browser/browser-session-manager.js";
 import { encodeBrowserFrame } from "../src/browser/protocol.js";
 import type { ExecutionBackend, ExecutionRequest, ExecutionResult } from "../src/execution/contracts.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 class FakeBrowserHost implements BrowserHostProcess {
   readonly stdout = new PassThrough();
@@ -62,10 +63,10 @@ class FakeBrowserHost implements BrowserHostProcess {
 }
 
 const managers: BrowserSessionManager[] = [];
-const roots: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
   await Promise.all(managers.splice(0).map((manager) => manager.close()));
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 const fileBackend: ExecutionBackend = {
@@ -333,7 +334,7 @@ describe("BrowserExecutionBackend", () => {
     const homeRoot = join(root, "home");
     mkdirSync(homeRoot, { recursive: true });
     writeFileSync(join(homeRoot, "report.txt"), "hello world");
-    roots.push(root);
+    temp.track(root);
 
     const host = new FakeBrowserHost();
     const manager = new BrowserSessionManager({
@@ -376,7 +377,7 @@ describe("BrowserExecutionBackend", () => {
     writeFileSync(join(profile, "Documents", "report.txt"), "hello world");
     writeFileSync(join(redirect, "report.txt"), "private bot");
     writeFileSync(join(homeRoot, ".openbot", "grants.json"), JSON.stringify({ version: 1, grants: {} }));
-    roots.push(root);
+    temp.track(root);
 
     const host = new FakeBrowserHost();
     const manager = new BrowserSessionManager({

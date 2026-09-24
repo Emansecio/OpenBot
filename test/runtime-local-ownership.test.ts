@@ -1,8 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { copyFile, mkdir, readFile, readdir, realpath, symlink, writeFile } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LocalProcessRunner, LocalRuntimeDriver, LocalRuntimeReconciler } from "../src/execution/runtime/local/driver.js";
 import { nativeEnvironment } from "../src/execution/runtime/local/environment.js";
@@ -12,17 +11,18 @@ import { RuntimeManager } from "../src/execution/runtime/manager.js";
 import { NativeJobHelperCache } from "../src/execution/runtime/local/helper-cache.js";
 import { RuntimeScheduler } from "../src/execution/runtime/scheduler.js";
 import type { RuntimeLease } from "../src/execution/runtime/contracts.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const tempRoots = new TempRoots();
 const managers: RuntimeManager[] = [];
 const jobs: WindowsJobProcess[] = [];
 afterEach(async () => {
   await Promise.all(jobs.splice(0).map((job) => job.stop()));
   await Promise.all(managers.splice(0).map((manager) => manager.close()));
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await tempRoots.cleanup();
   vi.restoreAllMocks();
 });
-async function fixture(): Promise<string> { const root = await mkdtemp(join(tmpdir(), "openbot-native-ownership-")); roots.push(root); return root; }
+async function fixture(): Promise<string> { const root = await tempRoots.makeAsync("openbot-native-ownership-"); return root; }
 const record = (): RuntimeLeaseRecord => { const leaseId = randomUUID(); return { recoveryKind: "native-job-v1", leaseId, agentId: "fixture", runtimeBootId: randomUUID(), temporaryId: `tmp-${leaseId}`, sandboxId: nativeSandboxId(leaseId) }; };
 
 it("measures only admission waits with bounded aggregate counters", async () => {
@@ -135,6 +135,33 @@ describe.runIf(process.platform === "win32")("native owned foreground processes"
     await expect(nativeEnvironment(canceled, {}, controller.signal)).rejects.toThrow();
     await expect(readFile(join(canceled, ".openbot-runtime"))).rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  it("executa um processo Windows real com cwd, workspace, temporários e caches dentro da home canônica", async () => {
+    const home = await fixture();
+    await mkdir(join(home, "Documents"));
+    const runner = new LocalProcessRunner("fixture", home);
+    const activeLease = { agentId: "fixture", capability: { networkProfile: "host" } } as RuntimeLease;
+    const script = [
+      "const fs=require('fs')",
+      "fs.writeFileSync('Documents/process-write.txt','owned')",
+      "process.stdout.write(JSON.stringify({cwd:process.cwd(),workspace:process.env.OPENBOT_WORKSPACE,temp:process.env.TEMP,tmp:process.env.TMP,npm:process.env.npm_config_cache,pip:process.env.PIP_CACHE_DIR,uv:process.env.UV_CACHE_DIR,xdg:process.env.XDG_CACHE_HOME}))",
+    ].join(";");
+
+    const result = await runner.run(activeLease, {
+      operation: "process.run", executable: process.execPath, argv: ["-e", script], cwd: ".", timeoutMs: 5_000, networkProfile: "host",
+    }, new AbortController().signal);
+    expect(result).toMatchObject({ ok: true, operation: "process.run", exitCode: 0 });
+    if (!result.ok || result.operation !== "process.run") throw new Error("native process fixture failed");
+    const observed = JSON.parse(result.stdout) as Record<"cwd" | "workspace" | "temp" | "tmp" | "npm" | "pip" | "uv" | "xdg", string>;
+    const canonicalHome = await realpath(home);
+    expect(resolve(observed.cwd)).toBe(resolve(canonicalHome));
+    expect(resolve(observed.workspace)).toBe(resolve(canonicalHome));
+    for (const key of ["temp", "tmp", "npm", "pip", "uv", "xdg"] as const) {
+      const rel = relative(canonicalHome, resolve(observed[key]));
+      expect(rel === "" || (rel !== ".." && !rel.startsWith(`..\\`) && !isAbsolute(rel))).toBe(true);
+    }
+    await expect(readFile(join(home, "Documents", "process-write.txt"), "utf8")).resolves.toBe("owned");
+  }, 15_000);
 
   it("rejects operational junctions and non-directories before creating paths outside home", async () => {
     const home = await fixture(), outside = await fixture();

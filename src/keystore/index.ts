@@ -27,7 +27,7 @@ import path from "node:path";
 import os from "node:os";
 
 import type { BoxSecretsStatus } from "../shared/contracts.js";
-import { writeFileExclusiveSync } from "../shared/fs-atomic.js";
+import { renameWithRetry, writeFileExclusiveSync } from "../shared/fs-atomic.js";
 import type { Gateway, RpcHandler } from "../server/gateway.js";
 import { RpcError } from "../server/gateway.js";
 import {
@@ -178,7 +178,7 @@ export async function writeScopedSecretsFile(file: string, shape: ScopedSecretsF
     await handle.sync();
     await handle.close();
     handle = undefined;
-    await fsp.rename(tmp, file);
+    await renameWithRetry(tmp, file);
     renamed = true;
   } finally {
     await handle?.close().catch(() => undefined);
@@ -204,7 +204,7 @@ async function writeDurableBytes(file: string, bytes: Buffer): Promise<void> {
     await handle.sync();
     await handle.close();
     handle = undefined;
-    await fsp.rename(tmp, file);
+    await renameWithRetry(tmp, file);
     renamed = true;
   } finally {
     await handle?.close().catch(() => undefined);
@@ -268,7 +268,7 @@ export async function migrateLocalFileToDpapi(options: LocalFileMigrationOptions
       await handle.close();
       handle = undefined;
       await options.beforeRename?.();
-      await fsp.rename(tmp, file);
+      await renameWithRetry(tmp, file);
       renamed = true;
       promoted = true;
     } finally {
@@ -286,7 +286,7 @@ export async function migrateLocalFileToDpapi(options: LocalFileMigrationOptions
       }
     }
     const archive = `${keyFile}.migrated-${Date.now()}-${process.pid}`;
-    await fsp.rename(keyFile, archive);
+    await renameWithRetry(keyFile, archive);
     completed = true;
     return true;
   } catch (error) {
@@ -321,7 +321,7 @@ export async function writeSecretsFile(file: string, shape: SecretsFileShape): P
     await handle.sync();
     await handle.close();
     handle = undefined;
-    await fsp.rename(tmp, file);
+    await renameWithRetry(tmp, file);
     renamed = true;
   } finally {
     await handle?.close().catch(() => undefined);
@@ -465,7 +465,12 @@ function readSecretsFileSync(file: string): ScopedSecretsFile {
     if (code === "ENOENT") return { version: SECRETS_FILE_VERSION, scopes: {} };
     throw err;
   }
-  const parsed: unknown = JSON.parse(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`keystore: ${file} não é um objeto JSON válido`);
+  }
   if (!isPlainObject(parsed)) return { version: SECRETS_FILE_VERSION, scopes: {} };
   return toScopedShape(parsed, file);
 }

@@ -98,7 +98,7 @@ app.whenReady().then(async () => {
 }).catch(error => { console.error(error); clearTimeout(watchdog); app.exit(1); });
 `;
 
-describe.skipIf(process.platform !== "win32")("real Windows close-to-tray", () => {
+describe.skipIf(process.platform !== "win32" || process.env.OPENBOT_RUN_LIVE_DESKTOP_TEST !== "1")("real Windows close-to-tray", () => {
   it("handles native close, real menu callbacks, restore and deferred normal quit with disposable state", async () => {
     const root = mkdtempSync(join(tmpdir(), "openbot-tray-"));
     let pid: number | undefined;

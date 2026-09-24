@@ -21,11 +21,17 @@ const ZERO_USAGE: BudgetCounters = {
 /** Maximum number of async task executions in the shared worker by default. */
 export const DEFAULT_ASYNC_TASK_MAX_CONCURRENT = 4;
 
-// Durable budget counters are token-shaped, not byte-shaped. Counting Unicode
-// code points is intentionally conservative (especially for ASCII) while
-// avoiding UTF-8 byte inflation for CJK and other multi-byte text.
+// A conservative admission estimate; provider-reported usage takes precedence
+// when reconciling an effect. This is not a tokenizer or measured consumption.
 function estimateTextTokens(value: string): number {
   return Array.from(value).length;
+}
+
+export interface ProviderEffectOptions<T> {
+  /** Entire provider request text, including instructions and steering. */
+  readonly requestText?: () => string;
+  /** Provider-reported counts; absent dimensions retain an estimated charge. */
+  readonly usage?: (result: T) => { readonly inputTokens?: number; readonly outputTokens?: number };
 }
 
 export interface AsyncTaskExecutionContext {
@@ -35,7 +41,7 @@ export interface AsyncTaskExecutionContext {
   readonly grant: import("./contracts.js").DelegatedCapabilityGrant;
   /** Every injected effect must cross this grant boundary before it runs. */
   readonly runEffect: <T>(operation: DelegatedCapabilityOperation, call: () => Promise<T>, options?: { readonly reserve?: Partial<BudgetCounters>; readonly usage?: (result: T) => Partial<BudgetCounters>; readonly retrySafe?: boolean }) => Promise<T>;
-  readonly runProvider: <T>(operation: DelegatedCapabilityOperation & { kind: "provider" }, call: () => Promise<T>) => Promise<T>;
+  readonly runProvider: <T>(operation: DelegatedCapabilityOperation & { kind: "provider" }, call: () => Promise<T>, options?: ProviderEffectOptions<T>) => Promise<T>;
   readonly authorize: (operation: DelegatedCapabilityOperation) => void;
   readonly consumeSteer: () => string | null;
 }
@@ -90,9 +96,12 @@ export class AsyncTaskRuntime {
   private readonly activeClaims = new Map<string, Promise<void>>();
   private recoveryNextAtMs = 0;
   private recoveryFailureCount = 0;
+  private expiryNextAtMs = 0;
   private roundRobinCursor = 0;
   private projectionFailureCount = 0;
   private projectionRetryAtMs = 0;
+  private claimScheduleFailureCount = 0;
+  private claimScheduleRetryAtMs = 0;
 
   constructor(options: AsyncTaskRuntimeOptions) {
     this.store = options.store;
@@ -100,7 +109,7 @@ export class AsyncTaskRuntime {
     this.execute = options.execute;
     this.providerAdmission = options.providerAdmission;
     this.ownerId = options.ownerId ?? `async-worker-${randomUUID()}`;
-    this.pollIntervalMs = options.pollIntervalMs ?? 25;
+    this.pollIntervalMs = options.pollIntervalMs ?? 1_000;
     this.leaseDurationMs = options.leaseDurationMs ?? 5_000;
     this.maxAttempts = options.maxAttempts ?? 3;
     this.retryDelayMs = options.retryDelayMs ?? 100;
@@ -345,6 +354,7 @@ export class AsyncTaskRuntime {
   private async loop(): Promise<void> {
     while (!this.stopped) {
       this.maybeRecoverExpiredWork();
+      this.maybeExpireQueuedWork();
       const progressed = this.scheduleClaims();
       await this.flushProjections();
       if (!progressed) await this.waitForWork();
@@ -355,6 +365,17 @@ export class AsyncTaskRuntime {
     await Promise.allSettled(this.activeClaims.values());
   }
 
+  private maybeExpireQueuedWork(): void {
+    const nowMs = this.nowFn();
+    if (nowMs < this.expiryNextAtMs) return;
+    this.expiryNextAtMs = nowMs + Math.max(1_000, this.recoveryIntervalMs());
+    try {
+      this.store.expireBudgetExhaustedTasks(nowMs);
+    } catch (error) {
+      console.warn(`[openbot] async task budget expiry deferred: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   /**
    * Claims a fair round-robin slice without awaiting executors. A claim is
    * tracked before its promise starts so the same agent can never own two
@@ -363,12 +384,33 @@ export class AsyncTaskRuntime {
   private scheduleClaims(): boolean {
     const agents = Array.from(new Set(this.agentIds()));
     if (agents.length === 0 || this.activeClaims.size >= this.maxConcurrentTasks) return false;
+    const nowMs = this.nowFn();
+    // Admission retry pacing is process-local scheduling state. Keep it on a
+    // wall clock so a deterministic task clock cannot strand a worker after a
+    // transient store failure.
+    const wallNowMs = Date.now();
+    if (wallNowMs < this.claimScheduleRetryAtMs) return false;
+    let runnable: Set<string>;
+    try {
+      runnable = new Set(this.store.runnableAgentIds(nowMs));
+      this.claimScheduleFailureCount = 0;
+      this.claimScheduleRetryAtMs = 0;
+    } catch (error) {
+      this.claimScheduleFailureCount = Math.min(this.claimScheduleFailureCount + 1, 7);
+      const backoff = Math.min(5_000, this.pollIntervalMs * (2 ** Math.max(0, this.claimScheduleFailureCount - 1)));
+      const retryAt = wallNowMs + backoff;
+      this.claimScheduleRetryAtMs = Number.isSafeInteger(retryAt) ? retryAt : Number.MAX_SAFE_INTEGER;
+      console.warn(`[openbot] async task admission scan deferred: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+    if (runnable.size === 0) return false;
     const start = this.roundRobinCursor % agents.length;
     let scanned = 0;
     let progressed = false;
     while (!this.stopped && this.activeClaims.size < this.maxConcurrentTasks && scanned < agents.length) {
       const agentId = agents[(start + scanned) % agents.length]!;
       scanned += 1;
+      if (!runnable.has(agentId)) continue;
       if (this.agentFences.has(agentId) || this.activeClaims.has(agentId)) continue;
       let claim;
       try {
@@ -376,7 +418,7 @@ export class AsyncTaskRuntime {
           ownerId: this.ownerId,
           nowMs: this.nowFn(),
           leaseDurationMs: this.leaseDurationMs,
-        });
+        }, false);
       } catch {
         // A concurrent revocation/expiry must not kill the shared worker.
         continue;
@@ -437,8 +479,8 @@ export class AsyncTaskRuntime {
           type: "update",
           parentAgentId: record?.lineage.parentAgentId ?? envelope.agentId,
           ...(envelope.channel === "async-tasks"
-            ? { tasks: record === null ? [] : [projectAsyncTaskForRenderer(record)] }
-            : { subagents: record === null ? [] : [projectAsyncTaskForRenderer(record)] }),
+            ? { tasks: record === null ? [] : [projectAsyncTaskForRenderer(record, this.store.canSteer(record))] }
+            : { subagents: record === null ? [] : [projectAsyncTaskForRenderer(record, this.store.canSteer(record))] }),
         };
         try {
           const accepted = await this.publishProjection(event);
@@ -542,13 +584,13 @@ export class AsyncTaskRuntime {
         budgetVersion = reserved.version;
         return { amounts: normalized, version: reserved.version };
       };
-      const reconcileEffect = (reservationId: string, amounts: BudgetCounters, actual: Partial<BudgetCounters>): void => {
+      const reconcileEffect = (reservationId: string, amounts: BudgetCounters, actual: Partial<BudgetCounters>, estimated?: { readonly inputTokens?: number; readonly outputTokens?: number }): void => {
         const latest = this.store.getTask(task.taskId);
         if (latest === null) throw new Error("Task disappeared during effect reconciliation.");
         current = latest;
         const reconciled = this.store.reconcileTaskBudget(task.taskId, budgetVersion, reservationId, { ...ZERO_USAGE, ...actual }, {
           leaseOwnerId, attempt, expectedTaskVersion: current.version,
-        }, this.nowFn());
+        }, this.nowFn(), estimated);
         budgetVersion = reconciled.version;
         void amounts;
       };
@@ -565,7 +607,7 @@ export class AsyncTaskRuntime {
           case "filesystem": return operation.operation === "write" ? { ...toolEffect, workspaceWriteBytes: state.budget.maxWorkspaceWriteBytes } : toolEffect;
         }
       };
-      const runEffectImpl = async <T>(operation: DelegatedCapabilityOperation, call: () => Promise<T>, options: { readonly reserve?: Partial<BudgetCounters>; readonly usage?: (result: T) => Partial<BudgetCounters>; readonly retrySafe?: boolean } = {}): Promise<T> => {
+      const runEffectImpl = async <T>(operation: DelegatedCapabilityOperation, call: () => Promise<T>, options: { readonly reserve?: Partial<BudgetCounters>; readonly usage?: (result: T) => Partial<BudgetCounters>; readonly estimated?: (result: T) => { readonly inputTokens?: number; readonly outputTokens?: number } | undefined; readonly retrySafe?: boolean } = {}): Promise<T> => {
         if (unsafeEffectFenceFailed) {
           throw unsafeEffectFenceError ?? new Error("Unsafe effect marker persistence failed.");
         }
@@ -593,9 +635,18 @@ export class AsyncTaskRuntime {
               unsafeEffectFenceError = error;
               throw error;
             }
+            if (operation.kind === "provider") {
+              current = this.store.recordProgress({
+                taskId: task.taskId, expectedVersion: current.version, leaseOwnerId, attempt,
+                progress: {
+                  phase: "provider_request", summary: "Solicitação ao provedor iniciada; novas orientações indisponíveis",
+                  completedUnits: null, totalUnits: null, updatedAtMs: this.nowFn(),
+                },
+              });
+            }
           }
           const result = await call();
-          reconcileEffect(reservationId, reserved.amounts, options.usage?.(result) ?? reserved.amounts);
+          reconcileEffect(reservationId, reserved.amounts, options.usage?.(result) ?? reserved.amounts, options.estimated?.(result));
           return result;
         } catch (error) {
           // A failed read consumed only its attempt counters; size dimensions
@@ -637,7 +688,7 @@ export class AsyncTaskRuntime {
           });
         },
         runEffect,
-        runProvider: async (operation, call) => {
+        runProvider: async (operation, call, options = {}) => {
           context.authorize(operation);
           if (controller.signal.aborted) throw new Error("Task was aborted before provider admission.");
           let lease: { release: () => void } | undefined;
@@ -648,23 +699,32 @@ export class AsyncTaskRuntime {
           try {
             const state = this.store.getBudgetState(task.taskId);
             const outputRemaining = state === null ? 0 : Math.max(0, state.budget.maxOutputTokens - state.usage.used.outputTokens - state.usage.reserved.outputTokens);
+            const inputRemaining = state === null ? 0 : Math.max(0, state.budget.maxInputTokens - state.usage.used.inputTokens - state.usage.reserved.inputTokens);
             // The shipped adapters enforce a 16-token protocol minimum. Do
             // not invoke one with a larger effective cap than the remaining
             // durable budget; wait/retry cannot make that effect safe.
-            if (outputRemaining < 16) throw new AsyncTaskContractError("budget_exhausted", "Provider output budget is exhausted.");
+            if (outputRemaining < 16 || inputRemaining < 1) throw new AsyncTaskContractError("budget_exhausted", "Provider token budget is exhausted.");
+            let estimatedTokens: { inputTokens?: number; outputTokens?: number } = {};
             return await runEffectImpl(operation, execute, {
-              reserve: { providerCalls: 1, inputTokens: estimateTextTokens(current.input.objective), outputTokens: outputRemaining },
-              usage: (result) => ({
-                providerCalls: 1,
-                inputTokens: estimateTextTokens(current.input.objective),
-                outputTokens: (() => {
-                  const outputTokens = typeof result === "string"
-                    ? estimateTextTokens(result)
-                    : (typeof result === "object" && result !== null && "message" in result && typeof (result as { message?: { content?: unknown } }).message?.content === "string" ? estimateTextTokens((result as { message: { content: string } }).message.content) : 0);
-                  if (outputTokens > outputRemaining) throw new AsyncTaskContractError("budget_exhausted", "Provider output exceeded the remaining token budget.");
-                  return outputTokens;
-                })(),
-              }),
+              reserve: { providerCalls: 1, inputTokens: inputRemaining, outputTokens: outputRemaining },
+              usage: (result) => {
+                const reported = options.usage?.(result);
+                const outputText = typeof result === "string" ? result
+                  : typeof result === "object" && result !== null && "message" in result
+                    && typeof (result as { message?: { content?: unknown } }).message?.content === "string"
+                    ? (result as { message: { content: string } }).message.content : "";
+                const inputTokens = reported?.inputTokens ?? Math.min(inputRemaining, estimateTextTokens(options.requestText?.() ?? current.input.objective));
+                const outputTokens = reported?.outputTokens ?? Math.min(outputRemaining, estimateTextTokens(outputText));
+                if (inputTokens > inputRemaining || outputTokens > outputRemaining) {
+                  throw new AsyncTaskContractError("budget_exhausted", "Provider-reported token usage exceeded the remaining budget.");
+                }
+                estimatedTokens = {
+                  ...(reported?.inputTokens === undefined ? { inputTokens } : {}),
+                  ...(reported?.outputTokens === undefined ? { outputTokens } : {}),
+                };
+                return { providerCalls: 1, inputTokens, outputTokens };
+              },
+              estimated: () => Object.keys(estimatedTokens).length === 0 ? undefined : estimatedTokens,
             });
           } finally {
             lease?.release();
@@ -673,7 +733,7 @@ export class AsyncTaskRuntime {
         consumeSteer: () => {
           const steer = this.store.getTask(task.taskId)?.steerIntent;
           if (steer !== undefined && steer !== null && steer.consumedAtMs === null) {
-            try { this.store.consumeSteerIntent(task.taskId, leaseOwnerId, attempt, this.nowFn()); } catch { /* lease/abort wins */ }
+            this.store.consumeSteerIntent(task.taskId, leaseOwnerId, attempt, this.nowFn());
             return steer.message;
           }
           return null;

@@ -3,11 +3,9 @@
  * foreign/missing targets, station identity and reconnect-safe ordered frames.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createGateway, type RpcHandler } from "../src/server/gateway.js";
 import { createServer } from "node:http";
@@ -15,13 +13,14 @@ import { ReactionStore } from "../src/reactions/store.js";
 import { registerReactionHandlers } from "../src/rpc/reactions.js";
 import type { ServerHandle } from "../src/main.js";
 import { startServer, stopServer } from "../src/main.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const handles: ServerHandle[] = [];
-const roots: string[] = [];
+const tempRoots = new TempRoots();
 
 afterEach(async () => {
   await Promise.all(handles.splice(0).map((h) => stopServer(h)));
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await tempRoots.cleanup();
 });
 
 function context(handle: ServerHandle) {
@@ -35,8 +34,7 @@ function handler(handle: ServerHandle, method: string): RpcHandler {
 }
 
 async function harness(): Promise<ServerHandle> {
-  const root = mkdtempSync(join(tmpdir(), "openbot-p24-rx-"));
-  roots.push(root);
+  const root = tempRoots.make("openbot-p24-rx-");
   const handle = await startServer(0, {
     configPath: join(root, "config.json"), stateRoot: join(root, "state"), runtimeRoot: join(root, "runtime"),
     browserRoot: join(root, "browser"), keystoreDir: join(root, "keystore"), storePath: join(root, "store.db"),
@@ -137,10 +135,63 @@ describe("P2.4 reactions (RPC + SSE ordered)", () => {
 
   it("reactToMessage alias resolves a durable entry and fails closed on missing target", async () => {
     const handle = await harness();
-    const { entryId } = await durableEntry(handle, "agent-a");
+    const { entryId, conversationId } = await durableEntry(handle, "agent-a");
     const ok = await handler(handle, "reactToMessage")({ agentId: "agent-a", messageId: entryId, reaction: "laugh" }, context(handle));
     expect(ok).toMatchObject({ ok: true });
+    const listed = await handler(handle, "listReactions")({ agentId: "agent-a", conversationId }, context(handle)) as Array<{ entryId: string; conversationId: string }>;
+    expect(listed).toEqual(expect.arrayContaining([expect.objectContaining({ entryId, conversationId })]));
     await expect(Promise.resolve().then(() => handler(handle, "reactToMessage")({ agentId: "agent-a", messageId: "nao-existe", reaction: "laugh" }, context(handle)))).rejects.toMatchObject({ status: 404 });
     await expect(Promise.resolve().then(() => handler(handle, "addReaction")({ agentId: "agent-b", entryId, emoji: "heart", nonce: "foreign" }, context(handle)))).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("resolves an unscoped entry without loading conversation pages or transcript bodies", async () => {
+    const handle = await harness();
+    const { entryId, conversationId } = await durableEntry(handle, "agent-a");
+    const pages = vi.spyOn(handle.conversationStore, "list");
+    const entries = vi.spyOn(handle.store, "getEntries");
+    try {
+      const reaction = await handler(handle, "addReaction")({ agentId: "agent-a", entryId, emoji: "heart", nonce: "indexed" }, context(handle)) as { conversationId: string };
+      expect(reaction.conversationId).toBe(conversationId);
+      expect(pages).not.toHaveBeenCalled();
+      expect(entries).not.toHaveBeenCalled();
+    } finally {
+      pages.mockRestore();
+      entries.mockRestore();
+    }
+  });
+
+  it("reconciles a legacy unscoped reaction before nonce deduplication", async () => {
+    const handle = await harness();
+    const { entryId, conversationId } = await durableEntry(handle, "agent-a");
+    const now = Date.now();
+    handle.store.databaseForSharedStores().prepare(`INSERT INTO reactions
+      (id, agent_id, conversation_id, entry_id, emoji, nonce, state, reason, created_at_ms, updated_at_ms)
+      VALUES ('rx-legacy', 'agent-a', NULL, ?, 'heart', 'legacy-nonce', 'confirmed', NULL, ?, ?)`)
+      .run(entryId, now, now);
+    const retried = await handler(handle, "addReaction")({ agentId: "agent-a", entryId, conversationId, emoji: "heart", nonce: "legacy-nonce" }, context(handle)) as { id: string };
+    expect(retried.id).toBe("rx-legacy");
+    const listed = await handler(handle, "listReactions")({ agentId: "agent-a", conversationId }, context(handle)) as Array<{ id: string }>;
+    expect(listed.map((item) => item.id)).toEqual(["rx-legacy"]);
+  });
+
+  it("does not assign an unscoped reaction when the entry ID exists in two conversations", async () => {
+    const handle = await harness();
+    const first = handle.conversationStore.create("agent-a");
+    const second = handle.conversationStore.create("agent-a");
+    for (const conversation of [first, second]) {
+      handle.store.append("agent-a", [{ kind: "message", id: "duplicate-entry", role: "user", content: "same id", timestampMs: Date.now() }], conversation.id);
+    }
+    await expect(Promise.resolve().then(() => handler(handle, "addReaction")({ agentId: "agent-a", entryId: "duplicate-entry", emoji: "heart", nonce: "ambiguous" }, context(handle)))).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("rejects a reaction in a temporary conversation outside the first page", async () => {
+    const handle = await harness();
+    const temporary = handle.conversationStore.create("agent-a", { temporary: true });
+    const entryId = "temporary-message";
+    handle.store.append("agent-a", [{ kind: "message", id: entryId, role: "user", content: "temporary", timestampMs: Date.now() }], temporary.id);
+    for (let index = 0; index < 201; index += 1) handle.conversationStore.create("agent-a", { title: `Later ${index}` });
+    handle.store.databaseForSharedStores().prepare("UPDATE agent_conversations SET updated_at_ms = 1 WHERE id = ?").run(temporary.id);
+    expect(handle.conversationStore.list("agent-a", { limit: 200 }).items.some((item) => item.id === temporary.id)).toBe(false);
+    await expect(Promise.resolve().then(() => handler(handle, "addReaction")({ agentId: "agent-a", conversationId: temporary.id, entryId, emoji: "heart", nonce: "temporary-nonce" }, context(handle)))).rejects.toMatchObject({ status: 404, message: expect.stringContaining("reaction_conversa_temporaria") });
   });
 });

@@ -128,8 +128,9 @@ describe("P2.4 reasoning protocol", () => {
     }
   });
 
-  it("drops reasoning events that arrive after content (invalid order) and after end", async () => {
+  it.each(["off", "automatic"] as const)("drops reasoning after content, including retained tool-round text (memory=%s)", async mode => {
     const { db } = tmpStore();
+    db.memoryStore.setSettings("a", mode);
     const restore = overrideProviderCapability("xai", "grok-4.6", { reasoning: true });
     try {
       const adapter = reasoningAdapter("xai", {

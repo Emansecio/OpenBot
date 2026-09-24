@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -214,6 +215,15 @@ function terminalize(handle: ServerHandle, input: DispatchAsyncTaskInput) {
   }).task;
 }
 
+function deployedTaskBridgeSanitizer(): (record: unknown) => { allowedActions?: string[]; detail: string } | null {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const source = readFileSync(join(root, "client/extracted/dist/electron-main/main.cjs"), "utf8");
+  const start = source.indexOf("  const boundedUiText = (value, fallback, maxBytes) => {");
+  const end = source.indexOf("  const readOpenBotGatewayToken = () => {", start);
+  if (start < 0 || end < 0) throw new Error("deployed async task bridge sanitizer missing");
+  return new Function("Buffer", `${source.slice(start, end)}\nreturn sanitizeAsyncTaskRecord;`)(Buffer) as (record: unknown) => { allowedActions?: string[]; detail: string } | null;
+}
+
 describe("P2.2 canonical task projection (RED)", () => {
   it("accepts native id alias for every read-only task list method", async () => {
     const handle = await harness();
@@ -390,6 +400,49 @@ describe("P2.2 canonical task projection (RED)", () => {
 });
 
 describe("P2.2 ownership and bridge prerequisites", () => {
+  it("uses the backend steer decision in deployed Electron list and detail sanitization", async () => {
+    const handle = await harness();
+    const task = taskInput("agent-a");
+    handle.asyncTaskStore.dispatch(task);
+    const claim = handle.asyncTaskStore.claimNext("agent-a", { ownerId: "bridge-owner", nowMs: Date.now(), leaseDurationMs: 5_000 })!;
+    const bridge = deployedTaskBridgeSanitizer();
+    const get = () => handler(handle, "getAsyncTask")({ agentId: "agent-a", taskId: task.taskId }, context(handle));
+    const list = () => handler(handle, "getAsyncTasks")({ agentId: "agent-a" }, context(handle));
+    expect(handle.asyncTaskStore.canSteer(claim.task)).toBe(true);
+    expect(bridge(await get())?.allowedActions).toContain("steer");
+    handle.asyncTaskStore.start({ taskId: task.taskId, expectedVersion: claim.task.version, leaseOwnerId: "bridge-owner", attempt: claim.attempt.attempt, startedAtMs: Date.now() });
+    const before = bridge(await get());
+    expect(before?.allowedActions).toContain("steer");
+    expect((await list() as unknown[]).map(bridge).find((row) => row?.allowedActions?.includes("steer"))).toBeTruthy();
+
+    const current = handle.asyncTaskStore.getTask(task.taskId)!;
+    handle.asyncTaskStore.markUnsafeEffectStarted({ taskId: task.taskId, expectedVersion: current.version, leaseOwnerId: "bridge-owner", attempt: claim.attempt.attempt, markedAtMs: Date.now() });
+    expect(bridge(await get())?.allowedActions).not.toContain("steer");
+    expect((await list() as unknown[]).map(bridge).find((row) => row?.allowedActions?.includes("steer"))).toBeFalsy();
+
+    const second = taskInput("agent-b");
+    handle.asyncTaskStore.dispatch(second);
+    const secondClaim = handle.asyncTaskStore.claimNext("agent-b", { ownerId: "bridge-owner-b", nowMs: Date.now(), leaseDurationMs: 5_000 })!;
+    handle.asyncTaskStore.start({ taskId: second.taskId, expectedVersion: secondClaim.task.version, leaseOwnerId: "bridge-owner-b", attempt: secondClaim.attempt.attempt, startedAtMs: Date.now() });
+    const beforeSteer = handle.asyncTaskStore.getTask(second.taskId)!;
+    handle.asyncTaskStore.steer({ taskId: second.taskId, agentId: "agent-b", parentTurnId: second.parentTurnId,
+      intentId: randomUUID(), expectedSteerVersion: beforeSteer.steerVersion, requestedAtMs: Date.now(), message: "Revise o foco" });
+    const getSecond = () => handler(handle, "getAsyncTask")({ agentId: "agent-b", taskId: second.taskId }, context(handle));
+    expect(bridge(await getSecond())).toMatchObject({ detail: "Orientação recebida; aguardando envio ao provedor" });
+    expect(bridge(await getSecond())?.allowedActions).not.toContain("steer");
+    handle.asyncTaskStore.consumeSteerIntent(second.taskId, "bridge-owner-b", secondClaim.attempt.attempt, Date.now());
+    expect(bridge(await getSecond())).toMatchObject({ detail: "Orientação incluída na solicitação ao provedor" });
+
+    const fileBase = taskInput("agent-a");
+    const fileTask: DispatchAsyncTaskInput = { ...fileBase, grant: { ...fileBase.grant, kind: "filesystem",
+      constraints: { operations: ["read"], roots: ["C:\\workspace"] } } };
+    handle.asyncTaskStore.dispatch(fileTask);
+    const fileClaim = handle.asyncTaskStore.claimNext("agent-a", { ownerId: "bridge-file-owner", nowMs: Date.now(), leaseDurationMs: 5_000 })!;
+    handle.asyncTaskStore.start({ taskId: fileTask.taskId, expectedVersion: fileClaim.task.version, leaseOwnerId: "bridge-file-owner", attempt: fileClaim.attempt.attempt, startedAtMs: Date.now() });
+    const fileRead = await handler(handle, "getAsyncTask")({ agentId: "agent-a", taskId: fileTask.taskId }, context(handle));
+    expect(bridge(fileRead)?.allowedActions).not.toContain("steer");
+  });
+
   it("rejects cross-agent task RPC and SSE, rejects terminal control, and accepts same-agent reads", async () => {
     const handle = await harness();
     const task = taskInput("agent-a");
@@ -418,7 +471,7 @@ describe("P2.2 ownership and bridge prerequisites", () => {
   });
 
   it("keeps attachment bridge preconditions while leaving DOM lifecycle to the real Electron gate", () => {
-    const root = new URL("..", import.meta.url).pathname.replace(/^\/(.):/, "$1:");
+    const root = fileURLToPath(new URL("..", import.meta.url));
     const preload = readFileSync(join(root, "client/extracted/dist/electron-preload/preload.cjs"), "utf8");
     for (const method of ["stageAttachmentBytes", "commitStagedAttachments", "discardStagedAttachment"]) {
       expect(preload).toContain(`async ${method}(`);
@@ -426,7 +479,7 @@ describe("P2.2 ownership and bridge prerequisites", () => {
   });
 
   it("keeps the production backend local state inside the managed E2E root", () => {
-    const root = new URL("..", import.meta.url).pathname.replace(/^\/(.):/, "$1:");
+    const root = fileURLToPath(new URL("..", import.meta.url));
     const source = readFileSync(resolve(root, "scripts/electron-p22-tasks-verify.mjs"), "utf8");
     expect(source).toContain('OPENBOT_LOCAL_DATA_ROOT: join(runRoot, "local-data")');
   });

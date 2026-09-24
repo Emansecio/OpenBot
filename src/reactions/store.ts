@@ -51,7 +51,8 @@ function fromRow(row: ReactionRow): Reaction {
   };
 }
 
-export type EntryResolveResult = true | false | "temporary";
+/** A successful resolution may carry the canonical conversation for the entry. */
+export type EntryResolveResult = true | false | "temporary" | { conversationId: string };
 
 export class ReactionStore {
   private readonly db: Database.Database;
@@ -67,6 +68,7 @@ export class ReactionStore {
     setRemoved: Database.Statement;
     delete: Database.Statement;
     purgeAgent: Database.Statement;
+    reconcileLegacy: Database.Statement;
   };
 
   constructor(options: { db: Database.Database; nowFn?: () => number; resolveEntry?: (agentId: string, entryId: string, conversationId?: string) => EntryResolveResult }) {
@@ -83,6 +85,7 @@ export class ReactionStore {
       setRemoved: s("UPDATE reactions SET state = 'removed', updated_at_ms = ? WHERE id = ? AND agent_id = ? AND state != 'removed'"),
       delete: s("DELETE FROM reactions WHERE id = ?"),
       purgeAgent: s("DELETE FROM reactions WHERE agent_id = ?"),
+      reconcileLegacy: s("UPDATE reactions SET conversation_id = ?, updated_at_ms = ? WHERE id = ? AND agent_id = ? AND conversation_id IS NULL"),
     };
   }
 
@@ -92,12 +95,14 @@ export class ReactionStore {
     if (typeof input.emoji !== "string" || !input.emoji.trim() || Buffer.byteLength(input.emoji, "utf8") > MAX_EMOJI_BYTES) throw new Error("emoji inválido");
     if (typeof input.nonce !== "string" || !input.nonce.trim() || Buffer.byteLength(input.nonce, "utf8") > MAX_NONCE_BYTES) throw new Error("nonce inválido");
     if (input.conversationId !== undefined && (typeof input.conversationId !== "string" || !input.conversationId.trim())) throw new Error("conversationId inválido");
-    const conversationId = input.conversationId ?? null;
+    let conversationId = input.conversationId ?? null;
     if (this.resolveEntry) {
       const resolved = this.resolveEntry(agentId, input.entryId, conversationId ?? undefined);
       if (resolved === "temporary") throw new Error("reaction_conversa_temporaria");
       if (!resolved) throw new Error("reaction_entry_inexistente");
+      if (typeof resolved === "object") conversationId = resolved.conversationId;
     }
+    this.reconcileLegacy(agentId, input.entryId);
     // Nonce dedupe: the same (agent, conversation, entry, emoji, nonce) is idempotent.
     const current = this.statements.byNonce.get(agentId, conversationId, input.entryId, input.emoji, input.nonce) as ReactionRow | undefined;
     if (current !== undefined) return fromRow(current);
@@ -112,10 +117,33 @@ export class ReactionStore {
   list(agentId: string, conversationId?: string): readonly Reaction[] {
     if (typeof agentId !== "string" || !agentId) throw new Error("agentId inválido");
     if (conversationId !== undefined && (typeof conversationId !== "string" || !conversationId)) throw new Error("conversationId inválido");
+    // Older rows may have been written before conversation resolution was
+    // connected to persistence. Fill them only when the resolver can identify
+    // one unambiguous durable conversation for the entry.
+    this.reconcileLegacy(agentId);
     const rows = (conversationId === undefined
       ? this.statements.list.all(agentId)
       : this.statements.listByConversation.all(agentId, conversationId)) as ReactionRow[];
     return rows.map(fromRow);
+  }
+
+  private reconcileLegacy(agentId: string, entryId?: string): void {
+    if (!this.resolveEntry) return;
+    const rows = entryId === undefined
+      ? this.db.prepare("SELECT * FROM reactions WHERE agent_id = ? AND conversation_id IS NULL").all(agentId) as ReactionRow[]
+      : this.db.prepare("SELECT * FROM reactions WHERE agent_id = ? AND entry_id = ? AND conversation_id IS NULL").all(agentId, entryId) as ReactionRow[];
+    const resolvedEntries = new Map<string, EntryResolveResult>();
+    for (const row of rows) {
+      if (!resolvedEntries.has(row.entry_id)) resolvedEntries.set(row.entry_id, this.resolveEntry(agentId, row.entry_id));
+      const resolved = resolvedEntries.get(row.entry_id)!;
+      if (typeof resolved === "object" && resolved.conversationId.trim()) {
+        // A scoped row may already exist from a retry. Keep the old row intact
+        // if moving it would collide with the durable uniqueness contract.
+        const existing = this.statements.byNonce.get(agentId, resolved.conversationId, row.entry_id, row.emoji, row.nonce) as ReactionRow | undefined;
+        if (existing !== undefined) continue;
+        this.statements.reconcileLegacy.run(resolved.conversationId, this.nowFn(), row.id, agentId);
+      }
+    }
   }
 
   remove(agentId: string, reactionId: string): boolean {

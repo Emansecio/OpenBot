@@ -1,6 +1,5 @@
 import * as fs from "node:fs";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -8,18 +7,18 @@ vi.mock("node:fs", { spy: true });
 
 // @ts-expect-error executable local helper has no declaration file.
 import { atomicWriteFile } from "../scripts/release-common.mjs";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
   vi.restoreAllMocks();
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 describe("release atomic state publication", () => {
   it("preserva a versão anterior quando o retry do rename falha", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-atomic-write-recovery-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-atomic-write-recovery-");
     const destination = join(root, "state.json");
     await writeFile(destination, "previous state\n", "utf8");
 
@@ -34,8 +33,7 @@ describe("release atomic state publication", () => {
   });
 
   it("publica a nova versão quando o retry tem sucesso", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-atomic-write-retry-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-atomic-write-retry-");
     const destination = join(root, "state.json");
     await writeFile(destination, "previous state\n", "utf8");
 

@@ -363,11 +363,22 @@ function shrinkProviderMessage(message: ProviderChatMessage, maxBytes: number): 
   return providerMessageBytes(candidate) <= maxBytes ? candidate : undefined;
 }
 
+function truncateProviderToolMessage(
+  message: Extract<ProviderChatMessage, { role: "tool" }>,
+  budget: number,
+  tokenizer: ContextTokenizer,
+): ProviderChatMessage {
+  const content = truncateProviderText(message.content, Math.max(0, budget), tokenizer);
+  if (message.toolResult === undefined) return { ...message, content };
+  const { partialContent: _partialContent, ...metadata } = message.toolResult;
+  return { ...message, content, toolResult: { ...metadata, error: content } };
+}
+
 function shrinkProviderGroup(group: readonly ProviderChatMessage[], maxBytes: number): ProviderChatMessage[] {
   let candidate = group.map((message) => isMultimodalUser(message) ? replaceOversizedImages(message, BYTE_IMAGE_MARKER) : message);
   if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= maxBytes) return candidate;
   candidate = candidate.map((message) => message.role === "tool" && typeof message.content === "string"
-    ? { ...message, content: truncateProviderText(message.content, Math.max(0, Math.floor(maxBytes / 2)), createContextTokenizer("bytes")) }
+    ? truncateProviderToolMessage(message, Math.floor(maxBytes / 2), createContextTokenizer("bytes"))
     : message);
   if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= maxBytes) return candidate;
   const prompt = candidate.find((message) => message.role === "user" && typeof message.content === "string");
@@ -575,7 +586,7 @@ function fitNewestGroupToTokenBudget(group: readonly ProviderChatMessage[], budg
   let candidate = group.map((message) => isMultimodalUser(message) ? replaceOversizedImages(message, TOKEN_IMAGE_MARKER) : message);
   if (countProviderMessageTokens(candidate, tokenizer) <= budgetTokens) return candidate;
   candidate = candidate.map((message) => message.role === "tool" && typeof message.content === "string"
-    ? { ...message, content: truncateProviderText(message.content, Math.max(0, Math.floor(budgetTokens / 2)), tokenizer) }
+    ? truncateProviderToolMessage(message, Math.floor(budgetTokens / 2), tokenizer)
     : message);
   if (countProviderMessageTokens(candidate, tokenizer) <= budgetTokens) return candidate;
   const prompt = candidate.find((message) => message.role === "user" && typeof message.content === "string");

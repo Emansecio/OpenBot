@@ -109,10 +109,10 @@ function projectResult(value: unknown): NativeAsyncTaskProjectionResult | null {
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "abandoned"]);
 
-function allowedActions(record: AsyncTaskRecord): readonly NativeAsyncTaskProjectionAction[] {
+function allowedActions(record: AsyncTaskRecord, steerable: boolean): readonly NativeAsyncTaskProjectionAction[] {
   const actions: NativeAsyncTaskProjectionAction[] = [];
   if (!TERMINAL_STATUSES.has(record.status)) actions.push("abort");
-  if (record.status === "running") actions.push("steer");
+  if (steerable) actions.push("steer");
   return actions;
 }
 
@@ -120,10 +120,13 @@ function detailFor(record: AsyncTaskRecord): string {
   switch (record.status) {
     case "queued": return "Na fila";
     case "admitted": return "Admitido";
-    case "running": return record.progress?.summary ?? "Em execução";
+    case "running": return record.steerIntent?.consumedAtMs === null
+      ? "Orientação recebida; aguardando envio ao provedor"
+      : record.steerIntent !== null ? "Orientação incluída na solicitação ao provedor" : record.progress?.summary ?? "Em execução";
     case "retry_wait": return record.error?.message ?? "Aguardando nova tentativa";
     case "cancelling": return "Cancelando";
-    case "completed": return record.result === null ? "Concluída" : record.result.kind === "inline" ? record.result.text : "Concluída";
+    case "completed": return record.steerIntent?.consumedAtMs !== undefined && record.steerIntent?.consumedAtMs !== null
+      ? "Concluída com orientação aplicada" : record.result === null ? "Concluída" : record.result.kind === "inline" ? record.result.text : "Concluída";
     case "failed": return record.error?.message ?? "Falhou";
     case "cancelled": return "Cancelada";
     case "abandoned": return "Abandonada";
@@ -136,13 +139,13 @@ function detailFor(record: AsyncTaskRecord): string {
  * The input is trusted (it came from SQLite parsing), but every text field is
  * still re-bounded and unknown/private fields are structurally dropped.
  */
-export function projectAsyncTaskForRenderer(record: AsyncTaskRecord): NativeAsyncTaskProjectionItem {
+export function projectAsyncTaskForRenderer(record: AsyncTaskRecord, steerable = record.status === "running"): NativeAsyncTaskProjectionItem {
   const progress = record.progress === null ? null : projectProgress(record.progress);
   const error = record.error === null ? null : projectFailure(record.error);
   const result = record.result === null ? null : projectResult(record.result);
   const objective = Array.isArray(record.input) ? "" : (record.input as { objective?: unknown })?.objective;
   const label = boundedText(objective, "Tarefa", PROJECTION_LABEL_MAX_BYTES);
-  const actions = allowedActions(record);
+  const actions = allowedActions(record, steerable);
   const item: NativeAsyncTaskProjectionItem = {
     id: record.taskId,
     kind: record.kind,
@@ -160,8 +163,8 @@ export function projectAsyncTaskForRenderer(record: AsyncTaskRecord): NativeAsyn
 }
 
 /** Converts a list of durable records, preserving SQLite order. */
-export function projectAsyncTaskListForRenderer(records: readonly AsyncTaskRecord[]): NativeAsyncTaskProjectionItem[] {
-  return records.map((record) => projectAsyncTaskForRenderer(record));
+export function projectAsyncTaskListForRenderer(records: readonly AsyncTaskRecord[], canSteer?: (record: AsyncTaskRecord) => boolean): NativeAsyncTaskProjectionItem[] {
+  return records.map((record) => projectAsyncTaskForRenderer(record, canSteer?.(record) ?? record.status === "running"));
 }
 
 /** Derives a bounded inline-result preview used by bridge sanitizers. */

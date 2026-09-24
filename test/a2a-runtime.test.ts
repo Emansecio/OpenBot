@@ -156,6 +156,21 @@ describe("P2.1 A2A runtime", () => {
     await runtime.stop();
   });
 
+  it("rejects a durably partial consumer turn instead of ACKing it", async () => {
+    const h = runtimeHarness();
+    h.store.send(envelope("partial-turn"));
+    h.setConsume(async () => ({ ackNonce: "must-not-ack", outcome: "partial" }));
+    const runtime = new A2ARuntime(h.options);
+    runtime.start();
+    await waitFor(() => h.store.getMessage("partial-turn")?.status === "rejected");
+    expect(h.store.getMessage("partial-turn")).toMatchObject({
+      status: "rejected",
+      ackNonce: null,
+      terminalReason: "turn-partial",
+    });
+    await runtime.stop();
+  });
+
   it("fails closed instead of ACKing an accepted nonce whose turn crashed before completion", async () => {
     const h = runtimeHarness();
     const message = h.store.send(envelope("false-ack-window")).message;

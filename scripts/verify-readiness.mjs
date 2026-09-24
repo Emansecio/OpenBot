@@ -18,7 +18,7 @@ export const READINESS_GATES = Object.freeze([
   {
     id: 1,
     label: "sentinela de isolamento de paths",
-    commands: [npmStep("keystore isolation", ["test", "--", "test/keystore.test.ts", "test/rpc-send.test.ts", "--maxWorkers=1", "--no-file-parallelism"])],
+    commands: [npmStep("keystore isolation", ["test", "--", "test/keystore.test.ts", "test/rpc-send.test.ts", "test/rpc-send-queue.test.ts", "test/rpc-send-dialog.test.ts", "test/rpc-send-stream.test.ts", "test/rpc-send-store.test.ts", "--maxWorkers=1", "--no-file-parallelism"])],
   },
   { id: 2, label: "lint e typecheck", commands: [npmStep("lint", ["run", "lint"]), npmStep("typecheck", ["run", "typecheck"])] },
   {

@@ -1,9 +1,10 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { runInNewContext } from "node:vm";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const root = resolve(new URL("..", import.meta.url).pathname.replace(/^\/(.):/, "$1:"));
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const main = readFileSync(resolve(root, "client/extracted/dist/electron-main/main.cjs"), "utf8");
 const preload = readFileSync(resolve(root, "client/extracted/dist/electron-preload/preload.cjs"), "utf8");
 const rendererHtml = readFileSync(resolve(root, "client/extracted/dist/renderer/index.html"), "utf8");

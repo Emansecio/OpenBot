@@ -70,18 +70,27 @@ export type ClassifiedAgentPath =
   | { kind: "home"; relative: string }
   | { kind: "host"; root: string; relative: string };
 
-/** Drive-letter absolute paths (`C:\...`, `D:/...`, `C:`). All else stays bot-relative. */
+/** Drive-letter and UNC share paths. Device namespaces stay rejected. */
 export function isAbsoluteWindowsPath(value: string): boolean {
-  return typeof value === "string" && /^[A-Za-z]:(?:[\\/]|$)/u.test(value);
+  return typeof value === "string" && (
+    /^[A-Za-z]:(?:[\\/]|$)/u.test(value) ||
+    /^\\\\(?![?.](?:[\\/]|$))[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/u.test(value)
+  );
 }
 
 export function classifyAgentPath(relative: string): ClassifiedAgentPath {
   if (typeof relative !== "string" || relative.length === 0 || relative.includes("\0")) {
     throw new WorkspaceError("invalid_path", "Workspace path is invalid.");
   }
+  if (/^\\\\[?.](?:[\\/]|$)/u.test(relative)) {
+    throw new WorkspaceError("invalid_path", "Windows device paths are not supported.");
+  }
   if (isAbsoluteWindowsPath(relative)) {
-    const root = `${relative.slice(0, 1).toUpperCase()}:\\`;
-    const rest = relative.slice(2).split(/[\\/]/u).filter((part) => part.length > 0 && part !== ".");
+    const root = /^[A-Za-z]:/u.test(relative)
+      ? `${relative.slice(0, 1).toUpperCase()}:\\`
+      : path.parse(path.normalize(relative)).root;
+    const rest = relative.slice(/^[A-Za-z]:/u.test(relative) ? 2 : root.length)
+      .split(/[\\/]/u).filter((part) => part.length > 0 && part !== ".");
     if (rest.some((part) => part === "..")) {
       throw new WorkspaceError("outside_workspace", "Workspace path is outside the workspace.");
     }

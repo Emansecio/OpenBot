@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,15 +7,16 @@ import { HomeAuditLogger } from "../src/execution/audit.js";
 import { LocalExecutionBroker, createAgentHomeBroker } from "../src/execution/broker.js";
 import type { ExecutionBackend, ExecutionRequest, ExecutionResult } from "../src/execution/contracts.js";
 import { DEFAULT_HOME_POLICY, PolicyEngine, PolicyError, extractRequestPaths, parsePolicy, readHomePolicy } from "../src/execution/policy.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((entry) => rm(entry, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 const tempDir = async (prefix: string): Promise<string> => {
   const dir = await mkdtemp(join(tmpdir(), prefix));
-  roots.push(dir);
+  temp.track(dir);
   return dir;
 };
 

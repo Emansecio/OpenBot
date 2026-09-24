@@ -328,7 +328,7 @@ describe("P2.3 staging + image-gating RPC", () => {
     handle.registry.register({
       name: "xai",
       async streamChat(request, emit) {
-        requests.push(structuredClone({ ...request, signal: undefined }));
+        requests.push(structuredClone({ ...request, signal: undefined, onTransportStart: undefined }));
         emit({ type: "delta", delta: "Analisando a imagem." });
         throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
       },
@@ -337,12 +337,16 @@ describe("P2.3 staging + image-gating RPC", () => {
     const staged = await handle.attachmentStaging.stageBytes("agent-a", {
       filename: "pic.png", bytes: PNG, conversationId: conversation.id,
     });
-    handle.runner.sendPrompt({
+    await handle.runner.sendPrompt({
       agentId: "agent-a", conversationId: conversation.id, prompt: "Descreva a imagem", clientNonce: "image-original",
       attachments: [{ name: "pic.png", path: STAGED_PATH_PREFIX + staged.id }],
     });
     await handle.runner.flush("agent-a");
-    handle.runner.retryPrompt("agent-a", conversation.id);
+    expect(requests).toHaveLength(1);
+    expect(handle.store.getEntries("agent-a", conversation.id)).toContainEqual(expect.objectContaining({
+      kind: "notice", providerErrorKind: "network", retryable: true,
+    }));
+    await handle.runner.retryPrompt("agent-a", conversation.id);
     await handle.runner.flush("agent-a");
     expect(requests).toHaveLength(2);
     const images = (request: ProviderChatRequest) => request.messages.flatMap((message) => typeof message.content === "string"
@@ -351,7 +355,9 @@ describe("P2.3 staging + image-gating RPC", () => {
     expect(images(requests[1]!)).toEqual(images(requests[0]!));
     expect(handle.store.getEntries("agent-a", conversation.id).filter((entry) => entry.kind === "user-attachment")).toHaveLength(1);
     await fsp.rm(staged.storedPath);
-    handle.runner.retryPrompt("agent-a", conversation.id);
+    await expect(handle.runner.retryPrompt("agent-a", conversation.id)).rejects.toMatchObject({
+      status: 500, message: expect.stringContaining("Anexe a imagem novamente"),
+    });
     await handle.runner.flush("agent-a");
     expect(requests).toHaveLength(2);
     expect(handle.store.getEntries("agent-a", conversation.id)).toContainEqual(expect.objectContaining({

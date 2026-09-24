@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, open, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -18,16 +17,16 @@ import {
 } from "../src/execution/home-archive.js";
 import { AgentHomeStore } from "../src/execution/home.js";
 import { DEFAULT_WORKSPACE_QUOTA } from "../src/execution/quota.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
   vi.restoreAllMocks();
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "openbot-stream-archive-"));
-  roots.push(root);
+  const root = await temp.makeAsync("openbot-stream-archive-");
   const store = await AgentHomeStore.create(join(root, "workspaces"), {
     acl: { async apply() { return { status: "not-applicable", platform: "linux" }; } },
   });
@@ -56,6 +55,21 @@ function replaceHeader(bytes: Buffer, change: (document: HomeArchiveDocument) =>
 }
 
 describe("streamed home archives", () => {
+  it("rejects an ancestor junction even when the immediate archive parent is a regular directory", async () => {
+    const { root, home } = await fixture();
+    const archiveRoot = join(root, "archives");
+    await mkdir(join(archiveRoot, "nested"), { recursive: true });
+    const alias = join(root, "archive-link");
+    await symlink(archiveRoot, alias, process.platform === "win32" ? "junction" : "dir");
+    const direct = join(archiveRoot, "nested", "portable.obhome");
+    const linked = join(alias, "nested", "portable.obhome");
+    await expect(exportHomeArchive(home.root, "portable", linked)).rejects.toMatchObject({ code: "unsafe_path" });
+    await expect(stat(direct)).rejects.toMatchObject({ code: "ENOENT" });
+    await exportHomeArchive(home.root, "portable", direct);
+    await expect(validateHomeArchive(linked, "portable")).rejects.toMatchObject({ code: "unsafe_path" });
+    await expect(validateHomeArchive(direct, "portable")).resolves.toMatchObject({ version: 2 });
+  });
+
   it("aligns default limits with the existing workspace quota", () => {
     expect(DEFAULT_HOME_ARCHIVE_MAX_BYTES).toBe(DEFAULT_WORKSPACE_QUOTA.maxBytes);
     expect(DEFAULT_HOME_ARCHIVE_MAX_ENTRIES).toBe(DEFAULT_WORKSPACE_QUOTA.maxEntries);

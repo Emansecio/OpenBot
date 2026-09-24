@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile, stat } from "node:fs/promises";
+import { readFile, writeFile, stat } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -9,10 +9,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { dpapiCurrentUserBackend, loadDpapiAddon } from "../src/keystore/dpapi.js";
 import { createKeystore, migrateLocalFileToDpapi, writeScopedSecretsFile } from "../src/keystore/index.js";
 import { localFileBackend, providerApiKeyKey } from "../src/keystore/backend.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 describe("DPAPI CurrentUser", () => {
@@ -22,8 +23,7 @@ describe("DPAPI CurrentUser", () => {
     for (const script of ["build", "verify:backend-artifacts", "verify:dpapi-artifacts"]) {
       execFileSync(process.execPath, [npmCli!, "run", script], { stdio: "pipe" });
     }
-    const root = await mkdtemp(path.join(os.tmpdir(), "openbot-dpapi-live-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-dpapi-live-");
     const addonPath = path.resolve("native", "dpapi", `win32-${process.arch}`, "openbot-dpapi.node");
     expect(existsSync(addonPath)).toBe(true);
     const backend = dpapiCurrentUserBackend();
@@ -73,8 +73,7 @@ describe("DPAPI CurrentUser", () => {
   });
 
   it("falha pós-rename restaura o arquivo legado promovido", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "openbot-dpapi-rollback-red-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-dpapi-rollback-red-");
     const master = randomBytes(32);
     await writeFile(path.join(root, ".master.key"), master);
     const legacy = localFileBackend(master);
@@ -103,8 +102,7 @@ describe("DPAPI CurrentUser", () => {
   });
 
   it("migração transacional preserva chave e arquivo antes do rename e arquiva após verificação", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "openbot-dpapi-migration-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-dpapi-migration-");
     const master = randomBytes(32);
     await writeFile(path.join(root, ".master.key"), master);
     const legacy = localFileBackend(master);

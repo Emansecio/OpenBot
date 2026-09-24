@@ -8,8 +8,7 @@ import { LocalFileExecutor } from "./files.js";
 import { effectiveGrant, readSharedGrants } from "./home-grants.js";
 import { extractRequestPaths } from "./policy.js";
 import {
-  DEFAULT_WORKSPACE_QUOTA,
-  DEFAULT_WORKSPACE_QUOTA_SCOPES,
+  resolveWorkspaceQuota,
   WorkspaceQuota,
   type WorkspaceQuotaOptions,
 } from "./quota.js";
@@ -121,6 +120,10 @@ export interface HomeWorkspaceBackendOptions {
   agentId?: string;
   /** Optional quota override for focused runtime and backend tests. */
   quota?: WorkspaceQuotaOptions;
+  /** Preserve the runtime contract where recoverable trash is limited to home/shared paths. */
+  allowHostTrash?: boolean;
+  /** Preserve the runtime contract that host transfers require two absolute paths on one volume. */
+  requireAbsoluteHostTransferPeers?: boolean;
 }
 
 const readOnlyFailure = (operation: ExecutionRequest["operation"]): ExecutionResult =>
@@ -135,13 +138,15 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     private readonly mounts: Map<SharedUserDirectory, MountExecutors>,
     private readonly userProfile?: string,
     private readonly agentId?: string,
+    private readonly allowHostTrash = true,
+    private readonly requireAbsoluteHostTransferPeers = false,
   ) {}
 
   static async create(root: string, options: HomeWorkspaceBackendOptions = {}): Promise<HomeWorkspaceBackend> {
     const workspace = await WorkspaceSandbox.create(root, { allowAncestorLinks: true });
     const quota = new WorkspaceQuota(
       workspace,
-      options.quota ?? { ...DEFAULT_WORKSPACE_QUOTA, scopes: DEFAULT_WORKSPACE_QUOTA_SCOPES },
+      options.quota ?? resolveWorkspaceQuota(),
     );
     const overlay = options.userProfile !== undefined;
     const mounts = new Map<SharedUserDirectory, MountExecutors>();
@@ -168,6 +173,8 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
       mounts,
       options.userProfile,
       options.agentId,
+      options.allowHostTrash ?? true,
+      options.requireAbsoluteHostTransferPeers ?? false,
     );
   }
 
@@ -235,7 +242,7 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
         return failure(request.operation, "access_denied", "Shared folder grants could not be verified.");
       }
       const current = new HomeWorkspaceBackend(this.workspace, this.quota, this.files, this.commands,
-        mounts, this.userProfile, this.agentId);
+        mounts, this.userProfile, this.agentId, this.allowHostTrash, this.requireAbsoluteHostTransferPeers);
       return current.executeResolved(request, signal);
     }
     return this.executeResolved(request, signal);
@@ -271,7 +278,21 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
         name: `shared://${name}`, path: mount.workspace.root, access: mount.readOnly ? "read" : "write",
       })),
       legacyFolders,
+      quota: this.quota.limits(),
     };
+  }
+
+  /** Maps an absolute path inside this home back to the canonical private namespace. */
+  private classifyPath(value: string): ClassifiedAgentPath {
+    if (!isAbsoluteWindowsPath(value)) return classifyAgentPath(value);
+    const classified = classifyAgentPath(value);
+    const candidate = path.resolve(value);
+    const relative = path.relative(this.workspace.root, candidate);
+    if (relative === "") return { kind: "root" };
+    if (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+      return { kind: "home", relative };
+    }
+    return classified;
   }
 
   private async executeSearch(
@@ -284,7 +305,7 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     for (const scope of request.params.paths.map((item) => joinVirtual(request.cwd, item))) {
       let classified: ClassifiedAgentPath;
       try {
-        classified = classifyAgentPath(scope);
+        classified = this.classifyPath(scope);
       } catch (error) {
         if (error instanceof WorkspaceError) return fromWorkspaceError(request.operation, error);
         throw error;
@@ -391,7 +412,7 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     request: Extract<ExecutionRequest, { operation: "file.list" }>,
     signal?: AbortSignal,
   ): Promise<ExecutionResult> {
-    const classified = classifyAgentPath(request.path);
+    const classified = this.classifyPath(request.path);
     return this.delegateClassified(classified, request, signal);
   }
 
@@ -399,7 +420,7 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     request: Extract<ExecutionRequest, { operation: "file.read" | "file.stat" | "file.mkdir" | "file.write" }>,
     signal?: AbortSignal,
   ): Promise<ExecutionResult> {
-    const classified = classifyAgentPath(request.path);
+    const classified = this.classifyPath(request.path);
     if (classified.kind === "root") {
       if (request.operation === "file.stat") {
         return { ok: true, operation: "file.stat", kind: "directory", bytes: 0 };
@@ -436,10 +457,18 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     request: Extract<ExecutionRequest, { operation: "file.copy" | "file.move" }>,
     signal?: AbortSignal,
   ): Promise<ExecutionResult> {
-    const source = classifyAgentPath(sourcePath);
-    const destination = classifyAgentPath(destinationPath);
+    const source = this.classifyPath(sourcePath);
+    const destination = this.classifyPath(destinationPath);
     if (source.kind === "root" || destination.kind === "root") {
       return failure(request.operation, "invalid_path", "File path is invalid.");
+    }
+    if (this.requireAbsoluteHostTransferPeers && (source.kind === "host" || destination.kind === "host")) {
+      const bothAbsolute = isAbsoluteWindowsPath(sourcePath) && isAbsoluteWindowsPath(destinationPath);
+      const sourceRoot = bothAbsolute ? path.parse(path.resolve(sourcePath)).root.toLowerCase() : "";
+      const destinationRoot = bothAbsolute ? path.parse(path.resolve(destinationPath)).root.toLowerCase() : "";
+      if (!bothAbsolute || sourceRoot !== destinationRoot) {
+        return failure(request.operation, "invalid_path", "Host paths must be absolute and use the same volume.");
+      }
     }
     const destinationMount = this.mountFor(destination);
     if (destinationMount?.readOnly) return readOnlyFailure(request.operation);
@@ -503,8 +532,14 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     request: Extract<ExecutionRequest, { operation: "file.trash" }>,
     signal?: AbortSignal,
   ): Promise<ExecutionResult> {
-    const classified = classifyAgentPath(request.path);
+    const classified = this.classifyPath(request.path);
+    if (classified.kind === "home") {
+      return this.files.execute({ ...request, path: classified.relative }, signal);
+    }
     if (classified.kind !== "shared" && classified.kind !== "host") return this.files.execute(request, signal);
+    if (classified.kind === "host" && !this.allowHostTrash) {
+      return failure(request.operation, "unsupported", "Use process_run for recoverable host trash operations.");
+    }
     if (classified.relative === ".") return failure(request.operation, "invalid_path", "File path is invalid.");
     const mount = classified.kind === "host"
       ? await this.hostMount(classified.root)
@@ -547,6 +582,9 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     request: Extract<ExecutionRequest, { operation: "file.restore" }>,
     signal?: AbortSignal,
   ): Promise<ExecutionResult> {
+    if (request.path !== undefined && !this.allowHostTrash && this.classifyPath(request.path).kind === "host") {
+      return failure(request.operation, "unsupported", "Use process_run for recoverable host trash operations.");
+    }
     if (!validTrashId(request.trashId)) {
       return this.files.execute(request, signal);
     }
@@ -559,15 +597,21 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
       return this.files.execute(request, signal);
     }
     if (storedPath === undefined) return this.files.execute(request, signal);
-    const stored = classifyAgentPath(storedPath);
+    const stored = this.classifyPath(storedPath);
     const destinationPath = request.path ?? storedPath;
-    const destination = classifyAgentPath(destinationPath);
-    const routable = (kind: ClassifiedAgentPath["kind"]): boolean => kind === "shared" || kind === "host";
-    if (!routable(stored.kind) && !routable(destination.kind)) {
-      return this.files.execute(request, signal);
-    }
+    const destination = this.classifyPath(destinationPath);
     if (destination.kind === "root" || destination.relative === ".") {
       return failure(request.operation, "invalid_path", "File path is invalid.");
+    }
+    if (!this.allowHostTrash && (stored.kind === "host" || destination.kind === "host")) {
+      return failure(request.operation, "unsupported", "Use process_run for recoverable host trash operations.");
+    }
+    const routable = (kind: ClassifiedAgentPath["kind"]): boolean => kind === "shared" || kind === "host";
+    if (!routable(stored.kind) && !routable(destination.kind)) {
+      return this.files.execute({
+        ...request,
+        ...(request.path === undefined ? {} : { path: destination.relative }),
+      }, signal);
     }
     if (destination.kind === "home" && isReservedHomeRelative(destination.relative)) {
       return failure(request.operation, "access_denied", "File operation is not permitted.");
@@ -594,7 +638,7 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     signal?: AbortSignal,
   ): Promise<ExecutionResult> {
     if (classified.kind === "root") return this.files.execute(request, signal);
-    if (classified.kind === "home") return this.files.execute(request, signal);
+    if (classified.kind === "home") return this.files.execute(this.rewriteSharedRequest(request, classified.relative), signal);
     if (classified.kind === "host") {
       return (await this.hostMount(classified.root)).files.execute(this.rewriteSharedRequest(request, classified.relative), signal);
     }

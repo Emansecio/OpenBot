@@ -1,25 +1,16 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import {
-  copyFileSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  statSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { copyFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
+import { canCreateFileSymlinks } from "./helpers/symlink.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const workspaceRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const verifier = resolve(workspaceRoot, "scripts/verify-renderer-boundary.mjs");
-const temporaryRoots: string[] = [];
+const temp = new TempRoots();
 
 const INDEX_PATH = "client/extracted/dist/renderer/index.html";
 const ASSETS_PATH = "client/extracted/dist/renderer/assets";
@@ -114,8 +105,7 @@ function createFixture(): {
   manifest: FixtureManifest;
   baseline: FixtureBaseline;
 } {
-  const root = mkdtempSync(join(tmpdir(), "openbot-renderer-boundary-"));
-  temporaryRoots.push(root);
+  const root = temp.make("openbot-renderer-boundary-");
   const files = new Map<string, Buffer | string>([
     [INDEX_PATH, "<!doctype html><main>fixture</main>"],
     [IMMUTABLE_JS_PATH, "export const app = 'fixture';\n"],
@@ -228,8 +218,8 @@ function expectRejected(result: ReturnType<typeof runVerifier>, pattern: RegExp)
   expect(report.errors.some((error) => pattern.test(error))).toBe(true);
 }
 
-afterEach(() => {
-  for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+afterEach(async () => {
+  await temp.cleanup();
 });
 
 describe("renderer boundary verifier", () => {
@@ -425,8 +415,7 @@ describe("renderer boundary verifier", () => {
 
   it("rejects manifest and renderer paths that escape the selected root", () => {
     const fixture = createFixture();
-    const outsideRoot = mkdtempSync(join(tmpdir(), "openbot-renderer-outside-"));
-    temporaryRoots.push(outsideRoot);
+    const outsideRoot = temp.make("openbot-renderer-outside-");
     const outsideManifest = resolve(outsideRoot, "manifest.json");
     writeFileSync(outsideManifest, JSON.stringify(fixture.manifest), "utf8");
     expectRejected(runVerifier(fixture.root, outsideManifest), /manifest: path escapes repository root/u);
@@ -492,8 +481,7 @@ describe("renderer boundary verifier", () => {
 
   it("rejects a linked root and a linked renderer subtree without following either", () => {
     const linkedRootFixture = createFixture();
-    const linkParent = mkdtempSync(join(tmpdir(), "openbot-renderer-link-"));
-    temporaryRoots.push(linkParent);
+    const linkParent = temp.make("openbot-renderer-link-");
     const rootLink = resolve(linkParent, "root-link");
     symlinkSync(linkedRootFixture.root, rootLink, process.platform === "win32" ? "junction" : "dir");
     expectRejected(runVerifier(rootLink, resolve(rootLink, "client/client-artifacts.manifest.json")), /root: symbolic links and junctions are not allowed/u);
@@ -509,17 +497,15 @@ describe("renderer boundary verifier", () => {
     expectRejected(nestedRootResult, /root: symbolic links and junctions are not allowed/u);
 
     const subtreeFixture = createFixture();
-    const outside = mkdtempSync(join(tmpdir(), "openbot-renderer-link-target-"));
-    temporaryRoots.push(outside);
+    const outside = temp.make("openbot-renderer-link-target-");
     writeFileSync(resolve(outside, "escaped.js"), "export {};\n", "utf8");
     symlinkSync(outside, resolve(subtreeFixture.root, ASSETS_PATH, "linked"), process.platform === "win32" ? "junction" : "dir");
     expectRejected(runVerifier(subtreeFixture.root, subtreeFixture.manifestPath), /symbolic links and junctions are not allowed/u);
   });
 
-  it("rejects a declared renderer file replaced by a symlink even when bytes match", () => {
+  it.skipIf(!canCreateFileSymlinks)("rejects a declared renderer file replaced by a symlink even when bytes match", () => {
     const fixture = createFixture();
-    const outside = mkdtempSync(join(tmpdir(), "openbot-renderer-file-link-target-"));
-    temporaryRoots.push(outside);
+    const outside = temp.make("openbot-renderer-file-link-target-");
     const outsideFile = resolve(outside, "proprietary-image.png");
     copyFileSync(resolve(fixture.root, IMMUTABLE_PNG_PATH), outsideFile);
     rmSync(resolve(fixture.root, IMMUTABLE_PNG_PATH));

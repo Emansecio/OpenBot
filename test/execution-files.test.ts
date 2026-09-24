@@ -1,6 +1,5 @@
 import { mkdirSync, renameSync, rmdirSync } from "node:fs";
-import { mkdtemp, mkdir, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { win32 as path } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -8,14 +7,11 @@ import { MAX_FILE_BYTES } from "../src/execution/contracts.js";
 import { LocalFileExecutor } from "../src/execution/files.js";
 import { WorkspaceQuota } from "../src/execution/quota.js";
 import { WorkspaceSandbox } from "../src/execution/workspace.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
-async function temp(prefix = "openbot-files-"): Promise<string> {
-  const root = await mkdtemp(path.join(tmpdir(), prefix));
-  roots.push(root);
-  return root;
-}
-afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
+const tempRoots = new TempRoots();
+const temp = (prefix = "openbot-files-"): Promise<string> => tempRoots.makeAsync(prefix);
+afterEach(() => tempRoots.cleanup());
 
 describe("LocalFileExecutor", () => {
   it("lista, escreve e lê somente dentro do workspace", async () => {
@@ -81,7 +77,7 @@ describe("LocalFileExecutor", () => {
   it("rejeita traversal e não altera arquivo externo", async () => {
     const root = await temp();
     const outside = path.join(path.dirname(root), "outside-openbot.txt");
-    roots.push(outside);
+    tempRoots.track(outside);
     await writeFile(outside, "safe");
     const executor = await LocalFileExecutor.create(root);
     expect(await executor.execute({ operation: "file.write", path: "..\\outside-openbot.txt", content: "bad", encoding: "utf8" }))

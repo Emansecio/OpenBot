@@ -1,5 +1,3 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,18 +5,18 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConfigStore } from "../src/config/store.js";
 import { registerMcpHandlers, type McpRpcHandler } from "../src/rpc/mcp.js";
 import { McpManager } from "../src/mcp/manager.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 type Registered = Map<string, McpRpcHandler>;
 
-const tempRoots: string[] = [];
+const temp = new TempRoots();
 
-afterEach(() => {
-  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+afterEach(async () => {
+  await temp.cleanup();
 });
 
 function root(): string {
-  const value = mkdtempSync(join(tmpdir(), "openbot-rpc-mcp-"));
-  tempRoots.push(value);
+  const value = temp.make("openbot-rpc-mcp-");
   return value;
 }
 

@@ -114,16 +114,76 @@ describe("OpenCode Go", () => {
     const adapter = new OpenCodeGoAdapter({ apiKey: "oc-test", fetchImpl });
     const events: ProviderStreamEvent[] = [];
 
-    await adapter.streamChat(request("minimax-m3"), (event) => events.push(event));
+    await adapter.streamChat({
+      ...request("minimax-m3"),
+      messages: [
+        { role: "user", content: "use a tool" },
+        { role: "assistant", content: "", toolCalls: [{ id: "prior", type: "function", function: { name: "clock", arguments: "{}" } }] },
+        {
+          role: "tool",
+          toolCallId: "prior",
+          content: "clock failed",
+          toolResult: { ok: false, error: "clock failed", code: "io_error", partialContent: "partial clock output" },
+        },
+      ],
+    }, (event) => events.push(event));
 
     expect(captured?.url).toBe("https://opencode.ai/zen/go/v1/messages");
     const headers = new Headers(captured?.init?.headers);
     expect(headers.get("x-api-key")).toBe("oc-test");
     expect(headers.get("anthropic-version")).toBe("2023-06-01");
+    const body = JSON.parse(String(captured?.init?.body)) as { messages: Array<{ content: Array<Record<string, unknown>> }> };
+    const priorResult = body.messages.at(-1)?.content[0];
+    expect(priorResult).toMatchObject({ type: "tool_result", tool_use_id: "prior", is_error: true });
+    expect(JSON.parse(String(priorResult?.content))).toMatchObject({
+      openbotToolResult: { ok: false, error: "clock failed", code: "io_error" },
+      partialOutput: "partial clock output",
+    });
     expect(events).toEqual([
       { type: "delta", delta: "Olá" },
       { type: "tool-call", call: { id: "tool_1", type: "function", function: { name: "clock", arguments: "{\"tz\":\"UTC\"}" } } },
     ]);
+  });
+
+  it("rejeita início de tool call Anthropic sem index", async () => {
+    const frames = [
+      { type: "content_block_start", content_block: { type: "tool_use", id: "tool_1", name: "clock", input: {} } },
+      { type: "message_stop" },
+    ];
+    const adapter = new OpenCodeGoAdapter({
+      apiKey: "oc-test",
+      fetchImpl: vi.fn(async () => new Response(frames.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""))) as unknown as typeof fetch,
+    });
+
+    await expect(adapter.streamChat(request("minimax-m3"), () => undefined)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("rejeita tool call sem content_block_stop", async () => {
+    const frames = [
+      { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tool_1", name: "clock", input: {} } },
+      { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{\"tz\":\"UTC\"}" } },
+      { type: "message_delta", delta: { stop_reason: "tool_use" } },
+      { type: "message_stop" },
+    ];
+    const adapter = new OpenCodeGoAdapter({
+      apiKey: "oc-test",
+      fetchImpl: vi.fn(async () => new Response(frames.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""))) as unknown as typeof fetch,
+    });
+
+    await expect(adapter.streamChat(request("minimax-m3"), () => undefined)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("rejeita stop_reason desconhecido", async () => {
+    const frames = [
+      { type: "message_delta", delta: { stop_reason: "future_reason" } },
+      { type: "message_stop" },
+    ];
+    const adapter = new OpenCodeGoAdapter({
+      apiKey: "oc-test",
+      fetchImpl: vi.fn(async () => new Response(frames.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""))) as unknown as typeof fetch,
+    });
+
+    await expect(adapter.streamChat(request("minimax-m3"), () => undefined)).rejects.toMatchObject({ status: 502, code: "future_reason" });
   });
 
   it("fails closed without credentials or a known protocol", async () => {

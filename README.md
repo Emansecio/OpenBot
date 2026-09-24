@@ -154,6 +154,13 @@ Comportamento do chat sob falhas: [`docs/chat-provider-resilience.md`](docs/chat
 
 Requisitos: Node.js ≥ 20 (testado em v22), Windows (keystore DPAPI a partir de T4).
 
+O launcher do checkout prioriza `runtime/node/node.exe`, quando presente, sem
+alterar o PATH do Windows. O runtime local e os módulos nativos devem ser
+compatíveis; nesta instalação, Node 22 usa o SQLite nativo de ABI 127. O Electron
+fica em `node_modules/electron/dist`. Esses binários locais não são versionados.
+Para usar os comandos npm acima no PowerShell desta pasta:
+`$env:PATH = "$PWD\runtime\node;$env:PATH"`.
+
 ## Fluxo operacional do checkout
 
 ### Fase 2 concluída — ambiente prático por bot
@@ -173,8 +180,12 @@ Requisitos: Node.js ≥ 20 (testado em v22), Windows (keystore DPAPI a partir de
 ### Operação das homes e diagnóstico de execução
 
 - Manutenção de home fecha sessões do navegador sem apagar cookies, login ou armazenamento persistente. A exclusão explícita do bot usa uma operação de purge separada. A manutenção bloqueia novas execuções do bot e aguarda as operações em andamento; falha de drenagem impede a mutação da home.
+- A exclusão cancela também as compactações em andamento. A pasta vai para quarentena para permitir recuperação, inclusive quando ultrapassou a quota; a validação de caminhos continua obrigatória. A criação prepara os arquivos em staging antes de publicar a pasta ativa e descarta a preparação se uma escrita falhar.
+- A limpeza definitiva usa o RPC local `purgeDeletedAgentData` com `{ "agentId": "id-do-bot", "confirm": true }`. Ele remove as quarentenas e os snapshots desse ID e libera o espaço; recusa bots cadastrados, homes ativas e exclusões ainda pendentes de reconciliação. É irreversível e nunca roda automaticamente. Para listar os IDs sem ler o conteúdo das pastas, use `listQuarantinedAgents` com `{ "includeInventory": false }`; a listagem padrão com inventário permanece disponível.
 - Processos nativos usam Job Objects com recuperação por identidade versionada. O helper compilado fica no cache gerenciado do runtime; o primeiro uso compila, e os seguintes verificam e reutilizam o binário. Temporários e caches de ferramentas recebem defaults por home em `.openbot-runtime`, sem trocar o perfil/credenciais do usuário; `env` explícito prevalece. Isso controla o ciclo de vida, não isola permissões do Windows nem fornece serviços persistentes.
 - Processos sobrepostos na mesma home compartilham um observador de quota. Eventos repetidos são agrupados; a fila de paths é limitada. Há inventário inicial, reconciliação periódica enquanto há processos e reconciliação final. Isso não é quota rígida do NTFS nem desfaz arquivos já gravados.
+- `workspace_info` expõe os limites efetivos em `quota.global` e `quota.folders` sem varrer a home. O consumo não faz parte dessa resposta. Os defaults permanecem 2 GiB por workspace, 256 MiB em `Downloads`, 1,5 GiB em `Projects` e 64 MiB em `.openbot`, com os limites de arquivos/entradas definidos no backend.
+- A quota persistente por bot usa o campo opcional `workspaceQuota` dos RPCs existentes `createAgent` e `updateAgent`. Ele aceita overrides parciais `maxBytes`, `maxFiles`, `maxEntries` e `folders` (`Downloads`, `Projects` ou `.openbot`); `workspaceQuota: null` remove o override. Em `updateAgent`, a resposta só retorna depois que o fence de manutenção drena arquivos/processos, para e invalida o backend anterior; o limite novo vale na próxima operação. Reduzir um limite não remove dados existentes.
 - Novos exports/snapshots usam arquivo binário v2, com payload transferido em blocos de 256 KiB. A importação reconhece o formato pelo conteúdo e aceita o JSON/Base64 legado; somente o v2 limita a memória do payload independentemente do tamanho total. Metadados continuam proporcionais ao número de entradas e têm limite próprio. Os limites de quota continuam valendo.
 - `npm run diagnostics:execution` lê `getExecutionDiagnostics` no gateway local autenticado, sem executar bots, iniciar processos ou varrer homes. Mostra admissão/fila de provider e runtime, contadores de quota das homes inicializadas, memória e event loop do gateway. Contadores são locais ao processo e reiniciam no bootstrap; não são medição de capacidade máxima. O comando precisa de um gateway que já contenha esta versão.
 - Concorrência e limites padrão não foram ampliados indiscriminadamente. Bots existentes e novos usam o mesmo fluxo no próximo bootstrap atualizado; não é necessário recriar os bots. Atualizar o código não reinicia uma instância já em execução.

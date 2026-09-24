@@ -82,11 +82,13 @@ export interface TurnExecution {
     /** Rótulo legível (já sanitizado por `toolCallSummary`) enquanto `phase === "tool"`. */
     toolName?: string;
 }
+/** Resultado factual do turno, independente do sucesso do transporte. */
+export type TurnOutcome = "success" | "partial" | "error" | "aborted";
 /** Resultado confirmado do último turno encerrado de um agente. */
 export interface LastTurnOutcome {
     turnId: string;
     conversationId?: string;
-    outcome: "success" | "error" | "aborted";
+    outcome: TurnOutcome;
     finishedAtMs: number;
 }
 /** A fase ao vivo é um refinamento da fase durável já existente — não um segundo sistema. */
@@ -194,6 +196,7 @@ export interface TurnAttemptRecord {
 export interface TurnAttemptCompletion {
     turnId: string;
     completedAtMs: number;
+    outcome: TurnOutcome;
 }
 
 export interface KickstartRunRecord {
@@ -232,6 +235,7 @@ export interface TranscriptAgentSnapshot {
         conversationId?: string;
         turnId: string;
         completedAtMs: number;
+        outcome?: TurnOutcome;
     }>;
     kickstartRuns?: KickstartRunRecord[];
 }
@@ -265,8 +269,9 @@ export interface TranscriptStore {
     append(agentId: string, entries: readonly TranscriptEntry[], conversationId?: string, consumeStagedAttachments?: boolean): void;
     beginTurnAttempt(attempt: TurnAttemptRecord): void;
     updateTurnAttempt(agentId: string, turnId: string, phase: TurnAttemptPhase): void;
-    finishTurnAttempt(agentId: string, turnId: string): void;
+    finishTurnAttempt(agentId: string, turnId: string, outcome?: TurnOutcome): void;
     hasCompletedTurnForNonce?(agentId: string, nonce: string, conversationId?: string): boolean;
+    getTurnOutcomeForNonce?(agentId: string, nonce: string, conversationId?: string): TurnOutcome | undefined;
     clear(agentId: string): void;
     /** Clears multiple agents atomically when the backing store supports batching. */
     clearAgents?(agentIds: readonly string[]): void;
@@ -366,6 +371,7 @@ interface TurnMetadata extends ResolvedProvider {
     contextNoticePublished?: boolean;
     streamController?: AbortController;
     finalized?: boolean;
+    terminalErrorObserved?: boolean;
     contentStarted?: boolean;
     reasoning?: TurnReasoningState;
     isResume?: boolean;
@@ -373,6 +379,8 @@ interface TurnMetadata extends ResolvedProvider {
     providerAttemptsUsed?: number;
     toolRoundsUsed?: number;
     toolCallsUsed?: number;
+    /** Provider tool-call identity occurrence counts observed in this turn. */
+    toolCallIdOccurrences?: Map<string, number>;
     completedEffectIds?: string[];
 }
 
@@ -471,7 +479,7 @@ export interface TurnRunnerOptions {
 import { createHash, randomUUID } from "node:crypto";
 import { isCatalogProvider, type ModelResolution } from "../providers/model-catalog.js";
 import { MODEL_CATALOG } from "../config/models.js";
-import { makeToolCallEntry, stableToolCallId, toolCallLocalId, toolCallSummary } from "../execution/tool-card.js";
+import { makeToolCallEntry, occurrenceToolCallId, stableToolCallId, toolCallLocalId, toolCallSummary } from "../execution/tool-card.js";
 import { resolveToolLoopBudget, runToolLoop } from "../execution/tool-loop.js";
 import { BROWSER_TOOL_NAMES, selectTurnProviderTools, WHATSAPP_TOOL_NAME } from "../execution/home-tools.js";
 import { previewFromText } from "./activity.js";
@@ -798,7 +806,7 @@ export function createMemoryTranscriptStore(): TranscriptStore {
             if (attempt?.agentId === agentId)
                 turnAttempts.set(turnId, { ...attempt, phase });
         },
-        finishTurnAttempt(agentId, turnId) {
+        finishTurnAttempt(agentId, turnId, outcome = "success") {
             const attempt = turnAttempts.get(turnId);
             if (attempt?.agentId !== agentId)
                 return;
@@ -811,7 +819,7 @@ export function createMemoryTranscriptStore(): TranscriptStore {
                         completedNonces.set(agentId, byNonce);
                     }
                     const conversations = byNonce.get(attempt.clientNonce) ?? new Map();
-                    conversations.set(resolvedConversationId, { turnId, completedAtMs: now() });
+                    conversations.set(resolvedConversationId, { turnId, completedAtMs: now(), outcome });
                     byNonce.set(attempt.clientNonce, conversations);
                 }
             }
@@ -963,6 +971,11 @@ export function createMemoryTranscriptStore(): TranscriptStore {
             const resolvedConversationId = conversationKey(conversationId ?? activeConversations.get(agentId));
             return completedNonces.get(agentId)?.get(nonce)?.has(resolvedConversationId) ?? false;
         },
+        getTurnOutcomeForNonce(agentId, nonce, conversationId) {
+            validateMemoryConversation(agentId, conversationId);
+            const resolvedConversationId = conversationKey(conversationId ?? activeConversations.get(agentId));
+            return completedNonces.get(agentId)?.get(nonce)?.get(resolvedConversationId)?.outcome;
+        },
         clear(agentId) {
             byAgent.delete(agentId);
             promptQueue.clear(agentId);
@@ -1078,7 +1091,11 @@ export function createMemoryTranscriptStore(): TranscriptStore {
                     completedNonces.set(agentId, byNonce);
                 }
                 const conversations = byNonce.get(completion.nonce) ?? new Map();
-                conversations.set(conversationId, { turnId: completion.turnId, completedAtMs: completion.completedAtMs });
+                conversations.set(conversationId, {
+                    turnId: completion.turnId,
+                    completedAtMs: completion.completedAtMs,
+                    outcome: completion.outcome ?? "success",
+                });
                 byNonce.set(completion.nonce, conversations);
             }
             for (const run of snapshot.kickstartRuns ?? []) {
@@ -1814,7 +1831,10 @@ export class TurnRunner {
                     return;
                 }
                 const result = await this.runTurn(args, inference, { kind: "user" });
-                queue.transition(agentId, conversationId!, clientNonce!, "running", result.outcome === "success" && result.echoPersisted ? "completed" : "interrupted");
+                // Queue completion means the accepted item reached a durable
+                // terminal result; the task outcome is stored separately.
+                const consumed = (result.outcome === "success" || result.outcome === "partial") && result.echoPersisted;
+                queue.transition(agentId, conversationId!, clientNonce!, "running", consumed ? "completed" : "interrupted");
             } catch (error) {
                 queue.transition(agentId, conversationId!, clientNonce!, "queued", "interrupted");
                 queue.transition(agentId, conversationId!, clientNonce!, "running", "interrupted");
@@ -2842,19 +2862,19 @@ export class TurnRunner {
         if (echoEntryId === undefined) return { outcome: "unknown-durability" };
         return { outcome: "found", record: { status: "accepted", ...(echoEntryId ? { echoEntryId } : {}) } };
     }
-    /**
-     * Durable consumer barrier used by A2A. Absence or ambiguity fails closed:
-     * an accepted nonce/user echo alone is not proof that the turn completed.
-     */
-    isPromptCompleted(agentId: string, nonce: string, conversationId?: string): boolean {
-        if (this.store.hasCompletedTurnForNonce === undefined)
-            return false;
+    /** Durable terminal result; acceptance/user echo alone is not completion. */
+    promptOutcome(agentId: string, nonce: string, conversationId?: string): TurnOutcome | undefined {
+        if (this.store.getTurnOutcomeForNonce === undefined)
+            return undefined;
         if (conversationId !== undefined) {
             this.validateAcceptanceConversation(agentId, conversationId);
-            return this.store.hasCompletedTurnForNonce(agentId, nonce, conversationId);
+            return this.store.getTurnOutcomeForNonce(agentId, nonce, conversationId);
         }
         const scopes = this.store.findAcceptedNonceConversations?.(agentId, nonce) ?? (this.store.hasAcceptedNonce(agentId, nonce) ? [undefined] : []);
-        return scopes.length === 1 && this.store.hasCompletedTurnForNonce(agentId, nonce, scopes[0]);
+        return scopes.length === 1 ? this.store.getTurnOutcomeForNonce(agentId, nonce, scopes[0]) : undefined;
+    }
+    isPromptCompleted(agentId: string, nonce: string, conversationId?: string): boolean {
+        return this.promptOutcome(agentId, nonce, conversationId) !== undefined;
     }
     findAgentIdByNonce(nonce: string): string | undefined {
         const ids = this.config?.snapshot().agents.map((entry) => entry.id) ?? [];
@@ -2971,12 +2991,12 @@ export class TurnRunner {
             agents: ids.map(id => this.promptStatus(id)) };
     }
     // ── pipeline do turno ───────────────────────────────────────────────────────
-    async runTurn(args: SandSendPromptArgs, inference: ResolvedProvider, origin: TurnOrigin = { kind: "user" }, acceptance?: { confirm(): void; reject(error: unknown): void }): Promise<{ outcome: "success" | "error" | "aborted"; echoPersisted: boolean }> {
+    async runTurn(args: SandSendPromptArgs, inference: ResolvedProvider, origin: TurnOrigin = { kind: "user" }, acceptance?: { confirm(): void; reject(error: unknown): void }): Promise<{ outcome: TurnOutcome; echoPersisted: boolean }> {
         const { agentId, prompt, attachments, clientNonce, conversationId } = args;
         const turnId = `turn:${randomUUID()}`;
         const startedAtMs = Date.now();
         const attemptStartedAtMs = this.nowFn();
-        let outcome: "success" | "error" | "aborted" = "error";
+        let outcome: TurnOutcome = "error";
         const execution: TurnExecution = { phase: "preparing", startedAtMs: attemptStartedAtMs, phaseChangedAtMs: attemptStartedAtMs };
         const turn: TurnMetadata = {
             turnId,
@@ -3394,7 +3414,7 @@ export class TurnRunner {
                             },
                         });
                         return {
-                            kind: "tool",
+                            kind: "tool" as const,
                             playback,
                             observableCount,
                             result: loopResult,
@@ -3403,7 +3423,7 @@ export class TurnRunner {
                     turn.providerAttemptsUsed = (turn.providerAttemptsUsed ?? 0) + 1;
                     const streamResult = await streamChat(provider, request, onEvent, statusOptions);
                     return {
-                        kind: "stream",
+                        kind: "stream" as const,
                         playback,
                         observableCount,
                         result: streamResult,
@@ -3438,7 +3458,26 @@ export class TurnRunner {
                 this.flushTranscriptSnapshots();
             }
             this.persistResumeCheckpoint(agentId, turn, conversationId, providerAttempt.result?.cursor ?? turn.resumeCursor);
-            outcome = providerAttempt.result.aborted ? "aborted" : providerAttempt.result.error || !providerAttempt.result.message?.content.trim() ? "error" : "success";
+            outcome = providerAttempt.result.aborted
+                ? "aborted"
+                : providerAttempt.result.error || !providerAttempt.result.message?.content.trim()
+                    ? "error"
+                    : providerAttempt.kind === "tool" && providerAttempt.result.taskOutcome === "partial"
+                        ? "partial"
+                        : "success";
+            // The router returns observer failures as StreamChatResult.error.
+            // If the terminal error event itself was not observed, force the
+            // same interrupted finalization before the generic finally block
+            // can otherwise persist the partial text as a normal completion.
+            if (!providerAttempt.result.aborted && providerAttempt.result.error !== undefined && turn.terminalErrorObserved !== true) {
+                try {
+                    this.onStreamEvent(agentId, { type: "error", error: providerAttempt.result.error }, turn, providerAttempt.kind === "tool");
+                }
+                catch (error) {
+                    this.finalizeAssistant(agentId, this.liveAssistant.get(agentId)?.content, { keepPartial: true }, turn);
+                    throw error;
+                }
+            }
             const ensureAbortedNotice = () => {
                 // Direct lookup when available; full-scan fallback preserves behavior.
                 const alreadyPublished = this.store.findRetryableErrorNotice !== undefined
@@ -3510,25 +3549,43 @@ export class TurnRunner {
             catch {
                 // Transcript cleanup must not prevent turn/controller teardown.
             }
-            this.finalizeAssistant(agentId, this.liveAssistant.get(agentId)?.content, { silent: true }, turn);
-            this.runningTurns = Math.max(0, this.runningTurns - 1);
-            this.turnControllers.delete(agentId);
-            const live = this.latestAssistantPreview(agentId, conversationId);
-            this.currentTurns.delete(agentId);
-            this.lastTurns.set(agentId, {
-                turnId,
-                ...(conversationId === undefined ? {} : { conversationId }),
-                outcome: controller.signal.aborted ? "aborted" : outcome,
-                finishedAtMs: this.nowFn(),
-            });
-            this.activity?.patch(agentId, {
-                isRunning: (this.pendingCounts.get(agentId) ?? 0) > 1,
-                ...(live ? { lastMessageId: live.id, lastMessagePreview: live.content, lastEntry: previewFromText(live.content) } : {}),
-            });
-            this.store.finishTurnAttempt(agentId, turnId);
+            try {
+                this.finalizeAssistant(agentId, this.liveAssistant.get(agentId)?.content, { silent: true, keepPartial: outcome === "error" || outcome === "aborted" }, turn);
+            }
+            catch (error) {
+                outcome = "error";
+                const pending = this.liveAssistant.get(agentId);
+                if (pending) {
+                    // Expose the retained text as interrupted, without claiming
+                    // durability. The throw leaves the journal open for recovery.
+                    this.publishUpdate(agentId, this.assistantMessage(agentId, pending.id, pending.content, false, turn, "interrupted"), conversationId);
+                }
+                throw error;
+            }
+            finally {
+                // Persistent storage failures must also release the executor;
+                // the next turn must never reuse this assistant's live identity.
+                this.liveAssistant.delete(agentId);
+                this.runningTurns = Math.max(0, this.runningTurns - 1);
+                this.turnControllers.delete(agentId);
+                this.currentTurns.delete(agentId);
+                this.lastTurns.set(agentId, {
+                    turnId,
+                    ...(conversationId === undefined ? {} : { conversationId }),
+                    outcome: controller.signal.aborted ? "aborted" : outcome,
+                    finishedAtMs: this.nowFn(),
+                });
+                const live = this.latestAssistantPreview(agentId, conversationId);
+                this.activity?.patch(agentId, {
+                    isRunning: (this.pendingCounts.get(agentId) ?? 0) > 1,
+                    ...(live ? { lastMessageId: live.id, lastMessagePreview: live.content, lastEntry: previewFromText(live.content) } : {}),
+                });
+            }
+            const terminalOutcome: TurnOutcome = controller.signal.aborted ? "aborted" : outcome;
+            this.store.finishTurnAttempt(agentId, turnId, terminalOutcome);
             if (process.env.NODE_ENV !== "test") console.info(`[openbot][turn-result] ${JSON.stringify({
                 operationId: turnId, provider: inference.provider, model: inference.model, startedAtMs,
-                durationMs: Date.now() - startedAtMs, outcome: controller.signal.aborted ? "aborted" : outcome,
+                durationMs: Date.now() - startedAtMs, outcome: terminalOutcome,
             })}`);
         }
         return { outcome: controller.signal.aborted ? "aborted" : outcome, echoPersisted };
@@ -4073,7 +4130,11 @@ export class TurnRunner {
             }
             case "tool-call": {
                 const { call } = event;
-                const id = stableToolCallId(call.id, call.function.name, call.function.arguments);
+                const providerId = stableToolCallId(call.id, call.function.name, call.function.arguments);
+                const occurrences = turn.toolCallIdOccurrences ??= new Map<string, number>();
+                const occurrence = occurrences.get(providerId) ?? 0;
+                occurrences.set(providerId, occurrence + 1);
+                const id = occurrenceToolCallId(providerId, call.function.name, call.function.arguments, occurrence);
                 this.publishToolCall(agentId, makeToolCallEntry(id, call.function.name, toolCallSummary(call.function.name, call.function.arguments), hasToolLoop ? "pending" : "completed", undefined, toolCallLocalId(turn.turnId, id)), turn.conversationId);
                 break;
             }
@@ -4110,12 +4171,14 @@ export class TurnRunner {
                 this.terminalizeReasoning(agentId, turn, error.kind === "aborted" ? "interrupted" : "error");
                 if (error.kind === "aborted") {
                     this.finalizeAssistant(agentId, this.liveAssistant.get(agentId)?.content, { keepPartial: true }, turn);
+                    turn.terminalErrorObserved = true;
                     appended.push(retryableTurnNotice(turn, turn.responseLimited ? "response-limit" : "aborted", turn.responseLimited
                         ? "A resposta atingiu o limite seguro de tamanho."
                         : "Geração interrompida."));
                     break;
                 }
                 this.finalizeAssistant(agentId, this.liveAssistant.get(agentId)?.content, { keepPartial: true }, turn);
+                turn.terminalErrorObserved = true;
                 appended.push({
                     kind: "notice",
                     id: `notice:${turn.turnId}:provider-error`,
@@ -4249,10 +4312,9 @@ export class TurnRunner {
         const live = this.liveAssistant.get(agentId);
         const rawContent = (text !== undefined && text.length > 0 ? text : live?.content) ?? "";
         const content = utf8Prefix(rawContent, MAX_LIVE_RESPONSE_BYTES);
-        if (live && turn !== undefined)
-            turn.finalized = true;
-        this.liveAssistant.delete(agentId);
         if (content.length === 0) {
+            if (live && turn !== undefined) turn.finalized = true;
+            this.liveAssistant.delete(agentId);
             return;
         }
         const id = live?.id ?? this.newIdFn("assistant");
@@ -4262,6 +4324,10 @@ export class TurnRunner {
             this.finalizeStreamSnapshot(agentId, entry, turn?.conversationId, live);
         else
             this.appendAndPublish(agentId, [entry], turn?.conversationId);
+        // Keep the same identity and text available to the error finalizer if
+        // persistence or publication fails. A failed write is not completion.
+        if (live && turn !== undefined) turn.finalized = true;
+        this.liveAssistant.delete(agentId);
         // A resposta textual já foi persistida/publicada como `message` acima.
         // Não a replique em um card `send-message`: o renderer exibe ambos os
         // kinds e isso transformaria uma única resposta em duas bolhas idênticas.

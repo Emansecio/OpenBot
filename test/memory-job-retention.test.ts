@@ -1,20 +1,18 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { SqliteTranscriptStore } from "../src/store/index.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const DAY_MS = 24 * 60 * 60_000;
-const roots: string[] = [];
+const temp = new TempRoots();
 
-afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+afterEach(async () => {
+  await temp.cleanup();
 });
 
 function createStore(): { store: SqliteTranscriptStore; dbPath: string } {
-  const root = mkdtempSync(join(tmpdir(), "openbot-memory-job-retention-"));
-  roots.push(root);
+  const root = temp.make("openbot-memory-job-retention-");
   const dbPath = join(root, "store.db");
   return { store: new SqliteTranscriptStore({ path: dbPath }), dbPath };
 }

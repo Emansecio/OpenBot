@@ -213,6 +213,16 @@ describe("T5 router — mapeamento de erros transientes vs permanentes", () => {
     expect(err.retryable).toBe(false);
   });
 
+  it("classifica falha de leitura pelo código aninhado sem perder a causa", () => {
+    const socket = Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" });
+    const error = new TypeError("terminated", { cause: new Error("reader failed", { cause: socket }) });
+    expect(classifyProviderError(error)).toMatchObject({ kind: "network", code: "UND_ERR_SOCKET", retryable: true, cause: error });
+    expect(classifyProviderError(Object.assign(new Error("unauthorized", { cause: socket }), { status: 401 }))).toMatchObject({ kind: "auth", retryable: false });
+    const cyclic = new Error("cycle");
+    cyclic.cause = cyclic;
+    expect(classifyProviderError(cyclic)).toMatchObject({ kind: "unknown", retryable: false });
+  });
+
   it("400/404/422 → validation (permanente)", () => {
     for (const status of [400, 404, 422]) {
       const err = classifyProviderError(Object.assign(new Error("bad request"), { status }));

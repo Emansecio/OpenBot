@@ -402,7 +402,8 @@ function parseReservation(value: unknown, name: string): BudgetReservation {
 }
 
 function parseUsage(value: unknown): SubagentBudgetUsage {
-  const input = exactBudgetObject(value, ["used", "reserved", "reservations"], "usage");
+  const hasEstimated = typeof value === "object" && value !== null && "estimated" in value;
+  const input = exactBudgetObject(value, hasEstimated ? ["used", "reserved", "reservations", "estimated"] : ["used", "reserved", "reservations"], "usage");
   const used = parseCounters(input.used, "usage.used");
   const reserved = parseCounters(input.reserved, "usage.reserved");
   if (!Array.isArray(input.reservations)) invalidBudgetContract("usage.reservations must be an array.");
@@ -411,7 +412,16 @@ function parseUsage(value: unknown): SubagentBudgetUsage {
   let aggregate = emptyBudgetCounters();
   for (const reservation of reservations) aggregate = addCounters(aggregate, reservation.amounts);
   if (COUNTER_FIELDS.some((field) => aggregate[field] !== reserved[field])) invalidBudgetContract("Persisted reserved counters do not match reservations.");
-  return { used, reserved, reservations };
+  let estimated: SubagentBudgetUsage["estimated"];
+  if (hasEstimated) {
+    const raw = exactBudgetObject(input.estimated, ["inputTokens", "outputTokens"], "usage.estimated");
+    estimated = {
+      inputTokens: nonNegativeCounter(raw.inputTokens, "usage.estimated.inputTokens"),
+      outputTokens: nonNegativeCounter(raw.outputTokens, "usage.estimated.outputTokens"),
+    };
+    if (estimated.inputTokens > used.inputTokens || estimated.outputTokens > used.outputTokens) invalidBudgetContract("Estimated tokens cannot exceed used tokens.");
+  }
+  return { used, reserved, reservations, ...(estimated === undefined ? {} : { estimated }) };
 }
 
 export function emptyBudgetCounters(): BudgetCounters {
@@ -439,6 +449,12 @@ export function liquidateBudgetReservations(usageValue: SubagentBudgetUsage): Su
     used: addCounters(usage.used, usage.reserved),
     reserved: emptyBudgetCounters(),
     reservations: [],
+    ...(usage.estimated === undefined && usage.reserved.inputTokens === 0 && usage.reserved.outputTokens === 0 ? {} : {
+      estimated: {
+        inputTokens: (usage.estimated?.inputTokens ?? 0) + usage.reserved.inputTokens,
+        outputTokens: (usage.estimated?.outputTokens ?? 0) + usage.reserved.outputTokens,
+      },
+    }),
   };
 }
 
@@ -474,6 +490,7 @@ export function reserveBudget(
     used: usage.used,
     reserved: addCounters(usage.reserved, reservation.amounts),
     reservations: [...usage.reservations, reservation],
+    ...(usage.estimated === undefined ? {} : { estimated: usage.estimated }),
   };
 }
 
@@ -481,6 +498,7 @@ export function reconcileBudgetReservation(
   usageValue: SubagentBudgetUsage,
   reservationIdValue: string,
   actualValue: BudgetCounters,
+  estimatedValue?: { readonly inputTokens?: number; readonly outputTokens?: number },
 ): SubagentBudgetUsage {
   const usage = parseUsage(usageValue);
   const reservationId = reservationIdentifier(reservationIdValue);
@@ -488,10 +506,16 @@ export function reconcileBudgetReservation(
   const reservation = usage.reservations.find((entry) => entry.reservationId === reservationId);
   if (reservation === undefined) invalidBudgetContract("Budget reservation does not exist.");
   if (COUNTER_FIELDS.some((field) => actual[field] > reservation.amounts[field])) invalidBudgetContract("Actual usage cannot exceed its reservation.");
+  const estimated = estimatedValue === undefined && usage.estimated === undefined ? undefined : {
+    inputTokens: (usage.estimated?.inputTokens ?? 0) + nonNegativeCounter(estimatedValue?.inputTokens ?? 0, "estimated.inputTokens"),
+    outputTokens: (usage.estimated?.outputTokens ?? 0) + nonNegativeCounter(estimatedValue?.outputTokens ?? 0, "estimated.outputTokens"),
+  };
+  if (estimated !== undefined && (estimated.inputTokens > usage.used.inputTokens + actual.inputTokens || estimated.outputTokens > usage.used.outputTokens + actual.outputTokens)) invalidBudgetContract("Estimated tokens cannot exceed used tokens.");
   return {
     used: addCounters(usage.used, actual),
     reserved: subtractCounters(usage.reserved, reservation.amounts),
     reservations: usage.reservations.filter((entry) => entry.reservationId !== reservationId),
+    ...(estimated === undefined ? {} : { estimated }),
   };
 }
 

@@ -11,16 +11,17 @@ import { registerRosterHandlers } from "../src/rpc/roster.js";
 import { reconcileRosterHomes } from "../src/rpc/roster-reconciliation.js";
 import { createGateway } from "../src/server/gateway.js";
 import { createProviderRegistry } from "../src/providers/router.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 async function tempRoot(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix));
-  roots.push(root);
+  temp.track(root);
   return root;
 }
 
@@ -145,6 +146,24 @@ describe("roster/home reconciliation", () => {
       { agentId: "corrupt-home", reason: "home ativo possui manifesto inválido" },
     ]);
     expect(result).toMatchObject({ restored: [], quarantined: [], created: [] });
+  });
+
+  it("isola pasta obrigatória inválida e continua preparando o bot saudável", async () => {
+    const root = await tempRoot("openbot-roster-reconcile-local-invalid-");
+    const config = await configFor(root, [
+      { id: "broken", name: "Broken" },
+      { id: "healthy", name: "Healthy" },
+    ]);
+    const homes = await AgentHomeStore.create(join(root, "workspaces"));
+    const broken = await homes.ensure("broken");
+    await homes.ensure("healthy");
+    await rm(join(broken.root, "Documents"), { recursive: true, force: true });
+    await writeFile(join(broken.root, "Documents"), "keep");
+
+    const result = await reconcileRosterHomes(config, homes);
+    expect(result.pending).toEqual([{ agentId: "broken", reason: "home ativo possui integridade ou caminho inseguro" }]);
+    await expect(homes.ensure("healthy")).resolves.toMatchObject({ agentId: "healthy" });
+    await expect(readFile(join(broken.root, "Documents"), "utf8")).resolves.toBe("keep");
   });
 
   it("isola marker ativo inválido por agente e continua reconciliando homes saudáveis", async () => {

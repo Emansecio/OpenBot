@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { cpus, tmpdir, totalmem } from "node:os";
 import { join } from "node:path";
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
@@ -252,7 +252,10 @@ async function benchmarkQueues() {
 
 async function benchmarkQuota() {
   const started = performance.now();
-  const root = await mkdtemp(join(tmpdir(), "openbot-hot-paths-quota-"));
+  // Windows may return an 8.3 short path from mkdtemp. Canonicalize the
+  // fixture before passing it to the workspace guard so the fixture itself
+  // does not look like a reparse point when compared with realpath().
+  const root = await realpath(await mkdtemp(join(tmpdir(), "openbot-hot-paths-quota-")));
   try {
     const workspace = await WorkspaceSandbox.create(root);
     const quota = new WorkspaceQuota(workspace, { maxBytes: 100, maxFiles: 2 });
@@ -637,6 +640,9 @@ async function benchmarkLongStream() {
   const dbPath = join(root, "transcript.sqlite");
   const { store, backing, counts } = instrumentSqliteTranscriptStore(dbPath);
   try {
+  // This benchmark measures incremental text publication without a tool loop.
+  // Tool-enabled rounds intentionally retain text until the round ends.
+  backing.memoryStore.setSettings("long-stream-agent", "off");
   const deltas = Array.from(
     { length: LONG_STREAM_DELTA_COUNT },
     (_, index) => `d${index.toString().padStart(4, "0")}|`,
@@ -861,7 +867,7 @@ async function benchmarkMaxAvatar() {
 }
 
 async function benchmarkMaxAttachments() {
-  const root = await mkdtemp(join(tmpdir(), "openbot-hot-paths-attachments-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "openbot-hot-paths-attachments-")));
   try {
     const bytesPerFile = MAX_TEXT_ATTACHMENT_BYTES - 1;
     const attachments = await Promise.all(Array.from({ length: MAX_ATTACHMENTS_PER_TURN }, async (_, index) => {

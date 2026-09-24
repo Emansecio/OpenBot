@@ -1,21 +1,20 @@
 import Database from "better-sqlite3";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SqliteTranscriptStore } from "../src/store/index.js";
 import { AttachmentStagingStore } from "../src/attachments/staging.js";
 import { startServer } from "../src/main.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const temporaryRoots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
-  await Promise.all(temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 async function temporaryRoot(): Promise<string> {
-  const path = await mkdtemp(join(tmpdir(), "openbot-data-recovery-live-"));
-  temporaryRoots.push(path);
+  const path = await temp.makeAsync("openbot-data-recovery-live-");
   return path;
 }
 

@@ -1,16 +1,15 @@
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { startServer } from "../src/main.js";
 import type { WslCommandRunner } from "../src/execution/runtime/wsl/provisioner.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
   vi.unstubAllEnvs();
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 const runner: WslCommandRunner = {
@@ -22,8 +21,7 @@ const runner: WslCommandRunner = {
 describe("WSL live bootstrap seam", () => {
   it("fecha a seleção de distro temporária quando a flag explícita está desligada", async () => {
     vi.stubEnv("OPENBOT_RUNTIME_WSL_LIVE_TEST", "0");
-    const root = await mkdtemp(join(tmpdir(), "openbot-live-seam-bootstrap-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-live-seam-bootstrap-");
 
     await expect(startServer(0, {
       stateRoot: root,
@@ -40,8 +38,7 @@ describe("WSL live bootstrap seam", () => {
   it("não expõe quota arbitrária no bootstrap de produção comum", async () => {
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("OPENBOT_RUNTIME_WSL_LIVE_TEST", "0");
-    const root = await mkdtemp(join(tmpdir(), "openbot-live-quota-closed-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-live-quota-closed-");
 
     await expect(startServer(0, {
       configPath: join(root, "config.json"),

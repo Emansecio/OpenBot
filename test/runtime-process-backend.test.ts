@@ -1,5 +1,4 @@
-import { mkdir, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -19,9 +18,10 @@ import {
   type ExecutionRequest,
   type ExecutionResult,
 } from "../src/execution/contracts.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
-afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
+const temp = new TempRoots();
+afterEach(() => temp.cleanup());
 
 const request = (overrides: Partial<Extract<ExecutionRequest, { operation: "process.run" }>> = {}): Extract<ExecutionRequest, { operation: "process.run" }> => ({
   operation: "process.run",
@@ -117,8 +117,7 @@ describe("WslProcessBackend", () => {
   });
 
   it("checks scoped limits in the shared initial inventory before lease admission", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-process-quota-scope-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-process-quota-scope-");
     await mkdir(join(root, "Downloads"));
     await writeFile(join(root, "Downloads", "existing.txt"), "12345");
     const quota = new WorkspaceQuota(await WorkspaceSandbox.create(root), {
@@ -164,8 +163,7 @@ describe("WslProcessBackend", () => {
   });
 
   it("expõe números da quota e recalcula uma vez antes do próximo write após abort", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-process-quota-dirty-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-process-quota-dirty-");
     const workspace = await WorkspaceSandbox.create(root);
     const quota = new WorkspaceQuota(workspace, { maxBytes: 4, maxFiles: 10, maxEntries: 10 });
     const excess = join(root, "excess.bin");
@@ -173,12 +171,14 @@ describe("WslProcessBackend", () => {
       run: vi.fn(async (_lease, _request, signal) => {
         await writeFile(excess, "12345");
         return await new Promise<ExecutionResult>((resolve) => {
-          signal.addEventListener("abort", () => resolve({
+          const onAbort = () => resolve({
             ok: false,
             operation: "process.run",
             code: "process_aborted",
             message: "aborted",
-          }), { once: true });
+          });
+          signal.addEventListener("abort", onAbort, { once: true });
+          if (signal.aborted) onAbort();
         });
       }),
     };
@@ -201,8 +201,7 @@ describe("WslProcessBackend", () => {
   });
 
   it("faz somente scan inicial e reconciliação final, independentemente da duração", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-process-quota-scans-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-process-quota-scans-");
     const workspace = await WorkspaceSandbox.create(root);
     const scan = vi.fn(async () => ({ bytes: 0, files: 0, directories: 0, entries: 0 }));
     const quota = new WorkspaceQuota(workspace, { maxBytes: 100, maxFiles: 10, maxEntries: 10 }, scan);
@@ -227,8 +226,7 @@ describe("WslProcessBackend", () => {
   });
 
   it("shares one observer across backend instances and scans only at group boundaries", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-process-quota-overlap-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-process-quota-overlap-");
     const quota = new WorkspaceQuota(await WorkspaceSandbox.create(root), { maxBytes: 100, maxFiles: 10, maxEntries: 10, observationIdleMs: 0 });
     const finish: Array<() => void> = [];
     let bothStarted!: () => void;
@@ -258,8 +256,7 @@ describe("WslProcessBackend", () => {
   });
 
   it("aborts all overlapping managed processes when the shared quota is exceeded", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-process-quota-shared-abort-"));
-    roots.push(root);
+    const root = await temp.makeAsync("openbot-process-quota-shared-abort-");
     const quota = new WorkspaceQuota(await WorkspaceSandbox.create(root), { maxBytes: 4, maxFiles: 10, maxEntries: 10, observationIdleMs: 0 });
     let count = 0;
     let bothStarted!: () => void;

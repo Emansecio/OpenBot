@@ -1,4 +1,4 @@
-import { copyFile, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -11,16 +11,17 @@ import {
   validateStdioConfig,
 } from "../src/mcp/security.js";
 import type { McpHttpServerConfig, McpStdioServerConfig } from "../src/mcp/contracts.js";
+import { canCreateFileSymlinks } from "./helpers/symlink.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const tempRoots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
-  await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 async function temporaryRoot(): Promise<string> {
-  const root = await mkdtemp(path.join(os.tmpdir(), "openbot-mcp-"));
-  tempRoots.push(root);
+  const root = await temp.makeAsync("openbot-mcp-");
   return root;
 }
 
@@ -96,7 +97,7 @@ describe("MCP security", () => {
     await expect(validateStdioConfig(named, { approvedCwdRoots: [root], allowedCommands: ["python"] })).rejects.toThrow(McpSecurityError);
   });
 
-  it("rejects an approved-looking executable symlink whose real target is blocked", async () => {
+  it.skipIf(!canCreateFileSymlinks)("rejects an approved-looking executable symlink whose real target is blocked", async () => {
     const root = await temporaryRoot();
     const cwd = path.join(root, "cwd");
     await mkdir(cwd);
@@ -113,7 +114,7 @@ describe("MCP security", () => {
     }, { approvedCwdRoots: [root], allowedCommands: [approved] })).rejects.toThrow(McpSecurityError);
   });
 
-  it("executes a private Node snapshot when its approved alias is swapped after validation", async () => {
+  it.skipIf(!canCreateFileSymlinks)("executes a private Node snapshot when its approved alias is swapped after validation", async () => {
     const root = await temporaryRoot();
     const cwd = path.join(root, "cwd");
     await mkdir(cwd);
@@ -139,7 +140,7 @@ describe("MCP security", () => {
     }
   });
 
-  it("fails closed when the approved Node alias is swapped before snapshotting", async () => {
+  it.skipIf(!canCreateFileSymlinks)("fails closed when the approved Node alias is swapped before snapshotting", async () => {
     const root = await temporaryRoot();
     const cwd = path.join(root, "cwd");
     await mkdir(cwd);

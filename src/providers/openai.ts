@@ -36,9 +36,11 @@ import {
   ApiError,
   OpenAiToolCallAccumulator,
   buildChatBody,
+  classifyOpenAiFinishReason,
   extractOpenAiErrorMessage,
   findSseFrameBoundary,
   normalizeOpenAiError,
+  normalizeToolCallArguments,
   openAiStreamErrorStatus,
   parseRetryAfterMs,
   providerTimeoutError,
@@ -217,9 +219,6 @@ export class OpenAiAdapter implements ProviderAdapter {
     let finishReason: string | undefined;
     let finishPayload: unknown;
 
-    const isIncompleteReason = (reason: string | undefined): reason is "length" | "content_filter" | "max_tokens" =>
-      reason === "length" || reason === "content_filter" || reason === "max_tokens";
-
     const dispatchFrame = (frame: string): boolean => {
       const data = splitSseLines(frame).filter((line) => line.startsWith("data:"))
         .map((line) => line.slice(5).replace(/^ /, "")).join("\n");
@@ -271,14 +270,15 @@ export class OpenAiAdapter implements ProviderAdapter {
         if (done) break;
         onActivity();
         buffer += decoder.decode(value, { stream: true });
-        if (buffer.length > 1_048_576) throw new ApiError("openai: buffer SSE excedeu 1 MiB", 502);
         let boundary = findSseFrameBoundary(buffer);
         while (boundary !== undefined) {
           const frame = buffer.slice(0, boundary.index);
           buffer = buffer.slice(boundary.index + boundary.length);
+          if (Buffer.byteLength(frame, "utf8") > 1_048_576) throw new ApiError("openai: frame SSE excedeu 1 MiB", 502);
           if (dispatchFrame(frame)) { terminated = true; break; }
           boundary = findSseFrameBoundary(buffer);
         }
+        if (!terminated && Buffer.byteLength(buffer, "utf8") > 1_048_576) throw new ApiError("openai: buffer SSE residual excedeu 1 MiB", 502);
       }
       if (!terminated) throw new ApiError("openai: stream terminou antes de [DONE]", 502);
     } finally {
@@ -287,13 +287,13 @@ export class OpenAiAdapter implements ProviderAdapter {
       await reader.cancel().catch(() => undefined);
       reader.releaseLock();
     }
-    if (isIncompleteReason(finishReason)) {
-      throw new ApiError(`openai: geração interrompida (${finishReason})`, 400, finishPayload, { code: finishReason });
+    const finishDisposition = classifyOpenAiFinishReason(finishReason);
+    if (finishDisposition === "incomplete" || finishDisposition === "unknown") {
+      throw new ApiError(`openai: geração interrompida (${finishReason})`, finishDisposition === "incomplete" ? 400 : 502, finishPayload, { code: finishReason });
     }
-    if (toolAccumulator.hasAny && !toolAccumulator.complete) {
-      throw new ApiError("openai: tool call incompleta no fim do stream", 502);
+    if (toolAccumulator.hasAny) {
+      for (const call of toolAccumulator.finalizedCalls("openai")) emit({ type: "tool-call", call });
     }
-    for (const call of toolAccumulator.calls()) emit({ type: "tool-call", call });
   }
 
   private async readResponsesStream(
@@ -303,7 +303,7 @@ export class OpenAiAdapter implements ProviderAdapter {
     onActivity: () => void,
     reportServiceTier = false,
   ): Promise<void> {
-    type ToolSlot = { id: string; name: string; arguments: string; emitted: boolean };
+    type ToolSlot = { id: string; name: string; arguments: string; emitted: boolean; itemDone: boolean; argumentsDone: boolean };
     const reader = body.getReader();
     const decoder = new TextDecoder("utf-8");
     const tools = new Map<number, ToolSlot>();
@@ -337,13 +337,28 @@ export class OpenAiAdapter implements ProviderAdapter {
       const name = typeof item.name === "string" ? item.name : current?.name;
       const args = typeof item.arguments === "string" ? item.arguments : current?.arguments ?? "";
       if (!id || !name) throw new ApiError("openai: function call inválida no stream Responses", 502, item);
-      const slot = { id, name, arguments: args, emitted: current?.emitted ?? false };
+      const slot = {
+        id,
+        name,
+        arguments: args,
+        emitted: current?.emitted ?? false,
+        itemDone: current?.itemDone ?? false,
+        argumentsDone: current?.argumentsDone ?? false,
+      };
       tools.set(index, slot);
       return slot;
     };
-    const emitTool = (index: number, item?: Record<string, unknown>): void => {
-      const slot = item ? upsertTool(index, item) : tools.get(index);
+    const markToolDone = (index: number, item: Record<string, unknown>): void => {
+      const slot = upsertTool(index, item);
+      slot.itemDone = true;
+      if (typeof item.arguments === "string") slot.argumentsDone = true;
+    };
+    const emitTool = (index: number): void => {
+      const slot = tools.get(index);
       if (!slot || slot.emitted) return;
+      if (!slot.itemDone) throw new ApiError("openai: function call não terminou antes da conclusão da response", 502);
+      if (!slot.argumentsDone) throw new ApiError("openai: argumentos de function call não terminaram antes da conclusão da response", 502);
+      slot.arguments = normalizeToolCallArguments(slot.arguments, "openai Responses");
       slot.emitted = true;
       emit({
         type: "tool-call",
@@ -381,24 +396,33 @@ export class OpenAiAdapter implements ProviderAdapter {
           if (typeof event.delta === "string" && event.delta) emit({ type: "delta", delta: event.delta });
           return false;
         case "response.output_item.added":
-          if (index !== undefined && item?.type === "function_call") upsertTool(index, item);
+          if (item?.type === "function_call") {
+            if (index === undefined) throw new ApiError("openai: function call Responses sem output_index", 502, parsed);
+            upsertTool(index, item);
+          }
           return false;
         case "response.function_call_arguments.delta": {
-          if (index === undefined || typeof event.delta !== "string") return false;
+          if (index === undefined) throw new ApiError("openai: argumentos de function call sem output_index", 502, parsed);
+          if (typeof event.delta !== "string") return false;
           const slot = tools.get(index);
           if (!slot) throw new ApiError("openai: argumentos chegaram antes da function call", 502, parsed);
           slot.arguments += event.delta;
           return false;
         }
         case "response.function_call_arguments.done": {
-          if (index === undefined || typeof event.arguments !== "string") return false;
+          if (index === undefined) throw new ApiError("openai: argumentos finais de function call sem output_index", 502, parsed);
+          if (typeof event.arguments !== "string") return false;
           const slot = tools.get(index);
           if (!slot) throw new ApiError("openai: function call ausente para argumentos finais", 502, parsed);
           slot.arguments = event.arguments;
+          slot.argumentsDone = true;
           return false;
         }
         case "response.output_item.done":
-          if (index !== undefined && item?.type === "function_call") emitTool(index, item);
+          if (item?.type === "function_call") {
+            if (index === undefined) throw new ApiError("openai: function call final Responses sem output_index", 502, parsed);
+            markToolDone(index, item);
+          }
           return false;
         case "response.completed":
         case "response.done": {
@@ -414,10 +438,10 @@ export class OpenAiAdapter implements ProviderAdapter {
           if (Array.isArray(output)) {
             output.forEach((entry, outputPosition) => {
               const outputItem = record(entry);
-              if (outputItem?.type === "function_call") emitTool(outputPosition, outputItem);
+              if (outputItem?.type === "function_call") markToolDone(outputPosition, outputItem);
             });
           }
-          for (const toolIndex of tools.keys()) emitTool(toolIndex);
+          for (const toolIndex of [...tools.keys()].sort((left, right) => left - right)) emitTool(toolIndex);
           return true;
         }
         case "response.failed":
@@ -435,17 +459,18 @@ export class OpenAiAdapter implements ProviderAdapter {
         if (done) break;
         onActivity();
         buffer += decoder.decode(value, { stream: true });
-        if (buffer.length > 1_048_576) throw new ApiError("openai: buffer SSE Responses excedeu 1 MiB", 502);
         let boundary = findSseFrameBoundary(buffer);
         while (boundary !== undefined) {
           const frame = buffer.slice(0, boundary.index);
           buffer = buffer.slice(boundary.index + boundary.length);
+          if (Buffer.byteLength(frame, "utf8") > 1_048_576) throw new ApiError("openai: frame SSE Responses excedeu 1 MiB", 502);
           if (dispatchFrame(frame)) {
             completed = true;
             break;
           }
           boundary = findSseFrameBoundary(buffer);
         }
+        if (!completed && Buffer.byteLength(buffer, "utf8") > 1_048_576) throw new ApiError("openai: buffer SSE Responses residual excedeu 1 MiB", 502);
       }
       if (!completed) throw new ApiError("openai: stream terminou antes de response.completed", 502);
     } finally {

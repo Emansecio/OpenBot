@@ -1,14 +1,16 @@
 import { execFile, spawn as spawnChild } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const root = resolve(new URL("..", import.meta.url).pathname.replace(/^\/(.):/, "$1:"));
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const desktopCmdPath = join(root, "scripts", "openbot-desktop.cmd");
-const temporaryRoots: string[] = [];
+const temp = new TempRoots();
 const currentProcessEvidence = {
   pid: process.pid,
   creationTime: "start-gateway-spawn-test",
@@ -16,12 +18,12 @@ const currentProcessEvidence = {
 };
 
 afterEach(async () => {
-  await Promise.all(temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 async function temporaryRoot(prefix: string): Promise<string> {
   const path = await mkdtemp(join(tmpdir(), prefix));
-  temporaryRoots.push(path);
+  temp.track(path);
   return path;
 }
 

@@ -81,6 +81,8 @@ interface ProviderState {
   controller?: AbortController;
 }
 
+const CONNECTION_UNREADABLE_ERROR = "Não foi possível ler a conexão deste provedor. Reconecte a conta nas configurações.";
+
 export function isCatalogProvider(value: unknown): value is CatalogProvider {
   return typeof value === "string" && (CATALOG_PROVIDERS as readonly string[]).includes(value);
 }
@@ -165,6 +167,7 @@ export class ModelCatalogService {
     if (state.connection !== undefined && state.connection !== connection) this.invalidate(provider);
     state.connection = connection;
     state.connected = connected;
+    if (state.error === CONNECTION_UNREADABLE_ERROR) state.error = undefined;
     if (state.saved && state.saved.connection !== connection) {
       state.saved = undefined;
       state.source = "local";
@@ -172,8 +175,19 @@ export class ModelCatalogService {
     }
   }
 
+  /**
+   * Boot waits for this before listening, so one unreadable connection (e.g. a
+   * DPAPI credential restored on another machine) degrades that provider to the
+   * local catalog instead of keeping the gateway down; get() retries it later.
+   */
   async initialize(): Promise<void> {
-    await Promise.all(CATALOG_PROVIDERS.map(provider => this.synchronize(provider)));
+    const results = await Promise.allSettled(CATALOG_PROVIDERS.map(provider => this.synchronize(provider)));
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") return;
+      const provider = CATALOG_PROVIDERS[index]!;
+      this.states.get(provider)!.error = CONNECTION_UNREADABLE_ERROR;
+      console.warn(`[openbot] catálogo: conexão de ${provider} indisponível no boot:`, result.reason instanceof Error ? result.reason.message : String(result.reason));
+    });
   }
 
   peek(provider: CatalogProvider): ProviderModelCatalog {

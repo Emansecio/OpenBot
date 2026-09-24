@@ -1,24 +1,23 @@
-import { mkdtemp, mkdir, readdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
 // @ts-expect-error The packager is an executable ESM script and intentionally has no emitted declaration.
 import { assertLinuxX64Elf, digestRootfs, isAllowedBaseDanglingSymlink, packageGuestRuntime, validateBaseRootfs, validateRootfs } from "../scripts/package-runtime-guest.mjs";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const execFileAsync = promisify(execFile);
 
-const temporaryRoots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
-  await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 const makeRoot = async () => {
-  const root = await mkdtemp(join(tmpdir(), "openbot-runtime-package-test-"));
-  temporaryRoots.push(root);
+  const root = await temp.makeAsync("openbot-runtime-package-test-");
   return root;
 };
 

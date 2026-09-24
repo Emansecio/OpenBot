@@ -1,21 +1,20 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ConfigStore } from "../src/config/store.js";
 import { registerRosterHandlers } from "../src/rpc/roster.js";
 import { createGateway } from "../src/server/gateway.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
   vi.restoreAllMocks();
-  await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "openbot-profile-persistence-"));
-  roots.push(root);
+  const root = await temp.makeAsync("openbot-profile-persistence-");
   const configPath = join(root, "config.json");
   const config = new ConfigStore({ configPath });
   const gateway = createGateway();

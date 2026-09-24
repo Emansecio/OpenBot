@@ -135,7 +135,7 @@ describe("prompt queue recovery and retention", () => {
       db.prepare("UPDATE prompt_queue SET state='completed',payload_digest=''").run();
       db.pragma("user_version = 18");
       migrateOpenBotSchema(db);
-      expect(db.pragma("user_version", { simple: true })).toBe(19);
+      expect(db.pragma("user_version", { simple: true })).toBe(20);
       expect(store.promptQueue.get("a", conversationId, "failed")).toMatchObject({ state: "interrupted", compacted: false });
       expect(store.promptQueue.compactTerminal()).toBe(1);
       expect(store.promptQueue.get("a", conversationId, "failed")?.args.prompt).toBe("payload-failed");

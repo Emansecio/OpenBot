@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, open, readdir } from "node:fs/promises";
+import { lstat, open, opendir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { HomeArchiveError, validateArchivePath } from "./home-archive.js";
@@ -24,7 +24,31 @@ export interface HomeInventory {
 }
 
 export const DEFAULT_HOME_INVENTORY_MAX_ENTRIES = DEFAULT_WORKSPACE_QUOTA.maxEntries ?? DEFAULT_WORKSPACE_QUOTA.maxFiles;
+export const WORKSPACE_ACL_STAMP_NAME = ".openbot-acl-v1.json";
 const INVENTORY_HASH_CHUNK_BYTES = 64 * 1024;
+
+/** Lifecycle validation must work even when a home exceeds its storage quota. */
+export async function validateHomeTree(root: string): Promise<void> {
+  const visit = async (current: string, prefix: string): Promise<void> => {
+    const metadata = await lstat(current);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new HomeArchiveError("unsafe_path", "Home contains an unsafe directory.");
+    }
+    const children = await opendir(current);
+    for await (const child of children) {
+      const path = validateArchivePath(prefix ? `${prefix}/${child.name}` : child.name);
+      const absolute = join(current, child.name);
+      const info = await lstat(absolute);
+      if (info.isSymbolicLink()) throw new HomeArchiveError("unsafe_path", `Home contains a symbolic link: ${path}`);
+      if (info.isDirectory()) {
+        if (!isHomeTrashArchivePath(path)) await visit(absolute, path);
+      } else if (!info.isFile()) {
+        throw new HomeArchiveError("unsafe_path", `Home contains an unsupported filesystem entry: ${path}`);
+      }
+    }
+  };
+  await visit(root, "");
+}
 
 const abortIfRequested = (signal: AbortSignal | undefined): void => {
   if (signal?.aborted) throw new HomeArchiveError("io_error", "Home inventory was aborted.");

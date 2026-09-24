@@ -258,7 +258,7 @@ describe("multi-bot structural performance gates", () => {
     }
   });
 
-  it("streams thousands of deterministic deltas with exact output and distinct durable writes", async () => {
+  it.each(["off", "automatic"] as const)("preserves thousands of provider deltas with bounded durable writes (memory=%s)", async mode => {
     const deltaCount = 2_048;
     const deltas = Array.from({ length: deltaCount }, (_, index) => `d${index.toString().padStart(4, "0")}|`);
     const expected = deltas.join("");
@@ -267,6 +267,7 @@ describe("multi-bot structural performance gates", () => {
     const root = await mkdtemp(join(tmpdir(), "openbot-performance-durable-stream-"));
     const dbPath = join(root, "transcript.sqlite");
     const backingStore = new SqliteTranscriptStore({ path: dbPath });
+    backingStore.memoryStore.setSettings("stream-agent", mode);
     let backingClosed = false;
     try {
     const counts = { append: 0, replace: 0, live: 0 };
@@ -307,7 +308,7 @@ describe("multi-bot structural performance gates", () => {
     });
     runner.setPublish((_channel, payload) => published.push(payload));
 
-    runner.sendPrompt({ agentId: "stream-agent", prompt: "stream", clientNonce: "stream-1" });
+    await runner.sendPrompt({ agentId: "stream-agent", prompt: "stream", clientNonce: "stream-1" });
     await runner.flush("stream-agent");
 
     const final = [...store.getEntries("stream-agent")].reverse().find((entry) => (
@@ -332,7 +333,9 @@ describe("multi-bot structural performance gates", () => {
     expect(final).toMatchObject({ content: expected, streaming: false });
     expect(providerCalls).toBe(1);
     expect(appendedEvents.length).toBeGreaterThan(0);
-    expect(deltaEvents).toHaveLength(deltaCount);
+    // Plain chat streams each delta; memory tools retain/coalesce round text
+    // until the model confirms it is a final response rather than narration.
+    expect(deltaEvents).toHaveLength(mode === "off" ? deltaCount : 1);
     expect(deltaEvents.map((event) => event.fragment).join("")).toBe(expected);
     expect(new Set(deltaEvents.map((event) => event.entryId)).size).toBe(1);
     expect(deltaEvents.every((event, index) => index === 0 || event.ordered.sequence > deltaEvents[index - 1]!.ordered.sequence)).toBe(true);

@@ -28,6 +28,7 @@ import {
 import { validateCompatBaseUrl } from "../providers/openai-compat.js";
 import { isCatalogProvider, type ModelCatalogService } from "../providers/model-catalog.js";
 import { writeFileAtomicSync, writeFileExclusiveSync } from "../shared/fs-atomic.js";
+import { normalizeWorkspaceQuotaConfig, type WorkspaceQuotaConfig } from "../execution/quota.js";
 import { MODEL_CATALOG } from "./models.js";
 
 export const MAX_AGENT_NAME_CHARS = 120;
@@ -88,6 +89,8 @@ export interface LocalAgent {
   serviceTier?: import("../providers/model-catalog.js").ServiceTier;
   runtimeMode?: LocalAgentRuntimeMode;
   integrations?: LocalAgentIntegrations;
+  /** Optional partial storage limits; omitted values retain product defaults. */
+  workspaceQuota?: WorkspaceQuotaConfig;
 }
 
 export interface OpenBotFlags {
@@ -454,8 +457,13 @@ function validateAgent(agent: LocalAgent, ids: Set<string>, globalModel: string,
     throw new Error(`config inválida: modelo não suportado: ${effectiveModel}`);
   }
   const integrations = normalizeIntegrations(agent.integrations, `agents.${agent.id}.integrations`, serverIds);
-  const { integrations: _legacyIntegrations, ...agentWithoutIntegrations } = agent;
-  return integrations === undefined ? agentWithoutIntegrations : { ...agentWithoutIntegrations, integrations };
+  const workspaceQuota = normalizeWorkspaceQuotaConfig(agent.workspaceQuota);
+  const { integrations: _legacyIntegrations, workspaceQuota: _legacyWorkspaceQuota, ...agentWithoutPolicies } = agent;
+  return {
+    ...agentWithoutPolicies,
+    ...(integrations === undefined ? {} : { integrations }),
+    ...(workspaceQuota === undefined ? {} : { workspaceQuota }),
+  };
 }
 
 function validateAgents(agents: readonly LocalAgent[], globalModel: string, serverIds: ReadonlySet<string>, allowUnverified = false): LocalAgent[] {

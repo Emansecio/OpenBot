@@ -1,18 +1,17 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AgentHomeStore } from "../src/execution/home.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((entry) => rm(entry, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 const tempDir = async (): Promise<string> => {
-  const dir = await mkdtemp(join(tmpdir(), "openbot-snapshots-"));
-  roots.push(dir);
+  const dir = await temp.makeAsync("openbot-snapshots-");
   return dir;
 };
 
@@ -76,12 +75,13 @@ describe("home snapshots", () => {
 
   it("stores snapshots outside every agent home and outside the inventory", async () => {
     const root = await tempDir();
+    const canonicalRoot = await realpath(root);
     const store = await AgentHomeStore.create(root);
     const home = await store.ensure("agent-a");
     await store.snapshot("agent-a");
     const snapshots = await store.listSnapshots("agent-a");
     // Snapshots live under the workspaces root but never inside a bot's home.
-    expect(snapshots[0]!.path.toLowerCase().startsWith(root.toLowerCase())).toBe(true);
+    expect(snapshots[0]!.path.toLowerCase().startsWith(canonicalRoot.toLowerCase())).toBe(true);
     expect(snapshots[0]!.path.toLowerCase().startsWith(home.root.toLowerCase())).toBe(false);
     const inventory = await store.inventory("agent-a");
     expect(inventory.entries.some((entry) => entry.path.includes(".snapshots"))).toBe(false);

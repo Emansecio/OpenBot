@@ -1,5 +1,3 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,19 +6,19 @@ import { createProviderRegistry } from "../src/providers/router.js";
 import { createTurnRunner } from "../src/rpc/send.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
 import { ModelCatalogService } from "../src/providers/model-catalog.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const temp = new TempRoots();
 const stores: SqliteTranscriptStore[] = [];
 
-afterEach(() => {
+afterEach(async () => {
   for (const store of stores.splice(0)) store.close();
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 describe("turn crash recovery", () => {
   it("confirma somente o echo persistido e mantém o mesmo nonce durante a preparação", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-send-acceptance-"));
-    roots.push(root);
+    const root = temp.make("openbot-send-acceptance-");
     const path = join(root, "store.db");
     const store = new SqliteTranscriptStore({ path });
     stores.push(store);
@@ -52,8 +50,7 @@ describe("turn crash recovery", () => {
   });
 
   it("reexecuta retry interrompido pelo crash sem duplicar a mensagem original", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-retry-crash-"));
-    roots.push(root);
+    const root = temp.make("openbot-retry-crash-");
     const path = join(root, "store.db");
     const first = new SqliteTranscriptStore({ path });
     stores.push(first);

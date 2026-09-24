@@ -8,3 +8,7 @@ Antes de editar, confira status/diff. Preserve trabalho alheio; conflito direto 
 Git, testes, troca de branch e restore não são automaticamente seguros; operações irreversíveis exigem confirmação específica. Ao desfazer, reverta só o que você introduziu.
 Valide o comportamento modificado e seus riscos com a menor checagem suficiente, incluindo gates da fronteira afetada. Não enfraqueça testes. Corrija regressões causadas; relate falhas preexistentes sem absorvê-las.
 Revise o diff e encerre ao atender os critérios. Resuma o que mudou, o que foi verificado e o que não foi; não prometa o que não mediu.
+
+## Persistência operacional
+
+Não encerre por erro recuperável, tentativa malsucedida, teste falhando, caminho incorreto ou resultado parcial. Diagnostique, ajuste a abordagem e continue pelas alternativas razoáveis dentro do escopo; não esconda falhas nem reduza critérios de validação. Não peça confirmação nem pause por decisões técnicas rotineiras já abrangidas pelo pedido. Respeite as restrições, limites de autoridade e gates deste arquivo. Pare apenas quando o objetivo estiver concluído e validado ou quando um impedimento real exigir necessariamente decisão/intervenção do usuário (ou da autoridade indicada neste arquivo); diferencie-o de dificuldade solucionável e, se bloquear, apresente evidências, tentativas e a ação exata necessária.

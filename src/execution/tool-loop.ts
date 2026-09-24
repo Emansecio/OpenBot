@@ -1,13 +1,16 @@
 import { createHash } from "node:crypto";
 import type { LocalExecutionBroker, LocalToolPermission } from "./broker.js";
 import type { ExecutionRequest, ExecutionResult } from "./contracts.js";
-import { makeToolCallEntry, stableToolCallId, toolCallLocalId, toolCallResult, toolCallSummary, type ToolCallEntry } from "./tool-card.js";
+import { makeToolCallEntry, occurrenceToolCallId, stableToolCallId, toolCallLocalId, toolCallResult, toolCallSummary, type ToolCallEntry } from "./tool-card.js";
 import { toolCallToExecutionRequest } from "./tool-request.js";
 import { BROWSER_CAPTURE_TEXT_PREFIX, buildToolTurnMessages, type ToolResultInput } from "../providers/tool-calls.js";
 import { ProviderError, type ProviderAssistantMessage, type ProviderChatMessage, type ProviderChatRequest, type ProviderStreamEvent, type ProviderToolCall, type StreamChatResult } from "../providers/router.js";
 import { MAX_LIVE_RESPONSE_BYTES, MAX_TRANSCRIPT_DELTA_BYTES } from "../rpc/stream-state.js";
 import type { ToolCallResult } from "../shared/contracts.js";
 import { resumeFingerprintHash, stableResumeEffectId, type ResumeEffectRecord } from "../providers/resume.js";
+
+/** Resultado do loop com a conclusão factual da solicitação, além do transporte. */
+export type ToolLoopResult = StreamChatResult & { taskOutcome?: "partial" };
 
 /**
  * Safety defaults for requests that do not carry a resolved model capability.
@@ -302,7 +305,11 @@ export function maskStaleToolResults(
       if (Buffer.byteLength(message.content, "utf8") <= STALE_TOOL_RESULT_KEEP_BYTES) return message;
       const metadata = metadataByToolMessage.get(index);
       if (metadata?.readOnly !== true) return message;
-      return { ...message, content: maskStaleToolResultContent(metadata.name, message.content, message.toolCallId) };
+      return {
+        role: "tool",
+        ...(message.toolCallId === undefined ? {} : { toolCallId: message.toolCallId }),
+        content: maskStaleToolResultContent(metadata.name, message.content, message.toolCallId),
+      };
     }
     if (isVisualCaptureMessage(message)) {
       return { role: "user", content: "Untrusted browser capture omitted after it was already used in this turn." };
@@ -443,7 +450,7 @@ function distinctToolNames(
 function deterministicPartialFinalResult(
   results: readonly ToolResultInput[],
   pendingCalls: readonly ProviderToolCall[] = [],
-): StreamChatResult {
+): ToolLoopResult {
   const completed = distinctToolNames(results, true);
   const failed = distinctToolNames(results, false);
   const pending = [...new Set(pendingCalls.map((call) => boundedToolName(call.function.name)))].slice(0, MAX_PARTIAL_REPORT_TOOL_NAMES);
@@ -457,7 +464,7 @@ function deterministicPartialFinalResult(
   if (completed.length === 0 && failed.length === 0 && pending.length === 0) {
     lines.push("Nenhuma ferramenta teve resultado confirmável; a solicitação permanece pendente.");
   }
-  return { aborted: false, message: { role: "assistant", content: lines.join("\n") } };
+  return { aborted: false, message: { role: "assistant", content: lines.join("\n") }, taskOutcome: "partial" };
 }
 
 function withFinalizationInstruction(system: string | undefined): string {
@@ -468,7 +475,7 @@ function withFinalizationInstruction(system: string | undefined): string {
     : `${base}\n\n${TOOL_LOOP_FINALIZATION_INSTRUCTION}`;
 }
 
-function emitFinalizationResult(options: ToolLoopOptions, result: StreamChatResult): StreamChatResult {
+function emitFinalizationResult(options: ToolLoopOptions, result: ToolLoopResult): ToolLoopResult {
   if (result.aborted || options.request.signal?.aborted || result.message === undefined) return result;
   if (result.cursor !== undefined) options.onEvent({ type: "resume-cursor", cursor: result.cursor });
   options.onEvent({ type: "message", message: result.message });
@@ -488,8 +495,8 @@ async function tryFinalizeToolLoop(
   messages: readonly ProviderChatMessage[],
   results: readonly ToolResultInput[],
   pendingCalls: readonly ProviderToolCall[] = [],
-): Promise<StreamChatResult> {
-  const fallback = (): StreamChatResult => {
+): Promise<ToolLoopResult> {
+  const fallback = (): ToolLoopResult => {
     if (options.request.signal?.aborted) return abortedResult();
     return emitFinalizationResult(options, deterministicPartialFinalResult(results, pendingCalls));
   };
@@ -529,6 +536,7 @@ async function tryFinalizeToolLoop(
       return emitFinalizationResult(options, {
         aborted: false,
         message: result.message,
+        taskOutcome: "partial",
         ...(result.cursor === undefined ? {} : { cursor: result.cursor }),
       });
     }
@@ -539,17 +547,21 @@ async function tryFinalizeToolLoop(
   return fallback();
 }
 
-export async function runToolLoop(options: ToolLoopOptions): Promise<StreamChatResult> {
+export async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopResult> {
   const messages: ProviderChatMessage[] = [...options.request.messages];
   const budget = resolveToolLoopBudget(options.request, options.toolLoopBudget);
   const initialMessageCount = messages.length;
   const turnStartedAt = Date.now();
   let previousRoundFingerprints = new Set<string>();
   const warnedFingerprints = new Set<string>();
+  /** Mutations remain deduplicated for the whole turn, even across intervening calls. */
+  const executedMutationFingerprints = new Set<string>();
   /** Read-only fingerprints whose cached outcomes remain valid only while no mutation runs. */
   const observationFingerprints = new Set<string>();
   /** Per-turn count of actual executions per fingerprint — distinguishes resumable occurrences. */
   const executionCounts = new Map<string, number>();
+  /** Occurrences let repeated provider IDs receive matching local identities. */
+  const toolCallIdOccurrences = new Map<string, number>();
   /** Bounded-by-round tool outcomes retained for a deterministic final report. */
   const turnToolResults: ToolResultInput[] = [];
   /** Successful output hashes already observed; identical output never renews a window. */
@@ -573,7 +585,7 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<StreamChatR
     calls: readonly ProviderToolCall[],
     reason: string,
     cardReason = reason,
-  ): Promise<StreamChatResult> => {
+  ): Promise<ToolLoopResult> => {
     const results: ToolResultInput[] = [];
     for (const call of calls) {
       const id = stableToolCallId(call.id, call.function.name, call.function.arguments);
@@ -642,6 +654,10 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<StreamChatR
     };
     const receiveEvent = (event: ProviderStreamEvent): void => {
       if (event.type === "delta") observedText = true;
+      // Holding response text must not reopen the reasoning-before-content
+      // window: reject late starts/progress before publishing any activity.
+      if ((event.type === "reasoning-start" || event.type === "reasoning-progress")
+        && (observedText || observedToolCallEvent || stagedMessage !== undefined || stagedDone)) return;
       // Sinais de atividade real do provedor, reportados ANTES da retenção do
       // texto: o estado ao vivo precisa refletir que o provedor está
       // respondendo mesmo quando o texto da rodada ainda está retido.
@@ -762,17 +778,35 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<StreamChatR
       flushRoundEvents(observedToolCallEvent, false);
       return result;
     }
+    // The exact catalog sent in this provider round is the execution allowlist.
+    // Missing `tools` means no tool was announced and therefore none may run.
+    const advertisedToolNames = new Set((preparedRequest.tools ?? []).map((tool) => tool.function.name));
     const rawCalls = result.message.toolCalls?.map(normalizeToolCall) ?? [];
     if (stagedTextLimited) return responseLimitResult(responseLimitError());
-    flushRoundEvents(rawCalls.length > 0 || observedToolCallEvent, true);
-    if (rawCalls.length === 0) return result;
-    if (rawCalls.length > budget.maxCallsPerRound) {
+    if (rawCalls.length === 0) {
+      flushRoundEvents(observedToolCallEvent, true);
+      return turnToolResults.some((toolResult) => !toolResult.ok)
+        ? { ...result, taskOutcome: "partial" }
+        : result;
+    }
+    const calls: ProviderToolCall[] = rawCalls.map((call) => {
+      const providerId = stableToolCallId(call.id, call.function.name, call.function.arguments);
+      const occurrence = toolCallIdOccurrences.get(providerId) ?? 0;
+      toolCallIdOccurrences.set(providerId, occurrence + 1);
+      // Provider IDs are not safe local identities once repeated. Preserve
+      // every call, but assign the same deterministic turn-local identity used
+      // by transcript publication so cards and results stay associated.
+      const id = occurrenceToolCallId(providerId, call.function.name, call.function.arguments, occurrence);
+      return id === call.id ? call : { ...call, id };
+    });
+    flushRoundEvents(true, true);
+    if (calls.length > budget.maxCallsPerRound) {
       const limitMessage = "Tool call batch limit reached before these calls could run.";
       const limitResults: ToolResultInput[] = [];
       // Close every pending card before attempting the bounded rescue. The
       // calls are deliberately not executed: the provider exceeded the
       // per-round admission limit before any side effect was authorized.
-      for (const call of rawCalls) {
+      for (const call of calls) {
         const id = stableToolCallId(call.id, call.function.name, call.function.arguments);
         options.onProgress?.({
           entry: makeToolCallEntry(id, call.function.name, toolCallSummary(call.function.name, call.function.arguments), "failed", {
@@ -790,18 +824,10 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<StreamChatR
         });
       }
       turnToolResults.push(...limitResults);
-      messages.push(...buildToolTurnMessages({ ...result.message, toolCalls: rawCalls }, limitResults));
+      messages.push(...buildToolTurnMessages({ ...result.message, toolCalls: calls }, limitResults));
       return tryFinalizeToolLoop(options, messages, turnToolResults);
     }
 
-    const calls: ProviderToolCall[] = [];
-    const seenIds = new Set<string>();
-    for (const call of rawCalls) {
-      const id = stableToolCallId(call.id, call.function.name, call.function.arguments);
-      if (seenIds.has(id)) continue;
-      seenIds.add(id);
-      calls.push(call);
-    }
     const normalizedMessage = { ...result.message, toolCalls: calls };
 
     if (round === activeRoundLimit) {
@@ -854,12 +880,18 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<StreamChatR
         : (outcome.error ?? outcome.content) || "erro desconhecido na execução";
       const content = truncateToolResult(wireContent, budget.maxResultBytes - toolResultBytes);
       toolResultBytes += Buffer.byteLength(content, "utf8");
+      const partialContent = !outcome.ok && outcome.content.length > 0 && outcome.content !== wireContent
+        ? truncateToolResult(outcome.content, budget.maxResultBytes - toolResultBytes)
+        : undefined;
+      if (partialContent !== undefined) toolResultBytes += Buffer.byteLength(partialContent, "utf8");
       const toolResult: ToolResultInput = {
         toolCallId: id,
         name: call.function.name,
         content,
         ok: outcome.ok,
         ...(!outcome.ok ? { error: content } : {}),
+        ...(partialContent !== undefined && partialContent.length > 0 ? { partialContent } : {}),
+        result: outcome.result,
         ...(outcome.visual === undefined ? {} : { visual: outcome.visual }),
       };
       toolResults.push(toolResult);
@@ -977,13 +1009,11 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<StreamChatR
           });
         }
         if (!isReadOnlyToolCall(call)) invalidateReadObservations();
-        const extensionContent = extensionResult.ok
-          ? extensionResult.content
-          : extensionResult.error ?? extensionResult.content;
+        const extensionError = extensionResult.error ?? extensionResult.content;
         return {
           ok: extensionResult.ok,
-          content: extensionContent,
-          ...(!extensionResult.ok ? { error: extensionContent } : {}),
+          content: extensionResult.content,
+          ...(!extensionResult.ok ? { error: extensionError } : {}),
           result: extensionResult.result ?? (extensionResult.ok
             ? { ok: true }
             : { ok: false, code: "io_error", message: extensionResult.error ?? "shared tool failed" }),
@@ -1047,7 +1077,7 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<StreamChatR
       return {
         ok: cardResult.ok,
         content,
-        ...(!cardResult.ok ? { error: content } : {}),
+        ...(!cardResult.ok ? { error: cardResult.message ?? content } : {}),
         result: cardResult,
         ...(includeVisual ? { visual } : {}),
       };
@@ -1055,6 +1085,7 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<StreamChatR
 
     const applyOutcome = (item: PendingCall, outcome: ToolOutcome): StreamChatResult | undefined => {
       persistOutcome(item, outcome);
+      if (!isReadOnlyToolCall(item.call)) executedMutationFingerprints.add(item.fingerprint);
       if (recordSuccessfulOutcome(item, outcome)) noProgressObservation = true;
       finish(item.call, item.id, item.summary, item.fingerprint, outcome);
       if (options.request.signal?.aborted) return abortedResult();
@@ -1079,16 +1110,27 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<StreamChatR
       const summary = toolCallSummary(call.function.name, call.function.arguments);
       const id = stableToolCallId(call.id, call.function.name, call.function.arguments);
       const fingerprint = semanticFingerprint(call);
-      if (isReadOnlyToolCall(call)) {
+      const readOnly = isReadOnlyToolCall(call);
+      if (readOnly) {
         observationFingerprints.add(fingerprint);
+      }
+      if (!advertisedToolNames.has(call.function.name)) {
+        finish(
+          call,
+          id,
+          summary,
+          fingerprint,
+          blockedExecutionOutcome("tool is unavailable in this turn"),
+        );
+        continue;
       }
       const sameRound = roundOutcomes.get(fingerprint);
       if (sameRound !== undefined) {
         finish(call, id, summary, fingerprint, sameRound);
         continue;
       }
-      if (previousRoundFingerprints.has(fingerprint)) {
-        if (!isReadOnlyToolCall(call)) {
+      if (previousRoundFingerprints.has(fingerprint) || (!readOnly && executedMutationFingerprints.has(fingerprint))) {
+        if (!readOnly) {
           if (warnedFingerprints.has(fingerprint)) {
             finish(call, id, summary, fingerprint, repeatedOutcome());
             // Keep the assistant call/result contract complete before the
@@ -1163,6 +1205,7 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<StreamChatR
         const previous = options.resumableEffects.prepare(effectId, fingerprintHash);
         if (previous.status === "completed") {
           if (!persistedOutcome(previous.result)) throw new ProviderError("persisted resume effect outcome is invalid", { kind: "validation", code: "unsafe_effect" });
+          if (!readOnly) executedMutationFingerprints.add(fingerprint);
           finish(call, id, summary, fingerprint, previous.result);
           continue;
         }

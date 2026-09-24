@@ -1,19 +1,18 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AgentHomeStore } from "../src/execution/home.js";
 import { readSharedGrants } from "../src/execution/home-grants.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const tempRoots = new TempRoots();
 const temp = async () => {
-  const root = await mkdtemp(join(tmpdir(), "openbot-home-migration-"));
-  roots.push(root);
+  const root = await tempRoots.makeAsync("openbot-home-migration-");
   return root;
 };
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((entry) => rm(entry, { recursive: true, force: true })));
+  await tempRoots.cleanup();
 });
 
 describe("home layout migration", () => {

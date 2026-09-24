@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, unlink } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, readdir, realpath, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -28,8 +28,8 @@ import {
   writeUsageBaseline,
   type DriftReport,
 } from "./home-drift.js";
-import { inventoryHome, type HomeInventory } from "./home-inventory.js";
-import { writeFileExclusive } from "../shared/fs-atomic.js";
+import { inventoryHome, validateHomeTree, WORKSPACE_ACL_STAMP_NAME, type HomeInventory } from "./home-inventory.js";
+import { renameWithRetry, writeFileExclusive } from "../shared/fs-atomic.js";
 import { WorkspaceError, WorkspaceSandbox } from "./workspace.js";
 
 export const HOME_LAYOUT_VERSION = 2;
@@ -61,6 +61,7 @@ const RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu;
 // Process-local queue: the default gateway is single-process, so serializing
 // workspace ACL writes within this process is sufficient for the confirmed race.
 const workspaceAclQueues = new Map<string, Promise<void>>();
+const homeEnsureQueues = new Map<string, Promise<void>>();
 const WELCOME = [
   "# Computador do OpenBot",
   "",
@@ -128,7 +129,7 @@ async function atomicReplaceFile(path: string, contents: string): Promise<void> 
     await handle.sync();
     await handle.close();
     handle = undefined;
-    await rename(temporary, path);
+    await renameWithRetry(temporary, path);
   } finally {
     await handle?.close().catch(() => undefined);
     await unlink(temporary).catch(() => undefined);
@@ -277,9 +278,59 @@ export class AgentHomeStore {
 
   async ensure(agentId: string): Promise<AgentHome> {
     const id = sanitizeAgentId(agentId);
+    const key = workspaceQueueKey(this.pathFor(id));
+    const pending = (homeEnsureQueues.get(key) ?? Promise.resolve())
+      .then(() => this.ensureHome(id));
+    const tail = pending.then(() => undefined, () => undefined);
+    homeEnsureQueues.set(key, tail);
+    void tail.finally(() => {
+      if (homeEnsureQueues.get(key) === tail) homeEnsureQueues.delete(key);
+    });
+    return pending;
+  }
+
+  private async ensureHome(id: string): Promise<AgentHome> {
     const homeRoot = join(this.root, id);
-    const existedBefore = await this.exists(homeRoot);
-    await mkdir(homeRoot, { recursive: true });
+    if (await this.exists(homeRoot)) return this.initializeHome(id, homeRoot, false);
+    const stage = join(this.stagingRoot, `create-${id}-${randomUUID()}`);
+    const staging = await WorkspaceSandbox.create(this.stagingRoot, { allowAncestorLinks: true });
+    await staging.resolveDestination(relative(this.stagingRoot, stage));
+    let stageCreated = false;
+    let moved = false;
+    let primaryFailure: unknown;
+    try {
+      await mkdir(stage);
+      stageCreated = true;
+      await this.initializeHome(id, stage, true);
+      if (await this.exists(homeRoot)) throw new HomeLifecycleError("conflict", "An active home already exists for this agent.");
+      await renameWithRetry(stage, homeRoot);
+      moved = true;
+      const acl = await this.applyAcl(id, homeRoot, "create");
+      this.assertAcl(acl);
+      return { agentId: id, root: homeRoot, acl, created: true };
+    } catch (error) {
+      primaryFailure = error;
+      if (moved) {
+        try {
+          await this.quarantineForRecovery(id);
+        } catch (rollbackError) {
+          throw new AggregateError([error, rollbackError], "Failed to quarantine home after bootstrap failure.", { cause: rollbackError });
+        }
+      }
+      throw error;
+    } finally {
+      if (stageCreated && !moved) {
+        try {
+          if (!isWithinRoot(this.stagingRoot, stage)) throw new HomeLifecycleError("unsafe_path", "Staging path is outside the managed staging root.");
+          await this.stageDiscarder(stage);
+        } catch (cleanupError) {
+          throw new AggregateError([primaryFailure, cleanupError], "Failed to create home and discard partial staging.", { cause: cleanupError });
+        }
+      }
+    }
+  }
+
+  private async initializeHome(id: string, homeRoot: string, created: boolean): Promise<AgentHome> {
     const sandbox = await WorkspaceSandbox.create(homeRoot, { allowAncestorLinks: true });
     for (const name of HOME_DIRECTORIES) {
       // Resolve every pre-existing component before touching it. In particular,
@@ -292,6 +343,10 @@ export class AgentHomeStore {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
       await sandbox.resolveExisting(name);
+      const directoryMetadata = await lstat(directory);
+      if (!directoryMetadata.isDirectory()) {
+        throw new HomeLifecycleError("integrity_error", `Home directory ${name} is not a directory.`);
+      }
     }
     const manifestPath = await sandbox.resolveDestination(".openbot/home.json");
     let existing: string | undefined;
@@ -301,21 +356,18 @@ export class AgentHomeStore {
       if (!isMissing(error)) throw error;
     }
     if (existing !== undefined) {
-      let manifest: AgentHomeManifest;
+      let parsed: unknown;
       try {
-        manifest = JSON.parse(existing) as AgentHomeManifest;
+        parsed = JSON.parse(existing) as unknown;
       } catch {
-        throw new Error("home.json corrompido");
+        throw new HomeLifecycleError("integrity_error", "home.json corrompido");
       }
-      if (typeof manifest.agentId !== "string" || manifest.agentId.length === 0) {
-        throw new Error("home.json corrompido");
-      }
-      if (!sameAgentId(manifest.agentId, id)) {
-        throw new Error("pasta de workspace reutilizada por outro agente");
-      }
-      this.validateManifestLayout(manifest);
+      const manifest = this.validateManifest(parsed, id, true);
       await this.migrateLayout(sandbox, id, manifest);
     } else {
+      if (!created) {
+        throw new HomeLifecycleError("integrity_error", "Home manifest is missing or corrupt.");
+      }
       const manifest: AgentHomeManifest = {
         agentId: id,
         createdAt: new Date().toISOString(),
@@ -329,38 +381,21 @@ export class AgentHomeStore {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         const racedPath = await sandbox.resolveExisting(".openbot/home.json");
         const raced = await readFile(racedPath, "utf8");
-        let racedManifest: AgentHomeManifest;
+        let racedValue: unknown;
         try {
-          racedManifest = JSON.parse(raced) as AgentHomeManifest;
+          racedValue = JSON.parse(raced) as unknown;
         } catch {
-          throw new Error("home.json corrompido");
+          throw new HomeLifecycleError("integrity_error", "home.json corrompido");
         }
-        this.validateManifestLayout(racedManifest);
-        if (!sameAgentId(racedManifest.agentId, id)) {
-          throw new Error("pasta de workspace reutilizada por outro agente", { cause: error });
-        }
+        const racedManifest = this.validateManifest(racedValue, id, true);
         await this.migrateLayout(sandbox, id, racedManifest);
       }
     }
     await this.writeWelcome(sandbox);
-    if (existedBefore) {
+    if (!created) {
       return { agentId: id, root: sandbox.root };
     }
-    const acl = await this.applyAcl(id, sandbox.root, "create");
-    try {
-      this.assertAcl(acl);
-    } catch (error) {
-      // A newly bootstrapped home must never remain active when Windows ACL
-      // setup failed. Quarantine preserves any data written concurrently while
-      // keeping the failed registration out of the active workspace tree.
-      try {
-        await this.remove(id);
-      } catch (rollbackError) {
-        throw new AggregateError([error, rollbackError], "Failed to rollback home after ACL bootstrap failure.", { cause: rollbackError });
-      }
-      throw error;
-    }
-    return { agentId: id, root: sandbox.root, acl, created: true };
+    return { agentId: id, root: sandbox.root, created: true };
   }
 
   /** Compensates a roster commit that failed after creating a fresh home. */
@@ -413,7 +448,7 @@ export class AgentHomeStore {
       // The marker lives under .openbot; a damaged home may lack the directory.
       await mkdir(join(source, ".openbot"), { recursive: true });
     }
-    if (verifyInventory) await inventoryHome(source, id);
+    if (verifyInventory) await validateHomeTree(source);
     // Prepare the marker while the home is still active. This makes the
     // rename itself the commit point: once the destination exists, its
     // administrative marker is already present and valid.
@@ -446,7 +481,7 @@ export class AgentHomeStore {
       throw new HomeLifecycleError("integrity_error", "Quarantine marker contents are invalid.");
     }
     try {
-      await rename(source, destination);
+      await renameWithRetry(source, destination);
     } catch (error) {
       // The source remains the authoritative home when the commit fails.
       // Best-effort cleanup is safe because the marker was created by us;
@@ -502,15 +537,62 @@ export class AgentHomeStore {
     return entries;
   }
 
+  /** Explicit, irreversible cleanup. The caller must fence roster creation and recovery. */
+  async purgeDeletedAgentData(agentId: string): Promise<{ quarantinesRemoved: number; snapshotsRemoved: number }> {
+    const id = sanitizeAgentId(agentId);
+    if ((await readdir(this.root)).some((name) => sameAgentId(name, id))) {
+      throw new HomeLifecycleError("conflict", "An active home still exists for this agent.");
+    }
+    const sandbox = await WorkspaceSandbox.create(this.root, { allowAncestorLinks: true });
+    await sandbox.resolveExisting(".quarantine");
+    await sandbox.resolveExisting(".snapshots");
+    const quarantines = (await this.listQuarantineMetadata()).filter((entry) => sameAgentId(entry.agentId, id));
+    const targets: Array<{ root: string; marker?: string }> = [];
+    let snapshotsRemoved = 0;
+    for (const entry of quarantines) {
+      const root = await sandbox.resolveExisting(`.quarantine/${entry.quarantineId}`);
+      if (!isWithinRoot(this.quarantineRoot, root)) throw new HomeLifecycleError("unsafe_path", "Quarantine path is outside its managed root.");
+      await validateHomeTree(root);
+      targets.push({ root, marker: await readFile(join(root, ".openbot", "quarantine.json"), "utf8") });
+    }
+    for (const name of await readdir(this.snapshotsRoot)) {
+      if (!sameAgentId(name, id)) continue;
+      const root = await sandbox.resolveExisting(`.snapshots/${name}`);
+      if (!isWithinRoot(this.snapshotsRoot, root)) throw new HomeLifecycleError("unsafe_path", "Snapshot path is outside its managed root.");
+      await validateHomeTree(root);
+      snapshotsRemoved += (await readdir(root)).filter((entry) => Number.isSafeInteger(this.snapshotSeq(entry))).length;
+      targets.push({ root });
+    }
+    // Validate every target before removing any bytes. Keep the quarantine
+    // identity recoverable if a filesystem error interrupts recursive removal.
+    for (const target of targets) {
+      try {
+        await rm(target.root, { recursive: true, force: true });
+      } catch (error) {
+        if (target.marker !== undefined && await this.exists(target.root)) {
+          try {
+            await mkdir(join(target.root, ".openbot"), { recursive: true });
+            await this.ensureQuarantineMarker(target.root, target.marker);
+          } catch (markerError) {
+            throw new AggregateError([error, markerError], "Failed to preserve quarantine identity after interrupted cleanup.", { cause: markerError });
+          }
+        }
+        throw error;
+      }
+    }
+    return { quarantinesRemoved: quarantines.length, snapshotsRemoved };
+  }
+
   /** Restores a quarantined home without replacing an existing active home. */
   async restore(agentId: string, quarantineId?: string): Promise<AgentHome> {
     const id = sanitizeAgentId(agentId);
     const active = join(this.root, id);
     if (await this.exists(active)) throw new HomeLifecycleError("conflict", "An active home already exists for this agent.");
-    const candidates = (await this.listQuarantine()).filter((entry) => sameAgentId(entry.agentId, id) && (quarantineId === undefined || entry.quarantineId === quarantineId));
+    const candidates = (await this.listQuarantineMetadata()).filter((entry) => sameAgentId(entry.agentId, id) && (quarantineId === undefined || entry.quarantineId === quarantineId));
     if (candidates.length === 0) throw new HomeLifecycleError("not_found", "No matching quarantined home exists.");
     if (candidates.length > 1) throw new HomeLifecycleError("conflict", "More than one quarantined home matches this agent; select one explicitly.");
     const candidate = candidates[0]!;
+    await validateHomeTree(candidate.root);
     const manifest = await this.readHomeManifest(candidate.root, id);
     if (!sameAgentId(manifest.agentId, id)) throw new HomeLifecycleError("integrity_error", "Quarantined home belongs to another agent.");
     const quarantineMarkerPath = join(candidate.root, ".openbot", "quarantine.json");
@@ -522,7 +604,7 @@ export class AgentHomeStore {
     }
     let moved = false;
     try {
-      await rename(candidate.root, active);
+      await renameWithRetry(candidate.root, active);
       moved = true;
       const activeMarkerPath = join(active, ".openbot", "quarantine.json");
       await this.quarantineMarkerRemover(activeMarkerPath);
@@ -541,7 +623,7 @@ export class AgentHomeStore {
       }
       if (moved) {
         try {
-          await rename(active, candidate.root);
+          await renameWithRetry(active, candidate.root);
           await this.ensureQuarantineMarker(candidate.root, markerContents);
         } catch (rollbackError) {
           throw new HomeLifecycleError(
@@ -704,7 +786,7 @@ export class AgentHomeStore {
       }
       if (await this.exists(target)) throw new HomeLifecycleError("conflict", "An active home already exists for this agent.");
       try {
-        await rename(stage, target);
+        await renameWithRetry(stage, target);
         moved = true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new HomeLifecycleError("conflict", "An active home already exists for this agent.");
@@ -720,7 +802,7 @@ export class AgentHomeStore {
       primaryFailure = error;
       if (moved) {
         try {
-          await rename(target, stage);
+          await renameWithRetry(target, stage);
         } catch (rollbackError) {
           primaryFailure = new AggregateError([error, rollbackError], "Failed to rollback imported home after lifecycle failure.");
           throw primaryFailure;
@@ -754,6 +836,10 @@ export class AgentHomeStore {
     const homes: HomeInventory[] = [];
     for (const child of children) {
       if (child.isSymbolicLink()) throw new HomeLifecycleError("unsafe_path", "Workspace root contains an unsafe entry.");
+      if (child.name === WORKSPACE_ACL_STAMP_NAME) {
+        if (!child.isFile()) throw new HomeLifecycleError("unsafe_path", "Workspace ACL stamp is unsafe.");
+        continue;
+      }
       if (child.name === ".quarantine" || child.name === ".staging" || child.name === ".snapshots") {
         if (!child.isDirectory()) throw new HomeLifecycleError("unsafe_path", "Workspace lifecycle directory is unsafe.");
         continue;
@@ -973,16 +1059,39 @@ export class AgentHomeStore {
     } catch {
       throw new HomeLifecycleError("integrity_error", "Home manifest is missing or corrupt.");
     }
-    if (
-      typeof value !== "object" || value === null ||
-      typeof (value as { agentId?: unknown }).agentId !== "string" ||
-      typeof (value as { createdAt?: unknown }).createdAt !== "string" ||
-      typeof (value as { layoutVersion?: unknown }).layoutVersion !== "number" ||
-      !sameAgentId((value as { agentId: string }).agentId, agentId)
-    ) throw new HomeLifecycleError("integrity_error", "Home manifest identity is invalid.");
-    const manifest = value as AgentHomeManifest;
-    this.validateManifestLayout(manifest);
-    return manifest;
+    return this.validateManifest(value, agentId);
+  }
+
+  private validateManifest(value: unknown, agentId: string, preserveEnsureIdentityConflict = false): AgentHomeManifest {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new HomeLifecycleError("integrity_error", "Home manifest is invalid.");
+    }
+    const manifest = value as Partial<AgentHomeManifest>;
+    if (typeof manifest.agentId !== "string" || manifest.agentId.length === 0) {
+      throw new HomeLifecycleError("integrity_error", "Home manifest identity is invalid.");
+    }
+    if (!sameAgentId(manifest.agentId, agentId)) {
+      if (preserveEnsureIdentityConflict) throw new Error("pasta de workspace reutilizada por outro agente");
+      throw new HomeLifecycleError("integrity_error", "pasta de workspace reutilizada por outro agente");
+    }
+    if (typeof manifest.createdAt !== "string" || manifest.createdAt.trim().length === 0 || Number.isNaN(Date.parse(manifest.createdAt))) {
+      throw new HomeLifecycleError("integrity_error", "Home manifest createdAt is invalid.");
+    }
+    if (typeof manifest.layoutVersion !== "number") {
+      throw new HomeLifecycleError("integrity_error", "Home manifest layout version is invalid.");
+    }
+    if (manifest.migratedAt !== undefined && (typeof manifest.migratedAt !== "string" || Number.isNaN(Date.parse(manifest.migratedAt)))) {
+      throw new HomeLifecycleError("integrity_error", "Home manifest migratedAt is invalid.");
+    }
+    if (manifest.migrationLog !== undefined && (!Array.isArray(manifest.migrationLog) || !manifest.migrationLog.every((entry) => typeof entry === "string"))) {
+      throw new HomeLifecycleError("integrity_error", "Home manifest migrationLog is invalid.");
+    }
+    if (manifest.welcomeHash !== undefined && (typeof manifest.welcomeHash !== "string" || !/^[0-9a-f]{64}$/iu.test(manifest.welcomeHash))) {
+      throw new HomeLifecycleError("integrity_error", "Home manifest welcomeHash is invalid.");
+    }
+    const validated = manifest as AgentHomeManifest;
+    this.validateManifestLayout(validated);
+    return validated;
   }
 
   private validateManifestLayout(manifest: AgentHomeManifest): void {

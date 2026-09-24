@@ -30,6 +30,7 @@ export const CONVERSATION_COMPACTION_SEQUENCE_INTERVAL = 40;
 export const CONVERSATION_COMPACTION_PRESSURE_RATIO = 0.85;
 export const REFLECTION_REQUEST_MAX_BYTES = 64 * 1024;
 export const REFLECTION_REQUEST_RETRY_BYTES = 32 * 1024;
+export class ReflectionRequestTooLargeError extends Error {}
 export const OPENBOT_UNTRUSTED_MEMORY_CONTEXT_BEGIN = "[[OPENBOT_UNTRUSTED_MEMORY_CONTEXT_BEGIN]]";
 export const OPENBOT_UNTRUSTED_MEMORY_CONTEXT_END = "[[OPENBOT_UNTRUSTED_MEMORY_CONTEXT_END]]";
 export const OPENBOT_UNTRUSTED_TOOL_HISTORY_BEGIN = "[[OPENBOT_UNTRUSTED_TOOL_HISTORY_BEGIN]]";
@@ -436,8 +437,8 @@ function projectPreviousSummary(
   maxBytes: number,
 ): ReflectionPreviousSummary | null {
   if (summary === undefined || summary === null) return null;
-  const renderedBudget = Math.max(512, Math.floor(maxBytes / 2));
-  const jsonBudget = Math.max(512, maxBytes - renderedBudget);
+  const renderedBudget = Math.floor(maxBytes / 2);
+  const jsonBudget = maxBytes - renderedBudget;
   const summaryJsonText = jsonText(summary.summaryJson);
   return {
     revision: summary.revision,
@@ -492,9 +493,12 @@ export function buildReflectionRequestPayload(
   maxBytes = REFLECTION_REQUEST_MAX_BYTES,
 ): ReflectionRequestProjectionInput {
   const targetBytes = Math.max(4 * 1024, maxBytes);
-  const previousSummary = projectPreviousSummary(input.previousSummary, Math.max(1_024, Math.floor(targetBytes * 0.55)));
-  const existingMemories = (input.existingMemories ?? []).slice(0, 24);
-  const userProfile = (input.userProfile ?? []).slice(0, 12);
+  let summaryBudget = Math.max(1_024, Math.floor(targetBytes * 0.55));
+  const previousSummary = projectPreviousSummary(input.previousSummary, summaryBudget);
+  const existingMemories = (input.existingMemories ?? []).slice(0, 24)
+    .map(memory => ({ ...memory, text: truncateText(memory.text, 240) }));
+  const userProfile = (input.userProfile ?? []).slice(0, 12)
+    .map(memory => ({ ...memory, text: truncateText(memory.text, 240) }));
   const base = {
     agentId: input.agentId,
     conversationId: input.conversationId,
@@ -509,6 +513,22 @@ export function buildReflectionRequestPayload(
     transcriptFingerprint: input.transcriptFingerprint ?? createReflectionTranscriptFingerprint(input),
     ...(existingMemories.length > 0 ? { existingMemories } : {}),
     ...(userProfile.length > 0 ? { userProfile } : {}),
+  };
+  // Bound the serialized metadata too: JSON escaping and shared-profile text
+  // consume the same budget as transcript entries. Leave room for the latter.
+  while (reflectionPayloadBytes({ ...base, entries: [] }) > Math.floor(targetBytes / 2)) {
+    if (base.previousSummary !== null && summaryBudget > 128) {
+      summaryBudget = Math.max(128, Math.floor(summaryBudget / 2));
+      base.previousSummary = projectPreviousSummary(input.previousSummary, summaryBudget);
+    } else if (existingMemories.length > 1) existingMemories.pop();
+    else if (userProfile.length > 1) userProfile.pop();
+    else throw new ReflectionRequestTooLargeError("reflection: metadados excedem o limite do pedido");
+  }
+  const checkedPayload = (payload: ReflectionRequestProjectionInput): ReflectionRequestProjectionInput => {
+    if (reflectionPayloadBytes(payload) > targetBytes) {
+      throw new ReflectionRequestTooLargeError("reflection: entrada excede o limite do pedido; histórico preservado");
+    }
+    return payload;
   };
   const anchorIndexes = latestReflectionAnchorIndexes(input.entries);
   const perEntryBytes = Math.max(
@@ -529,12 +549,28 @@ export function buildReflectionRequestPayload(
   if (input.entrySequenceIds !== undefined && input.entrySequenceIds.length === input.entries.length && input.entries.length > 0) {
     const covered: unknown[] = [];
     let coveredIndex = -1;
+    const payloadFor = (entries: unknown[], index: number): ReflectionRequestProjectionInput => {
+      const coveredThrough = input.entrySequenceIds![index]!;
+      const omitted = input.entries.length - entries.length;
+      return {
+        ...base,
+        throughSequenceId: coveredThrough,
+        ...(coveredThrough < input.throughSequenceId ? { deferredThroughSequenceId: input.throughSequenceId } : {}),
+        entries: omitted > 0
+          ? [{ kind: "notice", untrusted: true, text: `${omitted} later transcript entries deferred to the next OpenBot reflection job` }, ...entries]
+          : entries,
+      };
+    };
     for (let index = 0; index < input.entries.length; index += 1) {
-      const projected = projectReflectionEntry(input.entries[index], entryCap(input.entries[index]));
-      if (reflectionPayloadBytes({ ...base, entries: [...covered, projected] }) > targetBytes) {
+      const entry = input.entries[index];
+      const isMessage = typeof entry === "object" && entry !== null && (entry as { kind?: unknown }).kind === "message";
+      const projected = projectReflectionEntry(entry, isMessage ? Number.MAX_SAFE_INTEGER : entryCap(entry));
+      if (reflectionPayloadBytes(payloadFor([...covered, projected], index)) > targetBytes) {
         if (covered.length === 0) {
-          // Even an oversized first entry advances the boundary by one.
-          covered.push(projectReflectionEntry(input.entries[index], REFLECTION_MIN_ENTRY_BYTES));
+          // Never retire a message after examining only its prefix. A message
+          // that cannot fit alone stays in the transcript with a visible error.
+          if (isMessage) return checkedPayload(payloadFor([projected], index));
+          covered.push(projectReflectionEntry(entry, REFLECTION_MIN_ENTRY_BYTES));
           coveredIndex = 0;
         }
         break;
@@ -542,16 +578,7 @@ export function buildReflectionRequestPayload(
       covered.push(projected);
       coveredIndex = index;
     }
-    const coveredThrough = input.entrySequenceIds[coveredIndex]!;
-    const omitted = input.entries.length - covered.length;
-    return {
-      ...base,
-      throughSequenceId: coveredThrough,
-      ...(coveredThrough < input.throughSequenceId ? { deferredThroughSequenceId: input.throughSequenceId } : {}),
-      entries: omitted > 0
-        ? [{ kind: "notice", untrusted: true, text: `${omitted} later transcript entries deferred to the next OpenBot reflection job` }, ...covered]
-        : covered,
-    };
+    return checkedPayload(payloadFor(covered, coveredIndex));
   }
   const selected = new Map<number, unknown>();
   for (const index of anchorIndexes) {
@@ -599,10 +626,10 @@ export function buildReflectionRequestPayload(
   const compactEntries = omitted > 0
     ? [{ kind: "notice", untrusted: true, text: `${omitted} earlier transcript entries omitted by OpenBot reflection projection` }, ...compactAnchors]
     : compactAnchors;
-  return {
+  return checkedPayload({
     ...base,
     entries: compactEntries,
-  };
+  });
 }
 
 export function buildReflectionRequestMessage(

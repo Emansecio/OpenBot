@@ -1217,8 +1217,7 @@ describe.concurrent("Windows local release lifecycle", () => {
     }
   }, 120_000);
 
-  it("mantém repair/update/uninstall em roots com apóstrofo e não deixa lock sibling", async () => {
-    if (process.platform !== "win32") return;
+  it.skipIf(process.platform !== "win32")("mantém repair/update/uninstall em roots com apóstrofo e não deixa lock sibling", async () => {
     const root = await mkdtemp(join(tmpdir(), "openbot-release-apostrophe-'"));
     const source = join(root, "source 'tree");
     const releaseV1 = join(root, "release 'v1");
@@ -1321,8 +1320,7 @@ describe.concurrent("Windows local release lifecycle", () => {
     }
   }, 120_000);
 
-  it("forwards validated purge arguments through the deferred Windows uninstall wrapper", async () => {
-    if (process.platform !== "win32") return;
+  it.skipIf(process.platform !== "win32")("forwards validated purge arguments through the deferred Windows uninstall wrapper", async () => {
     const root = await mkdtemp(join(tmpdir(), "openbot wrapper args "));
     const source = join(root, "source tree");
     const releaseRoot = join(root, "release output");
@@ -1381,8 +1379,7 @@ describe.concurrent("Windows local release lifecycle", () => {
     }
   }, 120_000);
 
-  it("keeps process.json when Windows quiesce cannot prove termination", async () => {
-    if (process.platform !== "win32") return;
+  it.skipIf(process.platform !== "win32")("keeps process.json when Windows quiesce cannot prove termination", async () => {
     const root = await mkdtemp(join(tmpdir(), "openbot-quiesce-fail-"));
     const helper = `
       import { promises as fs } from "node:fs";
@@ -1414,8 +1411,7 @@ describe.concurrent("Windows local release lifecycle", () => {
     }
   });
 
-  it("cleans the temporary runtime when the deferred wrapper hits its inner failure branch", async () => {
-    if (process.platform !== "win32") return;
+  it.skipIf(process.platform !== "win32")("cleans the temporary runtime when the deferred wrapper hits its inner failure branch", async () => {
     const root = await mkdtemp(join(tmpdir(), "openbot-wrapper-inner-fail-"));
     const tempRoot = join(root, "temp runtime");
     const source = join(root, "versions", "1.0.0");

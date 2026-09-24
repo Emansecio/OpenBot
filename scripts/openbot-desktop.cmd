@@ -3,6 +3,14 @@ setlocal EnableExtensions
 cd /d "%~dp0.."
 if not exist logs mkdir logs
 
+rem Prefer the checkout's compatible runtime without changing the Windows PATH.
+if exist "%CD%\runtime\node\node.exe" set "PATH=%CD%\runtime\node;%PATH%"
+where node >nul 2>&1
+if errorlevel 1 (
+  echo Node nao encontrado. Instale o runtime local em runtime\node ou configure o Node no PATH.
+  exit /b 1
+)
+
 set "OPENBOT_LOCAL_GATEWAY=1"
 set "SAND_DEV_CAPABILITY="
 set "SAND_DEV_CONTROL_PORT="

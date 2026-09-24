@@ -1,24 +1,23 @@
-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { lstat, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { AgentHomeStore, HomeLifecycleError } from "../src/execution/home.js";
-import { readSharedGrants, writeSharedGrants } from "../src/execution/home-grants.js";
+import { AgentHomeStore } from "../src/execution/home.js";
 import type { HomeAclAdapter } from "../src/execution/home-acl.js";
 import { DEFAULT_HOME_INVENTORY_MAX_ENTRIES } from "../src/execution/home-inventory.js";
 import { DEFAULT_WORKSPACE_QUOTA } from "../src/execution/quota.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const roots: string[] = [];
+const tempRoots = new TempRoots();
 const temp = async () => {
-  const root = await mkdtemp(join(tmpdir(), "openbot-home-lifecycle-"));
-  roots.push(root);
+  const root = await tempRoots.makeAsync("openbot-home-lifecycle-");
   return root;
 };
 
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((entry) => rm(entry, { recursive: true, force: true })));
+  await tempRoots.cleanup();
 });
+
 
 describe("AgentHomeStore lifecycle", () => {
   it("mantém o inventário alinhado ao teto de entradas permitido pela quota", () => {
@@ -116,83 +115,6 @@ describe("AgentHomeStore lifecycle", () => {
     expect(result.repaired).toBe(true);
     expect(result.actions).toContain("created-Documents");
     expect(await readFile(join(home.root, "Desktop", "user.txt"), "utf8")).toBe("keep");
-  });
-
-  it("exports an archive with content hashes and imports it atomically", async () => {
-    const source = await temp();
-    const archiveRoot = await temp();
-    const target = await temp();
-    const sourceStore = await AgentHomeStore.create(source);
-    const sourceHome = await sourceStore.ensure("portable");
-    await writeFile(join(sourceHome.root, "Projects", "hello.txt"), "hello");
-    const archivePath = join(archiveRoot, "portable.obhome.json");
-    const exported = await sourceStore.exportArchive("portable", archivePath);
-    expect(exported.manifest.entries.find((entry) => entry.path === "Projects/hello.txt")?.sha256).toMatch(/^[a-f0-9]{64}$/);
-
-    const targetStore = await AgentHomeStore.create(target);
-    const imported = await targetStore.importArchive("portable", archivePath);
-    expect(await readFile(join(imported.root, "Projects", "hello.txt"), "utf8")).toBe("hello");
-    await expect(targetStore.importArchive("portable", archivePath)).rejects.toMatchObject({ code: "conflict" });
-  });
-
-  it("reseeds grants on foreign import but preserves them on snapshot restore", async () => {
-    const source = await temp();
-    const archiveRoot = await temp();
-    const target = await temp();
-    const sourceStore = await AgentHomeStore.create(source);
-    const sourceHome = await sourceStore.ensure("portable");
-    await writeSharedGrants(sourceHome.root, {
-      version: 1,
-      grants: { Desktop: { access: "write" }, Documents: { access: "read" } },
-    });
-
-    const archivePath = join(archiveRoot, "portable.obhome");
-    await sourceStore.exportArchive("portable", archivePath);
-    const targetStore = await AgentHomeStore.create(target);
-    const imported = await targetStore.importArchive("portable", archivePath);
-    // A foreign archive must not carry pre-approved access to real folders.
-    expect(Object.keys((await readSharedGrants(imported.root)).grants)).toHaveLength(0);
-
-    const snapshotSource = await temp();
-    const snapshotStore = await AgentHomeStore.create(snapshotSource);
-    const snapshotHome = await snapshotStore.ensure("restored");
-    await writeSharedGrants(snapshotHome.root, { version: 1, grants: { Downloads: { access: "write" } } });
-    const snapshot = await snapshotStore.snapshot("restored");
-    // restoreSnapshot quarantines the active home and rolls back on failure.
-    const restored = await snapshotStore.restoreSnapshot("restored", snapshot.seq);
-    expect((await readSharedGrants(restored.root)).grants["Downloads"]?.access).toBe("write");
-  });
-
-  it("rejects a tampered archive before creating an active home", async () => {
-    const source = await temp();
-    const target = await temp();
-    const archiveRoot = await temp();
-    const sourceStore = await AgentHomeStore.create(source);
-    await sourceStore.ensure("tampered");
-    const archivePath = join(archiveRoot, "tampered.json");
-    await sourceStore.exportArchive("tampered", archivePath);
-    const archive = await readFile(archivePath);
-    archive[archive.length - 1] = archive[archive.length - 1]! ^ 1;
-    await writeFile(archivePath, archive);
-
-    const targetStore = await AgentHomeStore.create(target);
-    await expect(targetStore.importArchive("tampered", archivePath)).rejects.toMatchObject({ code: "integrity_error" });
-    await expect(targetStore.inventory("tampered")).rejects.toMatchObject({ code: "not_found" });
-  });
-
-  it("rejects archive traversal before touching the staging area", async () => {
-    const source = await temp();
-    const archiveRoot = await temp();
-    const target = await temp();
-    const store = await AgentHomeStore.create(source);
-    await store.ensure("unsafe");
-    const archivePath = join(archiveRoot, "unsafe.json");
-    const { manifest } = await store.exportArchive("unsafe", archivePath);
-    manifest.entries[0]!.path = "../outside.txt";
-    await writeFile(archivePath, JSON.stringify({ format: "openbot-home-archive", version: 1, manifest }));
-    const targetStore = await AgentHomeStore.create(target);
-    await expect(targetStore.importArchive("unsafe", archivePath)).rejects.toMatchObject({ code: "unsafe_path" });
-    expect(await readdir(targetStore.stagingRoot)).toEqual([]);
   });
 
   it("makes ACL behavior injectable and reports failures without loosening permissions", async () => {

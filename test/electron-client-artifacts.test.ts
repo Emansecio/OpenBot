@@ -2,9 +2,10 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const root = resolve(new URL("..", import.meta.url).pathname.replace(/^\/(.):/, "$1:"));
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const manifestPath = resolve(root, "client/client-artifacts.manifest.json");
 type Artifact = { path: string; sha256: string; version: string; sourceMap?: { status: string; reference?: string } };
 type ClientArtifactManifest = {
@@ -27,8 +28,8 @@ describe("Electron client artifact baseline", () => {
     expect(manifest.artifacts.main.version).toBe("0.16.0");
     expect(manifest.artifacts.preload.version).toBe("0.16.0");
     expect(manifest.artifacts.rendererInjected).toMatchObject({
-      version: "openbot-local-settings-v58-execution-recovery",
-      sha256: "111a4d5c9e3bd3c4cbd180ce11327f44335013c880139dfe8b61fecca4b761e1",
+      version: "openbot-local-settings-v59-conversation-status",
+      sha256: "8ec6f1d39580e0e74558115662c87f2cf0e5063334a01d0adef30bc03fb66f82",
     });
     expect(manifest.artifacts.rendererMemoryUi).toMatchObject({
       path: "client/extracted/dist/renderer/assets/openbot-memory-ui.js",

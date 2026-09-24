@@ -28,17 +28,20 @@ const { createTranscriptAdapter, createTranscriptSnapshotGate } = require("../cl
 const AGENT_ID = "agent-a";
 const REPLICA = `transcript:${AGENT_ID}`;
 
-it("keeps tool lifecycle entries from becoming visible notices", () => {
+it("projects bounded tool outcomes as visible notices without raw output", () => {
   const { adapter, emitted } = makeAdapter();
   const entry = { kind: "tool-call", id: "tool-1", name: "process_run", summary: "run process", status: "running" };
   adapter.reset({ type: "snapshot", agentId: AGENT_ID, entries: [entry] });
-  expect(emitted.at(-1).entries).toEqual([entry]);
+  expect(emitted.at(-1).entries).toEqual([{
+    kind: "notice", id: "tool-1", level: "info", text: "run process — em execução",
+  }]);
   adapter.accept({ type: "updated", agentId: AGENT_ID, ordered: order(1), entry: {
     ...entry, status: "failed", result: { ok: false, message: "Process exited with code 7.", stdout: "synthetic-private-output" },
   } });
-  expect(emitted.at(-1).entry).toEqual({ ...entry, status: "failed" });
-  expect(emitted.at(-1).entry.kind).not.toBe("notice");
-  expect(emitted.at(-1).entry.result).toBeUndefined();
+  expect(emitted.at(-1).entry).toEqual({
+    kind: "notice", id: "tool-1", level: "error", text: "run process — falhou",
+  });
+  expect(JSON.stringify(emitted.at(-1).entry)).not.toContain("synthetic-private-output");
 });
 
 function assistant(content = "", streaming = true) {

@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
-import { GATEWAY_HOST, startServer, stopServer } from "../src/main.js";
+import { GATEWAY_HOST, startServer, stopServer, terminateOwnProcessTree } from "../src/main.js";
 import { defaultRegistry } from "../src/providers/router.js";
 import { ProviderAdmissionScheduler } from "../src/providers/admission.js";
 import { McpManager } from "../src/mcp/manager.js";
@@ -517,6 +517,21 @@ describe("bootstrap (T1)", () => {
     expect(calls).toEqual([]);
     for (const close of manualClose) await close();
     rmSync(root, { recursive: true, force: true });
+  });
+
+  it("encerramento com falha derruba a árvore do próprio processo no Windows antes de sair", () => {
+    const invocations: Array<{ command: string; args: readonly string[] }> = [];
+    const run = ((command: string, args: readonly string[]) => {
+      invocations.push({ command, args });
+      return { status: 0 };
+    }) as unknown as Parameters<typeof terminateOwnProcessTree>[0];
+    terminateOwnProcessTree(run, "win32");
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]!.command).toMatch(/System32[\\/]taskkill\.exe$/i);
+    expect(invocations[0]!.args).toEqual(["/PID", String(process.pid), "/T", "/F"]);
+
+    terminateOwnProcessTree(run, "linux");
+    expect(invocations).toHaveLength(1);
   });
 });
 

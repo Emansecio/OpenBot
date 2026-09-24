@@ -153,9 +153,10 @@ function createE2eAdapter() {
         message.role === "user" && message.content.includes("desktop e2e retry recovery")
       ));
       if (retryRequest) retryAttempts += 1;
+      const retryShouldFail = retryRequest && retryAttempts <= 3;
       if (skillRequest) streamState.skillContextObserved = true;
       const deltas = retryRequest
-        ? [retryAttempts === 1 ? "E2E retry partial." : "E2E retry recovered."]
+        ? retryShouldFail ? [] : ["E2E retry recovered."]
         : skillRequest
         ? ["E2E skill ", "backend received ", "shared context."]
         : [
@@ -207,7 +208,7 @@ function createE2eAdapter() {
           }
           await sleep(skillRequest || retryRequest ? 80 : 400);
         }
-        if (retryRequest && retryAttempts === 1) {
+        if (retryShouldFail) {
           streamState.retryFailureObserved = true;
           await persistStatus();
           throw Object.assign(new Error("E2E retryable provider failure"), { status: 503 });
@@ -280,6 +281,19 @@ handle = await startServer(port, {
   sharedIntegrationsEnabled: true,
   gatewayToken,
 });
+// The first desktop scenario holds the provider stream open for cancellation.
+// Use the direct text path here; the separate memory gate covers automatic
+// reflection, while this fixture exercises the Skill tool flow later.
+if (!emptyAgent) handle.store.memoryStore.setSettings(DEFAULT_AGENT_ID, "off");
+if (!emptyAgent) {
+  const regularTools = handle.runner.tools;
+  // The held-open cancellation round must use the direct streaming path.
+  // Restore the normal tool catalog after abort so the later Skill scenario
+  // still runs through the production tool loop.
+  handle.runner.tools = async (agentId, signal) => streamState.abortObserved
+    ? typeof regularTools === "function" ? regularTools(agentId, signal) : regularTools
+    : [];
+}
 if (!emptyAgent) await handle.homes?.ensure(DEFAULT_AGENT_ID);
 if (args.includes("--delete-drain-delay")) {
   config.mutate(current => ({ agents: [...current.agents, { id: "delete-timeout-fixture", name: "Deletion Fixture", avatarId: "delete-timeout-fixture" }] }));

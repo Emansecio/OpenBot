@@ -1,20 +1,19 @@
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createLocalFileLogger, installLocalFileLoggerFromEnvironment, redactLogText } from "../src/local-logger.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
-const temporaryRoots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
-  await Promise.all(temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await temp.cleanup();
 });
 
 describe("bounded local logger", () => {
   it("rotates during the same process and keeps bounded retention", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-local-logger-"));
-    temporaryRoots.push(root);
+    const root = await temp.makeAsync("openbot-local-logger-");
     const path = join(root, "gateway.log");
     const logger = createLocalFileLogger({ path, maxBytes: 96, backups: 2 });
 
@@ -45,8 +44,7 @@ describe("bounded local logger", () => {
   });
 
   it("does not install a logger when the destination cannot be created", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-local-logger-fail-"));
-    temporaryRoots.push(root);
+    const root = await temp.makeAsync("openbot-local-logger-fail-");
     const file = join(root, "not-a-directory");
     await writeFile(file, "occupied");
     const target = { log() {}, info() {}, warn() {}, error() {} };

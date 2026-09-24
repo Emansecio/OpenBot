@@ -136,7 +136,7 @@ GREEN exige que o Electron real complete todos os comandos, que a falha injetada
 
 ```powershell
 npm run typecheck
-npx vitest run test/runtime-local-ownership.test.ts test/runtime-process-backend.test.ts test/execution-quota.test.ts test/home-archive.test.ts test/home-snapshots.test.ts test/home-lifecycle-rpc.test.ts test/async-task-runtime.test.ts test/execution-diagnostics.test.ts --maxWorkers=1 --no-file-parallelism
+npx vitest run test/runtime-local-ownership.test.ts test/runtime-process-backend.test.ts test/execution-quota.test.ts test/home-archive.test.ts test/home-snapshots.test.ts test/home-lifecycle-rpc.test.ts test/home-lifecycle-rpc-repair.test.ts test/async-task-runtime.test.ts test/async-task-runtime-recovery.test.ts test/execution-diagnostics.test.ts --maxWorkers=1 --no-file-parallelism
 npm run verify:e2e:browser
 ```
 
@@ -283,7 +283,7 @@ O teste live usa main/preload/renderer e controles nativos reais, com gateway em
 ## Fechamento para bandeja do Windows
 
 ```powershell
-npm exec --offline -- vitest run test/desktop-tray.test.ts test/desktop-tray-live.test.ts test/electron-windows-patches.test.ts --maxWorkers=1 --no-file-parallelism
+npm exec --offline -- vitest run test/desktop-tray.test.ts test/desktop-tray-live.test.ts test/electron-windows-patches.test.ts test/electron-renderer-chat-patches.test.ts test/electron-renderer-ui-patches.test.ts --maxWorkers=1 --no-file-parallelism
 npm run verify:clean-profile
 ```
 
@@ -293,7 +293,7 @@ O teste live usa Electron/Tray/Menu reais e perfil temporário, sem bots ou gate
 
 ```powershell
 npm run verify:desktop-identity
-npm exec --offline -- vitest run test/taskbar-shortcut.test.ts test/electron-windows-patches.test.ts --maxWorkers=1 --no-file-parallelism
+npm exec --offline -- vitest run test/taskbar-shortcut.test.ts test/electron-windows-patches.test.ts test/electron-renderer-chat-patches.test.ts test/electron-renderer-ui-patches.test.ts --maxWorkers=1 --no-file-parallelism
 npm run verify:release-lifecycle
 npm run verify:visual-ui
 ```
@@ -321,7 +321,7 @@ ter criado os atalhos. Não apaga caches do Explorer nem inicia bots reais.
 ## Feedback e persistência do perfil
 
 ```powershell
-npm exec --offline -- vitest run test/profile-persistence.test.ts test/rpc-send-preparation.test.ts test/rpc-retry-target.test.ts test/electron-windows-patches.test.ts --maxWorkers=1 --no-file-parallelism
+npm exec --offline -- vitest run test/profile-persistence.test.ts test/rpc-send-preparation.test.ts test/rpc-retry-target.test.ts test/electron-windows-patches.test.ts test/electron-renderer-chat-patches.test.ts test/electron-renderer-ui-patches.test.ts --maxWorkers=1 --no-file-parallelism
 node scripts/visual-ui-verify.mjs --profile-feedback-only
 node scripts/visual-ui-verify.mjs --profile-only
 ```
@@ -351,7 +351,7 @@ O gate usa Electron real para conferir a tela de boas-vindas, animação, foco, 
 ### Recuperação orientada pelo backend
 
 ```powershell
-npm exec --offline -- vitest run test/turn-uncertain-effects.test.ts test/rpc-send-preparation.test.ts test/rpc-send.test.ts test/prompt-queue.test.ts test/rpc-send-gateway.integration.test.ts --maxWorkers=1 --no-file-parallelism
+npm exec --offline -- vitest run test/turn-uncertain-effects.test.ts test/rpc-send-preparation.test.ts test/rpc-send.test.ts test/rpc-send-queue.test.ts test/rpc-send-dialog.test.ts test/rpc-send-stream.test.ts test/rpc-send-store.test.ts test/prompt-queue.test.ts test/rpc-send-gateway.integration.test.ts --maxWorkers=1 --no-file-parallelism
 npm run verify:visual-ui
 ```
 
@@ -508,7 +508,7 @@ removido; em falha, fica preservado somente para diagnóstico.
 ### Fila de mensagens e cancelamento por turno
 
 ```powershell
-npm exec --offline -- vitest run test/prompt-queue.test.ts test/prompt-queue-recovery.test.ts test/queue-task-overlay-regressions.test.ts test/rpc-send.test.ts test/rpc-send-gateway.integration.test.ts --maxWorkers=1 --no-file-parallelism
+npm exec --offline -- vitest run test/prompt-queue.test.ts test/prompt-queue-recovery.test.ts test/queue-task-overlay-regressions.test.ts test/rpc-send.test.ts test/rpc-send-queue.test.ts test/rpc-send-dialog.test.ts test/rpc-send-stream.test.ts test/rpc-send-store.test.ts test/rpc-send-gateway.integration.test.ts --maxWorkers=1 --no-file-parallelism
 node scripts/visual-ui-verify.mjs --prompt-queue-only
 ```
 
@@ -567,7 +567,7 @@ real. Execute gates com janelas em série e `ELECTRON_EXE` apontando ao Electron
 ### Encerramento seguro para exclusão
 
 ```powershell
-npm exec --offline -- vitest run test/agent-deletion-lifecycle.test.ts test/roster-agents.test.ts test/electron-windows-patches.test.ts --maxWorkers=1 --no-file-parallelism
+npm exec --offline -- vitest run test/agent-deletion-lifecycle.test.ts test/agent-deletion-reconciliation.test.ts test/roster-agents.test.ts test/roster-agents-config.test.ts test/roster-agents-delete.test.ts test/electron-windows-patches.test.ts test/electron-renderer-chat-patches.test.ts test/electron-renderer-ui-patches.test.ts --maxWorkers=1 --no-file-parallelism
 node scripts/visual-ui-verify.mjs --cancel-collapsed-only
 node scripts/visual-ui-verify.mjs --delete-timeout-only
 ```
@@ -579,6 +579,20 @@ limpeza: o bot e seus dados permanecem, e a proteção só é liberada após pro
 encerramento bem-sucedido. Falha no encerramento mantém a proteção até recuperação
 por reinício. O teste de UI verifica erro recuperável e fechamento do diálogo;
 o teste de cancelamento exige abort observado com a sidebar recolhida.
+
+Os testes de `agent-deletion-lifecycle` também cobrem criação interrompida por
+falha de escrita, exclusão/reversão acima da quota padrão, cancelamento das
+compactações e limpeza definitiva via `purgeDeletedAgentData`. O expurgo exige
+`confirm: true`, preserva outros bots e recusa IDs ativos ou com recuperação
+pendente. A remoção parcial mantém o marcador da quarentena para uma nova
+tentativa, e a recriação do mesmo ID aguarda a limpeza terminar.
+
+```powershell
+npm exec --offline -- vitest run test/home-archive.test.ts test/execution-home-lifecycle.test.ts test/execution-home-archive.test.ts test/home-lifecycle-rpc.test.ts test/home-lifecycle-rpc-repair.test.ts test/memory-worker-resilience.test.ts --maxWorkers=1 --no-file-parallelism
+```
+
+Os arquivos de home aceitam nomes curtos 8.3 do Windows. O teste de arquivo
+também exige rejeição de links/junctions em ancestrais do destino e da origem.
 
 Para a verificação comum, use:
 

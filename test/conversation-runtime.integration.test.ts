@@ -1,7 +1,3 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createProviderRegistry } from "../src/providers/router.js";
@@ -11,18 +7,18 @@ import { registerRpcHandlers } from "../src/rpc/index.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
 import { Gateway } from "../src/server/gateway.js";
 import { createFakeAdapter } from "./mocks/fake-provider-adapter.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const handles: ServerHandle[] = [];
-const roots: string[] = [];
+const temp = new TempRoots();
 
 afterEach(async () => {
   await Promise.all(handles.splice(0).map((handle) => stopServer(handle)));
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  await temp.cleanup();
 });
 
 async function boot(script: Parameters<typeof createFakeAdapter>[1] = {}) {
-  const root = mkdtempSync(join(tmpdir(), "openbot-conversation-runtime-"));
-  roots.push(root);
+  const root = temp.make("openbot-conversation-runtime-");
   const registry = createProviderRegistry();
   const adapter = createFakeAdapter("xai", script);
   registry.register(adapter);
@@ -306,8 +302,7 @@ describe("conversation-aware turn runtime", () => {
   });
 
   it("uses the injected SQLite store connection for conversations", async () => {
-    const root = mkdtempSync(join(tmpdir(), "openbot-injected-store-"));
-    roots.push(root);
+    const root = temp.make("openbot-injected-store-");
     const injected = new SqliteTranscriptStore({ path: ":memory:" });
     const registry = createProviderRegistry();
     const adapter = createFakeAdapter("xai", { deltas: ["ok"] });

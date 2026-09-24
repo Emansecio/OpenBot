@@ -547,7 +547,7 @@
   "permittedOverlays": [
     {
       "path": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
-      "sha256": "111a4d5c9e3bd3c4cbd180ce11327f44335013c880139dfe8b61fecca4b761e1"
+      "sha256": "8ec6f1d39580e0e74558115662c87f2cf0e5063334a01d0adef30bc03fb66f82"
     },
     {
       "path": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
