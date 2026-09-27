@@ -473053,7 +473053,7 @@ import_electron50.app.whenReady().then(async () => {
       throw new Error("abortAsyncTask requires taskId and intentId");
     }
     const reason = request4.reason === "parent" || request4.reason === "shutdown" || request4.reason === "budget_exhausted" ? request4.reason : "user";
-    const result = await withActiveOpenBotAgent(request3, (next) => callOpenBotProviderRpc("abortAsyncTask", { taskId: request4.taskId, intentId: request4.intentId, reason }, { timeoutMs: TASK_CONTROL_TIMEOUT_MS }));
+    const result = await withActiveOpenBotAgent(request3, (next) => callOpenBotProviderRpc("abortAsyncTask", { agentId: next.agentId, taskId: request4.taskId, intentId: request4.intentId, reason }, { timeoutMs: TASK_CONTROL_TIMEOUT_MS }));
     return { taskId: result && result.taskId ? result.taskId : request4.taskId, intentId: request4.intentId, status: result && result.status ? result.status : "requested" };
   });
   import_electron50.ipcMain.handle("sand:async-task-steer", async (_event, request3) => {
@@ -473064,7 +473064,7 @@ import_electron50.app.whenReady().then(async () => {
       throw new Error("steerAsyncTask requires taskId, intentId and message");
     }
     const message = boundedUiText(request4.message, "", 4096);
-    const result = await withActiveOpenBotAgent(request3, (next) => callOpenBotProviderRpc("steerAsyncTask", { taskId: request4.taskId, intentId: request4.intentId, message }, { timeoutMs: TASK_CONTROL_TIMEOUT_MS }));
+    const result = await withActiveOpenBotAgent(request3, (next) => callOpenBotProviderRpc("steerAsyncTask", { agentId: next.agentId, taskId: request4.taskId, intentId: request4.intentId, message }, { timeoutMs: TASK_CONTROL_TIMEOUT_MS }));
     return { taskId: result && result.taskId ? result.taskId : request4.taskId, intentId: request4.intentId, status: result && result.status ? result.status : "requested" };
   });
   import_electron50.ipcMain.handle("sand:async-task-stream-start", async (_event, request3) => {

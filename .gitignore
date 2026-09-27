@@ -1,7 +1,6 @@
 node_modules/
 /dist/
 /runtime/node/
-target/
 *.log
 .DS_Store
 
@@ -16,9 +15,9 @@ target/
 *.sqlite
 *.sqlite3
 /process.json
+/process.json.*
 
 # Generated packages, diagnostics, and local agent sessions.
-/release/
 /logs/
 /test-results/
 /coverage/
@@ -28,4 +27,6 @@ target/
 /.pi/
 /.slim/
 /%SystemDrive%/
-/windows-artifact-gate.json
+
+# Specs/planos locais da ferramenta superpowers (não versionados)
+/docs/superpowers/

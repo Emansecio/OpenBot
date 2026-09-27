@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { WINDOWS_JOB_SCRIPT } from "./windows-job-script.js";
-import { nativePowerShellPath } from "./environment.js";
+import { inheritableEnvironment, nativePowerShellPath } from "./environment.js";
 import { NativeJobHelperCache } from "./helper-cache.js";
 import type { RuntimeLeaseRecord, RuntimeResourceReconciler } from "../recovery.js";
 
@@ -34,7 +34,7 @@ export class WindowsJobProcess {
   private stopped!: () => void;
   private readonly stopCompleted = new Promise<void>((resolve) => { this.stopped = resolve; });
 
-  constructor(readonly name: string, environment: NodeJS.ProcessEnv = process.env, private readonly executable?: string) {
+  constructor(readonly name: string, environment: NodeJS.ProcessEnv = inheritableEnvironment(), private readonly executable?: string) {
     if (process.platform !== "win32") throw unavailable();
     if (!executable && args[args.length - 1]!.length > 31_000) throw unavailable();
     this.child = spawn(executable ?? nativePowerShellPath(), executable ? [] : args, { windowsHide: true, shell: false, env: environment, stdio: ["pipe", "pipe", "pipe"] });

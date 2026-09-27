@@ -1,7 +1,12 @@
 import Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 
-export const OPENBOT_SCHEMA_VERSION = 20;
+/**
+ * Bump when a migration step changes data or replaces a trigger definition:
+ * data backfills and trigger (re)creation only run for databases older than
+ * this version, inside the migration transaction.
+ */
+export const OPENBOT_SCHEMA_VERSION = 22;
 
 const CONVERSATION_BOUND_TABLES = [
   "transcript_entries",
@@ -37,7 +42,7 @@ function tableColumns(db: Database.Database, table: string): Set<string> {
   );
 }
 
-function validateAgentId(agentId: string): void {
+export function validateAgentId(agentId: string): void {
   if (typeof agentId !== "string" || agentId.trim().length === 0) {
     throw new Error("agentId deve ser uma string não vazia");
   }
@@ -221,8 +226,6 @@ function createAsyncTaskSchema(db: Database.Database): void {
       CHECK ((lease_owner IS NULL AND lease_expires_at_ms IS NULL AND lease_version IS NULL)
         OR (lease_owner IS NOT NULL AND lease_expires_at_ms IS NOT NULL AND lease_version IS NOT NULL))
     );
-    CREATE INDEX IF NOT EXISTS idx_async_task_attempts_task
-      ON async_task_attempts(task_id, attempt);
 
     CREATE TABLE IF NOT EXISTS async_task_grants (
       task_id TEXT PRIMARY KEY,
@@ -351,8 +354,6 @@ function createA2ASchema(db: Database.Database): void {
       ON a2a_messages(recipient_agent_id, status, available_at_ms, priority, created_at_ms, message_id);
     CREATE INDEX IF NOT EXISTS idx_a2a_recipient_status
       ON a2a_messages(recipient_agent_id, status, created_at_ms);
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_a2a_sender_incarnation_nonce
-      ON a2a_messages(sender_agent_id, sender_incarnation, nonce);
     CREATE TABLE IF NOT EXISTS a2a_parent_usage (
       sender_agent_id TEXT NOT NULL,
       sender_incarnation TEXT NOT NULL,
@@ -396,8 +397,6 @@ function createA2ASchema(db: Database.Database): void {
       UNIQUE(source_outbox_id),
       UNIQUE(message_id, transition_version, event_kind)
     );
-    CREATE INDEX IF NOT EXISTS idx_a2a_projection_agent
-      ON a2a_projection_outbox(agent_id, epoch, sequence);
   `);
 }
 
@@ -473,8 +472,6 @@ function migrateA2AIdentitySchema(db: Database.Database): void {
         ON a2a_messages(recipient_agent_id, status, available_at_ms, priority, created_at_ms, message_id);
       CREATE INDEX IF NOT EXISTS idx_a2a_recipient_status
         ON a2a_messages(recipient_agent_id, status, created_at_ms);
-      CREATE UNIQUE INDEX IF NOT EXISTS ux_a2a_sender_incarnation_nonce
-        ON a2a_messages(sender_agent_id, sender_incarnation, nonce);
     `);
   });
   migrate();
@@ -606,6 +603,9 @@ function createMemorySchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_memory_jobs_claim
       ON memory_jobs(agent_id, status, next_attempt_at_ms, created_at_ms);
+    -- Finished-job cleanup on every enqueue selects by status and age across agents.
+    CREATE INDEX IF NOT EXISTS idx_memory_jobs_status_updated
+      ON memory_jobs(status, updated_at_ms);
 
     CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
       memory_id UNINDEXED,
@@ -656,16 +656,30 @@ function createMemorySchema(db: Database.Database): void {
       DELETE FROM memory_fts WHERE memory_id = OLD.id;
     END;
 
+  `);
+}
+
+/**
+ * Transcript search triggers. A message is indexed once it is complete: the
+ * one-second persists of a streaming answer would otherwise delete and
+ * re-insert its growing text on every write. The update trigger also fires
+ * when the streaming flags change, so the final write indexes the text even
+ * when it equals the last streamed snapshot.
+ */
+const INDEXABLE_MESSAGE = (row: "NEW" | "t") => `${row}.kind = 'message'
+      AND length(trim(COALESCE(json_extract(${row}.payload_json, '$.content'), ''))) > 0
+      AND COALESCE(json_extract(${row}.payload_json, '$.streaming'), 0) != 1
+      AND COALESCE(json_extract(${row}.payload_json, '$.isStreaming'), 0) != 1`;
+
+function createTranscriptHistoryTriggers(db: Database.Database): void {
+  db.exec(`
     DROP TRIGGER IF EXISTS transcript_entries_history_fts_ai;
     DROP TRIGGER IF EXISTS transcript_entries_history_fts_au;
     DROP TRIGGER IF EXISTS transcript_entries_history_fts_ad;
-    DROP TRIGGER IF EXISTS conversation_summaries_history_fts_ai;
-    DROP TRIGGER IF EXISTS conversation_summaries_history_fts_au;
-    DROP TRIGGER IF EXISTS conversation_summaries_history_fts_ad;
 
     CREATE TRIGGER transcript_entries_history_fts_ai
     AFTER INSERT ON transcript_entries
-    WHEN NEW.kind = 'message' AND length(trim(COALESCE(json_extract(NEW.payload_json, '$.content'), ''))) > 0
+    WHEN ${INDEXABLE_MESSAGE("NEW")}
       AND NOT EXISTS (
         SELECT 1 FROM agent_conversations
         WHERE id = NEW.conversation_id AND agent_id = NEW.agent_id AND temporary = 1
@@ -686,6 +700,8 @@ function createMemorySchema(db: Database.Database): void {
       OR OLD.conversation_id IS NOT NEW.conversation_id
       OR OLD.kind IS NOT NEW.kind
       OR json_extract(OLD.payload_json, '$.content') IS NOT json_extract(NEW.payload_json, '$.content')
+      OR json_extract(OLD.payload_json, '$.streaming') IS NOT json_extract(NEW.payload_json, '$.streaming')
+      OR json_extract(OLD.payload_json, '$.isStreaming') IS NOT json_extract(NEW.payload_json, '$.isStreaming')
     BEGIN
       DELETE FROM history_fts
       WHERE rowid = (
@@ -695,7 +711,7 @@ function createMemorySchema(db: Database.Database): void {
       DELETE FROM history_fts_source_map WHERE source_id = 'entry:' || OLD.sequence_id;
       INSERT INTO history_fts_source_map(source_id)
       SELECT 'entry:' || NEW.sequence_id
-      WHERE NEW.kind = 'message' AND length(trim(COALESCE(json_extract(NEW.payload_json, '$.content'), ''))) > 0
+      WHERE ${INDEXABLE_MESSAGE("NEW")}
         AND NOT EXISTS (
           SELECT 1 FROM agent_conversations
           WHERE id = NEW.conversation_id AND agent_id = NEW.agent_id AND temporary = 1
@@ -716,9 +732,7 @@ function createMemorySchema(db: Database.Database): void {
       );
       DELETE FROM history_fts_source_map WHERE source_id = 'entry:' || OLD.sequence_id;
     END;
-
   `);
-  createConversationSummaryHistoryTriggers(db);
 }
 
 /** Tracks writes that can change the forgotten-source provenance walk. The
@@ -944,7 +958,15 @@ function createConversationSummaryHistoryTriggers(db: Database.Database): void {
  * must be one-to-one with the current virtual-table rows before any migrated
  * write can run.
  */
-function ensureHistoryFtsSourceMap(db: Database.Database): void {
+function ensureHistoryFtsSourceMap(db: Database.Database, thorough: boolean): void {
+  if (!thorough) {
+    // The map and the FTS rows are written by the same trigger bodies, so a
+    // matching newest rowid is the steady state. Both reads are O(log n); the
+    // counts below scan every FTS row and only run on upgrades or a mismatch.
+    const newestFts = (db.prepare("SELECT rowid FROM history_fts ORDER BY rowid DESC LIMIT 1").get() as { rowid: number } | undefined)?.rowid ?? null;
+    const newestMapped = (db.prepare("SELECT MAX(fts_rowid) AS rowid FROM history_fts_source_map").get() as { rowid: number | null }).rowid;
+    if (newestFts === newestMapped) return;
+  }
   const counts = db.prepare(`
     SELECT
       (SELECT COUNT(*) FROM history_fts) AS fts_count,
@@ -1018,7 +1040,7 @@ export function rebuildOpenBotFts(db: Database.Database, now = Date.now()): void
     INSERT INTO history_fts_source_map(source_id)
     SELECT 'entry:' || t.sequence_id
     FROM transcript_entries t
-    WHERE t.kind = 'message' AND length(trim(COALESCE(json_extract(t.payload_json, '$.content'), ''))) > 0
+    WHERE ${INDEXABLE_MESSAGE("t")}
       AND NOT EXISTS (
         SELECT 1 FROM agent_conversations c
         WHERE c.id = t.conversation_id AND c.agent_id = t.agent_id AND c.temporary = 1
@@ -1029,7 +1051,7 @@ export function rebuildOpenBotFts(db: Database.Database, now = Date.now()): void
     SELECT map.fts_rowid, 'entry:' || t.sequence_id, t.agent_id, t.conversation_id, 'message', json_extract(t.payload_json, '$.content'), t.sequence_id
     FROM transcript_entries t
     JOIN history_fts_source_map AS map ON map.source_id = 'entry:' || t.sequence_id
-    WHERE t.kind = 'message' AND length(trim(COALESCE(json_extract(t.payload_json, '$.content'), ''))) > 0
+    WHERE ${INDEXABLE_MESSAGE("t")}
       AND NOT EXISTS (
         SELECT 1 FROM agent_conversations c
         WHERE c.id = t.conversation_id AND c.agent_id = t.agent_id AND c.temporary = 1
@@ -1118,6 +1140,17 @@ function hasMissingConversationIds(db: Database.Database, table: ConversationBou
     LIMIT 1
   `).get(agentId) as { present?: number } | undefined;
   return row?.present === 1;
+}
+
+/**
+ * Probe for rows a legacy writer left without a conversation; the full
+ * backfill is far costlier. On transcript_entries the predicate matches the
+ * partial index idx_transcript_missing_conversation, which stays empty.
+ */
+function hasRowsWithoutConversation(db: Database.Database): boolean {
+  return CONVERSATION_BOUND_TABLES.some((table) => db.prepare(
+    `SELECT 1 FROM ${quoteIdentifier(table)} WHERE conversation_id IS NULL OR conversation_id = '' LIMIT 1`,
+  ).get() !== undefined);
 }
 
 function backfillConversationIds(db: Database.Database, now: number): void {
@@ -1338,10 +1371,6 @@ function migrateConversationSummaryRetention(db: Database.Database): void {
   `).run();
 }
 
-/**
- * Creates the current schema and upgrades every supported earlier schema in place.
- * The function is intentionally independent from either store implementation.
- */
 /** P2.3 — server-side attachment staging registry. Bytes live on disk
  * under a controlled staging root; this table holds the durable metadata
  * (owner agent, optional conversation, sanitized filename, kind, size,
@@ -1372,6 +1401,23 @@ function createP23Schema(db: Database.Database): void {
   `);
 }
 
+/** Durable per-conversation prompt queue; payload columns are added by the migration. */
+function createPromptQueueSchema(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS prompt_queue (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      nonce TEXT NOT NULL,
+      args_json TEXT NOT NULL,
+      inference_json TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('queued','running','completed','cancelled','interrupted')),
+      UNIQUE(agent_id, conversation_id, nonce)
+    );
+    CREATE INDEX IF NOT EXISTS idx_prompt_queue_pending ON prompt_queue(agent_id, state, sequence);
+  `);
+}
+
 /** P2.4 — durable agent/conversation/entry-scoped reactions with nonce dedupe. */
 function createP24Schema(db: Database.Database): void {
   db.exec(`
@@ -1392,45 +1438,6 @@ function createP24Schema(db: Database.Database): void {
       ON reactions(agent_id, state, created_at_ms, id);
     CREATE INDEX IF NOT EXISTS idx_reactions_conversation
       ON reactions(agent_id, conversation_id, state);
-  `);
-}
-
-/** P2.6 — bounded provider checkpoints and durable effect idempotency ledger. */
-function createP26Schema(db: Database.Database): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS turn_checkpoints (
-      checkpoint_id TEXT PRIMARY KEY,
-      agent_id TEXT NOT NULL,
-      conversation_id TEXT NOT NULL,
-      turn_id TEXT NOT NULL,
-      provider TEXT NOT NULL,
-      model TEXT NOT NULL,
-      cursor TEXT NOT NULL,
-      safe_sequence_id INTEGER NOT NULL CHECK (safe_sequence_id >= 0),
-      completed_effect_ids_json TEXT NOT NULL,
-      expires_at_ms INTEGER NOT NULL,
-      version INTEGER NOT NULL CHECK (version >= 1),
-      budget_json TEXT NOT NULL,
-      updated_at_ms INTEGER NOT NULL,
-      UNIQUE(agent_id, conversation_id, turn_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_turn_checkpoints_agent_expiry
-      ON turn_checkpoints(agent_id, expires_at_ms, updated_at_ms);
-    CREATE TABLE IF NOT EXISTS turn_effects (
-      agent_id TEXT NOT NULL,
-      conversation_id TEXT NOT NULL,
-      turn_id TEXT NOT NULL,
-      effect_id TEXT NOT NULL,
-      fingerprint_hash TEXT NOT NULL,
-      status TEXT NOT NULL CHECK (status IN ('prepared', 'started', 'completed', 'unsafe')),
-      result_json TEXT,
-      created_at_ms INTEGER NOT NULL,
-      started_at_ms INTEGER,
-      completed_at_ms INTEGER,
-      PRIMARY KEY (agent_id, conversation_id, turn_id, effect_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_turn_effects_agent_status
-      ON turn_effects(agent_id, status, created_at_ms);
   `);
 }
 
@@ -1470,6 +1477,41 @@ function createAgentDeletionSchema(db: Database.Database): void {
   `);
 }
 
+/** Columns of an index, in order; expression columns read as `<expr>`. */
+function indexColumns(db: Database.Database, index: string): string[] {
+  return (db.pragma(`index_info(${quoteIdentifier(index)})`) as Array<{ name: string | null }>)
+    .map((column) => column.name ?? "<expr>");
+}
+
+/**
+ * Keeps an explicit index only when no table constraint already provides one
+ * over the same columns. Tables created by current DDL carry the constraint;
+ * tables upgraded with ALTER TABLE only have the explicit index.
+ */
+function reconcileConstraintIndex(db: Database.Database, table: string, index: string, columns: readonly string[], createSql: string): void {
+  if (!tableExists(db, table)) return;
+  const covered = (db.pragma(`index_list(${quoteIdentifier(table)})`) as Array<{ name: string; origin: string; partial: number }>)
+    .some((entry) => (entry.origin === "u" || entry.origin === "pk") && entry.partial === 0
+      && indexColumns(db, entry.name).join("\u0000") === columns.join("\u0000"));
+  db.exec(covered ? `DROP INDEX IF EXISTS ${quoteIdentifier(index)}` : createSql);
+}
+
+/** Connections this process already migrated; see {@link ensureOpenBotSchema}. */
+const migratedConnections = new WeakSet<Database.Database>();
+
+/**
+ * Migrates a connection once. Every store that shares the process connection
+ * calls this on construction; only the first call does the work.
+ */
+export function ensureOpenBotSchema(db: Database.Database): void {
+  if (migratedConnections.has(db)) return;
+  migrateOpenBotSchema(db);
+}
+
+/**
+ * Creates the current schema and upgrades every supported earlier schema in place.
+ * The function is intentionally independent from either store implementation.
+ */
 export function migrateOpenBotSchema(db: Database.Database): void {
   const version = db.pragma("user_version", { simple: true }) as number;
   if (version > OPENBOT_SCHEMA_VERSION) throw new Error(`store: versão SQLite não suportada: ${version}`);
@@ -1480,90 +1522,84 @@ export function migrateOpenBotSchema(db: Database.Database): void {
   createAsyncTaskSchema(db);
   createA2ASchema(db);
   createP23Schema(db);
-  db.exec(`CREATE TABLE IF NOT EXISTS prompt_queue (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    nonce TEXT NOT NULL,
-    args_json TEXT NOT NULL,
-    inference_json TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('queued','running','completed','cancelled','interrupted')),
-    UNIQUE(agent_id, conversation_id, nonce)
-  );
-  CREATE INDEX IF NOT EXISTS idx_prompt_queue_pending ON prompt_queue(agent_id,state,sequence);`);
+  createPromptQueueSchema(db);
   createP24Schema(db);
-  createP26Schema(db);
   createP28Schema(db);
   createAgentDeletionSchema(db);
   migrateA2AIdentitySchema(db);
   migrateA2AProjectionSchema(db);
+  // After the A2A migrations (which may rebuild the table): recovery, the
+  // runtime's idle check and history pruning select by status across agents.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_a2a_status_due ON a2a_messages(status, lease_expires_at_ms, expires_at_ms)");
   // Keep schema repairs and their backfills in one SQLite transaction. In
   // particular, a legacy attempt must never be left with the default
   // `unsafe_effect_started = 0` after a crash between ADD COLUMN and the
   // conservative backfill.
+  const upgrading = version < OPENBOT_SCHEMA_VERSION;
   const migrate = db.transaction(() => {
-  const queueColumns = tableColumns(db, "prompt_queue");
-  if (!queueColumns.has("payload_digest")) db.exec("ALTER TABLE prompt_queue ADD COLUMN payload_digest TEXT NOT NULL DEFAULT ''");
-  if (!queueColumns.has("payload_compacted")) db.exec("ALTER TABLE prompt_queue ADD COLUMN payload_compacted INTEGER NOT NULL DEFAULT 0 CHECK(payload_compacted IN (0,1))");
-  if (!queueColumns.has("recovery_of")) db.exec("ALTER TABLE prompt_queue ADD COLUMN recovery_of TEXT");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_compaction ON prompt_queue(payload_compacted,state,sequence)");
-  const asyncTaskColumns = tableColumns(db, "async_tasks");
-  if (!asyncTaskColumns.has("input_json")) {
-    db.exec("ALTER TABLE async_tasks ADD COLUMN input_json TEXT");
-  }
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS trg_async_tasks_input_insert_nonnull
-      BEFORE INSERT ON async_tasks
-      WHEN NEW.input_json IS NULL
-      BEGIN SELECT RAISE(ABORT, 'async task input_json is immutable and required'); END;
-  `);
-  // Recreated (not IF NOT EXISTS) so pre-existing databases pick up the
-  // NULL-to-value repair allowance below. Immutability of stored values is kept:
-  // only filling a missing input is permitted, never changing or clearing one.
-  db.exec("DROP TRIGGER IF EXISTS trg_async_tasks_input_immutable");
-  db.exec(`
-    CREATE TRIGGER trg_async_tasks_input_immutable
-      BEFORE UPDATE OF input_json ON async_tasks
-      WHEN NEW.input_json IS NULL OR (OLD.input_json IS NOT NULL AND NEW.input_json IS NOT OLD.input_json)
-      BEGIN SELECT RAISE(ABORT, 'async task input_json is immutable'); END;
-  `);
-  // Idempotent: reruns on every startup so a crash between ADD COLUMN and the
-  // backfill can never leave NULL rows behind permanently.
-  db.exec(`UPDATE async_tasks SET input_json = json_object(
-    'version', 1, 'objective', 'Legacy async task objective',
-    'source', json_object('kind', 'parent_turn', 'agentId', agent_id, 'turnEntryId', parent_turn_id)
-  ) WHERE input_json IS NULL`);
-  if (!asyncTaskColumns.has("settled_at_ms")) db.exec("ALTER TABLE async_tasks ADD COLUMN settled_at_ms INTEGER");
-  if (!asyncTaskColumns.has("settlement_nonce")) db.exec("ALTER TABLE async_tasks ADD COLUMN settlement_nonce TEXT");
-  const asyncTaskAttemptColumns = tableColumns(db, "async_task_attempts");
-  if (!asyncTaskAttemptColumns.has("unsafe_effect_started")) {
-    db.exec("ALTER TABLE async_task_attempts ADD COLUMN unsafe_effect_started INTEGER NOT NULL DEFAULT 0 CHECK (unsafe_effect_started IN (0, 1))");
-    // Older workers did not persist whether an effect crossed the external
-    // boundary. Active, retryable, and abandoned attempts are therefore
-    // conservatively treated as uncertain; terminal attempts cannot be
-    // claimed again and remain historical evidence only.
-    db.exec(`UPDATE async_task_attempts
-      SET unsafe_effect_started = 1
-      WHERE status IN ('admitted', 'running', 'retry_wait', 'cancelling', 'abandoned')`);
-  }
-  const projectionColumns = tableColumns(db, "async_task_projection_outbox");
-  if (!projectionColumns.has("source_outbox_id")) {
-    db.exec("ALTER TABLE async_task_projection_outbox ADD COLUMN source_outbox_id TEXT");
-    db.exec("UPDATE async_task_projection_outbox SET source_outbox_id = projection_id WHERE source_outbox_id IS NULL");
-  }
-  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_async_task_projection_source_channel ON async_task_projection_outbox(source_outbox_id, channel)");
-  const parentBudgetColumns = tableColumns(db, "async_task_parent_budget_usage");
-  if (!parentBudgetColumns.has("wall_used_ms")) db.exec("ALTER TABLE async_task_parent_budget_usage ADD COLUMN wall_used_ms INTEGER NOT NULL DEFAULT 0");
-  if (!parentBudgetColumns.has("wall_reserved_ms")) db.exec("ALTER TABLE async_task_parent_budget_usage ADD COLUMN wall_reserved_ms INTEGER NOT NULL DEFAULT 0");
-  if (!parentBudgetColumns.has("wall_reservations_json")) db.exec("ALTER TABLE async_task_parent_budget_usage ADD COLUMN wall_reservations_json TEXT NOT NULL DEFAULT '{}'");
-  const ownerColumns = tableColumns(db, "runtime_owners");
-  if (!ownerColumns.has("process_started_at_ms")) db.exec("ALTER TABLE runtime_owners ADD COLUMN process_started_at_ms REAL");
-  if (!ownerColumns.has("executable_path")) db.exec("ALTER TABLE runtime_owners ADD COLUMN executable_path TEXT");
-  const completionColumns = tableColumns(db, "turn_completions");
-  if (!completionColumns.has("outcome")) {
-    db.exec("ALTER TABLE turn_completions ADD COLUMN outcome TEXT NOT NULL DEFAULT 'success' CHECK(outcome IN ('success','partial','error','aborted'))");
-  }
-
+    const queueColumns = tableColumns(db, "prompt_queue");
+    if (!queueColumns.has("payload_digest")) db.exec("ALTER TABLE prompt_queue ADD COLUMN payload_digest TEXT NOT NULL DEFAULT ''");
+    if (!queueColumns.has("payload_compacted")) db.exec("ALTER TABLE prompt_queue ADD COLUMN payload_compacted INTEGER NOT NULL DEFAULT 0 CHECK(payload_compacted IN (0,1))");
+    if (!queueColumns.has("recovery_of")) db.exec("ALTER TABLE prompt_queue ADD COLUMN recovery_of TEXT");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_prompt_queue_compaction ON prompt_queue(payload_compacted,state,sequence)");
+    const asyncTaskColumns = tableColumns(db, "async_tasks");
+    if (!asyncTaskColumns.has("input_json")) {
+      db.exec("ALTER TABLE async_tasks ADD COLUMN input_json TEXT");
+    }
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_async_tasks_input_insert_nonnull
+        BEFORE INSERT ON async_tasks
+        WHEN NEW.input_json IS NULL
+        BEGIN SELECT RAISE(ABORT, 'async task input_json is immutable and required'); END;
+    `);
+    // Runs in the same transaction as ADD COLUMN and the version bump, so a
+    // crash in between rolls both back and the next boot repeats it.
+    if (upgrading) {
+      // Recreated (not IF NOT EXISTS) so pre-existing databases pick up the
+      // NULL-to-value repair allowance below. Immutability of stored values is
+      // kept: only filling a missing input is permitted, never changing or
+      // clearing one.
+      db.exec("DROP TRIGGER IF EXISTS trg_async_tasks_input_immutable");
+      db.exec(`
+        CREATE TRIGGER trg_async_tasks_input_immutable
+          BEFORE UPDATE OF input_json ON async_tasks
+          WHEN NEW.input_json IS NULL OR (OLD.input_json IS NOT NULL AND NEW.input_json IS NOT OLD.input_json)
+          BEGIN SELECT RAISE(ABORT, 'async task input_json is immutable'); END;
+      `);
+      db.exec(`UPDATE async_tasks SET input_json = json_object(
+        'version', 1, 'objective', 'Legacy async task objective',
+        'source', json_object('kind', 'parent_turn', 'agentId', agent_id, 'turnEntryId', parent_turn_id)
+      ) WHERE input_json IS NULL`);
+    }
+    if (!asyncTaskColumns.has("settled_at_ms")) db.exec("ALTER TABLE async_tasks ADD COLUMN settled_at_ms INTEGER");
+    if (!asyncTaskColumns.has("settlement_nonce")) db.exec("ALTER TABLE async_tasks ADD COLUMN settlement_nonce TEXT");
+    const asyncTaskAttemptColumns = tableColumns(db, "async_task_attempts");
+    if (!asyncTaskAttemptColumns.has("unsafe_effect_started")) {
+      db.exec("ALTER TABLE async_task_attempts ADD COLUMN unsafe_effect_started INTEGER NOT NULL DEFAULT 0 CHECK (unsafe_effect_started IN (0, 1))");
+      // Older workers did not persist whether an effect crossed the external
+      // boundary. Active, retryable, and abandoned attempts are therefore
+      // conservatively treated as uncertain; terminal attempts cannot be
+      // claimed again and remain historical evidence only.
+      db.exec(`UPDATE async_task_attempts
+        SET unsafe_effect_started = 1
+        WHERE status IN ('admitted', 'running', 'retry_wait', 'cancelling', 'abandoned')`);
+    }
+    const projectionColumns = tableColumns(db, "async_task_projection_outbox");
+    if (!projectionColumns.has("source_outbox_id")) {
+      db.exec("ALTER TABLE async_task_projection_outbox ADD COLUMN source_outbox_id TEXT");
+      db.exec("UPDATE async_task_projection_outbox SET source_outbox_id = projection_id WHERE source_outbox_id IS NULL");
+    }
+    const parentBudgetColumns = tableColumns(db, "async_task_parent_budget_usage");
+    if (!parentBudgetColumns.has("wall_used_ms")) db.exec("ALTER TABLE async_task_parent_budget_usage ADD COLUMN wall_used_ms INTEGER NOT NULL DEFAULT 0");
+    if (!parentBudgetColumns.has("wall_reserved_ms")) db.exec("ALTER TABLE async_task_parent_budget_usage ADD COLUMN wall_reserved_ms INTEGER NOT NULL DEFAULT 0");
+    if (!parentBudgetColumns.has("wall_reservations_json")) db.exec("ALTER TABLE async_task_parent_budget_usage ADD COLUMN wall_reservations_json TEXT NOT NULL DEFAULT '{}'");
+    const ownerColumns = tableColumns(db, "runtime_owners");
+    if (!ownerColumns.has("process_started_at_ms")) db.exec("ALTER TABLE runtime_owners ADD COLUMN process_started_at_ms REAL");
+    if (!ownerColumns.has("executable_path")) db.exec("ALTER TABLE runtime_owners ADD COLUMN executable_path TEXT");
+    const completionColumns = tableColumns(db, "turn_completions");
+    if (!completionColumns.has("outcome")) {
+      db.exec("ALTER TABLE turn_completions ADD COLUMN outcome TEXT NOT NULL DEFAULT 'success' CHECK(outcome IN ('success','partial','error','aborted'))");
+    }
     for (const table of CONVERSATION_BOUND_TABLES) ensureConversationColumn(db, table);
     db.exec(`
       CREATE INDEX IF NOT EXISTS idx_transcript_agent_conversation_sequence
@@ -1585,13 +1621,38 @@ export function migrateOpenBotSchema(db: Database.Database): void {
           json_extract(payload_json, '$.clientNonce'),
           sequence_id
         );
+      -- Tiny partial indexes over rows still in flight: boot reconciliation
+      -- and the per-turn open tool-call check read only these rows.
+      CREATE INDEX IF NOT EXISTS idx_transcript_missing_conversation
+        ON transcript_entries(sequence_id)
+        WHERE conversation_id IS NULL OR conversation_id = '';
+      CREATE INDEX IF NOT EXISTS idx_transcript_open_tool_calls
+        ON transcript_entries(agent_id, conversation_id, sequence_id)
+        WHERE kind = 'tool-call' AND json_extract(payload_json, '$.status') IN ('pending', 'running');
+      CREATE INDEX IF NOT EXISTS idx_transcript_streaming_messages
+        ON transcript_entries(agent_id, conversation_id, sequence_id)
+        WHERE kind = 'message' AND (json_extract(payload_json, '$.streaming') = 1 OR json_extract(payload_json, '$.isStreaming') = 1);
     `);
-    backfillConversationIds(db, Date.now());
+    // Order matters: the nonce ledgers are rebuilt from rows that already carry
+    // a conversation id, so the backfill must run first.
+    if (upgrading || hasRowsWithoutConversation(db)) backfillConversationIds(db, Date.now());
     migrateNoncePrimaryKeys(db);
-    migrateMemoryJobProviderModel(db);
+    if (upgrading) migrateMemoryJobProviderModel(db);
     migrateMemoryJobOutputs(db);
-    ensureHistoryFtsSourceMap(db);
+    ensureHistoryFtsSourceMap(db, upgrading);
     migrateConversationSummaryRetention(db);
+    if (upgrading) {
+      createTranscriptHistoryTriggers(db);
+      createConversationSummaryHistoryTriggers(db);
+      reconcileConstraintIndex(db, "async_task_attempts", "idx_async_task_attempts_task", ["task_id", "attempt"],
+        "CREATE INDEX IF NOT EXISTS idx_async_task_attempts_task ON async_task_attempts(task_id, attempt)");
+      reconcileConstraintIndex(db, "async_task_projection_outbox", "idx_async_task_projection_source_channel", ["source_outbox_id", "channel"],
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_async_task_projection_source_channel ON async_task_projection_outbox(source_outbox_id, channel)");
+      reconcileConstraintIndex(db, "a2a_messages", "ux_a2a_sender_incarnation_nonce", ["sender_agent_id", "sender_incarnation", "nonce"],
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_a2a_sender_incarnation_nonce ON a2a_messages(sender_agent_id, sender_incarnation, nonce)");
+      reconcileConstraintIndex(db, "a2a_projection_outbox", "idx_a2a_projection_agent", ["agent_id", "epoch", "sequence"],
+        "CREATE INDEX IF NOT EXISTS idx_a2a_projection_agent ON a2a_projection_outbox(agent_id, epoch, sequence)");
+    }
     if (version < 19) {
       // Older workers marked preparation failures completed, even without an echo.
       // Keep their payload recoverable instead of compacting an unexecuted message.
@@ -1604,9 +1665,15 @@ export function migrateOpenBotSchema(db: Database.Database): void {
         )`);
     }
     if (version < 18) rebuildOpenBotFts(db);
-    db.pragma(`user_version = ${OPENBOT_SCHEMA_VERSION}`);
+    if (version < 22) {
+      // Cursor resume (P2.6) was removed: no provider ever supported it, so
+      // these tables only ever held test data.
+      db.exec("DROP TABLE IF EXISTS turn_effects; DROP TABLE IF EXISTS turn_checkpoints;");
+    }
+    if (upgrading) db.pragma(`user_version = ${OPENBOT_SCHEMA_VERSION}`);
   });
   migrate();
+  migratedConnections.add(db);
 }
 
 /** Ensures the legacy agent-scoped store has a durable active conversation. */

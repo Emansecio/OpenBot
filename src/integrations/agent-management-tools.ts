@@ -1,6 +1,6 @@
 import { MODEL_CATALOG } from "../config/models.js";
 import { MAX_AGENT_DESCRIPTION_BYTES, MAX_AGENT_NAME_CHARS } from "../config/store.js";
-import type { ToolCallExecutor, ToolExecutionContext, ToolExecutionResult } from "../execution/tool-loop.js";
+import { parseToolArguments, type ToolCallExecutor, type ToolExecutionContext, type ToolExecutionResult } from "../execution/tool-loop.js";
 import type { ProviderTool } from "../providers/router.js";
 import { RpcError } from "../server/gateway.js";
 import { REASONING_EFFORTS, type ProviderKind, type ReasoningEffort } from "../shared/contracts.js";
@@ -87,13 +87,6 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function parseArguments(raw: string): Record<string, unknown> | undefined {
-  try {
-    return record(JSON.parse(raw) as unknown);
-  } catch {
-    return undefined;
-  }
-}
 
 function textField(
   body: Record<string, unknown>,
@@ -146,7 +139,7 @@ export class AgentManagementTools {
   private async execute(context: ToolExecutionContext): Promise<ToolExecutionResult> {
     if (context.call.function.name !== CREATE_BOT_TOOL_NAME) return { handled: false };
     if (context.signal?.aborted) return failure("aborted", "Bot creation was cancelled");
-    const body = parseArguments(context.call.function.arguments);
+    const body = parseToolArguments(context.call.function.arguments);
     if (body === undefined) return failure("validation", "create_bot arguments must be a JSON object");
 
     let request: Record<string, unknown>;

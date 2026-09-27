@@ -1,5 +1,4 @@
-import { mkdir } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { win32 as path } from "node:path";
 
 import { WorkspaceError, WorkspaceSandbox } from "./workspace.js";
@@ -78,6 +77,27 @@ export function isAbsoluteWindowsPath(value: string): boolean {
   );
 }
 
+/**
+ * A UNC path that reaches this machine (loopback, its own name) or an
+ * administrative share (`C$`, `ADMIN$`) would bypass the drive-letter
+ * protected paths, so only remote, ordinary shares are addressable.
+ */
+export function isLocalOrAdministrativeShare(value: string): boolean {
+  const match = /^[\\/]{2}([^\\/]+)[\\/]([^\\/]+)/u.exec(value);
+  if (match === null) return false;
+  const server = match[1]!.toLowerCase().replace(/^\[|\]$/gu, "");
+  const share = match[2]!;
+  if (share.endsWith("$")) return true;
+  const machine = hostname().toLowerCase();
+  return server === "localhost"
+    || server === "::1"
+    || server === "0:0:0:0:0:0:0:1"
+    || server.endsWith(".ipv6-literal.net")
+    || /^127(?:\.\d{1,3}){3}$/u.test(server)
+    || server === machine
+    || server.split(".")[0] === machine;
+}
+
 export function classifyAgentPath(relative: string): ClassifiedAgentPath {
   if (typeof relative !== "string" || relative.length === 0 || relative.includes("\0")) {
     throw new WorkspaceError("invalid_path", "Workspace path is invalid.");
@@ -86,6 +106,9 @@ export function classifyAgentPath(relative: string): ClassifiedAgentPath {
     throw new WorkspaceError("invalid_path", "Windows device paths are not supported.");
   }
   if (isAbsoluteWindowsPath(relative)) {
+    if (isLocalOrAdministrativeShare(relative)) {
+      throw new WorkspaceError("access_denied", "Local and administrative network shares are not supported; use the drive path.");
+    }
     const root = /^[A-Za-z]:/u.test(relative)
       ? `${relative.slice(0, 1).toUpperCase()}:\\`
       : path.parse(path.normalize(relative)).root;
@@ -200,27 +223,6 @@ export async function openExistingSharedRedirect(
   }
 }
 
-/** Creates the per-bot redirect tree on first write and returns its sandbox. */
-export async function materializeSharedRedirect(
-  userProfile: string,
-  name: SharedUserDirectory,
-  agentId: string,
-): Promise<WorkspaceSandbox | undefined> {
-  const redirectRoot = agentSharedDirectoryRoot(userProfile, name, agentId);
-  try {
-    await mkdir(redirectRoot, { recursive: true });
-    const redirect = await WorkspaceSandbox.create(redirectRoot, {
-      allowAncestorLinks: true,
-      allowRootReparse: true,
-    });
-    if (isBlockedUserRoot(redirect.root)) return undefined;
-    return redirect;
-  } catch (error) {
-    if (ignorableRedirectError(error)) return undefined;
-    throw error;
-  }
-}
-
 /**
  * Only explicit shared:// paths use these mounts. All ordinary relative paths
  * belong to the physical home, regardless of grants.
@@ -234,11 +236,9 @@ export async function loadAgentVisibleUserMounts(
   const realMounts = await loadSharedUserMounts(userProfile);
   const mounts = new Map<SharedUserDirectory, WorkspaceSandbox>();
   for (const name of SHARED_USER_DIRECTORIES) {
-    if (accessFor(name) !== "none") {
-      const real = realMounts.get(name);
-      if (real) mounts.set(name, real);
-      continue;
-    }
+    if (accessFor(name) === "none") continue;
+    const real = realMounts.get(name);
+    if (real) mounts.set(name, real);
   }
   return mounts;
 }
@@ -248,26 +248,6 @@ export interface BrowserUploadTarget {
   root: string;
   /** Path relative to `root`, still model-safe (no drive, no `..`). */
   path: string;
-}
-
-/** Resolve a bot-visible relative path against the private home and optional shared mounts. */
-export async function resolveAgentVisiblePath(
-  homeRoot: string,
-  relative: string,
-  mounts: ReadonlyMap<SharedUserDirectory, WorkspaceSandbox>,
-): Promise<string> {
-  const classified = classifyAgentPath(relative);
-  if (classified.kind === "root") {
-    const home = await WorkspaceSandbox.create(homeRoot, { allowAncestorLinks: true });
-    return home.root;
-  }
-  if (classified.kind === "shared") {
-    const mount = mounts.get(classified.mount);
-    if (mount) return mount.resolveExisting(classified.relative);
-    throw new WorkspaceError("access_denied", "Shared folder is not granted or unavailable.");
-  }
-  const home = await WorkspaceSandbox.create(homeRoot, { allowAncestorLinks: true });
-  return home.resolveExisting(classified.kind === "home" ? classified.relative : relative);
 }
 
 /** Resolve a browser upload to the authorized host root + relative path pair. */
@@ -290,6 +270,9 @@ export async function resolveBrowserUploadTarget(
   }
   const home = await WorkspaceSandbox.create(homeRoot, { allowAncestorLinks: true });
   const homeRelative = classified.kind === "home" ? classified.relative : relative;
-  await home.resolveExisting(homeRelative);
+  const resolved = await home.resolveExisting(homeRelative);
+  if (isReservedHomeRelative(path.relative(home.root, resolved))) {
+    throw new WorkspaceError("access_denied", "Workspace path cannot be accessed.");
+  }
   return { root: homeRoot, path: homeRelative.replaceAll("\\", "/") };
 }

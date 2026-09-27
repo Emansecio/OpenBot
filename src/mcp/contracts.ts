@@ -8,8 +8,6 @@ import type {
   Tool,
 } from "@modelcontextprotocol/client";
 
-/** Shared MCP transport kind. Configuration never carries resolved secrets. */
-export type McpTransportKind = "http" | "stdio";
 export type McpSessionScope = "shared" | "agent";
 
 export interface McpSecretRef {

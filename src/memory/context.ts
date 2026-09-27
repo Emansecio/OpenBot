@@ -11,15 +11,18 @@ import {
   computeModelContextBudget,
   createContextTokenizer,
   fitProviderMessagesToByteBudget,
+  MODEL_CONTEXT_TRUNCATION_MARKER,
   selectCompleteMessageGroups,
   type ContextTokenizer,
   type ModelCapabilities,
   type ModelContextBudget,
 } from "./model-context.js";
+import { utf8Prefix } from "../shared/utf8.js";
+import { neutralizeContextMarkers, redactSecrets, SECRET_REDACTION } from "../shared/context-text.js";
 
 export const CONTEXT_HARD_LIMIT_BYTES = 256 * 1024;
 export const CONTEXT_OUTPUT_RESERVE_BYTES = 0;
-export const CONTEXT_TRUNCATION_MARKER = "\n[context truncated by OpenBot]";
+export const CONTEXT_TRUNCATION_MARKER = MODEL_CONTEXT_TRUNCATION_MARKER;
 export const MEMORY_TOOL_RESULT_LIMIT_BYTES = 32 * 1024;
 export const MEMORY_SEARCH_TOOL_NAME = "memory_search";
 export const MEMORY_REMEMBER_TOOL_NAME = "memory_remember";
@@ -55,7 +58,6 @@ const CONTEXT_QUERY_TOKEN_MIN_LENGTH = 4;
 const PATH_REDACTION = "[path]";
 const VISUAL_REDACTION = "[redacted visual data]";
 const BINARY_REDACTION = "[redacted binary data]";
-const SECRET_REDACTION = "[REDACTED_SECRET]";
 const CONTEXT_QUERY_STOPWORDS = new Set([
   "about", "after", "again", "along", "also", "aqui", "attachment", "attachments", "begin", "brief",
   "cada", "como", "com", "content", "continua", "continue", "context", "desse", "dessa", "deste",
@@ -134,6 +136,8 @@ export interface ContextAssemblyInput {
   currentTurnContext?: string;
   currentPromptOverride?: { original: string; normalized: string };
   omittedAssistantTurnId?: string;
+  /** The running turn: its tool calls arrive through the tool loop, not the history. */
+  currentTurnId?: string;
   recentStore: ContextTranscriptView;
   memoryStore: MemoryStore;
   mode: MemoryMode;
@@ -167,8 +171,11 @@ export function shouldCompactConversationContext(
   if (!Number.isFinite(pressureRatio) || pressureRatio <= 0 || pressureRatio > 1) {
     throw new Error("conversation compaction pressure ratio inválido");
   }
+  // Byte pressure counts even with a token budget: a byte limit (1 MiB on
+  // some models) can bind long before the token window does.
+  if (context.bytes >= Math.floor(context.availableBytes * pressureRatio)) return true;
   const budget = context.modelBudget;
-  if (budget === undefined) return context.bytes >= Math.floor(context.availableBytes * pressureRatio);
+  if (budget === undefined) return false;
   if (budget.truncated) return true;
   const contentUsed = budget.used.transcript + budget.used.memory + budget.used.attachments;
   return budget.availableContentTokens > 0 && contentUsed >= Math.floor(budget.availableContentTokens * pressureRatio);
@@ -223,19 +230,6 @@ export interface MemoryRememberToolOptions extends MemoryToolOptions {
 
 function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
-}
-
-function utf8Prefix(text: string, maxBytes: number): string {
-  if (maxBytes <= 0) return "";
-  let bytes = 0;
-  let result = "";
-  for (const character of text) {
-    const size = Buffer.byteLength(character, "utf8");
-    if (bytes + size > maxBytes) break;
-    bytes += size;
-    result += character;
-  }
-  return result;
 }
 
 function truncateText(text: string, maxBytes: number): string {
@@ -310,29 +304,6 @@ function redactVisualAndBinary(text: string): string {
     .replace(/\b[A-Za-z0-9+/]{256,}={0,2}\b/gu, BINARY_REDACTION);
 }
 
-function redactSecrets(text: string): string {
-  return text
-    .replace(
-      /(-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)(?:[\s\S]*?)(-----END [A-Z0-9 ]*PRIVATE KEY-----)/gu,
-      `$1${SECRET_REDACTION}$2`,
-    )
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gu, SECRET_REDACTION)
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gu, SECRET_REDACTION)
-    .replace(/\bxai-[A-Za-z0-9_-]{8,}\b/gu, SECRET_REDACTION)
-    .replace(/\bghp_[A-Za-z0-9]{20,}\b/gu, SECRET_REDACTION)
-    .replace(/\bAKIA[0-9A-Z]{16}\b/gu, SECRET_REDACTION)
-    .replace(/(\bAuthorization\b\s*:\s*Bearer\s+)([^\s,"';]+)/giu, `$1${SECRET_REDACTION}`)
-    .replace(/(\bBearer\s+)([^\s,"';]+)/giu, `$1${SECRET_REDACTION}`)
-    .replace(
-      /(\b(?:api(?:[_ -]?(?:key|token))|token|password|passwd|pwd|cookie|authorization)\b\s*(?:=|:)\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
-      `$1${SECRET_REDACTION}`,
-    )
-    .replace(
-      /(\b(?:api(?:[_ -]?(?:key|token))|token|password|passwd|pwd|cookie|authorization)\b"\s*:\s*)(?:"[^"]*"|[^,\]}]+)/giu,
-      `$1"${SECRET_REDACTION}"`,
-    );
-}
-
 function redactPaths(text: string): string {
   return text
     .replace(/\b[A-Za-z]:\\[^\s"'`<>|]+/gu, PATH_REDACTION)
@@ -341,6 +312,21 @@ function redactPaths(text: string): string {
 
 function sanitizeProviderContextText(text: string): string {
   return redactPaths(redactVisualAndBinary(redactSecrets(text)));
+}
+
+/**
+ * Attachment blocks keep their content apart from secrets (the user chose to
+ * share the file); any text around them is sanitized like other turn context.
+ */
+function sanitizeAttachmentContext(text: string): string {
+  const block = /\[\[OPENBOT_UNTRUSTED_ATTACHMENT_BEGIN\]\][\s\S]*?\[\[OPENBOT_UNTRUSTED_ATTACHMENT_END\]\]/gu;
+  let result = "";
+  let last = 0;
+  for (const match of text.matchAll(block)) {
+    result += sanitizeProviderContextText(text.slice(last, match.index)) + redactSecrets(match[0]);
+    last = match.index + match[0].length;
+  }
+  return result + sanitizeProviderContextText(text.slice(last));
 }
 
 function sanitizeStructuredContextValue(value: unknown): unknown {
@@ -587,11 +573,7 @@ export function buildReflectionRequestPayload(
   }
   for (let index = input.entries.length - 1; index >= 0; index -= 1) {
     if (selected.has(index)) continue;
-    const raw = input.entries[index];
-    const cap = typeof raw === "object" && raw !== null && (raw as { kind?: unknown }).kind === "message"
-      ? perEntryBytes
-      : Math.max(REFLECTION_MIN_ENTRY_BYTES, Math.min(REFLECTION_UNTRUSTED_ENTRY_BYTES, perEntryBytes));
-    const projected = projectReflectionEntry(raw, cap);
+    const projected = projectReflectionEntry(input.entries[index], entryCap(input.entries[index]));
     const nextEntries = [...new Map([...selected, [index, projected]].entries()).entries()]
       .sort((left, right) => left[0] - right[0])
       .map(([, value]) => value);
@@ -632,13 +614,6 @@ export function buildReflectionRequestPayload(
   });
 }
 
-export function buildReflectionRequestMessage(
-  input: ReflectionRequestProjectionInput,
-  maxBytes = REFLECTION_REQUEST_MAX_BYTES,
-): string {
-  return JSON.stringify(buildReflectionRequestPayload(input, maxBytes));
-}
-
 function normalizeLine(value: string): string {
   return value.normalize("NFKC").replace(/\s+/gu, " ").trim();
 }
@@ -659,6 +634,10 @@ function sanitizeToolHistoryResultText(value: unknown): string {
 }
 
 function buildToolHistoryItem(entry: Extract<TranscriptEntry, { kind: "tool-call" }>): string {
+  return neutralizeContextMarkers(toolHistoryItemText(entry));
+}
+
+function toolHistoryItemText(entry: Extract<TranscriptEntry, { kind: "tool-call" }>): string {
   const lines = [
     `name: ${entry.name}`,
     `summary: ${truncateText(sanitizeProviderContextText(entry.summary), Math.max(512, TOOL_HISTORY_ITEM_MAX_BYTES / 2))}`,
@@ -993,21 +972,31 @@ function findActiveByCanonicalKey(memoryStore: MemoryStore, agentId: string, can
   return memoryStore.listMemories(agentId, { limit: 256 }).find((candidate) => candidate.canonicalKey === canonicalKey);
 }
 
-function parseMemoryRememberArgs(raw: string): { kind: MemoryKind; canonicalKey: string; text: string; scope: MemoryScope } {
+/** A memory tool's JSON arguments as a plain object with only the allowed keys. */
+function parseToolArgsObject(raw: string, toolName: string, allowedKeys: readonly string[]): Record<string, unknown> {
   let value: unknown;
   try {
     value = JSON.parse(raw);
   } catch {
-    throw new Error("memory_remember args must be valid JSON");
+    throw new Error(`${toolName} args must be valid JSON`);
   }
-  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("memory_remember args must be an object");
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${toolName} args must be an object`);
   const record = value as Record<string, unknown>;
-  const extra = Object.keys(record).filter((key) => !["kind", "canonicalKey", "text", "scope"].includes(key));
-  if (extra.length > 0) throw new Error(`memory_remember does not support: ${extra.join(", ")}`);
+  const extra = Object.keys(record).filter((key) => !allowedKeys.includes(key));
+  if (extra.length > 0) throw new Error(`${toolName} does not support: ${extra.join(", ")}`);
+  return record;
+}
+
+function parseMemoryScope(value: unknown, toolName: string): MemoryScope {
+  const scope = value === undefined ? "agent" : value;
+  if (scope !== "agent" && scope !== "user") throw new Error(`${toolName} scope is invalid`);
+  return scope;
+}
+
+function parseMemoryRememberArgs(raw: string): { kind: MemoryKind; canonicalKey: string; text: string; scope: MemoryScope } {
+  const record = parseToolArgsObject(raw, "memory_remember", ["kind", "canonicalKey", "text", "scope"]);
   if (typeof record.kind !== "string" || !MEMORY_KINDS.has(record.kind as MemoryKind)) throw new Error("memory_remember kind is invalid");
-  const scopeRaw = record.scope === undefined ? "agent" : record.scope;
-  if (scopeRaw !== "agent" && scopeRaw !== "user") throw new Error("memory_remember scope is invalid");
-  const scope = scopeRaw as MemoryScope;
+  const scope = parseMemoryScope(record.scope, "memory_remember");
   const canonicalKey = typeof record.canonicalKey === "string" ? normalizeRememberCanonicalKey(record.canonicalKey) : "";
   const text = typeof record.text === "string" ? record.text.trim() : "";
   if (byteLength(canonicalKey) === 0 || byteLength(canonicalKey) > MEMORY_POLICY_LIMITS.canonicalKeyBytes) {
@@ -1056,19 +1045,8 @@ export function createMemoryForgetTool(options: MemoryRememberToolOptions): Prov
 }
 
 function parseMemoryForgetArgs(raw: string): { canonicalKey: string; reason?: string; scope: MemoryScope } {
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new Error("memory_forget args must be valid JSON");
-  }
-  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("memory_forget args must be an object");
-  const record = value as Record<string, unknown>;
-  const extra = Object.keys(record).filter((key) => !["canonicalKey", "reason", "scope"].includes(key));
-  if (extra.length > 0) throw new Error(`memory_forget does not support: ${extra.join(", ")}`);
-  const scopeRaw = record.scope === undefined ? "agent" : record.scope;
-  if (scopeRaw !== "agent" && scopeRaw !== "user") throw new Error("memory_forget scope is invalid");
-  const scope = scopeRaw as MemoryScope;
+  const record = parseToolArgsObject(raw, "memory_forget", ["canonicalKey", "reason", "scope"]);
+  const scope = parseMemoryScope(record.scope, "memory_forget");
   const canonicalKey = typeof record.canonicalKey === "string" ? normalizeRememberCanonicalKey(record.canonicalKey) : "";
   if (byteLength(canonicalKey) === 0 || byteLength(canonicalKey) > MEMORY_POLICY_LIMITS.canonicalKeyBytes) {
     throw new Error("memory_forget canonicalKey is invalid");
@@ -1214,16 +1192,7 @@ export async function executeMemoryForgetTool(
 }
 
 function parseMemoryToolArgs(raw: string): { query: string; limit: number; conversationId?: string } {
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new Error("memory_search args must be valid JSON");
-  }
-  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("memory_search args must be an object");
-  const record = value as Record<string, unknown>;
-  const extra = Object.keys(record).filter((key) => !["query", "limit", "conversationId"].includes(key));
-  if (extra.length > 0) throw new Error(`memory_search does not support: ${extra.join(", ")}`);
+  const record = parseToolArgsObject(raw, "memory_search", ["query", "limit", "conversationId"]);
   const query = typeof record.query === "string" ? record.query.trim() : "";
   if (query.length === 0 || byteLength(query) > MEMORY_SEARCH_QUERY_BYTES) throw new Error("memory_search query is invalid");
   const limit = record.limit === undefined ? 5 : record.limit;
@@ -1319,7 +1288,7 @@ export async function executeMemorySearchTool(
       handled: true,
       ok: true,
       content: boundedMemoryToolResult(results),
-      result: { ok: true, operation: "memory.search", bytes: results.length },
+      result: { ok: true, operation: "memory.search", count: results.length },
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : "memory_search failed";
@@ -1333,6 +1302,40 @@ export async function executeMemorySearchTool(
   }
 }
 
+/**
+ * Messages a compaction leaves out of the summary: they stay in the recent
+ * window verbatim, so the next turn does not see only the summary.
+ */
+export const COMPACTION_LITERAL_TAIL_MESSAGES = 6;
+
+/**
+ * The last sequence a compaction summary may cover: the entry just before the
+ * conversation's last {@link COMPACTION_LITERAL_TAIL_MESSAGES} user/assistant
+ * messages. Undefined when the range holds no more messages than the tail.
+ */
+export function summaryBoundaryBeforeLiteralTail(rows: readonly { sequenceId: number; entry: TranscriptEntry }[]): number | undefined {
+  let messages = 0;
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const { entry } = rows[index]!;
+    if (entry.kind !== "message" || (entry.role !== "user" && entry.role !== "assistant")) continue;
+    messages += 1;
+    if (messages === COMPACTION_LITERAL_TAIL_MESSAGES) return index === 0 ? undefined : rows[index - 1]!.sequenceId;
+  }
+  return undefined;
+}
+
+/** Pinned memories fetched and rendered in each turn's context. */
+const PINNED_CONTEXT_LIMIT = 6;
+/** Core (identity, preference, constraint) memories considered per turn. */
+const CORE_CONTEXT_LIMIT = 8;
+
+/** Pinned first, then importance, then most recently updated. */
+function byPinnedImportance(left: Memory, right: Memory): number {
+  return (right.pinned ? 1 : 0) - (left.pinned ? 1 : 0)
+    || right.importance - left.importance
+    || right.updatedAtMs - left.updatedAtMs;
+}
+
 function buildRecentMessages(
   store: ContextTranscriptView,
   agentId: string,
@@ -1342,26 +1345,36 @@ function buildRecentMessages(
   currentTurnContext: string,
   currentPromptOverride: { original: string; normalized: string } | undefined,
   omittedAssistantTurnId: string | undefined,
-): { messages: ProviderChatMessage[]; sourceMessages: Array<{ id: string; role: "user" | "assistant"; content: string }> } {
+  currentTurnId?: string,
+): { messages: ProviderChatMessage[]; sourceMessages: Array<{ id: string; role: "user" | "assistant"; content: string }>; messageEntryIds: WeakMap<ProviderChatMessage, readonly string[]> } {
   const messages: ProviderChatMessage[] = [];
   const sourceMessages: Array<{ id: string; role: "user" | "assistant"; content: string }> = [];
+  // The transcript entries each built message came from, so the assembler can
+  // tell exactly which entries a trimmed window still carries.
+  const messageEntryIds = new WeakMap<ProviderChatMessage, readonly string[]>();
   let pendingUser: string | undefined;
+  let pendingUserIds: string[] = [];
   let pendingToolHistory: string[] = [];
   const flushUser = () => {
     if (pendingUser === undefined) return;
-    messages.push({ role: "user", content: pendingUser });
+    const message: ProviderChatMessage = { role: "user", content: pendingUser };
+    messages.push(message);
+    messageEntryIds.set(message, pendingUserIds);
     pendingUser = undefined;
+    pendingUserIds = [];
   };
   const flushToolHistory = () => {
     const message = buildToolHistoryMessage(pendingToolHistory);
     pendingToolHistory = [];
     if (message !== undefined) messages.push(message);
   };
-  const recent = store.getRecentEntries(agentId, {
+  const kinds: TranscriptEntry["kind"][] = ["message", "user-attachment", "tool-call"];
+  const afterSummary = store.getRecentEntries(agentId, {
     limit: MAX_CONTEXT_RECENT_FETCH,
-    kinds: ["message", "user-attachment", "tool-call"],
+    kinds,
     ...(afterSequenceId === undefined ? {} : { afterSequenceId }),
   }, conversationId);
+  const recent = afterSummary;
   for (const entry of recent) {
     if (entry.kind === "message" && (entry.role === "user" || entry.role === "assistant")
         && typeof entry.id === "string" && entry.content.length > 0) {
@@ -1370,7 +1383,8 @@ function buildRecentMessages(
     if (entry.kind === "message" && entry.role === "user") {
       flushToolHistory();
       flushUser();
-      pendingUser = entry.content;
+      pendingUser = neutralizeContextMarkers(entry.content);
+      if (typeof entry.id === "string") pendingUserIds = [entry.id];
       continue;
     }
     if (entry.kind === "user-attachment") {
@@ -1385,16 +1399,23 @@ function buildRecentMessages(
       continue;
     }
     if (entry.kind === "tool-call") {
-      if (entry.status === "completed" || entry.status === "failed") {
+      // The running turn's own calls reach the provider through the tool loop.
+      const localId: unknown = entry.localToolCallId;
+      const currentTurnCall = currentTurnId !== undefined && typeof localId === "string" && localId.startsWith(`${currentTurnId}\0`);
+      if ((entry.status === "completed" || entry.status === "failed") && !currentTurnCall) {
         pendingToolHistory.push(buildToolHistoryItem(entry));
       }
       continue;
     }
     if (entry.kind === "message" && entry.role === "assistant") {
+      // A turn's tool results sit between its request and its answer.
       flushUser();
+      flushToolHistory();
       const omittedByRetry = omittedAssistantTurnId !== undefined && entry.turnId === omittedAssistantTurnId;
       if (!entry.streaming && entry.completionState !== "interrupted" && !omittedByRetry) {
-        messages.push({ role: "assistant", content: entry.content });
+        const message: ProviderChatMessage = { role: "assistant", content: neutralizeContextMarkers(entry.content) };
+        messages.push(message);
+        if (typeof entry.id === "string") messageEntryIds.set(message, [entry.id]);
       }
     }
   }
@@ -1406,7 +1427,7 @@ function buildRecentMessages(
       last.content = `${currentPromptOverride.normalized}${last.content.slice(currentPromptOverride.original.length)}`;
     }
   }
-  const sanitizedCurrentAttachmentContext = currentAttachmentContext ? sanitizeProviderContextText(currentAttachmentContext) : "";
+  const sanitizedCurrentAttachmentContext = currentAttachmentContext ? sanitizeAttachmentContext(currentAttachmentContext) : "";
   const sanitizedCurrentTurnContext = currentTurnContext ? sanitizeProviderContextText(currentTurnContext) : "";
   if ((sanitizedCurrentAttachmentContext || sanitizedCurrentTurnContext) && messages.length > 0) {
     const last = messages[messages.length - 1];
@@ -1421,7 +1442,7 @@ function buildRecentMessages(
       }
     }
   }
-  return { messages, sourceMessages };
+  return { messages, sourceMessages, messageEntryIds };
 }
 
 function selectRecentMessages(messages: readonly ProviderChatMessage[], limit: number): ProviderChatMessage[] {
@@ -1437,7 +1458,8 @@ function selectRecentMessages(messages: readonly ProviderChatMessage[], limit: n
 }
 
 function buildUserContextMessage(blocks: readonly string[]): ProviderChatMessage | undefined {
-  const cleaned = blocks.map((block) => block.trim()).filter(Boolean);
+  // Memories, summaries and snippets are untrusted text: none may close this block.
+  const cleaned = blocks.map((block) => neutralizeContextMarkers(block.trim())).filter(Boolean);
   if (cleaned.length === 0) return undefined;
   return {
     role: "user",
@@ -1489,7 +1511,7 @@ export class ContextAssembler {
     const currentSummary = input.conversationId === undefined
       ? null
       : input.memoryStore.getSummary(input.agentId, input.conversationId, true);
-    const { messages: recentMessages, sourceMessages } = buildRecentMessages(
+    const { messages: recentMessages, sourceMessages, messageEntryIds } = buildRecentMessages(
       input.recentStore,
       input.agentId,
       input.conversationId,
@@ -1498,6 +1520,7 @@ export class ContextAssembler {
       input.currentTurnContext ?? "",
       input.currentPromptOverride,
       input.omittedAssistantTurnId,
+      input.currentTurnId,
     );
     const queryContext = [input.currentAttachmentContext ?? "", input.currentTurnContext ?? ""]
       .filter((value) => value.trim().length > 0)
@@ -1506,58 +1529,56 @@ export class ContextAssembler {
     const genericPrompt = isGenericPrompt(input.prompt);
     const skipCrossChatRetrieval = shouldSkipCrossChatRetrieval(input.prompt);
     // A memory sourced from this conversation is already represented while its
-    // source entries remain in the recent window; once compaction moves the
-    // boundary past them, the memory must become visible again.
-    const recentSourceIds = new Set(sourceMessages.map((entry) => entry.id));
-    const representedInRecent = (memory: Memory): boolean => memory.sourceEntryIds.some((source) => {
-      const entryId = typeof source === "string" ? source : source.entryId;
-      const sourceConversation = typeof source === "string" ? undefined : source.conversationId;
-      return (sourceConversation === undefined || sourceConversation === input.conversationId) && recentSourceIds.has(entryId);
-    });
-    // Without source entries there is no positive evidence the memory's fact
-    // left the recent window, so the historical exclusion is kept.
-    const conversationScopedOut = (memory: Memory): boolean => input.conversationId !== undefined
+    // source entries remain in the recent window the model actually receives;
+    // once they leave it (compaction, or trimming under pressure), the memory
+    // must become visible again.
+    const scopedOutBy = (keptIds: ReadonlySet<string>) => (memory: Memory): boolean => input.conversationId !== undefined
       && memoryReferencesConversation(memory, input.conversationId)
-      && (memory.sourceEntryIds.length === 0 || representedInRecent(memory));
+      // Without source entries there is no positive evidence the memory's
+      // fact left the recent window, so the historical exclusion is kept.
+      && (memory.sourceEntryIds.length === 0 || memory.sourceEntryIds.some((source) => {
+        const entryId = typeof source === "string" ? source : source.entryId;
+        const sourceConversation = typeof source === "string" ? undefined : source.conversationId;
+        return (sourceConversation === undefined || sourceConversation === input.conversationId) && keptIds.has(entryId);
+      }));
+    const keptEntryIds = (messages: readonly ProviderChatMessage[]): Set<string> =>
+      new Set(messages.flatMap((message) => messageEntryIds.get(message) ?? []));
+    const conversationScopedOut = scopedOutBy(new Set(sourceMessages.map((entry) => entry.id)));
     const pinned = crossChatEnabled
       ? input.memoryStore.listMemories(input.agentId, { limit: 64, automatic: true })
-        .filter((memory) => memory.pinned && !conversationScopedOut(memory))
-        .slice(0, 6)
+        .filter((memory) => memory.pinned)
       : [];
-    const pinnedIds = new Set(pinned.map((memory) => memory.id));
     const profileCandidates = crossChatEnabled
       ? [...input.memoryStore.listMemories(USER_PROFILE_AGENT_ID, { kind: [...USER_PROFILE_KINDS], limit: 32, automatic: true })]
-        .sort((left: Memory, right: Memory) => (
-          (right.pinned ? 1 : 0) - (left.pinned ? 1 : 0)
-          || right.importance - left.importance
-          || right.updatedAtMs - left.updatedAtMs
-        ))
+        .sort(byPinnedImportance)
         .slice(0, 6)
       : [];
     const coreCandidates = crossChatEnabled
-      ? input.memoryStore.listMemories(input.agentId, {
+      ? [...input.memoryStore.listMemories(input.agentId, {
         automatic: true,
         kind: ["identity", "preference", "constraint"],
         limit: 64,
-      })
-        .filter((memory) => !conversationScopedOut(memory))
-        .sort((left, right) => (
-          (right.pinned ? 1 : 0) - (left.pinned ? 1 : 0)
-          || right.importance - left.importance
-          || right.updatedAtMs - left.updatedAtMs
-        ))
-        .filter((memory) => !pinnedIds.has(memory.id))
-        .slice(0, 8)
+      })].sort(byPinnedImportance)
       : [];
-    const coreIds = new Set(coreCandidates.map((memory) => memory.id));
-    const relevant = crossChatEnabled && !skipCrossChatRetrieval
-      ? dedupeMemories(mergeRankedLists(buildContextSearchQueries(input.prompt, queryContext)
-        .map((query) => input.memoryStore.searchMemories(input.agentId, query, { limit: 6, automatic: true })))
-        .filter((result) => !conversationScopedOut(result.memory)))
+    const searchQueries = crossChatEnabled && !skipCrossChatRetrieval ? buildContextSearchQueries(input.prompt, queryContext) : [];
+    const relevantCandidates = searchQueries.length > 0
+      ? dedupeMemories(mergeRankedLists(searchQueries
+        .map((query) => input.memoryStore.searchMemories(input.agentId, query, { limit: 6, automatic: true }))))
       : [];
+    // The lists above are complete; each pass of the loop below picks what the
+    // kept recent window does not already represent.
+    const pickMemories = (scopedOut: (memory: Memory) => boolean) => {
+      const pinnedNow = pinned.filter((memory) => !scopedOut(memory)).slice(0, PINNED_CONTEXT_LIMIT);
+      const pinnedIds = new Set(pinnedNow.map((memory) => memory.id));
+      const coreNow = coreCandidates.filter((memory) => !scopedOut(memory) && !pinnedIds.has(memory.id)).slice(0, CORE_CONTEXT_LIMIT);
+      const coreIds = new Set(coreNow.map((memory) => memory.id));
+      const relevantNow = relevantCandidates.filter((memory) => !scopedOut(memory) && !memory.pinned && !coreIds.has(memory.id));
+      return { pinned: pinnedNow, core: coreNow, relevant: relevantNow };
+    };
+    const initialMemories = pickMemories(conversationScopedOut);
     const historySummaryCache = new Map<string, ConversationSummary | null>();
-    const history = crossChatEnabled && !skipCrossChatRetrieval
-      ? dedupeHistory(mergeRankedLists(buildContextSearchQueries(input.prompt, queryContext)
+    const history = searchQueries.length > 0
+      ? dedupeHistory(mergeRankedLists(searchQueries
         .map((query) => input.memoryStore.searchHistory(input.agentId, query, {
           automatic: true,
           limit: 6,
@@ -1578,42 +1599,66 @@ export class ContextAssembler {
 
     let historyCount = history.length === 0 ? 0 : Math.max(1, Math.ceil(history.length * clampedScale));
     let historyBytes = Math.max(160, Math.floor(DEFAULT_HISTORY_ITEM_BYTES * clampedScale));
-    let coreCount = coreCandidates.length === 0 ? 0 : Math.max(1, Math.ceil(coreCandidates.length * clampedScale));
+    let coreCount = initialMemories.core.length === 0 ? 0 : Math.max(1, Math.ceil(initialMemories.core.length * clampedScale));
     let coreBytes = Math.max(160, Math.floor(DEFAULT_MEMORY_ITEM_BYTES * clampedScale));
     let profileCount = profileCandidates.length === 0 ? 0 : Math.max(2, Math.ceil(profileCandidates.length * clampedScale));
     let profileBytes = Math.max(160, Math.floor(DEFAULT_MEMORY_ITEM_BYTES * clampedScale));
-    let relevantCount = relevant.length === 0 ? 0 : Math.max(1, Math.ceil(relevant.length * clampedScale));
+    let relevantCount = initialMemories.relevant.length === 0 ? 0 : Math.max(1, Math.ceil(initialMemories.relevant.length * clampedScale));
     let relevantBytes = Math.max(160, Math.floor(DEFAULT_MEMORY_ITEM_BYTES * clampedScale));
     // With slack the full summary is kept; the shrink loop below reduces it
     // only under real byte/token pressure instead of a fixed positional cut.
+    // Structured fields are spent first by selectSummaryContent, so the budget
+    // covers them in addition to the (policy-capped) rendered text.
+    const summaryFieldBytes = currentSummary ? summaryFieldItems(currentSummary.summaryJson).reduce((total, field) => total + byteLength(field), 0) : 0;
     const summaryTextBytes = currentSummary?.renderedText ? byteLength(currentSummary.renderedText) : 0;
     let summaryBytes = Math.max(
       MIN_SUMMARY_BYTES,
       Math.max(
-        Math.min(summaryTextBytes, MEMORY_POLICY_LIMITS.renderedSummaryBytes),
+        summaryFieldBytes + Math.min(summaryTextBytes, MEMORY_POLICY_LIMITS.renderedSummaryBytes),
         Math.floor((genericPrompt ? DEFAULT_SUMMARY_BYTES : Math.floor(DEFAULT_SUMMARY_BYTES * 0.75)) * clampedScale),
       ),
     );
     let recentLimit = Math.max(4, Math.floor(MAX_CONTEXT_RECENT_MESSAGES * Math.max(0.5, clampedScale)));
     const initialLimits = { historyCount, historyBytes, coreCount, coreBytes, profileCount, profileBytes, relevantCount, relevantBytes, summaryBytes, recentLimit };
 
+    const messageBytes = new WeakMap<ProviderChatMessage, number>();
+    const serializedBytes = (messages: readonly ProviderChatMessage[]): number => {
+      // JSON.stringify of an array is "[" + items joined by "," + "]".
+      let total = 2 + Math.max(0, messages.length - 1);
+      for (const message of messages) {
+        let size = messageBytes.get(message);
+        if (size === undefined) {
+          size = Buffer.byteLength(JSON.stringify(message), "utf8");
+          messageBytes.set(message, size);
+        }
+        total += size;
+      }
+      return total;
+    };
     for (;;) {
+      const recent = selectRecentMessages(recentMessages, recentLimit);
+      const keptIds = keptEntryIds(recent);
+      const { pinned: pinnedNow, core: coreNow, relevant: relevantNow } = pickMemories(scopedOutBy(keptIds));
+      const contextSources = (): MemoryContextSource[] => [
+        ...[...profileCandidates.slice(0, profileCount), ...coreNow.slice(0, coreCount), ...pinnedNow, ...relevantNow.slice(0, relevantCount)]
+          .flatMap(sourcesForMemory),
+        ...historyContextSources(history.slice(0, historyCount)),
+        ...(currentSummary ? [{ conversationId: currentSummary.conversationId, throughSequenceId: currentSummary.throughSequenceId, updatedAtMs: currentSummary.updatedAtMs }] : []),
+        ...(input.conversationId === undefined ? [] : [...keptIds].map((entryId) => ({ conversationId: input.conversationId!, entryId }))),
+      ];
       const blocks: string[] = [];
       const profileBlock = buildUntrustedBlock(
         "Shared user profile (describes the person across all bots; it does NOT describe this bot's task or what the user wants now — do not infer this bot's job from it)",
         profileCandidates.slice(0, profileCount).map((memory) => summarizeMemory(memory, profileBytes)),
       );
       if (profileBlock) blocks.push(profileBlock);
-      const coreBlock = buildUntrustedBlock("Core memories", coreCandidates.slice(0, coreCount).map((memory) => summarizeMemory(memory, coreBytes)));
+      const coreBlock = buildUntrustedBlock("Core memories", coreNow.slice(0, coreCount).map((memory) => summarizeMemory(memory, coreBytes)));
       if (coreBlock) blocks.push(coreBlock);
-      const pinnedBlock = buildUntrustedBlock("Pinned memories", pinned.slice(0, 4).map((memory) => summarizeMemory(memory, relevantBytes)));
+      const pinnedBlock = buildUntrustedBlock("Pinned memories", pinnedNow.map((memory) => summarizeMemory(memory, relevantBytes)));
       if (pinnedBlock) blocks.push(pinnedBlock);
       const relevantBlock = buildUntrustedBlock(
         "Relevant memories",
-        relevant
-          .filter((memory) => !memory.pinned && !coreIds.has(memory.id))
-          .slice(0, relevantCount)
-          .map((memory) => summarizeMemory(memory, relevantBytes)),
+        relevantNow.slice(0, relevantCount).map((memory) => summarizeMemory(memory, relevantBytes)),
       );
       if (relevantBlock) blocks.push(relevantBlock);
       if (currentSummary?.renderedText || (currentSummary !== null && currentSummary !== undefined && currentSummary.summaryJson !== undefined && currentSummary.summaryJson !== null)) {
@@ -1625,19 +1670,9 @@ export class ContextAssembler {
         history.slice(0, historyCount).map((result) => summarizeSearchHit(result, historyBytes)),
       );
       if (historyBlock) blocks.push(historyBlock);
-      const recent = selectRecentMessages(recentMessages, recentLimit);
-      const memoryContextSources: MemoryContextSource[] = [
-        ...[...profileCandidates.slice(0, profileCount), ...coreCandidates.slice(0, coreCount), ...pinned.slice(0, 4), ...relevant.filter((memory) => !memory.pinned && !coreIds.has(memory.id)).slice(0, relevantCount)]
-          .flatMap(sourcesForMemory),
-        ...historyContextSources(history.slice(0, historyCount)),
-        ...(currentSummary ? [{ conversationId: currentSummary.conversationId, throughSequenceId: currentSummary.throughSequenceId, updatedAtMs: currentSummary.updatedAtMs }] : []),
-        ...(input.conversationId === undefined ? [] : sourceMessages
-          .filter((entry) => recent.some((message) => message.role === entry.role && typeof message.content === "string" && message.content.includes(entry.content)))
-          .map((entry) => ({ conversationId: input.conversationId!, entryId: entry.id }))),
-      ];
       const contextMessage = buildUserContextMessage(blocks);
       const assembled = placeContextAtSuffix(recent, contextMessage);
-      const bytes = Buffer.byteLength(JSON.stringify(assembled), "utf8");
+      const bytes = serializedBytes(assembled);
       const modelFitted = modelBudget === undefined || modelTokenizer === undefined
         ? assembled
         : selectCompleteMessageGroups(assembled, modelTokenizer, modelBudget.availableContentTokens);
@@ -1653,7 +1688,7 @@ export class ContextAssembler {
             truncated: !modelFits,
           };
       if (bytes <= availableBytes && modelFits) return {
-        memoryContextSources,
+        memoryContextSources: contextSources(),
         messages: assembled,
         bytes,
         availableBytes,
@@ -1705,10 +1740,8 @@ export class ContextAssembler {
         recentLimit = Math.max(4, Math.floor(recentLimit / 2));
         continue;
       }
-      const tokenFitted = modelBudget === undefined || modelTokenizer === undefined
-        ? assembled
-        : selectCompleteMessageGroups(assembled, modelTokenizer, modelBudget.availableContentTokens);
-      const fitted = fitProviderMessagesToByteBudget(tokenFitted, availableBytes);
+      // modelFitted is exactly the token-fitted selection of this pass.
+      const fitted = fitProviderMessagesToByteBudget(modelFitted, availableBytes);
       const observedBudget = modelBudget === undefined || modelTokenizer === undefined
         ? undefined
         : {
@@ -1721,7 +1754,7 @@ export class ContextAssembler {
           };
       return {
         messages: fitted,
-        memoryContextSources,
+        memoryContextSources: contextSources(),
         bytes: Buffer.byteLength(JSON.stringify(fitted), "utf8"),
         availableBytes,
         truncated: true,

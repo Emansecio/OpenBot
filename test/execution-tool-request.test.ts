@@ -130,27 +130,3 @@ describe("browser tools translation", () => {
     expect(toolCallToExecutionRequest(call(name, args)).error).toMatch(/unsupported fields.*remove extra/i);
   });
 });
-
-describe("whatsapp tool translation", () => {
-  it("converts the structured host contract", () => {
-    expect(toolCallToExecutionRequest(call("whatsapp", { op: "doctor" }))).toEqual({
-      request: { operation: "whatsapp", op: "doctor" },
-    });
-    expect(toolCallToExecutionRequest(call("whatsapp", {
-      op: "send",
-      chat: "5511999999999",
-      text: "oi",
-    }))).toEqual({
-      request: { operation: "whatsapp", op: "send", chat: "5511999999999", text: "oi" },
-    });
-  });
-
-  it("rejects host paths in chat", () => {
-    expect(toolCallToExecutionRequest(call("whatsapp", { op: "send", chat: "C:\\\\Users\\\\x", text: "oi" })).error).toBeDefined();
-  });
-
-  it("explains the op-only contract for doctor and sweep", () => {
-    expect(toolCallToExecutionRequest(call("whatsapp", { op: "sweep", limit: 20 })).error)
-      .toMatch(/unsupported fields.*whatsapp sweep accepts only the op field.*limit/i);
-  });
-});

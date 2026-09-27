@@ -1,13 +1,7 @@
 import { randomUUID } from "node:crypto";
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  statSync,
-  unlinkSync,
-} from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 import {
   DEFAULT_REASONING_EFFORT,
@@ -27,7 +21,8 @@ import {
 } from "../mcp/security.js";
 import { validateCompatBaseUrl } from "../providers/openai-compat.js";
 import { isCatalogProvider, type ModelCatalogService } from "../providers/model-catalog.js";
-import { writeFileAtomicSync, writeFileExclusiveSync } from "../shared/fs-atomic.js";
+import { writeFileAtomicSync } from "../shared/fs-atomic.js";
+import { withFileLockSync } from "../shared/file-lock.js";
 import { normalizeWorkspaceQuotaConfig, type WorkspaceQuotaConfig } from "../execution/quota.js";
 import { MODEL_CATALOG } from "./models.js";
 
@@ -326,6 +321,14 @@ function normalizeMcpServers(value: unknown): McpServerConfig[] | undefined {
   return servers;
 }
 
+/** Server named by an MCP tool rule ("server/tool" or "mcp__server__tool"); undefined for a bare tool name. */
+export function mcpToolRuleServerId(rule: string): string | undefined {
+  const slash = rule.indexOf("/");
+  if (slash > 0) return rule.slice(0, slash);
+  const providerPrefix = rule.startsWith("mcp__") ? rule.slice(5).indexOf("__") : -1;
+  return providerPrefix > 0 ? rule.slice(5, 5 + providerPrefix) : undefined;
+}
+
 function normalizeMcpPolicy(value: unknown, field: string, serverIds: ReadonlySet<string>): McpAgentPolicy {
   if (!isRecord(value) || typeof value.enabled !== "boolean") throw configError(`${field}.enabled`);
   const allowed = new Set(["enabled", "serverAllowlist", "toolAllowlist", "toolDenylist"]);
@@ -343,13 +346,7 @@ function normalizeMcpPolicy(value: unknown, field: string, serverIds: ReadonlySe
     if (raw === undefined) continue;
     const list = dedupeStrings(raw, `${field}.${listName}`);
     for (const entry of list) {
-      const slash = entry.indexOf("/");
-      const providerPrefix = entry.startsWith("mcp__") ? entry.slice(5).indexOf("__") : -1;
-      const serverId = slash > 0
-        ? entry.slice(0, slash)
-        : providerPrefix > 0
-          ? entry.slice(5, 5 + providerPrefix)
-          : undefined;
+      const serverId = mcpToolRuleServerId(entry);
       if (serverId !== undefined && !serverIds.has(serverId.toLowerCase())) {
         throw new Error(`config inválida: ${field}.${listName} servidor desconhecido: ${serverId}`);
       }
@@ -384,7 +381,19 @@ function normalizeIntegrations(value: unknown, field: string, serverIds: Readonl
   return Object.keys(integrations).length === 0 ? undefined : integrations;
 }
 
-function validateAgent(agent: LocalAgent, ids: Set<string>, globalModel: string, serverIds: ReadonlySet<string>, allowUnverified = false): LocalAgent {
+/** Provider that owns a model id, or undefined when no known catalog lists it. */
+type ModelProviderResolver = (model: string) => ProviderKind | undefined;
+
+const staticModelProvider: ModelProviderResolver = (model) => MODEL_CATALOG.find((entry) => entry.id === model)?.provider;
+
+function validateAgent(
+  agent: LocalAgent,
+  ids: Set<string>,
+  globalModel: string,
+  serverIds: ReadonlySet<string>,
+  allowUnverified: boolean,
+  providerOf: ModelProviderResolver,
+): LocalAgent {
   if (!agent || typeof agent.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(agent.id)) throw new Error("config inválida: agent.id");
   if (agent.id.endsWith(".") || agent.id.endsWith(" ")) throw new Error("config inválida: agent.id");
   const stem = agent.id.split(".")[0] ?? "";
@@ -441,9 +450,14 @@ function validateAgent(agent: LocalAgent, ids: Set<string>, globalModel: string,
     // efetivo (agente pode herdar o modelo global). Comparar só com
     // `agent.model` rejeitaria `priority` num agente que herda um modelo
     // OpenAI — falso negativo que também derrubaria o load inteiro.
+    // Um modelo fora de todos os catálogos conhecidos só é aceito quando
+    // modelos não verificados são permitidos; o tier dele é validado pelo
+    // catálogo dinâmico no commit, então provider desconhecido não é rejeição.
     const tierModel = agent.model ?? globalModel;
-    const tierProvider = agent.provider ?? MODEL_CATALOG.find(m => m.id === tierModel)?.provider;
-    if (tierProvider !== "openai") throw new Error("Fast requer um modelo OpenAI compatível.");
+    const tierProvider = agent.provider ?? providerOf(tierModel);
+    if (tierProvider === undefined ? !allowUnverified : tierProvider !== "openai") {
+      throw new Error("Fast requer um modelo OpenAI compatível.");
+    }
   }
   if (agent.reasoningEffort !== undefined && !(REASONING_EFFORTS as readonly unknown[]).includes(agent.reasoningEffort)) {
     throw new Error("config inválida: agent.reasoningEffort");
@@ -466,11 +480,17 @@ function validateAgent(agent: LocalAgent, ids: Set<string>, globalModel: string,
   };
 }
 
-function validateAgents(agents: readonly LocalAgent[], globalModel: string, serverIds: ReadonlySet<string>, allowUnverified = false): LocalAgent[] {
+function validateAgents(
+  agents: readonly LocalAgent[],
+  globalModel: string,
+  serverIds: ReadonlySet<string>,
+  allowUnverified = false,
+  providerOf: ModelProviderResolver = staticModelProvider,
+): LocalAgent[] {
   if (!Array.isArray(agents)) throw new Error("config inválida: agents");
   if (agents.length > MAX_LOCAL_AGENTS) throw new Error(`config inválida: agents excede o limite de ${MAX_LOCAL_AGENTS}`);
   const ids = new Set<string>();
-  return agents.map((agent) => validateAgent(agent, ids, globalModel, serverIds, allowUnverified));
+  return agents.map((agent) => validateAgent(agent, ids, globalModel, serverIds, allowUnverified, providerOf));
 }
 
 function validateModelProvider(config: Pick<OpenBotConfig, "activeProvider" | "globalModel">, allowUnverified = false): void {
@@ -601,7 +621,8 @@ function decodeConfig(raw: unknown, allowUnverified = false): OpenBotConfig {
   if (mcpServers !== undefined) config.mcpServers = mcpServers;
   validateModelProvider(config, allowUnverified);
   config.agents = validateAgents(config.agents, config.globalModel, new Set((mcpServers ?? []).map((server) => server.id.toLowerCase())), allowUnverified);
-  return structuredClone(config);
+  // Callers always pass a value fresh from JSON.parse, so no defensive clone.
+  return config;
 }
 
 function requireConfiguredAgent(config: OpenBotConfig, agentId: string): LocalAgent {
@@ -632,97 +653,30 @@ export function resolveAgentMcpPolicy(config: OpenBotConfig, agentId: string): M
   };
 }
 
-interface ConfigLockRecord {
-  pid: number;
-  token: string;
-}
-
-const CONFIG_LOCK_RETRY_MS = 10;
-const CONFIG_LOCK_TIMEOUT_MS = 5_000;
-const configLockWait = new Int32Array(new SharedArrayBuffer(4));
-
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
-}
-
-function readConfigLock(file: string): ConfigLockRecord | null {
-  try {
-    const value: unknown = JSON.parse(readFileSync(file, "utf8"));
-    if (!isRecord(value) || typeof value.pid !== "number" || typeof value.token !== "string") return null;
-    return { pid: value.pid, token: value.token };
-  } catch {
-    return null;
-  }
-}
-
-function releaseConfigLock(file: string, token: string): void {
-  if (readConfigLock(file)?.token !== token) return;
-  try {
-    unlinkSync(file);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-}
+const CONFIG_LOCK_OPTIONS = { label: "config", timeoutMs: 5_000 } as const;
 
 function withConfigLock<T>(target: string, task: () => T): T {
-  const file = `${target}.lock`;
-  const token = randomUUID();
-  const deadline = Date.now() + CONFIG_LOCK_TIMEOUT_MS;
-  mkdirSync(dirname(file), { recursive: true });
+  return withFileLockSync(target, task, CONFIG_LOCK_OPTIONS);
+}
 
-  while (true) {
-    try {
-      writeFileExclusiveSync(file, JSON.stringify({ pid: process.pid, token }));
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const owner = readConfigLock(file);
-      if (owner !== null && !isProcessAlive(owner.pid)) {
-        releaseConfigLock(file, owner.token);
-        continue;
-      }
-      if (owner !== null) {
-        // O pid pode ter sido reutilizado pelo SO após a morte do dono.
-        // Um lock mais antigo que o timeout é tratado como obsoleto mesmo
-        // com pid aparentemente vivo; o release confere o token, então um
-        // dono realmente ativo nunca tem o lock roubado por engano.
-        try {
-          if (Date.now() - statSync(file).mtimeMs >= CONFIG_LOCK_TIMEOUT_MS) {
-            releaseConfigLock(file, owner.token);
-            continue;
-          }
-        } catch (statError) {
-          if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
-          continue;
-        }
-      }
-      if (owner === null) {
-        try {
-          if (Date.now() - statSync(file).mtimeMs >= CONFIG_LOCK_TIMEOUT_MS) {
-            unlinkSync(file);
-            continue;
-          }
-        } catch (statError) {
-          if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
-          continue;
-        }
-      }
-      if (Date.now() >= deadline) throw new Error(`config: timeout aguardando lock de ${target}`, { cause: error });
-      Atomics.wait(configLockWait, 0, 0, CONFIG_LOCK_RETRY_MS);
-    }
-  }
-
+/** Reads and decodes a config file, naming the file and keeping the parse error as the cause. */
+function readConfigFile(path: string, allowUnverified: boolean): OpenBotConfig {
+  let raw: unknown;
   try {
-    return task();
-  } finally {
-    releaseConfigLock(file, token);
+    raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  } catch (error) {
+    throw new Error(`config JSON corrompido: ${path}`, { cause: error });
   }
+  return decodeConfig(raw, allowUnverified);
+}
+
+/** Freezes the whole tree so shared read-only views cannot be mutated by accident. */
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
 }
 
 export class ConfigConflictError extends Error {
@@ -738,7 +692,10 @@ export interface ConfigMutationOptions {
 
 export class ConfigStore {
   readonly path: string;
+  /** Deep-frozen last committed state; replaced whole on every commit. */
   private config: OpenBotConfig;
+  /** Identity of the file this process last read or wrote, to skip re-reading it unchanged. */
+  private diskStamp: string | undefined;
   modelCatalog?: ModelCatalogService;
   private readonly allowUnverified: boolean;
 
@@ -746,38 +703,24 @@ export class ConfigStore {
     this.allowUnverified = options.allowUnverifiedModels === true;
     this.path = options.configPath ?? defaultConfigPath();
     if (existsSync(this.path)) {
-      let raw: unknown;
-      try {
-        raw = JSON.parse(readFileSync(this.path, "utf8")) as unknown;
-      } catch {
-        throw new Error("config JSON corrompido");
-      }
-      this.config = decodeConfig(raw, this.allowUnverified);
+      this.config = this.load();
     } else {
       // First boot races another process here: create under the file lock and
       // adopt the winner instead of overwriting it.
       this.config = withConfigLock(this.path, () => {
-        if (existsSync(this.path)) {
-          let raw: unknown;
-          try {
-            raw = JSON.parse(readFileSync(this.path, "utf8")) as unknown;
-          } catch {
-            throw new Error("config JSON corrompido");
-          }
-          return decodeConfig(raw, this.allowUnverified);
-        }
+        if (existsSync(this.path)) return this.load();
         const fresh = createDefaultConfig();
         this.persist(fresh);
-        return fresh;
+        return deepFreeze(fresh);
       });
     }
   }
 
   /**
-   * Returns the last committed in-memory state. External file edits only
-   * become visible after a commit re-reads the disk under the lock — the
-   * store assumes the config file is single-writer in steady state; the
-   * file lock exists for first-boot races and commit mutual exclusion, not
+   * Returns a mutable copy of the last committed state. External file edits
+   * only become visible after a commit re-reads the disk under the lock — the
+   * store assumes the config file is single-writer in steady state; the file
+   * lock exists for first-boot races and commit mutual exclusion, not
    * continuous multi-process write sharing.
    */
   snapshot(): OpenBotConfig {
@@ -785,10 +728,22 @@ export class ConfigStore {
   }
 
   /**
-   * Read-only accessors for hot paths (per-entry transcript publication).
-   * They read the live config without the full structuredClone of
-   * `snapshot()` and never hand out mutable references: only primitives.
+   * The last committed state without copying it. The object is deep-frozen:
+   * use it for reads on hot paths and {@link snapshot} when a mutable copy is
+   * needed.
    */
+  view(): Readonly<OpenBotConfig> {
+    return this.config;
+  }
+
+  hasAgent(agentId: string): boolean {
+    return this.config.agents.some((entry) => entry.id === agentId);
+  }
+
+  agentIds(): string[] {
+    return this.config.agents.map((entry) => entry.id);
+  }
+
   agentName(agentId: string): string | undefined {
     return this.config.agents.find((entry) => entry.id === agentId)?.name;
   }
@@ -801,11 +756,8 @@ export class ConfigStore {
     return this.config.profile?.machineId;
   }
 
-  update(
-    patch: OpenBotConfigUpdate | ((current: Readonly<OpenBotConfig>) => OpenBotConfigUpdate),
-    options: ConfigMutationOptions = {},
-  ): OpenBotConfig {
-    return this.commit(typeof patch === "function" ? patch : () => patch, options);
+  update(patch: OpenBotConfigUpdate, options: ConfigMutationOptions = {}): OpenBotConfig {
+    return this.commit(() => patch, options);
   }
 
   /** Computes a patch from the latest on-disk state while holding the lock. */
@@ -813,7 +765,7 @@ export class ConfigStore {
     mutator: (current: Readonly<OpenBotConfig>) => OpenBotConfigUpdate,
     options: ConfigMutationOptions = {},
   ): OpenBotConfig {
-    return this.update(mutator, options);
+    return this.commit(mutator, options);
   }
 
   /** Replaces profile atomically, allowing legacy optional fields to be removed. */
@@ -830,9 +782,7 @@ export class ConfigStore {
     replaceProfile = false,
   ): OpenBotConfig {
     return withConfigLock(this.path, () => {
-      const current = existsSync(this.path)
-        ? decodeConfig(JSON.parse(readFileSync(this.path, "utf8")) as unknown, this.allowUnverified)
-        : this.config;
+      const current = this.latest();
       const actualRevision = current.revision ?? 0;
       if (options.expectedRevision !== undefined && options.expectedRevision !== actualRevision) {
         throw new ConfigConflictError(options.expectedRevision, actualRevision);
@@ -849,8 +799,8 @@ export class ConfigStore {
         ...(patch.agents !== undefined ? { agents: patch.agents } : {}),
         ...(patch.mcpServers !== undefined ? { mcpServers: patch.mcpServers } : {}),
         profile: replaceProfile && patch.profile !== undefined
-        ? patch.profile as LocalProfile
-        : { ...current.profile, ...patch.profile },
+          ? patch.profile as LocalProfile
+          : { ...current.profile, ...patch.profile },
         hostSettings: { ...current.hostSettings, ...patch.hostSettings },
         flags: { ...current.flags, ...patch.flags },
       };
@@ -863,21 +813,26 @@ export class ConfigStore {
       if (next.compatReasoningEffort !== undefined && typeof next.compatReasoningEffort !== "boolean") {
         throw new Error("config inválida: compatReasoningEffort");
       }
-      next.agents = validateAgents(next.agents, next.globalModel, new Set((mcpServers ?? []).map((server) => server.id.toLowerCase())), this.allowUnverified);
-      if (this.modelCatalog) {
-        const check = (provider: string, model: string, effort?: ReasoningEffort) => {
-          if (isCatalogProvider(provider)) this.modelCatalog!.resolve(provider, model, effort);
-        };
+      const catalog = this.modelCatalog;
+      const providerOf: ModelProviderResolver = (model) => catalog?.find(model)?.provider ?? staticModelProvider(model);
+      next.agents = validateAgents(
+        next.agents,
+        next.globalModel,
+        new Set((mcpServers ?? []).map((server) => server.id.toLowerCase())),
+        this.allowUnverified,
+        providerOf,
+      );
+      if (catalog) {
         if (next.activeProvider !== current.activeProvider || next.globalModel !== current.globalModel || next.globalReasoningEffort !== current.globalReasoningEffort) {
-          check(next.activeProvider, next.globalModel, next.globalReasoningEffort);
+          if (isCatalogProvider(next.activeProvider)) catalog.resolve(next.activeProvider, next.globalModel, next.globalReasoningEffort);
         }
         for (const agent of next.agents) {
-          const previous = current.agents.find(a => a.id === agent.id);
+          const previous = current.agents.find((entry) => entry.id === agent.id);
           if (!previous || previous.model !== agent.model || previous.provider !== agent.provider || previous.reasoningEffort !== agent.reasoningEffort || previous.serviceTier !== agent.serviceTier) {
             const provider = agent.model
-              ? agent.provider ?? this.modelCatalog.find(agent.model)?.provider ?? MODEL_CATALOG.find(model => model.id === agent.model)?.provider ?? next.activeProvider
+              ? agent.provider ?? providerOf(agent.model) ?? next.activeProvider
               : next.activeProvider;
-            if (isCatalogProvider(provider)) this.modelCatalog.resolve(provider, agent.model ?? next.globalModel, agent.reasoningEffort ?? next.globalReasoningEffort, agent.serviceTier);
+            if (isCatalogProvider(provider)) catalog.resolve(provider, agent.model ?? next.globalModel, agent.reasoningEffort ?? next.globalReasoningEffort, agent.serviceTier);
           }
         }
       }
@@ -903,15 +858,43 @@ export class ConfigStore {
     return this.update({ hostSettings: settings });
   }
 
-  close(): void {}
+  /** Reads the file, remembering which on-disk version the result reflects. */
+  private load(): OpenBotConfig {
+    const stamp = this.stampOnDisk();
+    const config = deepFreeze(readConfigFile(this.path, this.allowUnverified));
+    this.diskStamp = stamp;
+    return config;
+  }
+
+  /**
+   * The newest committed state under the lock: the in-memory copy while the
+   * file is still the one this process last read or wrote, otherwise a fresh
+   * read of the external change.
+   */
+  private latest(): OpenBotConfig {
+    const stamp = this.stampOnDisk();
+    if (stamp === undefined || stamp === this.diskStamp) return this.config;
+    return this.load();
+  }
+
+  private stampOnDisk(): string | undefined {
+    try {
+      const stat = statSync(this.path);
+      return `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
 
   private replace(config: OpenBotConfig): OpenBotConfig {
     this.persist(config);
-    this.config = config;
+    this.config = deepFreeze(config);
     return this.snapshot();
   }
 
   private persist(config: OpenBotConfig): void {
     writeFileAtomicSync(this.path, `${JSON.stringify(config, null, 2)}\n`);
+    this.diskStamp = this.stampOnDisk();
   }
 }

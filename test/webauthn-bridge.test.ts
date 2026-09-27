@@ -10,6 +10,7 @@ const spawnState = vi.hoisted(() => ({
   exitCode: 0 as number | null,
   emitError: undefined as string | undefined,
   emitClose: true,
+  stdinError: false,
   killCalls: 0,
 }));
 
@@ -20,7 +21,7 @@ vi.mock("node:child_process", async () => {
     spawn: vi.fn((_path: string, _args: string[], options: Record<string, unknown>) => {
       spawnState.options.push(options);
       const child = new EventEmitter() as EventEmitterType & {
-        stdin: { end(input: string): void };
+        stdin: EventEmitterType & { end(input: string): void };
         stdout: PassThroughType;
         stderr: PassThroughType;
         kill(): boolean;
@@ -31,13 +32,14 @@ vi.mock("node:child_process", async () => {
         spawnState.killCalls += 1;
         return true;
       };
-      child.stdin = {
+      child.stdin = Object.assign(new EventEmitter(), {
         end: () => queueMicrotask(() => {
+          if (spawnState.stdinError) child.stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
           if (spawnState.output !== undefined) child.stdout.end(spawnState.output);
           if (spawnState.emitError !== undefined) child.emit("error", new Error(spawnState.emitError));
           if (spawnState.emitClose) child.emit("close", spawnState.exitCode);
         }),
-      };
+      });
       return child;
     }),
   };
@@ -54,6 +56,7 @@ afterEach(async () => {
   spawnState.exitCode = 0;
   spawnState.emitError = undefined;
   spawnState.emitClose = true;
+  spawnState.stdinError = false;
   spawnState.killCalls = 0;
   vi.unstubAllEnvs();
   await temp.cleanup();
@@ -130,6 +133,18 @@ describe("WebAuthn signer bridge", () => {
     await vi.advanceTimersByTimeAsync(120_000);
     await rejection;
     expect(spawnState.killCalls).toBe(1);
+  });
+
+  it("reports a signer that exits before reading its input instead of crashing on EPIPE", async () => {
+    const bridge = await fixtureBridge();
+    spawnState.stdinError = true;
+    spawnState.output = undefined;
+    spawnState.exitCode = 1;
+
+    await expect(bridge("/webauthn/ceremony", ceremony)).rejects.toMatchObject({
+      status: 502,
+      message: "WebAuthn signer rejected the ceremony",
+    });
   });
 
   it("keeps the first failure when signer error is followed by close", async () => {

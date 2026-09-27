@@ -184,6 +184,23 @@ describe("RuntimeManager", () => {
     await manager.close();
   });
 
+  it("não cancela o startup nem a admissão de outro agente quando um agente sem leases para", async () => {
+    const driver = new BlockingStartDriver();
+    const manager = new RuntimeManager({ driver });
+
+    const acquiring = manager.acquire("agent-b", capability());
+    await Promise.resolve();
+    const stopping = manager.stop("agent-a", "manual");
+    driver.startGate.resolve();
+    await expect(stopping).resolves.toBeDefined();
+
+    const lease = await acquiring;
+    expect(lease.agentId).toBe("agent-b");
+    expect(driver.stops).toBe(0);
+    await lease.release();
+    await manager.close();
+  });
+
   it("não deixa um health travado impedir o cancelamento do startup", async () => {
     const driver = new BlockingHealthDriver();
     const manager = new RuntimeManager({ driver });
@@ -289,6 +306,18 @@ describe("RuntimeManager", () => {
     await expect(manager.acquire("agent-a", capability())).rejects.toMatchObject({ code: "runtime_unhealthy" });
   });
 
+  it("inicia o runtime para o agente que pediu, mesmo quando outro agente Lite foi registrado antes", async () => {
+    const driver = new FakeDriver();
+    const manager = new RuntimeManager({ driver });
+
+    expect((await manager.ensure("lite-first", "lite")).state).toBe("lite-ready");
+    const lease = await manager.acquire("developer-later", capability());
+
+    expect(lease.agentId).toBe("developer-later");
+    expect(driver.starts).toBe(1);
+    await lease.release();
+  });
+
   it("vincula leases ao agente e não permite adquirir depois do fence", async () => {
     const driver = new FakeDriver();
     const manager = new RuntimeManager({ driver });
@@ -333,6 +362,32 @@ describe("RuntimeManager", () => {
     expect(lease.released).toBe(true);
     expect((await manager.status("agent-a")).activeLeaseCount).toBe(0);
     expect(driver.released).toEqual([lease.leaseId]);
+    await manager.close();
+  });
+
+  it("reinicia após uma falha de liberação sem encerrar os leases vivos de outros agentes", async () => {
+    const driver = new FakeDriver();
+    const journal = new MemoryRuntimeLeaseJournal();
+    const killed: string[] = [];
+    const manager = new RuntimeManager({
+      driver,
+      journal,
+      reconciler: { killSandbox: async (sandboxId) => { killed.push(sandboxId); }, removeTemporary: async () => undefined },
+    });
+    const failing = await manager.acquire("agent-a", capability());
+    const running = await manager.acquire("agent-b", capability());
+    driver.releaseFailures = 1;
+    await expect(failing.release()).rejects.toMatchObject({ code: "runtime_unhealthy" });
+
+    const next = await manager.acquire("agent-c", capability());
+
+    expect(driver.starts).toBe(2);
+    expect(killed).not.toContain(running.sandboxId);
+    expect(killed).not.toContain(failing.sandboxId);
+    await running.release();
+    await failing.release();
+    await next.release();
+    await expect(journal.list()).resolves.toEqual([]);
     await manager.close();
   });
 
@@ -705,5 +760,27 @@ describe("RuntimeManager", () => {
     const second = await manager.acquire("agent-b", capability());
     await second.release();
     await manager.close();
+  });
+
+  it("does not recreate a record when releasing the fence of an agent without one", () => {
+    const manager = new RuntimeManager({ driver: new GatedHealthDriver() });
+    manager.releaseAgentFence("never-started");
+    expect((manager as unknown as { agents: Map<string, unknown> }).agents.has("never-started")).toBe(false);
+  });
+});
+
+describe("runtime adversarial boundaries", () => {
+  it("does not allow a manager lease for a fenced agent", async () => {
+    const manager = new RuntimeManager({
+      driver: {
+        async start() { return { runtimeBootId: "boot", runtimeVersion: "1", imageDigest: `sha256:${"a".repeat(64)}` }; },
+        async health() { return { ok: true as const }; },
+        async acquire() { return { sandboxId: "sandbox" }; },
+        async release() {},
+        async stop() {},
+      },
+    });
+    manager.fenceAgent("agent-a");
+    await expect(manager.acquire("agent-a", { kind: "process.run", networkProfile: "none" })).rejects.toMatchObject({ code: "agent_fenced" });
   });
 });

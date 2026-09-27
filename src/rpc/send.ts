@@ -1,17 +1,9 @@
 import type { ConfigStore } from "../config/store.js";
 import { createPromptQueue, promptPayloadDigest, type PromptQueueStore } from "../store/prompt-queue.js";
-import type { Conversation } from "../conversations/store.js";
+import { autoConversationTitle, type Conversation } from "../conversations/store.js";
 import type { LocalExecutionBroker } from "../execution/broker.js";
-import type { ToolCallExecutor, ToolLoopOptions, ToolLoopResumableEffects } from "../execution/tool-loop.js";
+import type { ToolCallExecutor } from "../execution/tool-loop.js";
 import type { ProviderAdmissionScheduler } from "../providers/admission.js";
-import type {
-    ResumeBudgetSnapshot,
-    ResumeCheckpoint,
-    ResumeCheckpointScope,
-    ResumeEffectCommit,
-    ResumeEffectRecord,
-} from "../providers/resume.js";
-import { assertCheckpointUsable, boundedResumeResult, ResumeProtocolError } from "../providers/resume.js";
 import type {
     ProviderChatMessage,
     ProviderChatRequest,
@@ -282,6 +274,7 @@ export interface TranscriptStore {
     findAcceptedNonceConversations?(agentId: string, nonce: string): readonly (string | undefined)[];
     getActiveConversationId?(agentId: string): string | undefined;
     getLatestSequenceId?(agentId: string, conversationId?: string): number | null;
+    getEntriesWithSequenceByRange?(agentId: string, fromSequenceId: number, throughSequenceId: number, conversationId?: string): readonly { sequenceId: number; entry: TranscriptEntry }[];
     setActiveConversationId?(agentId: string, conversationId?: string): void;
     conversationStore?: ConversationStoreLike;
     validateConversation?(agentId: string, conversationId: string): void;
@@ -312,18 +305,8 @@ export interface TranscriptStore {
     restoreAgent?(agentId: string, snapshot: TranscriptAgentSnapshot): void;
     findUserEchoByNonce?(agentId: string, nonce: string, conversationId?: string): TranscriptEntry | undefined;
     findRetryableErrorNotice?(agentId: string, turnId: string, conversationId?: string): TranscriptEntry | undefined;
-    createResumeCheckpoint?(checkpoint: ResumeCheckpoint): boolean;
-    findResumeCheckpoint?(agentId: string, conversationId: string, turnId: string): ResumeCheckpoint | undefined;
-    getResumeCheckpoint?(scope: ResumeCheckpointScope): ResumeCheckpoint | undefined;
-    advanceResumeCheckpoint?(scope: ResumeCheckpointScope, expectedVersion: number, update: Pick<ResumeCheckpoint, "cursor" | "safeSequenceId" | "completedEffectIds" | "expiresAtMs" | "budget">): ResumeCheckpoint;
-    prepareResumeEffect?(scope: ResumeCheckpointScope, effectId: string, fingerprintHash: string): ResumeEffectRecord;
-    markResumeEffectStarted?(scope: ResumeCheckpointScope, effectId: string): ResumeEffectRecord | undefined;
-    markResumeEffectUnsafe?(scope: ResumeCheckpointScope, effectId: string): ResumeEffectRecord | undefined;
-    getResumeEffect?(scope: ResumeCheckpointScope, effectId: string): ResumeEffectRecord | undefined;
-    hasUnsafeResumeEffect?(scope: ResumeCheckpointScope): boolean;
-    completeResumeEffect?(scope: ResumeCheckpointScope, effectId: string, fingerprintHash: string, result: unknown): ResumeEffectRecord;
-    commitResumeEffectAndCheckpoint?(input: ResumeEffectCommit): ResumeCheckpoint;
-    reconcileResumeEffects?(agentId: string, nowMs?: number): number;
+    /** Suffix of the conversation equivalent to it for failure recovery; undefined means read it whole. */
+    getRetryableFailureWindow?(agentId: string, conversationId?: string): readonly TranscriptEntry[] | undefined;
     getKickstartRun?(agentId: string, clientNonce: string): KickstartRunRecord | undefined;
     claimKickstartRun?(input: Omit<KickstartRunRecord, "attempt" | "status" | "observableOutput" | "createdAtMs" | "updatedAtMs">): KickstartClaim;
     updateKickstartRun?(agentId: string, clientNonce: string, update: Partial<Pick<KickstartRunRecord, "status" | "turnId" | "provider" | "model" | "observableOutput" | "result" | "error">>): KickstartRunRecord | undefined;
@@ -360,6 +343,8 @@ interface TurnReasoningState {
 interface TurnMetadata extends ResolvedProvider {
     serviceTierActual?: Array<"priority" | "default" | "unknown">;
     memoryContextSources?: MemoryContextSource[];
+    /** Deduplicated view of memoryContextSources, valid while its length matches (the list only grows). */
+    memoryContextSourcesUnique?: { length: number; sources: MemoryContextSource[] };
     turnId: string;
     conversationId?: string;
     clientNonce?: string;
@@ -374,8 +359,6 @@ interface TurnMetadata extends ResolvedProvider {
     terminalErrorObserved?: boolean;
     contentStarted?: boolean;
     reasoning?: TurnReasoningState;
-    isResume?: boolean;
-    resumeCursor?: string;
     providerAttemptsUsed?: number;
     toolRoundsUsed?: number;
     toolCallsUsed?: number;
@@ -413,9 +396,6 @@ type TurnOrigin =
     | { kind: "user" }
     | { kind: "agent"; agentId: string };
 
-type MutableResumeEffectRecord = {
-    -readonly [Key in keyof ResumeEffectRecord]: ResumeEffectRecord[Key];
-} & Pick<ResumeCheckpointScope, "provider" | "model">;
 
 export interface TurnRunnerOptions {
     store?: TranscriptStore;
@@ -430,7 +410,6 @@ export interface TurnRunnerOptions {
     newId?: (role: "user" | "assistant") => string;
     ledgerCap?: number;
     executionBroker?: LocalExecutionBroker;
-    resolveHostPermission?: ToolLoopOptions["resolveHostPermission"];
     toolExecutor?: ToolCallExecutor;
     tools?: ProviderTool[] | ((agentId: string, signal?: AbortSignal) => ProviderTool[] | Promise<ProviderTool[]>);
     toolDiscoveryNotice?: (agentId: string) => string | undefined;
@@ -439,7 +418,7 @@ export interface TurnRunnerOptions {
         agentId: string,
         attachments: SandSendPromptArgs["attachments"],
         signal?: AbortSignal,
-        extras?: { provider?: string; model?: string; conversationId?: string; retry?: boolean },
+        extras?: { provider?: string; model?: string; conversationId?: string; retry?: boolean; supportsImages?: boolean },
     ) => Promise<ExtractedAttachment[]>;
     resolveTurnContext?: (
         agentId: string,
@@ -480,15 +459,15 @@ import { createHash, randomUUID } from "node:crypto";
 import { isCatalogProvider, type ModelResolution } from "../providers/model-catalog.js";
 import { MODEL_CATALOG } from "../config/models.js";
 import { makeToolCallEntry, occurrenceToolCallId, stableToolCallId, toolCallLocalId, toolCallSummary } from "../execution/tool-card.js";
-import { resolveToolLoopBudget, runToolLoop } from "../execution/tool-loop.js";
-import { BROWSER_TOOL_NAMES, selectTurnProviderTools, WHATSAPP_TOOL_NAME } from "../execution/home-tools.js";
+import { runToolLoop } from "../execution/tool-loop.js";
+import { BROWSER_TOOL_NAMES, selectTurnProviderTools } from "../execution/home-tools.js";
 import { previewFromText } from "./activity.js";
 import { MAX_LIVE_RESPONSE_BYTES, STREAM_PERSIST_INTERVAL_MS, STREAM_PUBLISH_INTERVAL_MS, splitTranscriptFragments, } from "./stream-state.js";
 import { DEFAULT_SYSTEM_PROMPT, resolveAgentInference } from "./identity.js";
 import { MAX_ATTACHMENTS_PER_TURN, formatAttachmentContext } from "./attachments.js";
 import { composeToolExecutors } from "../integrations/shared-tools.js";
-import { buildMemorySystemGuidance, ContextAssembler, CONTEXT_HARD_LIMIT_BYTES, CONVERSATION_COMPACTION_SEQUENCE_INTERVAL, createMemoryForgetTool, createMemoryRememberTool, createMemorySearchTool, executeMemoryForgetTool, executeMemoryRememberTool, executeMemorySearchTool, isContextOverflowError, isExplicitMemoryForgetIntent, isExplicitMemoryIntent, MEMORY_FORGET_TOOL_NAME, MEMORY_REMEMBER_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME, OPENBOT_UNTRUSTED_MEMORY_CONTEXT_BEGIN, OPENBOT_UNTRUSTED_MEMORY_CONTEXT_NOTE, planReflectionJob, shouldCompactConversationContext, } from "../memory/context.js";
-import { providerSupportsImages, providerSupportsReasoning, resolveProviderCapabilities } from "../providers/capabilities.js";
+import { buildMemorySystemGuidance, ContextAssembler, CONTEXT_HARD_LIMIT_BYTES, CONVERSATION_COMPACTION_SEQUENCE_INTERVAL, createMemoryForgetTool, createMemoryRememberTool, createMemorySearchTool, executeMemoryForgetTool, executeMemoryRememberTool, executeMemorySearchTool, isContextOverflowError, isExplicitMemoryForgetIntent, isExplicitMemoryIntent, MEMORY_FORGET_TOOL_NAME, MEMORY_REMEMBER_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME, OPENBOT_UNTRUSTED_MEMORY_CONTEXT_BEGIN, OPENBOT_UNTRUSTED_MEMORY_CONTEXT_NOTE, planReflectionJob, shouldCompactConversationContext, summaryBoundaryBeforeLiteralTail, } from "../memory/context.js";
+import { providerSupportsImages, providerSupportsReasoning } from "../providers/capabilities.js";
 import { sanitizeDisplayFilename } from "../attachments/staging.js";
 import { computeModelContextBudget, classifyProviderMessageTokens, createContextTokenizer, fitProviderMessagesToByteBudget, prepareProviderRound, providerMessagesIdentical, resolveModelCapabilities, selectCompleteMessageGroups, type ModelContextBudget, } from "../memory/model-context.js";
 const DEFAULT_TRANSCRIPT_PAGE_LIMIT = 50;
@@ -497,6 +476,7 @@ const SNAPSHOT_PAGE_LIMIT = 500;
 import { defaultRegistry, streamChat, } from "../providers/router.js";
 import { RpcError, SSE_MAX_FRAME_BYTES } from "../server/gateway.js";
 import { transcriptAgentRef, transcriptUserRef, normalizeTranscriptEntry, } from "../shared/contracts.js";
+import { utf8Prefix } from "../shared/utf8.js";
 /** Implementação em memória do `TranscriptStore` (T10 — persistência mínima). */
 export function createMemoryTranscriptStore(): TranscriptStore {
     const promptQueue = createPromptQueue();
@@ -542,13 +522,7 @@ export function createMemoryTranscriptStore(): TranscriptStore {
         return conversation;
     };
     const turnAttempts = new Map<string, TurnAttemptRecord>();
-    const resumeCheckpoints = new Map<string, ResumeCheckpoint>();
-    const resumeEffects = new Map<string, MutableResumeEffectRecord>();
     const conversationKey = (conversationId?: string): string => conversationId ?? DEFAULT_CONVERSATION;
-    const resumeScopeKey = (scope: ResumeCheckpointScope): string =>
-        `${scope.agentId}\u0000${scope.conversationId}\u0000${scope.turnId}`;
-    const resumeEffectKey = (scope: ResumeCheckpointScope, effectId: string): string =>
-        `${resumeScopeKey(scope)}\u0000${effectId}`;
     const entriesFor = (agentId: string, conversationId?: string, create = false): TranscriptEntry[] => {
         let conversations = byAgent.get(agentId);
         if (conversations === undefined) {
@@ -740,7 +714,7 @@ export function createMemoryTranscriptStore(): TranscriptStore {
             const conversation = conversationFor(agentId, conversationId);
             if (!conversation)
                 throw new Error("conversation não encontrada para o agente");
-            const text = firstUserText.trim();
+            const text = autoConversationTitle(firstUserText);
             if (text && conversation.titleSource === "auto" && ["Nova conversa", "New conversation", "New chat"].includes(conversation.title)) {
                 conversation.title = text;
                 conversation.updatedAtMs = now();
@@ -825,147 +799,6 @@ export function createMemoryTranscriptStore(): TranscriptStore {
             }
             turnAttempts.delete(turnId);
         },
-        createResumeCheckpoint(checkpoint) {
-            const key = resumeScopeKey(checkpoint);
-            if (resumeCheckpoints.has(key))
-                return false;
-            resumeCheckpoints.set(key, structuredClone(checkpoint));
-            return true;
-        },
-        getResumeCheckpoint(scope) {
-            const checkpoint = resumeCheckpoints.get(resumeScopeKey(scope));
-            if (checkpoint === undefined) return undefined;
-            if (checkpoint.provider !== scope.provider || checkpoint.model !== scope.model)
-                return undefined;
-            return structuredClone(checkpoint);
-        },
-        findResumeCheckpoint(agentId, conversationId, turnId) {
-            const checkpoint = resumeCheckpoints.get(resumeScopeKey({ agentId, conversationId, turnId, provider: "", model: "" }));
-            return checkpoint === undefined ? undefined : structuredClone(checkpoint);
-        },
-        advanceResumeCheckpoint(scope, expectedVersion, update) {
-            const checkpoint = resumeCheckpoints.get(resumeScopeKey(scope));
-            if (checkpoint === undefined)
-                throw new Error("resume checkpoint not found");
-            if (checkpoint.version !== expectedVersion || update.safeSequenceId < checkpoint.safeSequenceId)
-                throw new Error("resume checkpoint CAS rejected");
-            const next = { ...checkpoint, ...update, version: checkpoint.version + 1 };
-            resumeCheckpoints.set(resumeScopeKey(scope), next);
-            return structuredClone(next);
-        },
-        prepareResumeEffect(scope, effectId, fingerprintHash) {
-            const key = resumeEffectKey(scope, effectId);
-            const existing = resumeEffects.get(key);
-            if (existing !== undefined) {
-                if (existing.fingerprintHash !== fingerprintHash)
-                    throw new Error("resume effect key reused with different fingerprint");
-                return structuredClone(existing);
-            }
-            const record: MutableResumeEffectRecord = {
-                ...scope,
-                effectId,
-                fingerprintHash,
-                status: "prepared",
-                createdAtMs: now(),
-            };
-            resumeEffects.set(key, record);
-            return structuredClone(record);
-        },
-        markResumeEffectStarted(scope, effectId) {
-            const key = resumeEffectKey(scope, effectId);
-            const existing = resumeEffects.get(key);
-            if (existing === undefined)
-                return undefined;
-            if (existing.status === "prepared") {
-                existing.status = "started";
-                existing.startedAtMs = now();
-            }
-            return structuredClone(existing);
-        },
-        markResumeEffectUnsafe(scope, effectId) {
-            const key = resumeEffectKey(scope, effectId);
-            const existing = resumeEffects.get(key);
-            if (existing === undefined)
-                return undefined;
-            if (existing.status === "prepared" || existing.status === "started")
-                existing.status = "unsafe";
-            return structuredClone(existing);
-        },
-        getResumeEffect(scope, effectId) {
-            const existing = resumeEffects.get(resumeEffectKey(scope, effectId));
-            return existing === undefined ? undefined : structuredClone(existing);
-        },
-        hasUnsafeResumeEffect(scope) {
-            for (const effect of resumeEffects.values()) {
-                if (effect.agentId === scope.agentId &&
-                    effect.conversationId === scope.conversationId &&
-                    effect.turnId === scope.turnId &&
-                    effect.provider === scope.provider &&
-                    effect.model === scope.model &&
-                    effect.status === "unsafe") return true;
-            }
-            return false;
-        },
-        completeResumeEffect(scope, effectId, fingerprintHash, result) {
-            const existing = resumeEffects.get(resumeEffectKey(scope, effectId));
-            if (existing === undefined)
-                throw new Error("resume effect is not claimed");
-            if (existing.fingerprintHash !== fingerprintHash)
-                throw new Error("resume effect fingerprint conflict");
-            if (existing.status === "unsafe")
-                throw new Error("resume effect is unsafe");
-            existing.status = "completed";
-            existing.result = boundedResumeResult(result);
-            existing.completedAtMs = now();
-            return structuredClone(existing);
-        },
-        commitResumeEffectAndCheckpoint(input) {
-            const checkpoint = resumeCheckpoints.get(resumeScopeKey(input.scope));
-            if (checkpoint === undefined)
-                throw new Error("resume checkpoint not found");
-            const effect = resumeEffects.get(resumeEffectKey(input.scope, input.effectId));
-            if (effect === undefined)
-                throw new Error("resume effect is not claimed");
-            if (effect.fingerprintHash !== input.fingerprintHash)
-                throw new Error("resume effect fingerprint conflict");
-            if (effect.status === "unsafe")
-                throw new Error("resume effect is unsafe");
-            if (checkpoint.version !== input.checkpoint.expectedVersion)
-                throw new Error("resume checkpoint CAS rejected");
-            if (input.checkpoint.safeSequenceId < checkpoint.safeSequenceId)
-                throw new Error("resume checkpoint sequence regressed");
-            const completedEffectIds = [...new Set(input.checkpoint.completedEffectIds)];
-            if (!completedEffectIds.includes(input.effectId) || completedEffectIds.length > 128)
-                throw new Error("resume checkpoint effect ledger inválido");
-            const boundedResult = boundedResumeResult(input.result);
-            if (effect.status !== "completed") {
-                effect.status = "completed";
-                effect.result = boundedResult;
-                effect.completedAtMs = now();
-                for (const entry of input.transcriptEntries ?? []) {
-                    const list = entriesFor(input.scope.agentId, input.scope.conversationId, true);
-                    list.push(entry);
-                    indexEntries(input.scope.agentId, input.scope.conversationId, [entry]);
-                }
-            }
-            const next = { ...checkpoint, cursor: input.checkpoint.cursor, safeSequenceId: input.checkpoint.safeSequenceId, completedEffectIds, expiresAtMs: input.checkpoint.expiresAtMs, version: checkpoint.version + 1, budget: input.checkpoint.budget };
-            resumeCheckpoints.set(resumeScopeKey(input.scope), next);
-            return structuredClone(next);
-        },
-        reconcileResumeEffects(agentId, nowMs = now()) {
-            let changed = 0;
-            for (const effect of resumeEffects.values()) {
-                if (effect.agentId === agentId && effect.status === "started") {
-                    effect.status = "unsafe";
-                    changed += 1;
-                }
-            }
-            for (const [key, checkpoint] of resumeCheckpoints) {
-                if (checkpoint.agentId === agentId && checkpoint.expiresAtMs <= nowMs)
-                    resumeCheckpoints.delete(key);
-            }
-            return changed;
-        },
         hasCompletedTurnForNonce(agentId, nonce, conversationId) {
             validateMemoryConversation(agentId, conversationId);
             const resolvedConversationId = conversationKey(conversationId ?? activeConversations.get(agentId));
@@ -989,10 +822,6 @@ export function createMemoryTranscriptStore(): TranscriptStore {
             for (const [turnId, attempt] of turnAttempts)
                 if (attempt.agentId === agentId)
                     turnAttempts.delete(turnId);
-            for (const [key, checkpoint] of resumeCheckpoints)
-                if (checkpoint.agentId === agentId) resumeCheckpoints.delete(key);
-            for (const [key, effect] of resumeEffects)
-                if (effect.agentId === agentId) resumeEffects.delete(key);
             for (const [key, run] of kickstartRuns)
                 if (run.agentId === agentId) kickstartRuns.delete(key);
         },
@@ -1401,9 +1230,22 @@ export const MAX_PROVIDER_TRANSCRIPT_MESSAGES = 80;
 export const MAX_PROVIDER_TEXT_CONTEXT_BYTES = 1024 * 1024;
 /** Bounded operational result for hidden kickstart runs; never transcript text. */
 export const MAX_KICKSTART_RESULT_BYTES = 4 * 1024;
+/** Minimum interval between durable progress writes of a running kickstart. */
+const KICKSTART_PROGRESS_WRITE_MS = 250;
 export const MAX_KICKSTART_NONCE_BYTES = 256;
 export const KICKSTART_PROMPT_VERSION = 1;
 export const KICKSTART_INTERNAL_PROMPT = "Apresente-se brevemente ao usuário, em uma única resposta útil e concisa.";
+/** Context sources without duplicates; recomputed only when new sources arrived, not per streamed chunk. */
+function uniqueContextSources(turn: TurnMetadata): MemoryContextSource[] {
+    const sources = turn.memoryContextSources ?? [];
+    if (turn.memoryContextSourcesUnique?.length !== sources.length) {
+        turn.memoryContextSourcesUnique = {
+            length: sources.length,
+            sources: [...new Map(sources.map((source) => [JSON.stringify(source), source])).values()],
+        };
+    }
+    return turn.memoryContextSourcesUnique.sources;
+}
 function logContextTelemetry(provider: string, model: string, telemetry: ReturnType<typeof prepareProviderRound>["telemetry"]): void {
     if (process.env.NODE_ENV === "test")
         return;
@@ -1413,34 +1255,17 @@ function logContextTelemetry(provider: string, model: string, telemetry: ReturnT
 export const STREAM_UPDATE_MIN_MS = STREAM_PUBLISH_INTERVAL_MS;
 /** Avoid turning periodic full repair snapshots into another O(n²) stream. */
 const STREAM_SNAPSHOT_MIN_FRAGMENTS = 32;
-const utf8Prefix = (text: string, maxBytes: number): string => {
-    if (maxBytes <= 0)
-        return "";
-    let bytes = 0;
-    let result = "";
-    for (const character of text) {
-        const size = Buffer.byteLength(character, "utf8");
-        if (bytes + size > maxBytes)
-            break;
-        result += character;
-        bytes += size;
-    }
-    return result;
-};
-function fitProviderMessagesToBudget(messages: readonly ProviderChatMessage[], maxBytes: number): ProviderChatMessage[] {
-    return fitProviderMessagesToByteBudget(messages, maxBytes);
-}
 function fitProviderMessagesWithAnchor(messages: readonly ProviderChatMessage[], anchorContent: string | undefined, maxBytes: number, maxMessages: number): ProviderContextResult {
     if (!anchorContent) {
         const candidates = messages.slice(-maxMessages);
-        const fitted = fitProviderMessagesToBudget(candidates, maxBytes);
+        const fitted = fitProviderMessagesToByteBudget(candidates, maxBytes);
         return { messages: fitted, truncated: fitted.length < messages.length };
     }
     let initialCandidates = messages.slice(-maxMessages);
     while (initialCandidates[0]?.role === "assistant")
         initialCandidates = initialCandidates.slice(1);
     const carriesAnchor = (message: ProviderChatMessage): boolean => message.role === "user" && typeof message.content === "string" && (message.content === anchorContent || message.content.startsWith(`${anchorContent}\n\n`));
-    const initiallyFitted = fitProviderMessagesToBudget(initialCandidates, maxBytes);
+    const initiallyFitted = fitProviderMessagesToByteBudget(initialCandidates, maxBytes);
     if (initiallyFitted.some(carriesAnchor)) {
         return { messages: initiallyFitted, truncated: initialCandidates.length < messages.length || initiallyFitted.length < initialCandidates.length };
     }
@@ -1459,7 +1284,7 @@ function fitProviderMessagesWithAnchor(messages: readonly ProviderChatMessage[],
     while (candidates[0]?.role === "assistant")
         candidates = candidates.slice(1);
     const anchorBytes = Buffer.byteLength(JSON.stringify([anchor]), "utf8");
-    const fittedTail = fitProviderMessagesToBudget(candidates, Math.max(256, maxBytes - anchorBytes - 1));
+    const fittedTail = fitProviderMessagesToByteBudget(candidates, Math.max(256, maxBytes - anchorBytes - 1));
     const anchored = fitProviderMessagesToByteBudget([anchor, ...fittedTail], maxBytes);
     return {
         messages: anchored,
@@ -1482,24 +1307,22 @@ function transcriptSnapshot(agentId: string, entries: readonly TranscriptEntry[]
     if (frameBytes(complete) <= SSE_MAX_FRAME_BYTES)
         return complete;
     // Preserve the newest complete entries and let the client use the existing
-    // paginated `openAgentTail` RPC for the omitted history.
-    const selected: TranscriptEntry[] = [];
+    // paginated `openAgentTail` RPC for the omitted history. The frame with k
+    // entries is the empty frame plus each entry's JSON plus k - 1 commas, so
+    // each entry is serialized once instead of re-serializing every candidate.
+    let frameTotal = frameBytes({ ...base, entries: [], truncated: true, resyncRequired: true, method: "openAgentTail" });
+    const newestFirst: TranscriptEntry[] = [];
     for (let index = entries.length - 1; index >= 0; index -= 1) {
         const entry = entries[index];
         if (entry === undefined)
             continue;
-        const candidate = [entry, ...selected];
-        const partial: TranscriptSnapshotPayload = {
-            ...base,
-            entries: candidate,
-            truncated: true,
-            resyncRequired: true,
-            method: "openAgentTail",
-        };
-        if (frameBytes(partial) > SSE_MAX_FRAME_BYTES)
+        const entryBytes = Buffer.byteLength(JSON.stringify(entry), "utf8") + (newestFirst.length > 0 ? 1 : 0);
+        if (frameTotal + entryBytes > SSE_MAX_FRAME_BYTES)
             break;
-        selected.splice(0, selected.length, ...candidate);
+        frameTotal += entryBytes;
+        newestFirst.push(entry);
     }
+    const selected = newestFirst.reverse();
     const bounded: TranscriptSnapshotPayload = {
         ...base,
         entries: selected,
@@ -1586,7 +1409,6 @@ export class TurnRunner {
     private readonly newIdFn: (role: "user" | "assistant") => string;
     private readonly ledgerCap: number;
     private readonly executionBroker?: LocalExecutionBroker;
-    private readonly resolveHostPermission?: ToolLoopOptions["resolveHostPermission"];
     private readonly toolExecutor?: ToolCallExecutor;
     private readonly tools?: ProviderTool[] | ((agentId: string, signal?: AbortSignal) => ProviderTool[] | Promise<ProviderTool[]>);
     private readonly toolDiscoveryNoticeFn?: (agentId: string) => string | undefined;
@@ -1601,7 +1423,8 @@ export class TurnRunner {
     private readonly liveAssistant = new Map<string, LiveAssistantState>();
     /** Independent ordered namespaces: one stable default stream plus one per live entry. */
     private readonly transcriptOrderByKey = new Map<string, { epoch: string; sequence: number }>();
-    private transcriptSnapshotDeferDepth = 0;
+    /** Per agent: one agent's long turn must not hold back another agent's snapshots. */
+    private readonly transcriptSnapshotDeferDepth = new Map<string, number>();
     private readonly deferredTranscriptSnapshots = new Map<string, { agentId: string; conversationId?: string }>();
     /** P2.4: independent ordered namespace for sanitized reasoning progress (never persisted). */
     private readonly reasoningOrderByKey = new Map<string, { epoch: string; sequence: number }>();
@@ -1615,7 +1438,6 @@ export class TurnRunner {
     private readonly kickstartQueued = new Map<string, Set<string>>();
     private readonly kickstartActive = new Set<string>();
     private readonly kickstartActiveNonce = new Map<string, string>();
-    private readonly resumeTurns = new Set<string>();
     private readonly fencedAgents = new Map<string, number>();
     private runningTurns = 0;
     private shuttingDown = false;
@@ -1626,13 +1448,12 @@ export class TurnRunner {
         this.admission = opts.admission;
         this.systemPromptFn = opts.systemPrompt ?? (() => DEFAULT_SYSTEM_PROMPT);
         this.resolveProviderFn = opts.resolveProvider ?? (opts.config
-            ? (agentId) => resolveAgentInference(opts.config!.snapshot(), agentId)
+            ? (agentId) => resolveAgentInference(opts.config!.view(), agentId)
             : defaultResolveProvider);
         this.nowFn = opts.now ?? (() => Date.now());
         this.newIdFn = opts.newId ?? ((role) => `${role}:${randomUUID()}`);
         this.ledgerCap = opts.ledgerCap ?? DEFAULT_LEDGER_CAP;
         this.executionBroker = opts.executionBroker;
-        this.resolveHostPermission = opts.resolveHostPermission;
         this.toolExecutor = opts.toolExecutor;
         this.tools = opts.tools;
         this.toolDiscoveryNoticeFn = opts.toolDiscoveryNotice;
@@ -1675,8 +1496,13 @@ export class TurnRunner {
         // bot carries a large base64 avatar).
         const name = typeof this.config?.agentName === "function"
             ? this.config.agentName(agentId)
-            : this.config?.snapshot().agents.find((entry) => entry.id === agentId)?.name;
+            : this.config?.agentName(agentId);
         return transcriptAgentRef(agentId, name);
+    }
+    /** Normalizes an entry with this agent's name and the local user's author identity. */
+    private normalizeForTranscript(agentId: string, entry: TranscriptEntry): TranscriptEntry {
+        const author = this.humanAuthor();
+        return normalizeTranscriptEntry(entry, { agentName: this.agentPeer(agentId).name, userName: author.name, userAuthId: author.authId });
     }
     humanAuthor() {
         const configLike = this.config;
@@ -1685,7 +1511,7 @@ export class TurnRunner {
                 name: configLike.profileName(),
                 machineId: configLike.profileMachineId(),
             }
-            : this.config?.snapshot().profile;
+            : this.config?.view().profile;
         return transcriptUserRef(profile?.name, profile?.machineId);
     }
     private memoryStore(): TranscriptMemoryStore | undefined {
@@ -1729,8 +1555,23 @@ export class TurnRunner {
         if (plan === null)
             return;
         const memoryBoundary = memoryStore.getLatestCompletedJobBoundary(agentId, conversationId, "memory") ?? -1;
-        const effectiveSummaryRequested = plan.summaryRequested && throughSequenceId > summaryBoundary;
-        const effectiveMemoryRequested = plan.memoryRequested && throughSequenceId > memoryBoundary;
+        // A compaction summary stops before the last few messages, which stay
+        // verbatim in the recent window. Under context pressure with nothing
+        // older than that tail, everything is summarized as before.
+        let jobThrough = throughSequenceId;
+        let summaryWanted = plan.summaryRequested && throughSequenceId > summaryBoundary;
+        if (summaryWanted && transcript.getEntriesWithSequenceByRange !== undefined) {
+            const tailBoundary = summaryBoundaryBeforeLiteralTail(transcript.getEntriesWithSequenceByRange(agentId, summaryBoundary + 1, throughSequenceId, conversationId));
+            if (tailBoundary !== undefined && tailBoundary > summaryBoundary)
+                jobThrough = tailBoundary;
+            else if (!contextPressure)
+                summaryWanted = false;
+        }
+        const effectiveSummaryRequested = summaryWanted;
+        // Messages in the verbatim tail reach memory through the next job.
+        const effectiveMemoryRequested = plan.memoryRequested && (effectiveSummaryRequested ? jobThrough : throughSequenceId) > memoryBoundary;
+        if (!effectiveSummaryRequested)
+            jobThrough = throughSequenceId;
         if (!effectiveSummaryRequested && !effectiveMemoryRequested)
             return;
         const starts = [];
@@ -1745,7 +1586,7 @@ export class TurnRunner {
             provider,
             model,
             fromSequenceId,
-            throughSequenceId,
+            throughSequenceId: jobThrough,
             summaryRequested: effectiveSummaryRequested,
             memoryRequested: effectiveMemoryRequested,
             reasoningEffort,
@@ -1794,7 +1635,7 @@ export class TurnRunner {
     recoverQueuedPrompts(): void {
         for (const item of this.store.promptQueue?.list() ?? []) {
             const { args } = item;
-            if (this.config && !this.config.snapshot().agents.some(agent => agent.id === args.agentId)) {
+            if (this.config && !this.config.hasAgent(args.agentId)) {
                 this.store.promptQueue!.transition(args.agentId, args.conversationId!, args.clientNonce!, "queued", "cancelled");
                 continue;
             }
@@ -1900,7 +1741,7 @@ export class TurnRunner {
         if (!conversationId || !clientNonce || !originalNonce || clientNonce === originalNonce) throw new RpcError(400, "Identidade da revisão incompleta.");
         this.validateAcceptanceConversation(agentId, conversationId);
         if (this.shuttingDown || this.fencedAgents.has(agentId)) throw new RpcError(409, "O bot está em encerramento.");
-        if (this.config && !this.config.snapshot().agents.some(agent => agent.id === agentId)) throw new RpcError(404, "Bot não encontrado.");
+        if (this.config && !this.config.hasAgent(agentId)) throw new RpcError(404, "Bot não encontrado.");
         const queue = this.store.promptQueue;
         if (!queue) throw new RpcError(503, "Fila durável indisponível.");
         const existing = queue.get(agentId, conversationId, clientNonce);
@@ -1948,7 +1789,7 @@ export class TurnRunner {
             throw new RpcError(400, "kickstartAgent: exige agentId, clientNonce e mode=onboarding");
         if (this.shuttingDown) throw new RpcError(503, "kickstartAgent: servidor em encerramento");
         if (this.fencedAgents.has(agentId)) throw new RpcError(409, "kickstartAgent: agente em exclusão");
-        if (this.config && !this.config.snapshot().agents.some((entry) => entry.id === agentId))
+        if (this.config && !this.config.hasAgent(agentId))
             throw new RpcError(400, "kickstartAgent: agente não encontrado");
         if (this.store.getKickstartRun === undefined || this.store.claimKickstartRun === undefined || this.store.updateKickstartRun === undefined)
             throw new RpcError(503, "kickstartAgent: store sem suporte durável");
@@ -1986,7 +1827,7 @@ export class TurnRunner {
             clientNonce,
             ...(conversationId === undefined ? {} : { conversationId }),
             origin: "kickstart",
-            version: 1,
+            version: KICKSTART_PROMPT_VERSION,
             provider: inference.provider,
             model: inference.model,
         });
@@ -2030,10 +1871,21 @@ export class TurnRunner {
         this.store.updateKickstartRun?.(agentId, clientNonce, { status: "running", turnId, provider: inference.provider, model: inference.model });
         let observableOutput = false;
         let output = "";
+        let persistedOutput: string | undefined;
+        let persistedAtMs = 0;
         const appendOutput = (value: unknown) => {
             if (typeof value !== "string" || value.length === 0) return;
+            const first = !observableOutput;
             observableOutput = true;
-            output = utf8Prefix(output + value, MAX_KICKSTART_RESULT_BYTES);
+            if (Buffer.byteLength(output, "utf8") < MAX_KICKSTART_RESULT_BYTES)
+                output = utf8Prefix(output + value, MAX_KICKSTART_RESULT_BYTES);
+            // The first output is persisted at once (restart semantics depend on it);
+            // later progress is throttled and skipped once the capped text stops
+            // changing. Every terminal update below persists the final text.
+            const now = this.nowFn();
+            if (!first && (output === persistedOutput || now - persistedAtMs < KICKSTART_PROGRESS_WRITE_MS)) return;
+            persistedOutput = output;
+            persistedAtMs = now;
             this.store.updateKickstartRun?.(agentId, clientNonce, { observableOutput: true, result: { text: output } });
         };
         try {
@@ -2127,23 +1979,28 @@ export class TurnRunner {
      * Defers terminal-state snapshots while a batch is in flight so a round with
      * several tool completions emits one resync frame instead of one per tool.
      */
-    private deferTranscriptSnapshots(): void {
-        this.transcriptSnapshotDeferDepth += 1;
+    private deferTranscriptSnapshots(agentId: string): void {
+        this.transcriptSnapshotDeferDepth.set(agentId, (this.transcriptSnapshotDeferDepth.get(agentId) ?? 0) + 1);
     }
-    private flushTranscriptSnapshots(): void {
-        this.transcriptSnapshotDeferDepth -= 1;
-        if (this.transcriptSnapshotDeferDepth > 0) return;
-        const pending = [...this.deferredTranscriptSnapshots.values()];
-        this.deferredTranscriptSnapshots.clear();
-        for (const item of pending)
+    private flushTranscriptSnapshots(agentId: string): void {
+        const depth = (this.transcriptSnapshotDeferDepth.get(agentId) ?? 1) - 1;
+        if (depth > 0) {
+            this.transcriptSnapshotDeferDepth.set(agentId, depth);
+            return;
+        }
+        this.transcriptSnapshotDeferDepth.delete(agentId);
+        for (const [key, item] of this.deferredTranscriptSnapshots) {
+            if (item.agentId !== agentId) continue;
+            this.deferredTranscriptSnapshots.delete(key);
             this.publishTranscriptSnapshot(item.agentId, item.conversationId);
+        }
     }
     private publishOrDeferTranscriptSnapshot(agentId: string, conversationId?: string): void {
-        if (this.transcriptSnapshotDeferDepth === 0) {
+        if (!this.transcriptSnapshotDeferDepth.has(agentId)) {
             this.publishTranscriptSnapshot(agentId, conversationId);
             return;
         }
-        this.deferredTranscriptSnapshots.set(`${agentId}${conversationId ?? ""}`, { agentId, conversationId });
+        this.deferredTranscriptSnapshots.set(JSON.stringify([agentId, conversationId ?? null]), { agentId, conversationId });
     }
     publishTranscriptSnapshot(agentId: string, conversationId?: string): void {
         const page = this.store.openDurableAgentTail !== undefined
@@ -2235,7 +2092,7 @@ export class TurnRunner {
         if (this.fencedAgents.has(agentId)) {
             throw new RpcError(409, "sendPrompt: agente em exclusão");
         }
-        if (this.config && !this.config.snapshot().agents.some((entry) => entry.id === agentId)) {
+        if (this.config && !this.config.hasAgent(agentId)) {
             throw new RpcError(400, "sendPrompt: agente não encontrado");
         }
         if (clientNonce !== undefined && this.conversationStore !== undefined) {
@@ -2272,7 +2129,12 @@ export class TurnRunner {
         const catalog = this.config?.modelCatalog;
         if (catalog && isCatalogProvider(inference.provider) && !inference.modelResolution) {
             const generation = this.agentGenerations.get(agentId) ?? 0;
-            const preparation = (inference.serviceTier === "priority" ? catalog.get(inference.provider) : catalog.synchronize(inference.provider)).then(() => {
+            // Fast needs the saved catalog to confirm the tier; only an unconfirmed
+            // model pays for a discovery (for OpenAI that spawns the Codex app-server).
+            const provider = inference.provider;
+            const preparation = catalog.synchronize(provider).then(async () => {
+                if (inference.serviceTier === "priority" && !catalog.hasServiceTier(provider, inference.model, "priority")) await catalog.get(provider);
+            }).then(() => {
                 if ((this.agentGenerations.get(agentId) ?? 0) !== generation) throw new RpcError(409, "Envio cancelado durante a validação do modelo");
                 return this.acceptPrompt(pinnedArgs, {
                     ...inference, modelResolution: catalog.resolve(inference.provider, inference.model, inference.reasoningEffort, inference.serviceTier),
@@ -2449,7 +2311,8 @@ export class TurnRunner {
      */
     private assessFailureRecovery(agentId: string, requestedConversationId?: string): FailureRecoveryAssessment {
         const inspectCandidate = (candidate: string | undefined): FailureCandidate | undefined => {
-            const scoped = this.store.getEntries(agentId, candidate);
+            // Avoid reading whole conversations: the store returns only the suffix recovery inspects.
+            const scoped = this.store.getRetryableFailureWindow?.(agentId, candidate) ?? this.store.getEntries(agentId, candidate);
             const found = [...scoped].reverse().find((entry) => (entry.kind === "notice" &&
                 entry.level === "error" &&
                 entry.retryable === true &&
@@ -2530,243 +2393,6 @@ export class TurnRunner {
             return { kind: "none", reason: "origin", candidate };
         return { kind: "retry", candidate: { ...candidate, user } };
     }
-    resumePrompt(agentId: string, turnId: string, requestedConversationId?: string): { accepted: true } {
-        if (typeof agentId !== "string" || agentId.trim().length === 0 || typeof turnId !== "string" || turnId.trim().length === 0)
-            throw new RpcError(400, "resumePrompt: agentId e turnId são obrigatórios");
-        if (this.shuttingDown)
-            throw new RpcError(503, "resumePrompt: servidor em encerramento");
-        if (this.fencedAgents.has(agentId))
-            throw new RpcError(409, "resumePrompt: agente em exclusão");
-        if (this.config && !this.config.snapshot().agents.some((entry) => entry.id === agentId))
-            throw new RpcError(400, "resumePrompt: agente não encontrado");
-        if (typeof this.store.getResumeCheckpoint !== "function")
-            throw new RpcError(409, "resumePrompt: store sem suporte a checkpoint");
-        const conversationId = this.resolveConversation(agentId, requestedConversationId, true);
-        if (conversationId === undefined)
-            throw new RpcError(409, "resumePrompt: conversa persistida obrigatória");
-        const entries = this.store.getEntries(agentId, conversationId);
-        const user = [...entries].reverse().find((entry): entry is Extract<TranscriptEntry, { kind: "message" }> =>
-            entry.kind === "message" && entry.role === "user" && entry.turnId === turnId,
-        );
-        const selected = this.store.findResumeCheckpoint?.(agentId, conversationId, turnId)
-            ?? (user?.kind === "message" && user.provider !== undefined && user.model !== undefined
-                ? this.store.getResumeCheckpoint({ agentId, conversationId, turnId, provider: user.provider, model: user.model })
-                : undefined);
-        if (selected === undefined)
-            return this.finishResumeFailure(agentId, conversationId, turnId, "missing_cursor", "Nenhum checkpoint resumível foi encontrado.");
-        if (user?.kind === "message" && ((user.provider !== undefined && user.provider !== selected.provider) || (user.model !== undefined && user.model !== selected.model)))
-            return this.finishResumeFailure(agentId, conversationId, turnId, "foreign_checkpoint", "O checkpoint pertence a outro provider/modelo.");
-        const completed = entries.some((entry) => entry.kind === "message" && entry.role === "assistant" && entry.turnId === turnId && entry.completionState !== "interrupted" && entry.streaming !== true);
-        if (completed)
-            return this.finishResumeFailure(agentId, conversationId, turnId, "resume_aborted", "O turno já foi concluído; nenhum replay foi executado.");
-        const selectedScope: ResumeCheckpointScope = {
-            agentId,
-            conversationId,
-            turnId,
-            provider: selected.provider,
-            model: selected.model,
-        };
-        if (this.resumeTurns.has(`${agentId}\u0000${conversationId}\u0000${turnId}`)) return { accepted: true };
-        try {
-            assertCheckpointUsable(selected, selectedScope, this.nowFn());
-        }
-        catch (error) {
-            const code = error instanceof ResumeProtocolError && error.code === "invalid_cursor"
-                ? "invalid_cursor"
-                : error instanceof ResumeProtocolError && error.code === "expired_checkpoint"
-                    ? "expired_checkpoint"
-                    : "foreign_checkpoint";
-            return this.finishResumeFailure(agentId, conversationId, turnId, code, code === "expired_checkpoint" ? "O checkpoint de resume expirou." : "O checkpoint de resume não é válido para este turno.");
-        }
-        if (typeof this.store.hasUnsafeResumeEffect !== "function" || this.store.hasUnsafeResumeEffect(selectedScope))
-            return this.finishResumeFailure(agentId, conversationId, turnId, "unsafe_effect", "O turno possui um efeito sem resultado durável; nenhum replay foi executado.");
-        if (this.resumeBudgetExhausted(selected.budget))
-            return this.finishResumeFailure(agentId, conversationId, turnId, "resume_budget_exhausted", "O budget original do turno foi consumido.");
-        this.resumeTurns.add(`${agentId}\u0000${conversationId}\u0000${turnId}`);
-        this.pendingCounts.set(agentId, (this.pendingCounts.get(agentId) ?? 0) + 1);
-        const generation = this.agentGenerations.get(agentId) ?? 0;
-        this.enqueue(agentId, async () => {
-            try {
-                if (this.shuttingDown || this.fencedAgents.has(agentId) || (this.agentGenerations.get(agentId) ?? 0) !== generation) {
-                    this.finishResumeFailure(agentId, conversationId, turnId, "resume_aborted", "O resume foi cancelado porque o agente foi isolado.");
-                    return;
-                }
-                await this.runResumeTurn(agentId, conversationId, selected, user?.content ?? "");
-            }
-            finally {
-                this.resumeTurns.delete(`${agentId}\u0000${conversationId}\u0000${turnId}`);
-                const next = (this.pendingCounts.get(agentId) ?? 1) - 1;
-                if (next <= 0) this.pendingCounts.delete(agentId);
-                else this.pendingCounts.set(agentId, next);
-            }
-        }, undefined, conversationId);
-        return { accepted: true };
-    }
-    private finishResumeFailure(
-        agentId: string,
-        conversationId: string,
-        turnId: string,
-        code: string,
-        text: string,
-    ): { accepted: true } {
-        this.closeOpenToolCalls(agentId, { ok: false, code: "aborted", message: text }, conversationId);
-        const id = `notice:${turnId}:resume-${code}`;
-        if (!this.store.getEntries(agentId, conversationId).some((entry) => entry.kind === "notice" && entry.id === id)) {
-            this.appendAndPublish(agentId, [{ kind: "notice", id, type: "restart-interrupted", text, level: "error", retryable: false, turnId }], conversationId);
-        }
-        return { accepted: true };
-    }
-    private async runResumeTurn(
-        agentId: string,
-        conversationId: string,
-        checkpoint: ResumeCheckpoint,
-        prompt: string,
-    ): Promise<void> {
-        const controller = new AbortController();
-        const streamController = new AbortController();
-        const abort = () => streamController.abort(controller.signal.reason);
-        controller.signal.addEventListener("abort", abort, { once: true });
-        let resumeOutcome: "success" | "error" | "aborted" = "error";
-        this.turnControllers.set(agentId, controller);
-        this.runningTurns += 1;
-        const turnEntries = this.store.getEntries(agentId, conversationId);
-        const turnUser = turnEntries.find(
-            (entry): entry is Extract<TranscriptEntry, { kind: "message" }> =>
-                entry.kind === "message" && entry.role === "user" && entry.turnId === checkpoint.turnId,
-        );
-        const resumeStartedAtMs = this.nowFn();
-        const turn: TurnMetadata = {
-            turnId: checkpoint.turnId,
-            conversationId,
-            provider: checkpoint.provider,
-            model: checkpoint.model,
-            modelResolution: turnUser?.modelResolution,
-            reasoningEffort: [...turnEntries].reverse().find(
-                (entry): entry is Extract<TranscriptEntry, { kind: "message" }> =>
-                    entry.kind === "message" && entry.turnId === checkpoint.turnId && entry.reasoningEffort !== undefined,
-            )?.reasoningEffort ?? this.resolveProviderFn(agentId, { agentId, prompt }).reasoningEffort,
-            phase: "provider-pending",
-            execution: { phase: "awaiting-slot", startedAtMs: resumeStartedAtMs, phaseChangedAtMs: resumeStartedAtMs },
-            isResume: true,
-            clientNonce: turnUser?.clientNonce,
-        };
-        this.currentTurns.set(agentId, { turnId: turn.turnId, conversationId, execution: turn.execution });
-        this.lastTurns.delete(agentId);
-        const partial = [...turnEntries].reverse().find((entry) => entry.kind === "message" && entry.role === "assistant" && entry.turnId === checkpoint.turnId && entry.completionState === "interrupted");
-        if (partial?.kind === "message") {
-            this.liveAssistant.set(agentId, {
-                id: partial.id,
-                content: partial.content,
-                byteCount: Buffer.byteLength(partial.content, "utf8"),
-                lastPublishMs: this.nowFn(),
-                lastPersistMs: this.nowFn(),
-                limited: false,
-                replicaKey: `transcript:${agentId}`,
-                epoch: randomUUID(),
-                sequence: 0,
-                lastSnapshotSequence: 0,
-            });
-        }
-        turn.streamController = streamController;
-        try {
-            const selectedScope = { agentId, conversationId, turnId: checkpoint.turnId, provider: checkpoint.provider, model: checkpoint.model };
-            let liveCheckpoint = this.store.findResumeCheckpoint?.(agentId, conversationId, checkpoint.turnId)
-                ?? this.store.getResumeCheckpoint?.(selectedScope)
-                ?? checkpoint;
-            try {
-                assertCheckpointUsable(liveCheckpoint, selectedScope, this.nowFn());
-            }
-            catch (error) {
-                const code = error instanceof ResumeProtocolError && error.code === "expired_checkpoint"
-                    ? "expired_checkpoint"
-                    : error instanceof ResumeProtocolError && error.code === "invalid_cursor"
-                        ? "invalid_cursor"
-                        : "foreign_checkpoint";
-                this.finishResumeFailure(agentId, conversationId, checkpoint.turnId, code, code === "expired_checkpoint" ? "O checkpoint de resume expirou." : "O checkpoint de resume não é válido para este turno.");
-                return;
-            }
-            if (typeof this.store.hasUnsafeResumeEffect !== "function" || this.store.hasUnsafeResumeEffect(selectedScope)) {
-                this.finishResumeFailure(agentId, conversationId, checkpoint.turnId, "unsafe_effect", "O turno possui um efeito sem resultado durável; nenhum replay foi executado.");
-                return;
-            }
-            if (this.resumeBudgetExhausted(liveCheckpoint.budget)) {
-                this.finishResumeFailure(agentId, conversationId, checkpoint.turnId, "resume_budget_exhausted", "O budget original do turno foi consumido.");
-                return;
-            }
-            this.setExecutionPhase(agentId, turn, "awaiting-slot");
-            const context = this.toProviderMessages(agentId, prompt, "", undefined, liveCheckpoint.turnId, conversationId, "", undefined, 1, liveCheckpoint.model, liveCheckpoint.provider, [], undefined, turn.modelResolution);
-            // Reserve the recovery attempt with a CAS before entering the
-            // provider. A failed/aborted resume therefore consumes its durable
-            // allowance and cannot be retried forever after a process restart.
-            const reserved = this.reserveResumeAttempt(selectedScope, liveCheckpoint);
-            if (reserved === undefined) {
-                const latest = this.store.findResumeCheckpoint?.(agentId, conversationId, checkpoint.turnId)
-                    ?? this.store.getResumeCheckpoint?.(selectedScope);
-                this.finishResumeFailure(
-                    agentId,
-                    conversationId,
-                    checkpoint.turnId,
-                    latest !== undefined && this.resumeBudgetExhausted(latest.budget) ? "resume_budget_exhausted" : "resume_aborted",
-                    latest !== undefined && this.resumeBudgetExhausted(latest.budget)
-                        ? "O budget de recuperação do turno foi consumido."
-                        : "Não foi possível reservar o budget de recuperação com segurança.",
-                );
-                return;
-            }
-            liveCheckpoint = reserved;
-            const result = await streamChat(liveCheckpoint.provider, {
-                model: liveCheckpoint.model,
-                modelResolution: turn.modelResolution,
-                purpose: "resume",
-                sessionId: createHash("sha256").update(JSON.stringify([agentId, conversationId ?? "legacy"])).digest("hex"),
-                system: this.systemPromptFn(agentId),
-                messages: context.messages,
-                maxTokens: resolveModelCapabilities(turn.modelResolution?.entry ?? liveCheckpoint.model, liveCheckpoint.provider).maxOutputTokens,
-                reasoningEffort: turn.reasoningEffort,
-                signal: streamController.signal,
-                resume: { cursor: liveCheckpoint.cursor },
-            }, (event) => {
-                if (event.type === "tool-call") {
-                    this.finishResumeFailure(agentId, conversationId, liveCheckpoint.turnId, "unsafe_effect", "Resume não executa tools; o turno permanece sem replay.");
-                    streamController.abort();
-                    return;
-                }
-                this.onStreamEvent(agentId, event, turn, false);
-            }, {
-                registry: this.registry,
-                admission: this.admission,
-                agentId,
-                onAdmissionWait: (waiting: boolean) => this.setExecutionPhase(agentId, turn, waiting ? "awaiting-slot" : "awaiting-provider"),
-                onTransportStart: () => {
-                    this.setExecutionPhase(agentId, turn, "awaiting-provider");
-                    this.noteTurnActivity(turn, "provider-request");
-                },
-            });
-            if (result.error !== undefined || result.aborted) {
-                resumeOutcome = result.aborted ? "aborted" : "error";
-                this.finalizeAssistant(agentId, this.liveAssistant.get(agentId)?.content, { keepPartial: true }, turn);
-                this.finishResumeFailure(agentId, conversationId, checkpoint.turnId, result.error?.code ?? "resume_aborted", "O resume foi interrompido sem replay.");
-                return;
-            }
-            resumeOutcome = "success";
-        }
-        catch {
-            resumeOutcome = "error";
-            this.finishResumeFailure(agentId, conversationId, checkpoint.turnId, "resume_aborted", "O resume foi interrompido sem replay.");
-        }
-        finally {
-            controller.signal.removeEventListener("abort", abort);
-            this.turnControllers.delete(agentId);
-            this.currentTurns.delete(agentId);
-            this.lastTurns.set(agentId, {
-                turnId: checkpoint.turnId,
-                conversationId,
-                outcome: controller.signal.aborted ? "aborted" : resumeOutcome,
-                finishedAtMs: this.nowFn(),
-            });
-            this.runningTurns = Math.max(0, this.runningTurns - 1);
-        }
-    }
     /** Bloqueia novos turnos durante uma operação de exclusão do agente. */
     fenceAgents(agentIds: readonly string[]): void {
         for (const agentId of agentIds) {
@@ -2806,10 +2432,9 @@ export class TurnRunner {
                 continue;
             this.agentGenerations.delete(agentId);
             this.liveAssistant.delete(agentId);
-            for (const key of this.transcriptOrderByKey.keys()) {
-                if (key === `transcript:${agentId}` || key.startsWith(`transcript:${agentId}:entry:`))
-                    this.transcriptOrderByKey.delete(key);
-            }
+            this.lastTurns.delete(agentId);
+            this.reasoningOrderByKey.delete(agentId);
+            this.transcriptOrderByKey.delete(`transcript:${agentId}`);
         }
     }
     validateAcceptanceConversation(agentId: string, conversationId: string): void {
@@ -2877,7 +2502,7 @@ export class TurnRunner {
         return this.promptOutcome(agentId, nonce, conversationId) !== undefined;
     }
     findAgentIdByNonce(nonce: string): string | undefined {
-        const ids = this.config?.snapshot().agents.map((entry) => entry.id) ?? [];
+        const ids = this.config?.agentIds() ?? [];
         if (!ids.includes("openbot-default"))
             ids.push("openbot-default");
         const matches = ids.filter((id) => ((this.store.findAcceptedNonceConversations?.(id, nonce).length ??
@@ -2970,13 +2595,19 @@ export class TurnRunner {
         if (agentId !== undefined) {
             const isBusy = (this.pendingCounts.get(agentId) ?? 0) > 0 || this.turnControllers.has(agentId) || this.preparingCatalog.has(agentId);
             const cancelRequested = this.turnControllers.get(agentId)?.signal.aborted === true;
+            // Queued and interrupted prompts usually share a few conversations; look each up once.
+            const conversations = new Map<string, Conversation | null>();
+            const conversation = (id: string) => {
+                if (!conversations.has(id)) conversations.set(id, this.conversationById(agentId, id));
+                return conversations.get(id)!;
+            };
             const describe = (args: SandSendPromptArgs) => ({ clientNonce: args.clientNonce!, conversationId: args.conversationId!,
-                conversationTitle: this.conversationById(agentId, args.conversationId!)?.title.slice(0, 100) ?? "Conversa indisponível", preview: args.prompt.slice(0, 160) });
+                conversationTitle: conversation(args.conversationId!)?.title.slice(0, 100) ?? "Conversa indisponível", preview: args.prompt.slice(0, 160) });
             const interrupted = this.store.promptQueue?.list(agentId, "interrupted", 101) ?? [];
             return { isBusy, canCancel: isBusy && !cancelRequested, agentId, ...this.liveStatus(agentId),
                 ...(cancelRequested ? { cancelRequested: true as const } : {}),
                 queued: this.store.promptQueue?.list(agentId).map(item => describe(item.args)) ?? [],
-                recoverable: interrupted.slice(0, 100).map(item => ({ ...describe(item.args), canReview: !item.compacted && (!this.conversationStore || this.conversationById(agentId, item.args.conversationId!)?.archivedAtMs === null) &&
+                recoverable: interrupted.slice(0, 100).map(item => ({ ...describe(item.args), canReview: !item.compacted && (!this.conversationStore || conversation(item.args.conversationId!)?.archivedAtMs === null) &&
                     !(this.store.findUserEchoByNonce ? this.store.findUserEchoByNonce(agentId, item.args.clientNonce!, item.args.conversationId)
                         : this.store.getEntries(agentId, item.args.conversationId).find(entry => entry.kind === "message" && entry.role === "user" && entry.clientNonce === item.args.clientNonce)) })),
                 recoverableTruncated: interrupted.length > 100 };
@@ -3036,12 +2667,19 @@ export class TurnRunner {
             // 1) snapshot no início (reset — contrato transcript, mapa-frontend §3.3)
             this.publishTranscriptSnapshot(agentId, conversationId);
             const isRetry = args.retryFailureTurnId !== undefined;
+            // P2.3 image gate: an image attachment is only acceptable when the exact
+            // provider/model declares image support (the live catalog first, then
+            // the static matrix). The reader and the gate below use the same answer.
+            const declaredImages = inference.provider && inference.model
+                ? (inference.modelResolution?.capabilities.images ?? providerSupportsImages(inference.provider, inference.model))
+                : false;
             const extracted = this.readAttachmentsFn
                 ? await this.readAttachmentsFn(agentId, attachments, controller.signal, {
                     provider: inference.provider,
                     model: inference.model,
                     conversationId,
                     retry: isRetry,
+                    supportsImages: declaredImages,
                 })
                 : [];
             if (controller.signal.aborted)
@@ -3053,13 +2691,9 @@ export class TurnRunner {
             if (unavailable.length > 0) {
                 throw new Error(`Anexos indisponíveis: ${unavailable.map((entry) => `${sanitizeDisplayFilename(entry.name)} (${entry.skipped})`).join(", ")}. Selecione esses arquivos novamente ou remova-os antes de enviar.`);
             }
-            // P2.3 image gate: an image attachment is only acceptable when the exact
-            // provider/model declares image support. Otherwise the turn fails with an
-            // explicit `unsupported_feature` BEFORE any provider call — we never
-            // silently coerce an image into an incompatible payload.
-            const declaredImages = inference.provider && inference.model
-                ? (inference.modelResolution?.capabilities.images ?? providerSupportsImages(inference.provider, inference.model))
-                : false;
+            // Without image support the turn fails with an explicit
+            // `unsupported_feature` BEFORE any provider call — we never silently
+            // coerce an image into an incompatible payload.
             const anyImageRequested = (attachments ?? []).length > 0
                 && extracted.some((entry) => entry.kind === "image" || entry.imageDataUrl !== undefined || entry.skipped === "unsupported_feature");
             if (anyImageRequested && !declaredImages) {
@@ -3162,9 +2796,7 @@ export class TurnRunner {
             const { provider, model } = inference;
             const memoryContext = this.resolveMemoryTurnContext(agentId, conversationId);
             const listedTools = await this.toolsFor(agentId, controller.signal);
-            const needsStickyHostTools = listedTools?.some((tool) => (
-                tool.function.name === WHATSAPP_TOOL_NAME || BROWSER_TOOL_NAMES.includes(tool.function.name)
-            )) === true;
+            const needsStickyHostTools = listedTools?.some((tool) => BROWSER_TOOL_NAMES.includes(tool.function.name)) === true;
             const recentToolNames = needsStickyHostTools
                 ? this.store.getRecentEntries(agentId, { limit: 48, kinds: ["tool-call"] }, conversationId)
                     .flatMap((entry) => entry.kind === "tool-call" ? [entry.name] : [])
@@ -3267,7 +2899,7 @@ export class TurnRunner {
                 const attachmentContext = formatAttachmentContext(extracted);
                 const toolText = JSON.stringify(providerTools ?? []);
                 const buildContext = (scale: number) => {
-                    const context = this.toProviderMessages(agentId, prompt, attachmentContext, normalizedSkillPrompt === undefined ? undefined : { original: prompt, normalized: normalizedSkillPrompt }, args.retryFailureTurnId, conversationId, toolText, memoryContext, scale, model, provider, imageAttachments, memorySystemPrompt, inference.modelResolution, turnContext);
+                    const context = this.toProviderMessages(agentId, prompt, attachmentContext, normalizedSkillPrompt === undefined ? undefined : { original: prompt, normalized: normalizedSkillPrompt }, args.retryFailureTurnId, conversationId, toolText, memoryContext, scale, model, provider, imageAttachments, memorySystemPrompt, inference.modelResolution, turnContext, turnId);
                     turn.memoryContextSources?.push(...context.memoryContextSources ?? []);
                     return context;
                 };
@@ -3355,15 +2987,12 @@ export class TurnRunner {
                     if (hasToolLoop && providerTools) {
                         const loopResult = await runToolLoop({
                             agentId,
-                            ...(conversationId === undefined ? {} : { conversationId }),
                             request,
                             broker: this.executionBroker,
-                            resolveHostPermission: this.resolveHostPermission,
                             executeTool,
                             ...(memoryContext.mode !== "off" && !memoryContext.conversation.temporary
                                 ? { deferTextUntilToolResultFor: [MEMORY_REMEMBER_TOOL_NAME, MEMORY_FORGET_TOOL_NAME] }
                                 : {}),
-                            resumableEffects: this.resumableEffectsFor(agentId, conversationId, turnId, provider, model, turn),
                             onEvent,
                             onProviderActivity: (kind) => {
                                 // O texto da rodada fica retido até o fim; a fase ao
@@ -3384,6 +3013,8 @@ export class TurnRunner {
                                 contextOverflowRetry: {
                                     isOverflow: isContextOverflowError,
                                     messages: () => {
+                                        // The provider rejected the context as too large: compact it.
+                                        conversationCompactionNeeded = true;
                                         const reduced = buildContext(0.5);
                                         publishContextNotice(reduced);
                                         return reduced.messages;
@@ -3437,7 +3068,7 @@ export class TurnRunner {
             };
             // Incremental transcript events publish in order as usual; terminal
             // tool snapshots coalesce into one resync frame per attempt batch.
-            this.deferTranscriptSnapshots();
+            this.deferTranscriptSnapshots(agentId);
             let providerAttempt: Awaited<ReturnType<typeof runProviderAttempt>>;
             try {
                 providerAttempt = await runProviderAttempt(1, true);
@@ -3447,6 +3078,8 @@ export class TurnRunner {
                     && providerAttempt.result.error !== undefined
                     && isContextOverflowError(providerAttempt.result.error);
                 if (retryableOverflow) {
+                    // The provider rejected the context as too large: compact it.
+                    conversationCompactionNeeded = true;
                     providerAttempt = await runProviderAttempt(0.5, false);
                 }
                 else {
@@ -3455,9 +3088,8 @@ export class TurnRunner {
                 }
             }
             finally {
-                this.flushTranscriptSnapshots();
+                this.flushTranscriptSnapshots(agentId);
             }
-            this.persistResumeCheckpoint(agentId, turn, conversationId, providerAttempt.result?.cursor ?? turn.resumeCursor);
             outcome = providerAttempt.result.aborted
                 ? "aborted"
                 : providerAttempt.result.error || !providerAttempt.result.message?.content.trim()
@@ -3526,7 +3158,11 @@ export class TurnRunner {
             }
         }
         catch (err) {
+            // The acceptance must always settle: once the user echo is durable the
+            // send was accepted even if a later step (e.g. recording the nonce)
+            // failed, so the RPC never hangs waiting for a confirm that never comes.
             if (!echoPersisted) acceptance?.reject(new RpcError(500, `Envio não salvo: ${err instanceof Error ? err.message : String(err)}`));
+            else acceptance?.confirm();
             outcome = "error";
             // streamChat nunca lança (erros viram evento `error`); este catch é a rede
             // de segurança para falhas inesperadas — notifica via notice e segue.
@@ -3695,177 +3331,6 @@ export class TurnRunner {
             ...(lastTurn === undefined ? {} : { lastTurn }),
         };
     }
-    private persistResumeCheckpoint(
-        agentId: string,
-        turn: TurnMetadata,
-        conversationId: string | undefined,
-        cursor: string | undefined,
-    ): void {
-        if (typeof cursor !== "string" || cursor.length === 0 || typeof this.store.createResumeCheckpoint !== "function")
-            return;
-        const adapter = this.registry.get(turn.provider);
-        if (adapter?.resumeChat === undefined)
-            return;
-        const resolvedConversationId = conversationId ?? this.conversationStore?.ensureDefault(agentId)?.id;
-        if (typeof resolvedConversationId !== "string" || resolvedConversationId.length === 0)
-            return;
-        const safeSequenceId = typeof this.store.getLatestSequenceId === "function"
-            ? this.store.getLatestSequenceId(agentId, resolvedConversationId) ?? 0
-            : this.store.getEntries(agentId, resolvedConversationId).length;
-        const existing = this.store.findResumeCheckpoint?.(agentId, resolvedConversationId, turn.turnId);
-        if (existing !== undefined) {
-            if (existing.cursor === cursor && existing.safeSequenceId >= safeSequenceId)
-                return;
-            this.store.advanceResumeCheckpoint?.({
-                agentId,
-                conversationId: resolvedConversationId,
-                turnId: turn.turnId,
-                provider: turn.provider,
-                model: turn.model,
-            }, existing.version, {
-                cursor,
-                safeSequenceId: Math.max(existing.safeSequenceId, safeSequenceId),
-                completedEffectIds: [...new Set([...existing.completedEffectIds, ...(turn.completedEffectIds ?? [])])],
-                expiresAtMs: existing.expiresAtMs,
-                budget: this.resumeBudgetSnapshot(turn, existing.budget),
-            });
-            return;
-        }
-        this.store.createResumeCheckpoint({
-            checkpointId: `checkpoint:${turn.turnId}`,
-            agentId,
-            conversationId: resolvedConversationId,
-            turnId: turn.turnId,
-            provider: turn.provider,
-            model: turn.model,
-            cursor,
-            safeSequenceId,
-            completedEffectIds: turn.completedEffectIds ?? [],
-            expiresAtMs: this.nowFn() + 24 * 60 * 60 * 1_000,
-            version: 1,
-            budget: this.resumeBudgetSnapshot(turn),
-        });
-    }
-    private resumeBudgetSnapshot(turn: TurnMetadata, previous?: ResumeBudgetSnapshot): ResumeBudgetSnapshot {
-        const loopBudget = resolveToolLoopBudget({ modelResolution: turn.modelResolution });
-        return {
-            maxProviderAttempts: previous?.maxProviderAttempts ?? 3,
-            providerAttemptsUsed: Math.max(previous?.providerAttemptsUsed ?? 0, turn.providerAttemptsUsed ?? 1),
-            // Persist the effective hard ceiling, not the adaptive soft
-            // checkpoint. The loop may extend its initial soft window on
-            // meaningful progress, but resume must retain the finite hard cap.
-            maxToolRounds: previous?.maxToolRounds ?? loopBudget.maxTotalRounds,
-            toolRoundsUsed: Math.max(previous?.toolRoundsUsed ?? 0, turn.toolRoundsUsed ?? 0),
-            maxToolCalls: previous?.maxToolCalls ?? loopBudget.maxTotalCalls,
-            toolCallsUsed: Math.max(previous?.toolCallsUsed ?? 0, turn.toolCallsUsed ?? 0),
-        };
-    }
-    /**
-     * The persisted provider counter predates cursor recovery and includes the
-     * ordinary model rounds that produced the checkpoint. Keep those rounds out
-     * of the recovery allowance so a long tool turn does not consume its own
-     * retry budget. A production checkpoint always has at least one ordinary
-     * round; the lower bound also makes old/hand-seeded zero snapshots fail
-     * closed when the first recovery reservation is made.
-     */
-    private resumeProviderAttemptsUsed(budget: ResumeBudgetSnapshot): number {
-        if (!this.validResumeBudget(budget))
-            return Number.POSITIVE_INFINITY;
-        const ordinaryRounds = Math.max(1, budget.toolRoundsUsed + 1);
-        return Math.max(0, budget.providerAttemptsUsed - Math.min(budget.providerAttemptsUsed, ordinaryRounds));
-    }
-    private validResumeBudget(budget: ResumeBudgetSnapshot): boolean {
-        return [
-            budget.maxProviderAttempts,
-            budget.providerAttemptsUsed,
-            budget.maxToolRounds,
-            budget.toolRoundsUsed,
-            budget.maxToolCalls,
-            budget.toolCallsUsed,
-        ].every((value) => Number.isSafeInteger(value) && value >= 0);
-    }
-    /** Atomically consumes one recovery attempt before invoking resumeChat. */
-    private reserveResumeAttempt(
-        scope: ResumeCheckpointScope,
-        checkpoint: ResumeCheckpoint,
-    ): ResumeCheckpoint | undefined {
-        if (typeof this.store.advanceResumeCheckpoint !== "function" || !this.validResumeBudget(checkpoint.budget))
-            return undefined;
-        if (this.resumeBudgetExhausted(checkpoint.budget))
-            return undefined;
-        const ordinaryRounds = Math.max(1, checkpoint.budget.toolRoundsUsed + 1);
-        const providerAttemptsUsed = Math.max(checkpoint.budget.providerAttemptsUsed, ordinaryRounds) + 1;
-        if (!Number.isSafeInteger(providerAttemptsUsed))
-            return undefined;
-        try {
-            return this.store.advanceResumeCheckpoint(scope, checkpoint.version, {
-                cursor: checkpoint.cursor,
-                safeSequenceId: checkpoint.safeSequenceId,
-                completedEffectIds: [...checkpoint.completedEffectIds],
-                expiresAtMs: checkpoint.expiresAtMs,
-                budget: { ...checkpoint.budget, providerAttemptsUsed },
-            });
-        }
-        catch {
-            // A concurrent cursor/effect update wins the CAS. Do not call the
-            // provider without a durable reservation; the next resume can retry
-            // from the newer checkpoint if it is still safe.
-            return undefined;
-        }
-    }
-    private resumeBudgetExhausted(budget: ResumeBudgetSnapshot): boolean {
-        return !this.validResumeBudget(budget)
-            || this.resumeProviderAttemptsUsed(budget) >= budget.maxProviderAttempts
-            || budget.toolRoundsUsed >= budget.maxToolRounds
-            || budget.toolCallsUsed >= budget.maxToolCalls;
-    }
-    private resumableEffectsFor(
-        agentId: string,
-        conversationId: string | undefined,
-        turnId: string,
-        provider: string,
-        model: string,
-        turn: TurnMetadata,
-    ): ToolLoopResumableEffects | undefined {
-        if (typeof this.store.prepareResumeEffect !== "function"
-            || typeof this.store.markResumeEffectStarted !== "function"
-            || typeof this.store.completeResumeEffect !== "function"
-            || (turn.modelResolution?.capabilities.resume ?? resolveProviderCapabilities(provider, model).resume) !== "cursor")
-            return undefined;
-        const scopeConversationId = conversationId ?? this.conversationStore?.ensureDefault(agentId)?.id;
-        if (typeof scopeConversationId !== "string" || scopeConversationId.length === 0)
-            return undefined;
-        const scope = { agentId, conversationId: scopeConversationId, turnId, provider, model };
-        const ledger: ToolLoopResumableEffects = {
-            prepare: (effectId, fingerprintHash) => this.store.prepareResumeEffect!(scope, effectId, fingerprintHash),
-            markStarted: (effectId) => this.store.markResumeEffectStarted!(scope, effectId),
-            markUnsafe: (effectId) => this.store.markResumeEffectUnsafe?.(scope, effectId),
-            complete: (effectId, fingerprintHash, result) => {
-                turn.toolCallsUsed = (turn.toolCallsUsed ?? 0) + 1;
-                const completedEffectIds = [...new Set([...(turn.completedEffectIds ?? []), effectId])];
-                turn.completedEffectIds = completedEffectIds;
-                const checkpoint = this.store.findResumeCheckpoint?.(agentId, scopeConversationId, turnId);
-                if (checkpoint !== undefined && typeof this.store.commitResumeEffectAndCheckpoint === "function") {
-                    this.store.commitResumeEffectAndCheckpoint({
-                        scope,
-                        effectId,
-                        fingerprintHash,
-                        result,
-                        checkpoint: {
-                            expectedVersion: checkpoint.version,
-                            cursor: checkpoint.cursor,
-                            safeSequenceId: checkpoint.safeSequenceId,
-                            completedEffectIds,
-                            expiresAtMs: checkpoint.expiresAtMs,
-                            budget: this.resumeBudgetSnapshot(turn, checkpoint.budget),
-                        },
-                    });
-                }
-                return this.store.completeResumeEffect!(scope, effectId, fingerprintHash, result);
-            },
-        };
-        return ledger;
-    }
     /** Entries kind "message" → mensagens do diálogo (system fica à parte). */
     private toProviderMessages(
         agentId: string,
@@ -3883,6 +3348,7 @@ export class TurnRunner {
         systemTextOverride?: string,
         modelResolution?: ModelResolution,
         currentTurnContext = "",
+        currentTurnId?: string,
     ): ContextAssemblyResult {
         const anchorEntry = this.store.getEarliestUser(agentId, conversationId);
         const anchorContent = anchorEntry?.content;
@@ -3898,6 +3364,7 @@ export class TurnRunner {
                 currentTurnContext,
                 currentPromptOverride,
                 omittedAssistantTurnId,
+                ...(currentTurnId === undefined ? {} : { currentTurnId }),
                 recentStore: this.store,
                 memoryStore,
                 mode: memoryContext.mode,
@@ -3936,9 +3403,11 @@ export class TurnRunner {
                     ...(anchorEntry && conversationId && finalMessages.some((message) => message.role === "user" && typeof message.content === "string" && message.content.includes(anchorEntry.content))
                         ? [{ conversationId, entryId: anchorEntry.id }] : []),
                 ],
-                bytes: Buffer.byteLength(JSON.stringify(withImages), "utf8"),
+                // Images have their own byte cap; the text budget and the
+                // truncation check look at the messages before they are attached.
+                bytes: Buffer.byteLength(JSON.stringify(finalMessages), "utf8"),
                 availableBytes: assembled.availableBytes,
-                truncated: assembled.truncated || anchored.truncated || !providerMessagesIdentical(withImages, anchored.messages),
+                truncated: assembled.truncated || anchored.truncated || !providerMessagesIdentical(finalMessages, anchored.messages),
                 modelBudget: finalBudget,
             };
         }
@@ -4036,9 +3505,9 @@ export class TurnRunner {
         const withImages = this.attachImageParts(finalMessages, imageAttachments);
         return {
             messages: withImages,
-            bytes: Buffer.byteLength(JSON.stringify(withImages), "utf8"),
+            bytes: Buffer.byteLength(JSON.stringify(finalMessages), "utf8"),
             availableBytes: byteBudget,
-            truncated: anchored.truncated || !providerMessagesIdentical(withImages, anchored.messages),
+            truncated: anchored.truncated || !providerMessagesIdentical(finalMessages, anchored.messages),
             modelBudget: finalBudget,
         };
     }
@@ -4158,10 +3627,8 @@ export class TurnRunner {
             case "message": {
                 if (hasToolLoop && (event.message.toolCalls?.length ?? 0) > 0) break;
                 const live = this.liveAssistant.get(agentId);
-                const text = turn.isResume && live !== undefined
-                    ? (live.content.endsWith(event.message.content) ? live.content : `${live.content}${event.message.content}`)
-                    : event.message.content;
-                if (text.length === 0 && !this.liveAssistant.has(agentId))
+                const text = event.message.content;
+                if (text.length === 0 && live === undefined)
                     break;
                 this.finalizeAssistant(agentId, text, {}, turn);
                 break;
@@ -4199,10 +3666,6 @@ export class TurnRunner {
             case "tool-result":
             case "done":
                 this.terminalizeReasoning(agentId, turn, "completed");
-                break;
-            case "resume-cursor":
-                turn.resumeCursor = event.cursor;
-                this.persistResumeCheckpoint(agentId, turn, turn.conversationId, event.cursor);
                 break;
         }
         if (appended.length > 0)
@@ -4353,7 +3816,7 @@ export class TurnRunner {
                 turnId: turn.turnId,
                 provider: turn.provider,
                 model: turn.model,
-                ...(turn.memoryContextSources?.length ? { memoryContextSources: [...new Map(turn.memoryContextSources.map((source) => [JSON.stringify(source), source])).values()] } : {}),
+                ...(turn.memoryContextSources?.length ? { memoryContextSources: uniqueContextSources(turn) } : {}),
                 reasoningEffort: turn.reasoningEffort ?? "medium",
                 ...(turn.modelResolution?.serviceTier ? { serviceTierOutcome: { requested: turn.modelResolution.serviceTier, actual: turn.serviceTierActual ?? ["unknown" as const] } } : {}),
                 ...(turn.retryOfClientNonce !== undefined ? { retryOfClientNonce: turn.retryOfClientNonce } : {}),
@@ -4369,29 +3832,9 @@ export class TurnRunner {
             ? { id: entry.id, content: entry.content }
             : undefined;
     }
-    replaceAndPublish(agentId: string, entry: TranscriptEntry, conversationId?: string): void {
-        const normalized = normalizeTranscriptEntry(entry, {
-            agentName: this.agentPeer(agentId).name,
-            userName: this.humanAuthor().name,
-            userAuthId: this.humanAuthor().authId,
-        });
-        const id = normalized.id;
-        if (typeof id === "string" && this.store.replace(agentId, id, normalized, conversationId)) {
-            this.store.clearLiveEntry?.(agentId, id, conversationId);
-            this.publishFn("transcript", { type: "updated", agentId, ...(conversationId === undefined ? {} : { conversationId }), entry: normalized, ordered: this.nextTranscriptOrder(agentId) });
-            return;
-        }
-        if (typeof id === "string")
-            this.store.clearLiveEntry?.(agentId, id, conversationId);
-        this.appendAndPublish(agentId, [normalized], conversationId);
-    }
     /** Publishes a periodic authoritative-shaped preview without a SQLite write. */
     publishStreamSnapshot(agentId: string, entry: TranscriptEntry, conversationId: string | undefined, live: LiveAssistantState): void {
-        const normalized = normalizeTranscriptEntry(entry, {
-            agentName: this.agentPeer(agentId).name,
-            userName: this.humanAuthor().name,
-            userAuthId: this.humanAuthor().authId,
-        });
+        const normalized = this.normalizeForTranscript(agentId, entry);
         this.store.setLiveEntry?.(agentId, normalized, conversationId);
         this.publishFn("transcript", {
             type: "updated",
@@ -4405,38 +3848,26 @@ export class TurnRunner {
     }
     /** Commits and publishes one final snapshot; no delta is repeated here. */
     finalizeStreamSnapshot(agentId: string, entry: TranscriptEntry, conversationId: string | undefined, live: LiveAssistantState): void {
-        try {
-            const normalized = normalizeTranscriptEntry(entry, {
-                agentName: this.agentPeer(agentId).name,
-                userName: this.humanAuthor().name,
-                userAuthId: this.humanAuthor().authId,
-            });
-            const id = normalized.id;
-            if (typeof id !== "string" || !this.store.replace(agentId, id, normalized, conversationId)) {
-                this.store.append(agentId, [normalized], conversationId);
-            }
-            this.store.clearLiveEntry?.(agentId, live.id, conversationId);
-            this.publishFn("transcript", {
-                type: "updated",
-                agentId,
-                ...(conversationId === undefined ? {} : { conversationId }),
-                entry: normalized,
-                ordered: this.nextTranscriptOrder(agentId, live.replicaKey),
-                throughSequence: live.sequence,
-                final: true,
-            });
+        const normalized = this.normalizeForTranscript(agentId, entry);
+        const id = normalized.id;
+        if (typeof id !== "string" || !this.store.replace(agentId, id, normalized, conversationId)) {
+            this.store.append(agentId, [normalized], conversationId);
         }
-        finally {
-            // The order namespace is per agent lifetime. It must survive a turn so
-            // the renderer's `transcript:${agentId}` cursor remains monotonic.
-        }
+        this.store.clearLiveEntry?.(agentId, live.id, conversationId);
+        // The order namespace lives as long as the agent, not the turn, so the
+        // renderer's `transcript:${agentId}` cursor stays monotonic.
+        this.publishFn("transcript", {
+            type: "updated",
+            agentId,
+            ...(conversationId === undefined ? {} : { conversationId }),
+            entry: normalized,
+            ordered: this.nextTranscriptOrder(agentId, live.replicaKey),
+            throughSequence: live.sequence,
+            final: true,
+        });
     }
     replaceWithoutPublish(agentId: string, entry: TranscriptEntry, conversationId?: string): void {
-        const normalized = normalizeTranscriptEntry(entry, {
-            agentName: this.agentPeer(agentId).name,
-            userName: this.humanAuthor().name,
-            userAuthId: this.humanAuthor().authId,
-        });
+        const normalized = this.normalizeForTranscript(agentId, entry);
         const id = normalized.id;
         if (typeof id === "string" && this.store.replace(agentId, id, normalized, conversationId)) {
             this.store.clearLiveEntry?.(agentId, id, conversationId);
@@ -4447,11 +3878,7 @@ export class TurnRunner {
         this.store.append(agentId, [normalized], conversationId);
     }
     publishUpdate(agentId: string, entry: TranscriptEntry, conversationId?: string): void {
-        const normalized = normalizeTranscriptEntry(entry, {
-            agentName: this.agentPeer(agentId).name,
-            userName: this.humanAuthor().name,
-            userAuthId: this.humanAuthor().authId,
-        });
+        const normalized = this.normalizeForTranscript(agentId, entry);
         this.store.setLiveEntry?.(agentId, normalized, conversationId);
         this.publishFn("transcript", {
             type: "updated",
@@ -4462,11 +3889,7 @@ export class TurnRunner {
         });
     }
     appendAndPublish(agentId: string, entries: readonly TranscriptEntry[], conversationId?: string, consumeStagedAttachments = false): void {
-        const normalized = entries.map((entry) => normalizeTranscriptEntry(entry, {
-            agentName: this.agentPeer(agentId).name,
-            userName: this.humanAuthor().name,
-            userAuthId: this.humanAuthor().authId,
-        }));
+        const normalized = entries.map((entry) => this.normalizeForTranscript(agentId, entry));
         if (consumeStagedAttachments) this.store.append(agentId, normalized, conversationId, true);
         else this.store.append(agentId, normalized, conversationId);
         for (const entry of normalized) {
@@ -4477,14 +3900,14 @@ export class TurnRunner {
         }
     }
     closeOpenToolCalls(agentId: string, result: ToolCallResult, conversationId?: string): void {
-        this.deferTranscriptSnapshots();
+        this.deferTranscriptSnapshots(agentId);
         try {
             for (const entry of this.store.getOpenToolCalls(agentId, conversationId)) {
                 this.publishToolCall(agentId, { ...entry, status: "failed", result }, conversationId);
             }
         }
         finally {
-            this.flushTranscriptSnapshots();
+            this.flushTranscriptSnapshots(agentId);
         }
     }
     publishToolCall(agentId: string, entry: Extract<TranscriptEntry, { kind: "tool-call" }>, conversationId?: string): void {
@@ -4650,15 +4073,6 @@ export function registerSendPromptHandler(gateway: Gateway, opts: TurnRunnerOpti
         if (expectedFailureEntryId !== undefined && (typeof expectedFailureEntryId !== "string" || expectedFailureEntryId.trim().length === 0))
             throw new RpcError(400, "retryPrompt: expectedFailureEntryId inválido");
         return runner.retryPrompt(agentId, conversationId, expectedFailureEntryId);
-    });
-    gateway.registerHandler("resumePrompt", (body: unknown) => {
-        const record = (body ?? {}) as Record<string, unknown>;
-        const agentId = typeof record.agentId === "string" ? record.agentId
-            : typeof record.id === "string" ? record.id
-                : "";
-        const turnId = typeof record.turnId === "string" ? record.turnId : "";
-        const conversationId = typeof record.conversationId === "string" ? record.conversationId : undefined;
-        return runner.resumePrompt(agentId, turnId, conversationId);
     });
     const isPromptRpcBody = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
     gateway.registerHandler("getPromptStatus", (body: unknown) => {

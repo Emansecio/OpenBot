@@ -1,32 +1,62 @@
-import { promises as fs } from "node:fs";
-import { spawn } from "node:child_process";
+// The OpenBot desktop launcher for this checkout (the only launch path).
+//
+//   openbot-desktop.vbs (hidden, error dialog)
+//     -> openbot-desktop.cmd (picks runtime\node)
+//       -> node scripts/launch.mjs
+//
+// Flow: verify the backend build, ensure one gateway for this checkout on
+// 127.0.0.1:1340 (verifying the client and the taskbar registration while it
+// boots), run Electron, then stop the gateway only if this launcher owns it.
+import { spawn as spawnProcess } from "node:child_process";
+import { closeSync, mkdirSync, openSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  assertManagedInstallRoot,
-  acquireInstallLock,
-  assertPreflight,
-  atomicWriteJson,
   captureProcessEvidence,
-  canonicalizeInstallRoot,
-  canonicalizePath,
   defaultDataRoot,
   defaultLocalDataRoot,
-  installLayout,
   isMainModule,
-  parseArgs,
+  isProcessRunning,
+  processOwnershipMatches,
   queryProcessEvidence,
-  randomSuffix,
-  readInstallState,
-  removeOwnedProcessState,
   rotateLogFile,
-  stateReleaseId,
-  terminateOwnedProcess,
-} from "./release-common.mjs";
-import { shutdownGateway } from "./shutdown-gateway.mjs";
+  systemToolPath,
+} from "./common.mjs";
+import {
+  DEFAULT_GATEWAY_URL,
+  buildStamp,
+  checkoutRootId,
+  gatewayEntryScript,
+  gatewayTokenPath,
+  newInstanceId,
+  portInUse,
+  processStatePath,
+  readHealth,
+  readProcessState,
+  removeProcessStateIfOwner,
+  stopGateway,
+  waitForGateway,
+  watchChild,
+  writeProcessState,
+} from "./gateway-control.mjs";
+import { resolveElectronExecutable } from "./electron-executable.mjs";
 
-const scriptRoot = dirname(fileURLToPath(import.meta.url));
+const defaultRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/** Exit codes understood by openbot-desktop.vbs (5 is reserved for "Node not found" in the cmd). */
+export const EXIT = Object.freeze({ OK: 0, FAILURE: 1, BUILD: 2, ELECTRON: 3, GATEWAY: 4, TEARDOWN: 6 });
+export const SECOND_INSTANCE_EXIT = 23;
+const GATEWAY_READY_TIMEOUT_MS = 45_000;
+const LOCK_OPTIONS = { timeoutMs: 60_000, staleMs: 120_000, label: "gateway launcher" };
+const ELECTRON_LOG_MAX_BYTES = 2 * 1024 * 1024;
+
+export class LaunchError extends Error {
+  constructor(message, exitCode, options) {
+    super(message, options);
+    this.exitCode = exitCode;
+  }
+}
 
 export function createStartupTrace(options = {}) {
   const enabled = options.enabled ?? process.env.OPENBOT_STARTUP_TRACE === "1";
@@ -36,463 +66,372 @@ export function createStartupTrace(options = {}) {
   return {
     mark(event, fields = {}) {
       if (!enabled) return;
-      write(`[openbot][startup] ${JSON.stringify({
-        event,
-        elapsedMs: Number((now() - startedAt).toFixed(1)),
-        ...fields,
-      })}`);
+      write(`[openbot][startup] ${JSON.stringify({ event, elapsedMs: Number((now() - startedAt).toFixed(1)), ...fields })}`);
     },
   };
 }
 
-function packageRootFromScript() {
-  return resolve(scriptRoot, "..");
-}
+// Inherited variables that would point the desktop at a remote/dev gateway or
+// turn electron.exe into plain Node. Matched case-insensitively (Windows).
+const CLEARED_VARIABLES = new Set([
+  "SAND_DEV_CAPABILITY", "SAND_DEV_CONTROL_PORT", "SAND_HOST_GATEWAY_URL", "SAND_HOST_GATEWAY_TOKEN",
+  "VITE_DEV_SERVER_URL", "ELECTRON_RUN_AS_NODE", "OPENBOT_RELEASE_ROOT", "OPENBOT_INSTALL_ROOT",
+]);
 
-function envPath(env, key, fallback) {
-  const value = env[key]?.trim();
-  return value ? resolve(value) : fallback;
-}
-
-function assertLoopbackUrl(url) {
-  const parsed = new URL(String(url));
-  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:")
-    || !["127.0.0.1", "localhost", "::1", "[::1]"].includes(parsed.hostname.toLowerCase())) {
-    throw new Error("OpenBot gateway URL must be loopback");
+/** Environment shared by the gateway and Electron. */
+export function baseEnvironment(env, root) {
+  const next = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (value != null && !CLEARED_VARIABLES.has(name.toUpperCase())) next[name] = value;
   }
-  return parsed.toString().replace(/\/$/u, "");
+  next.OPENBOT_LOCAL_GATEWAY = "1";
+  next.OPENBOT_ROOT = root;
+  return next;
 }
 
-async function readGatewayHealth(url) {
-  const safeUrl = assertLoopbackUrl(url);
-  try {
-    const response = await fetch(`${safeUrl}/health`, { signal: AbortSignal.timeout(1_000) });
-    if (!response.ok) return null;
-    const health = await response.json();
-    return health?.ok === true && Number.isInteger(health.pid) && health.pid > 0 ? health : null;
-  } catch {
-    return null;
-  }
+export function gatewayEnvironment(env, root, logsRoot) {
+  return { ...baseEnvironment(env, root), OPENBOT_LOG_DIR: logsRoot };
 }
 
-function samePath(left, right) {
-  return resolve(left).toLowerCase() === resolve(right).toLowerCase();
-}
-
-export async function readOwnedGatewayHealth(url, nodeExecutable, gatewayScript) {
-  const health = await readGatewayHealth(url);
-  if (health == null) return null;
-  let evidence;
-  try {
-    evidence = await queryProcessEvidence(health.pid);
-  } catch {
-    return null;
-  }
-  if (evidence?.executablePath == null || evidence.commandLine == null) return null;
-  if (!samePath(evidence.executablePath, nodeExecutable)) return null;
-  if (!evidence.commandLine.toLowerCase().includes(resolve(gatewayScript).toLowerCase())) return null;
-  return health;
-}
-
-export async function readLaunchInstallState(releaseRoot, installRoot) {
-  const canonicalRelease = resolve(releaseRoot);
-  const canonicalInstall = resolve(installRoot);
-  if (samePath(canonicalRelease, canonicalInstall)) return null;
-  const state = await readInstallState(canonicalInstall);
-  if (state == null) throw new Error(`OpenBot install state is missing: ${installLayout(canonicalInstall).state}`);
-  assertManagedInstallRoot(canonicalInstall, state);
-  let activeReleaseId;
-  try {
-    activeReleaseId = stateReleaseId(state);
-  } catch {
-    throw new Error(`OpenBot install has an invalid active release identity: ${canonicalInstall}`);
-  }
-  const activeRelease = resolve(installLayout(canonicalInstall).versions, activeReleaseId);
-  if (!samePath(activeRelease, canonicalRelease)) {
-    throw new Error(`Release ${canonicalRelease} is not the active installed version`);
-  }
-  return state;
-}
-
-export async function waitForGateway(url, expectedPid, child, timeoutMs = 45_000) {
-  const safeUrl = assertLoopbackUrl(url);
-  if (!Number.isFinite(Number(timeoutMs)) || Number(timeoutMs) < 0) throw new Error("OpenBot gateway timeout must be a finite non-negative number");
-  const deadline = Date.now() + timeoutMs;
-  let lastError = null;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${safeUrl}/health`, { signal: AbortSignal.timeout(1_000) });
-      const health = await response.json();
-      if (response.ok && health?.ok === true && health.pid === expectedPid) return health;
-      lastError = new Error(`gateway health belongs to PID ${health?.pid ?? "unknown"}, expected ${expectedPid}`);
-    } catch (error) {
-      lastError = error;
-    }
-    if (child?.spawnError) throw new Error(`Local gateway failed to start: ${child.spawnError.message}`);
-    if (child?.exitCode != null) {
-      throw new Error(`Local gateway exited with code ${child.exitCode}; see gateway-error.log`);
-    }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
-  }
-  throw new Error(`Local gateway did not become ready: ${lastError?.message ?? "timeout"}; see gateway-error.log`);
-}
-
-function setDataEnvironment(env, dataRoot, localDataRoot) {
+/** Electron talks only to the proven local gateway at url. */
+export function electronEnvironment(env, { root, url, userData }) {
   return {
-    ...env,
-    OPENBOT_DATA_ROOT: dataRoot,
-    OPENBOT_LOCAL_DATA_ROOT: localDataRoot,
+    ...baseEnvironment(env, root),
+    SAND_HOST_GATEWAY_URL: url,
+    SAND_DEV_BOX_CONTROL_PLANE: "0",
+    SAND_DEV_APP_ICON: join(root, "assets", "openbot.ico"),
+    OPENBOT_USER_DATA: userData,
   };
 }
 
-export async function captureGatewayEvidenceWithRetry(pid, options = {}) {
-  const capture = options.captureProcessEvidence ?? captureProcessEvidence;
-  const attempts = Number(options.attempts ?? 4);
-  let lastError = null;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      return await capture(pid, { expectedExecutable: options.expectedExecutable, expectedRoot: options.expectedRoot });
-    } catch (error) {
-      lastError = error;
-      if (attempt + 1 < attempts) await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
-    }
+export function parseCdpPort(value) {
+  if (value == null || String(value).trim() === "") return null;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new LaunchError("OPENBOT_AUDIT_CDP_PORT deve ser uma porta válida entre 1 e 65535.", EXIT.FAILURE);
   }
-  throw lastError ?? new Error("Gateway ownership evidence was not captured");
+  return port;
 }
 
-export async function stopSpawnedGatewayHandle(child, timeoutMs = 2_000) {
-  if (child == null || child.exitCode != null || child.signalCode != null) return true;
-  try { child.kill(); } catch { /* the child may have exited between checks */ }
-  if (child.exitCode != null || child.signalCode != null) return true;
-  return new Promise((resolveStopped) => {
-    let settled = false;
-    const finish = (value) => { if (!settled) { settled = true; resolveStopped(value); } };
-    child.once?.("exit", () => finish(true));
-    setTimeout(() => finish(child.exitCode != null || child.signalCode != null), timeoutMs);
-  });
+export function electronArguments({ root, userData, logsRoot, cdpPort = null, extra = [] }) {
+  return [
+    `--user-data-dir=${userData}`,
+    // GPU acceleration paints an all-black window with some Windows drivers.
+    "--disable-gpu",
+    "--enable-logging",
+    `--log-file=${join(logsRoot, "electron-chromium.log")}`,
+    ...(cdpPort == null ? [] : [
+      "--remote-debugging-address=127.0.0.1",
+      `--remote-debugging-port=${cdpPort}`,
+      `--remote-allow-origins=http://127.0.0.1:${cdpPort}`,
+    ]),
+    join(root, "scripts", "openbot-electron.cjs"),
+    ...extra,
+  ];
 }
 
-/** Attach lifecycle listeners before any asynchronous launch bookkeeping. */
-export function observeChildProcess(child) {
-  let settled = false;
-  let resolveOutcome;
-  const outcome = new Promise((resolve) => {
-    resolveOutcome = resolve;
-  });
-  const finish = (value) => {
-    if (settled) return;
-    settled = true;
-    resolveOutcome(value);
+function defaultDeps() {
+  return {
+    spawn: spawnProcess,
+    readHealth,
+    portInUse,
+    isProcessRunning,
+    queryProcessEvidence,
+    captureProcessEvidence,
+    stopGateway,
+    withLock: async (target, task, options) => {
+      const { withFileLock } = await import(pathToFileURL(join(defaultRoot, "dist", "shared", "file-lock.js")).href);
+      return withFileLock(target, task, options);
+    },
   };
-  child.once?.("error", (error) => finish({ error }));
-  child.once?.("exit", (code, signal) => finish({ code, signal }));
-  if (child.exitCode != null || child.signalCode != null) {
-    finish({ code: child.exitCode, signal: child.signalCode });
-  }
-  return outcome;
 }
 
-export async function teardownLaunchGateway(options = {}) {
-  if (options.processState == null && options.gatewayChild != null) {
-    const stopped = await stopSpawnedGatewayHandle(options.gatewayChild, options.childTimeoutMs);
-    if (!stopped) throw new Error("OpenBot gateway child teardown was not proven");
-    return { ok: true, owned: true, teardownProven: true, forced: false, childHandle: true };
-  }
-  const shutdown = await (options.shutdownGateway ?? shutdownGateway)({
-    installRoot: options.installRoot,
-    processState: options.processState,
-    processStatePath: options.processStatePath,
-    url: options.url,
-    env: options.env,
-    queryProcessEvidence: options.queryProcessEvidence,
-    queryGatewayPid: options.queryGatewayPid,
-    isPortPresent: options.isPortPresent,
-    requestShutdown: options.requestShutdown,
-    forceKill: options.forceKill,
-    timeoutMs: options.timeoutMs,
-    removeState: false,
-  });
-  if (!shutdown.teardownProven) throw new Error("OpenBot gateway teardown was not proven");
-  if (options.removeProcessState === true && options.processStatePath != null) {
-    await removeOwnedProcessState(options.processStatePath, options.instanceId, {
-      allowMissingIdentity: options.instanceId == null,
-    });
-  }
-  return shutdown;
+function formatErrors(errors) {
+  return errors.slice(0, 10).map((error) => `  - ${error}`).join("\n") + (errors.length > 10 ? `\n  ... +${errors.length - 10}` : "");
 }
 
-export async function launchRelease(options = {}) {
-  const environment = options.env ?? process.env;
-  const trace = options.startupTrace ?? createStartupTrace({
-    enabled: options.startupTraceEnabled ?? environment.OPENBOT_STARTUP_TRACE === "1",
-    now: options.startupTraceNow,
-    write: options.startupTraceWrite,
-  });
-  trace.mark("launcher-start");
-  const root = await canonicalizePath(options.root ?? packageRootFromScript(), { allowMissing: false, directory: true });
-  const { manifest } = await assertPreflight(root, { arch: options.arch ?? process.arch });
-  trace.mark("preflight-complete");
-  const appRoot = join(root, "app");
-  const nodeExecutable = join(root, "runtime", "node.exe");
-  const electronExecutable = join(root, "runtime", "electron", "electron.exe");
-  const gatewayScript = join(appRoot, "dist", "main.js");
-  const electronMain = join(appRoot, "scripts", "openbot-electron.cjs");
-  const installRoot = await canonicalizeInstallRoot(options.installRoot ?? process.env.OPENBOT_INSTALL_ROOT ?? root);
-  const layout = installLayout(installRoot);
-  const installState = await readLaunchInstallState(root, layout.root);
-  const dataRoot = envPath(environment, "OPENBOT_DATA_ROOT", installState?.dataRoot ?? defaultDataRoot(environment));
-  const localDataRoot = envPath(environment, "OPENBOT_LOCAL_DATA_ROOT", installState?.localDataRoot ?? defaultLocalDataRoot(environment));
-  const userData = envPath(environment, "OPENBOT_USER_DATA", join(localDataRoot, "electron"));
-  const logsRoot = join(layout.root, "logs");
-  await fs.mkdir(logsRoot, { recursive: true });
-  const releaseLog = join(logsRoot, "release.log");
-  await rotateLogFile(releaseLog, { maxBytes: 2 * 1024 * 1024, backups: 2 });
-  await fs.appendFile(releaseLog, `${JSON.stringify({
-    event: "release-launch",
-    productVersion: manifest.productVersion,
-    buildId: manifest.buildId,
-    releaseId: manifest.releaseId,
-    contentSha256: manifest.contentSha256,
-    generatedAt: manifest.generatedAt,
-    launchedAt: new Date().toISOString(),
-  })}\n`, "utf8");
-  await fs.mkdir(dataRoot, { recursive: true });
-  await fs.mkdir(localDataRoot, { recursive: true });
-  await fs.mkdir(userData, { recursive: true });
-  trace.mark("directories-ready");
+async function recordedGatewayIsOurs(state, deps) {
+  const evidence = state.gateway?.evidence;
+  if (evidence == null) return false;
+  const current = await deps.queryProcessEvidence(state.gateway.pid).catch(() => null);
+  return current != null && processOwnershipMatches(evidence, current);
+}
 
-  const childEnv = setDataEnvironment(environment, dataRoot, localDataRoot);
-  childEnv.OPENBOT_LOCAL_GATEWAY = "1";
-  childEnv.SAND_HOST_GATEWAY_URL = "http://127.0.0.1:1340";
-  childEnv.OPENBOT_BROWSER_ELECTRON_PATH = electronExecutable;
-  childEnv.SAND_DEV_APP_ICON = join(root, "assets", "openbot.ico");
-  childEnv.OPENBOT_INSTALL_ROOT = layout.root;
-  childEnv.OPENBOT_RELEASE_ROOT = root;
-  childEnv.OPENBOT_USER_DATA = userData;
-  childEnv.OPENBOT_LOG_DIR = logsRoot;
-  childEnv.OPENBOT_PRODUCT_VERSION = manifest.productVersion;
-  childEnv.OPENBOT_BUILD_ID = manifest.buildId;
-  childEnv.OPENBOT_RELEASE_ID = manifest.releaseId;
-  childEnv.OPENBOT_CONTENT_SHA256 = manifest.contentSha256;
-  trace.mark("release-identity", { productVersion: manifest.productVersion, buildId: manifest.buildId, releaseId: manifest.releaseId });
+/**
+ * Make sure one gateway of this checkout answers on url. Runs `alongside`
+ * while a freshly spawned gateway boots. Returns who owns the gateway: the
+ * launcher stops it at the end only when `owned` is true.
+ */
+export async function ensureGateway(options) {
+  const { root, url, env, tokenPath, logsRoot } = options;
+  const trace = options.trace ?? createStartupTrace({ enabled: false });
+  const deps = { ...defaultDeps(), ...options.deps };
+  const alongside = options.alongside ?? (async () => undefined);
+  const statePath = processStatePath(root);
+  const rootId = checkoutRootId(root);
+  const build = buildStamp(root);
+  const port = new URL(url).port;
+  const logHint = join(logsRoot, "gateway-error.log");
 
-  const instanceId = randomSuffix();
-  let gateway = null;
-  let gatewayPid = null;
-  let ownsGateway = false;
-  let ownsProcessState = false;
-  let gatewayOwnership = null;
-  let electron = null;
-  let electronExitCode = null;
-  const spawnGateway = options.spawnGateway ?? spawn;
-  const spawnElectron = options.spawnElectron ?? spawn;
-  const waitForGatewayReady = options.waitForGateway ?? waitForGateway;
-  const captureEvidence = options.captureProcessEvidence ?? captureProcessEvidence;
-  const terminateOwned = options.terminateOwnedProcess ?? terminateOwnedProcess;
-  try {
-    const startupLock = await acquireInstallLock(layout.root, {
-      timeoutMs: options.startLockTimeoutMs,
-      operation: "launch-startup",
-    });
-    trace.mark("startup-lock-acquired");
-    try {
-      const existingHealth = await readOwnedGatewayHealth(childEnv.SAND_HOST_GATEWAY_URL, nodeExecutable, gatewayScript);
-      if (existingHealth) {
-        gatewayPid = existingHealth.pid;
-        trace.mark("gateway-ready", { adopted: true });
-      } else {
-        gateway = spawnGateway(nodeExecutable, [gatewayScript], {
-          cwd: appRoot,
-          env: childEnv,
-          windowsHide: true,
-          stdio: "ignore",
-        });
-        gateway.spawnError = null;
-        gateway.once("error", (error) => { gateway.spawnError = error; });
-        gatewayPid = gateway.pid;
-        ownsGateway = true;
-        trace.mark("gateway-spawned");
-        const [gatewayEvidence, launcherEvidence] = await Promise.all([
-          captureGatewayEvidenceWithRetry(gatewayPid, {
-            expectedExecutable: nodeExecutable,
-            expectedRoot: root,
-            captureProcessEvidence: captureEvidence,
+  return deps.withLock(statePath, async () => {
+    const [health, rawState] = await Promise.all([deps.readHealth(url), readProcessState(statePath)]);
+    const state = rawState?.rootId === rootId ? rawState : null;
+    const launcherAlive = state != null && state.launcherPid !== process.pid && await deps.isProcessRunning(state.launcherPid);
+
+    if (health != null) {
+      if (health.rootId !== rootId) {
+        throw new LaunchError(`A porta ${port} já está em uso pelo PID ${health.pid}, que não é o gateway deste checkout. Feche-o e tente novamente.`, EXIT.GATEWAY);
+      }
+      const recorded = state?.gateway.pid === health.pid;
+      const stale = health.build !== build;
+      if (!stale || launcherAlive || !recorded) {
+        if (stale) trace.mark("gateway-stale-build-kept", { reason: launcherAlive ? "in-use" : "unrecorded" });
+        await alongside();
+        if (recorded && !launcherAlive) {
+          // The launcher that started this gateway is gone: take it over so it
+          // is stopped when this window closes instead of lingering.
+          const instanceId = newInstanceId();
+          await writeProcessState(statePath, { ...state, instanceId, launcherPid: process.pid });
+          trace.mark("gateway-ready", { adopted: true, owned: true });
+          return { pid: health.pid, owned: true, adopted: true, instanceId, evidence: state.gateway.evidence ?? null, watch: null };
+        }
+        trace.mark("gateway-ready", { adopted: true, owned: false });
+        return { pid: health.pid, owned: false, adopted: true };
+      }
+      // An orphan from an older build: replace it with the current one.
+      trace.mark("gateway-restart-stale-build");
+      const stopped = await deps.stopGateway({ url, pid: health.pid, rootId, tokenPath, evidence: state.gateway.evidence ?? null });
+      if (!stopped.stopped) throw new LaunchError(`O gateway anterior (PID ${health.pid}) não encerrou.`, EXIT.GATEWAY);
+      await removeProcessStateIfOwner(statePath, state.instanceId);
+    } else if (state != null && await deps.isProcessRunning(state.gateway.pid) && await recordedGatewayIsOurs(state, deps)) {
+      // Our supervisor is alive but not answering: booting or restarting its worker.
+      trace.mark("gateway-wait-recorded", { pid: state.gateway.pid });
+      const waiting = new AbortController();
+      try {
+        await Promise.all([
+          waitForGateway(url, state.gateway.pid, {
+            rootId, logHint, timeoutMs: options.readyTimeoutMs ?? GATEWAY_READY_TIMEOUT_MS, signal: waiting.signal,
+            isAlive: () => deps.isProcessRunning(state.gateway.pid),
           }),
-          captureEvidence(process.pid, {
-            expectedExecutable: nodeExecutable,
-            expectedRoot: root,
-          }),
+          alongside().catch((error) => { waiting.abort(); throw error; }),
         ]);
-        gatewayOwnership = {
-          instanceId,
-          product: "OpenBot",
-          version: manifest.version,
-          productVersion: manifest.productVersion,
-          buildId: manifest.buildId,
-          releaseId: manifest.releaseId,
-          contentSha256: manifest.contentSha256,
-          dataRoot,
-          localDataRoot,
-          gateway: { url: childEnv.SAND_HOST_GATEWAY_URL, dataRoot },
-          launcherPid: process.pid,
-          gatewayPid,
-          electronPid: null,
-          processes: { gateway: gatewayEvidence, launcher: launcherEvidence },
-          startedAt: new Date().toISOString(),
-        };
-        await atomicWriteJson(layout.processState, gatewayOwnership);
-        ownsProcessState = true;
-        // Ownership is now in memory and on disk before readiness is awaited;
-        // a readiness failure can therefore still execute authenticated teardown.
-        await waitForGatewayReady(childEnv.SAND_HOST_GATEWAY_URL, gatewayPid, gateway, options.gatewayReadyTimeoutMs);
-        trace.mark("gateway-ready", { adopted: false });
+        const owned = !launcherAlive;
+        const instanceId = owned ? newInstanceId() : undefined;
+        if (owned) await writeProcessState(statePath, { ...state, instanceId, launcherPid: process.pid });
+        trace.mark("gateway-ready", { adopted: true, owned });
+        return { pid: state.gateway.pid, owned, adopted: true, instanceId, evidence: state.gateway.evidence, watch: null };
+      } catch (error) {
+        if (error instanceof LaunchError) throw error;
+        if (await deps.isProcessRunning(state.gateway.pid)) throw new LaunchError(error.message, EXIT.GATEWAY, { cause: error });
+        // It died while we waited; start a fresh one below.
+        await removeProcessStateIfOwner(statePath, state.instanceId);
       }
-    } catch (error) {
-      if (ownsGateway && gateway != null) {
-        let stopped = false;
-        let teardownError = null;
-        try {
-          stopped = await stopSpawnedGatewayHandle(gateway, options.childTimeoutMs);
-        } catch (stopError) {
-          teardownError = stopError;
-        }
-        if (stopped) {
-          if (ownsProcessState) {
-            await removeOwnedProcessState(layout.processState, instanceId);
-            ownsProcessState = false;
-          }
-          gateway = null;
-          gatewayPid = null;
-          ownsGateway = false;
-        } else {
-          teardownError ??= new Error("OpenBot gateway child teardown was not proven; ownership marker was preserved");
-        }
-        if (teardownError != null) {
-          throw new AggregateError([error, teardownError], "OpenBot startup failed and gateway teardown was not proven", { cause: error });
-        }
-      }
-      throw error;
-    } finally {
-      await startupLock.release();
-      trace.mark("startup-lock-released");
+    } else if (rawState != null && (state == null || !launcherAlive)) {
+      // A record for a gateway that no longer exists (or another checkout's leftover).
+      await removeProcessStateIfOwner(statePath, rawState.instanceId);
     }
 
-    electron = spawnElectron(electronExecutable, [
-      `--user-data-dir=${userData}`,
-      electronMain,
-      ...(options.args ?? []),
-    ], {
-      cwd: appRoot,
-      env: childEnv,
+    if (await deps.portInUse(url)) {
+      throw new LaunchError(`A porta ${port} está ocupada por um processo que não responde como gateway do OpenBot.`, EXIT.GATEWAY);
+    }
+
+    const child = deps.spawn(process.execPath, [gatewayEntryScript(root)], {
+      cwd: root,
+      env: gatewayEnvironment(env, root, logsRoot),
+      detached: true,
       windowsHide: true,
-      stdio: "inherit",
+      stdio: "ignore",
     });
-    const electronOutcome = observeChildProcess(electron);
-    trace.mark("electron-spawned");
-    if (ownsGateway) {
-      const [launcherEvidence, gatewayEvidence, electronEvidence] = await Promise.all([
-        captureEvidence(process.pid, {
-          expectedExecutable: nodeExecutable,
-          expectedRoot: root,
-        }),
-        captureEvidence(gatewayPid, {
-          expectedExecutable: nodeExecutable,
-          expectedRoot: root,
-        }),
-        captureEvidence(electron.pid, {
-          expectedExecutable: electronExecutable,
-          expectedRoot: root,
-        }),
+    const watch = watchChild(child);
+    if (!Number.isInteger(child.pid) || child.pid <= 0) {
+      await new Promise((resolveTurn) => setImmediate(resolveTurn));
+      throw new LaunchError(`O gateway local não iniciou: ${watch.error?.message ?? "sem PID"}`, EXIT.GATEWAY, { cause: watch.error });
+    }
+    trace.mark("gateway-spawned", { pid: child.pid });
+    const instanceId = newInstanceId();
+    const handle = { pid: child.pid, owned: true, adopted: false, instanceId, evidence: null, watch };
+    const waiting = new AbortController();
+    try {
+      // Record ownership before waiting, so a crash here still leaves a trail.
+      await writeProcessState(statePath, {
+        instanceId, product: "OpenBot", rootId, url, tokenPath,
+        launcherPid: process.pid, gateway: { pid: child.pid }, startedAt: new Date().toISOString(),
+      });
+      await Promise.all([
+        waitForGateway(url, child.pid, { watch, rootId, logHint, timeoutMs: options.readyTimeoutMs ?? GATEWAY_READY_TIMEOUT_MS, signal: waiting.signal })
+          .catch((error) => { throw new LaunchError(error.message, EXIT.GATEWAY, { cause: error }); }),
+        alongside().catch((error) => { waiting.abort(); throw error; }),
       ]);
-      gatewayOwnership.electronPid = electron.pid;
-      gatewayOwnership.processes = { launcher: launcherEvidence, gateway: gatewayEvidence, electron: electronEvidence };
-      await atomicWriteJson(layout.processState, gatewayOwnership);
-      trace.mark("process-state-recorded");
-    }
-    const electronResult = await electronOutcome;
-    if (electronResult.error != null) throw electronResult.error;
-    electronExitCode = electronResult.code ?? (electronResult.signal ? 1 : 0);
-    trace.mark("electron-exited", { exitCode: electronExitCode });
-    if (electronExitCode === 23) return { ok: true, exitCode: 0, secondary: true, version: manifest.version };
-    return { ok: electronExitCode === 0, exitCode: electronExitCode, version: manifest.version };
-  } finally {
-    const cleanupErrors = [];
-    try {
-      if (electron && electron.exitCode == null && electron.signalCode == null) {
-        const electronEvidence = gatewayOwnership?.processes?.electron;
-        if (electronEvidence != null) {
-          const result = await terminateOwned({
-            pid: electronEvidence.pid,
-            creationTime: electronEvidence.creationTime,
-            expectedExecutable: electronExecutable,
-            expectedRoot: root,
-          }, {
-            timeoutMs: options.electronTeardownTimeoutMs,
-            queryProcessEvidence: options.queryProcessEvidence,
-            isProcessRunning: options.isProcessRunning,
-            runTaskkill: options.runTaskkill,
-            taskkillPath: options.taskkillPath,
-            platform: options.platform ?? process.platform,
-          });
-          if (!result?.teardownProven) throw new Error("OpenBot Electron teardown was not proven");
-        } else if (!await stopSpawnedGatewayHandle(electron, options.electronTeardownTimeoutMs)) {
-          throw new Error("OpenBot Electron child teardown was not proven");
-        }
-      }
     } catch (error) {
-      cleanupErrors.push(error);
+      waiting.abort();
+      await deps.stopGateway({ url, pid: child.pid, watch, rootId, tokenPath }).catch(() => undefined);
+      await removeProcessStateIfOwner(statePath, instanceId).catch(() => undefined);
+      throw error;
     }
-    try {
-      if (ownsGateway && gatewayPid != null) {
-        await teardownLaunchGateway({
-          installRoot: layout.root,
-          processState: gatewayOwnership,
-          gatewayChild: gateway,
-          processStatePath: layout.processState,
-          url: childEnv.SAND_HOST_GATEWAY_URL,
-          env: childEnv,
-          shutdownGateway: options.shutdownGateway,
-          removeProcessState: ownsProcessState,
-          instanceId,
-        });
-      } else if (ownsProcessState) {
-        await removeOwnedProcessState(layout.processState, instanceId);
-      }
-    } catch (error) {
-      cleanupErrors.push(error);
+    child.unref();
+    trace.mark("gateway-ready", { adopted: false, owned: true });
+    return handle;
+  }, LOCK_OPTIONS);
+}
+
+/** Record process evidence for a gateway this launcher owns (used for a later forced stop). */
+async function recordGatewayEvidence(root, handle, deps) {
+  if (!handle.owned || handle.evidence != null) return;
+  try {
+    const evidence = await deps.captureProcessEvidence(handle.pid, { expectedExecutable: process.execPath, expectedRoot: root });
+    handle.evidence = evidence;
+    const statePath = processStatePath(root);
+    const state = await readProcessState(statePath);
+    if (state?.instanceId === handle.instanceId) {
+      await writeProcessState(statePath, { ...state, gateway: { pid: handle.pid, evidence } });
     }
-    trace.mark("cleanup-complete", { ok: cleanupErrors.length === 0 });
-    if (cleanupErrors.length > 0) {
-      throw new AggregateError(cleanupErrors, "OpenBot launch cleanup was not fully proven");
-    }
+  } catch {
+    // Without evidence, a later launcher can still adopt via /health; only the
+    // forced stop by a different launcher becomes unavailable.
   }
 }
 
-export async function launchPreflight(root = packageRootFromScript(), options = {}) {
-  return assertPreflight(await canonicalizePath(root, { allowMissing: false, directory: true }), options);
-}
-
-export async function main(argv = process.argv.slice(2)) {
-  const args = parseArgs(argv);
-  const root = args.root ? resolve(String(args.root)) : packageRootFromScript();
-  if (args.preflight === true) {
-    const result = await launchPreflight(root, { arch: args.arch ?? process.arch });
-    process.stdout.write(`${JSON.stringify({ ok: true, manifest: result.manifest }, null, 2)}\n`);
-    return result;
-  }
-  const result = await launchRelease({
-    root,
-    installRoot: args["install-root"],
-    env: process.env,
-    args: args._args,
+async function releaseGateway(root, handle, options, deps) {
+  if (!handle?.owned) return null;
+  const statePath = processStatePath(root);
+  const result = await deps.stopGateway({
+    url: options.url, pid: handle.pid, watch: handle.watch, rootId: checkoutRootId(root),
+    tokenPath: options.tokenPath, evidence: handle.evidence,
   });
-  process.exitCode = result.exitCode;
+  if (!result.stopped) throw new Error(`OpenBot gateway PID ${handle.pid} did not stop (${result.reason})`);
+  await deps.withLock(statePath, () => removeProcessStateIfOwner(statePath, handle.instanceId), LOCK_OPTIONS);
   return result;
 }
 
-if (isMainModule(import.meta.url)) {
-  main().catch((error) => {
-    console.error(`[launch] ${error.message}`);
-    process.exitCode = 1;
-  });
+async function forceStopElectron(watch) {
+  if (watch == null || watch.exited) return;
+  const pid = watch.child.pid;
+  if (process.platform === "win32" && Number.isInteger(pid)) {
+    // The live child handle proves the PID; /T takes the renderer processes too.
+    await new Promise((resolveKill) => {
+      spawnProcess(systemToolPath("taskkill.exe"), ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" })
+        .once("exit", resolveKill).once("error", resolveKill);
+    });
+  } else {
+    watch.child.kill("SIGKILL");
+  }
+  await Promise.race([watch.done, new Promise((resolveWait) => setTimeout(resolveWait, 5_000))]);
 }
+
+function openElectronLog(logsRoot) {
+  const path = join(logsRoot, "electron.log");
+  const fd = openSync(path, "a");
+  writeSync(fd, `[${new Date().toISOString()}] OpenBot Electron launcher started (pid ${process.pid})\n`);
+  return fd;
+}
+
+/** Run the desktop app. Resolves with the process exit code. */
+export async function launch(options = {}) {
+  const root = resolve(options.root ?? defaultRoot);
+  const env = options.env ?? process.env;
+  const url = options.url ?? DEFAULT_GATEWAY_URL;
+  const trace = options.trace ?? createStartupTrace({ enabled: env.OPENBOT_STARTUP_TRACE === "1" });
+  const deps = { ...defaultDeps(), ...options.deps };
+  const logsRoot = join(root, "logs");
+  trace.mark("launcher-start");
+
+  const cdpPort = parseCdpPort(env.OPENBOT_AUDIT_CDP_PORT);
+  let electronPath;
+  try {
+    electronPath = (options.resolveElectron ?? resolveElectronExecutable)(root);
+  } catch (error) {
+    throw new LaunchError(error.message, EXIT.ELECTRON, { cause: error });
+  }
+
+  // Never start a gateway from a stale or partial backend build.
+  const verifyBackend = options.verifyBackend
+    ?? (async () => (await import("./verify-backend-artifacts.mjs")).verifyBackendArtifacts({ sourceRoot: root }));
+  const backend = await verifyBackend();
+  if (!backend.ok) throw new LaunchError(`Build do backend ausente ou desatualizado. Rode npm run build.\n${formatErrors(backend.errors)}`, EXIT.BUILD);
+  trace.mark("backend-verified");
+
+  mkdirSync(logsRoot, { recursive: true });
+  const dataRoot = defaultDataRoot(env);
+  const tokenPath = gatewayTokenPath(dataRoot, env);
+  const userData = resolve(env.OPENBOT_USER_DATA?.trim() || join(defaultLocalDataRoot(env), "electron"));
+  mkdirSync(userData, { recursive: true });
+
+  const verifyClient = options.verifyClient
+    ?? (async () => (await import("./verify-client-artifacts.mjs")).verifyClientArtifacts({ root }));
+  const ensureTaskbar = options.ensureTaskbar
+    ?? (async () => (await import("./setup-desktop-shortcut.mjs")).ensureTaskbarShortcutCached({ root, electronPath }));
+  const alongside = async () => {
+    const client = await verifyClient();
+    if (!client.ok) throw new LaunchError(`Artefatos do cliente Electron inválidos (veja client/client-artifacts.manifest.json).\n${formatErrors(client.errors)}`, EXIT.BUILD);
+    trace.mark("client-verified");
+    if (process.platform === "win32") {
+      // Explorer takes the taskbar name/icon from the Start-menu registration.
+      try {
+        await ensureTaskbar();
+      } catch (error) {
+        throw new LaunchError(`Não foi possível confirmar a identidade OpenBot na barra de tarefas: ${error.message}`, EXIT.FAILURE, { cause: error });
+      }
+      trace.mark("taskbar-ready");
+    }
+  };
+
+  const gateway = await ensureGateway({ root, url, env, tokenPath, logsRoot, trace, deps, alongside, readyTimeoutMs: options.readyTimeoutMs });
+  let electron = null;
+  let exitCode = EXIT.FAILURE;
+  let failure = null;
+  try {
+    const evidence = recordGatewayEvidence(root, gateway, deps);
+    // Chromium appends to its --log-file as well; both are bounded here.
+    await Promise.all(["electron.log", "electron-chromium.log"].map((name) =>
+      rotateLogFile(join(logsRoot, name), { maxBytes: ELECTRON_LOG_MAX_BYTES, backups: 2 }).catch(() => undefined)));
+    const logFd = openElectronLog(logsRoot);
+    try {
+      const child = deps.spawn(electronPath, electronArguments({ root, userData, logsRoot, cdpPort, extra: options.args ?? [] }), {
+        cwd: root,
+        env: electronEnvironment(env, { root, url, userData }),
+        stdio: ["ignore", logFd, logFd],
+      });
+      electron = watchChild(child);
+    } finally {
+      closeSync(logFd);
+    }
+    trace.mark("electron-spawned", { pid: electron.child.pid });
+    await Promise.all([electron.done, evidence]);
+    if (electron.error != null) throw new LaunchError(`Electron não iniciou: ${electron.error.message}`, EXIT.ELECTRON, { cause: electron.error });
+    trace.mark("electron-exited", { exitCode: electron.code });
+    // 23: another window of this profile is already open and was focused.
+    exitCode = electron.code === SECOND_INSTANCE_EXIT ? EXIT.OK : electron.code;
+    if (electron.code === SECOND_INSTANCE_EXIT && gateway.owned) {
+      // The open window is using this gateway; leave it running. The next
+      // launcher takes it over (its recorded launcher is gone by then).
+      trace.mark("gateway-left-for-primary");
+      return exitCode;
+    }
+  } catch (error) {
+    failure = error;
+    await forceStopElectron(electron);
+  }
+  try {
+    await releaseGateway(root, gateway, { url, tokenPath }, deps);
+    trace.mark("cleanup-complete", { ok: true });
+  } catch (error) {
+    trace.mark("cleanup-complete", { ok: false });
+    if (failure != null) throw new AggregateError([failure, error], failure.message);
+    throw new LaunchError(`O OpenBot fechou, mas o gateway local não encerrou: ${error.message}`, EXIT.TEARDOWN, { cause: error });
+  }
+  if (failure != null) throw failure;
+  return exitCode;
+}
+
+export async function main(argv = process.argv.slice(2)) {
+  try {
+    process.exitCode = await launch({ args: argv });
+  } catch (error) {
+    const primary = error instanceof AggregateError ? error.errors[0] : error;
+    console.error(`[launch] ${error.message}`);
+    if (error instanceof AggregateError) for (const inner of error.errors.slice(1)) console.error(`[launch] ${inner.message}`);
+    process.exitCode = primary?.exitCode ?? EXIT.FAILURE;
+  }
+}
+
+if (isMainModule(import.meta.url)) await main();

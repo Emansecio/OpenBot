@@ -278,7 +278,6 @@ describe("deleteAgents browser lifecycle", () => {
     } finally {
       gateway.close();
       store.close();
-      config.close();
     }
   });
 
@@ -317,7 +316,6 @@ describe("deleteAgents browser lifecycle", () => {
     } finally {
       gateway.close();
       store.close();
-      config.close();
     }
   });
 
@@ -358,7 +356,6 @@ describe("deleteAgents browser lifecycle", () => {
     } finally {
       gateway.close();
       store.close();
-      config.close();
     }
   });
 });

@@ -14,7 +14,6 @@ function fixture() {
   const store = createMemoryTranscriptStore();
   onTestFinished(() => {
     gateway.close();
-    config.close();
     rmSync(root, { recursive: true, force: true });
   });
   config.update({ agents: [{ id: "a", name: "A", avatarId: "a" }, { id: "b", name: "B", avatarId: "b" }] });

@@ -9,7 +9,10 @@ export interface HealthResponse {
   activeAgentId?: string | null;
   busyAgentIds?: string[];
   startedAt: string;
-  lastBusyAtMs?: number | null;
+  /** Checkout identity (see server/build-identity.ts); absent in bare test gateways. */
+  rootId?: string;
+  /** Build stamp loaded by this process (see server/build-identity.ts). */
+  build?: string;
 }
 
 export interface PrepareUpgradeResponse {

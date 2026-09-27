@@ -22,7 +22,11 @@ try {
 } catch { exit 1 }
 `;
 
-/** Local generated cache, not an installed addon. Never removes an existing cache version. */
+/**
+ * Local generated cache, not an installed addon. A version that no longer
+ * verifies (e.g. an antivirus removed or altered the binary) is set aside
+ * under a quarantine name, never deleted, and rebuilt.
+ */
 export class NativeJobHelperCache {
   private preparing?: Promise<string>;
   constructor(readonly runtimeRoot: string) {}
@@ -55,8 +59,16 @@ export class NativeJobHelperCache {
       return target;
     };
     const destination = await cache.resolveDestination(cacheVersion);
-    try { await lstat(destination); return await verify(); }
-    catch (error) { if (!missing(error)) throw failure(); }
+    let present = true;
+    try { await lstat(destination); }
+    catch (error) { if (!missing(error)) throw failure(); present = false; }
+    if (present) {
+      try { return await verify(); }
+      catch {
+        await cache.resolveExisting(cacheVersion);
+        await rename(destination, await cache.resolveDestination(`.quarantine-${cacheVersion}-${randomUUID()}`));
+      }
+    }
     signal?.throwIfAborted();
     const stagingName = `.build-${randomUUID()}`;
     const staging = await cache.resolveDestination(stagingName);

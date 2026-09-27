@@ -3,11 +3,11 @@ import { execFile } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { assertNoReparseAncestors, createShortcut, isMainModule, parseArgs } from "./release-common.mjs";
+import { assertNoReparseAncestors, atomicWriteJson, createShortcut, isMainModule, parseArgs, windowsPowerShellPath } from "./common.mjs";
 import { TASKBAR_APP_ID } from "./shortcut-appid.mjs";
 
 async function desktopPath() {
-  const { stdout } = await promisify(execFile)("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+  const { stdout } = await promisify(execFile)(windowsPowerShellPath(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
     "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); [Environment]::GetFolderPath('Desktop')"],
   { windowsHide: true, encoding: "utf8", timeout: 10_000 });
   const directory = stdout.trim();
@@ -49,7 +49,7 @@ async function readTaskbarLink(path) {
     "$item=$folder.ParseName([IO.Path]::GetFileName($path))",
     "[pscustomobject]@{target=$link.TargetPath;arguments=$link.Arguments;cwd=$link.WorkingDirectory;icon=$link.IconLocation;appId=$item.ExtendedProperty('System.AppUserModel.ID')} | ConvertTo-Json -Compress",
   ].join("; ");
-  const { stdout } = await promisify(execFile)("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+  const { stdout } = await promisify(execFile)(windowsPowerShellPath(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
     { windowsHide: true, encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 });
   if (!(await readFile(path)).equals(bytes)) throw new Error(`Shortcut changed while reading: ${path}`);
   return { ...JSON.parse(stdout), bytes };
@@ -71,7 +71,7 @@ export async function ensureTaskbarShortcut(options = {}) {
   await Promise.all([access(target), access(icon)]);
   let programs = options.programsPath;
   if (programs === undefined) {
-    const { stdout } = await promisify(execFile)("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+    const { stdout } = await promisify(execFile)(windowsPowerShellPath(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
       "[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false); [Environment]::GetFolderPath('Programs')"],
     { windowsHide: true, encoding: "utf8", timeout: 10_000 });
     programs = stdout.trim();
@@ -106,6 +106,40 @@ export async function ensureTaskbarShortcut(options = {}) {
     changed = true;
   }
   return { path: canonical, changed, legacyRemoved: Boolean(conflicting) };
+}
+
+async function linkStat(path) {
+  try {
+    const info = await lstat(path);
+    return { size: info.size, mtimeMs: info.mtimeMs };
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/**
+ * ensureTaskbarShortcut behind a stamp: the PowerShell/COM round trips run
+ * only when the checkout, the Electron runtime or either Start-menu link
+ * changed since the last confirmed registration.
+ */
+export async function ensureTaskbarShortcutCached(options = {}) {
+  const root = resolve(options.root ?? join(dirname(fileURLToPath(import.meta.url)), ".."));
+  const electron = resolve(options.electronPath ?? process.env.ELECTRON_PATH ?? join(root, "node_modules", "electron", "dist", "electron.exe"));
+  const stampPath = resolve(options.stampPath ?? join(root, "logs", "taskbar-shortcut.json"));
+  let stamp = null;
+  try { stamp = JSON.parse(await readFile(stampPath, "utf8")); } catch { /* absent or torn: confirm again */ }
+  if (stamp?.version === 1 && stamp.root === root && stamp.electron === electron && typeof stamp.path === "string") {
+    const [current, legacy] = await Promise.all([linkStat(stamp.path), linkStat(join(dirname(stamp.path), "Electron.lnk"))]);
+    const same = (a, b) => (a == null && b == null) || (a != null && b != null && a.size === b.size && a.mtimeMs === b.mtimeMs);
+    if (current != null && same(current, stamp.link) && same(legacy, stamp.legacy)) {
+      return { path: stamp.path, changed: false, legacyRemoved: false, cached: true };
+    }
+  }
+  const result = await ensureTaskbarShortcut({ ...options, root, electronPath: electron });
+  const [link, legacy] = await Promise.all([linkStat(result.path), linkStat(join(dirname(result.path), "Electron.lnk"))]);
+  await atomicWriteJson(stampPath, { version: 1, root, electron, path: result.path, link, legacy });
+  return { ...result, cached: false };
 }
 
 if (isMainModule(import.meta.url)) {

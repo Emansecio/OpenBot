@@ -8,6 +8,7 @@ import { RpcError, type GatewayBridgeHandler } from "./gateway.js";
 const MAX_OPTIONS_BYTES = 256 * 1024;
 const MAX_RESULT_BYTES = 512 * 1024;
 const CEREMONY_TIMEOUT_MS = 120_000;
+const MAX_STDERR_BYTES = 8 * 1024;
 const defaultSignerPath = fileURLToPath(new URL("../../client/extracted/dist/native/sand-webauthn-signer.exe", import.meta.url));
 const SIGNER_ENV_ALLOWLIST = new Set(["COMSPEC", "PATH", "PATHEXT", "SYSTEMROOT", "TEMP", "TMP", "WINDIR"]);
 
@@ -53,6 +54,7 @@ async function runSigner(signerPath: string, input: string): Promise<unknown> {
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let bytes = 0;
+    let stderrBytes = 0;
     let settled = false;
     const finish = (callback: () => void): void => {
       if (settled) return;
@@ -75,8 +77,17 @@ async function runSigner(signerPath: string, input: string): Promise<unknown> {
       }
       stdout.push(chunk);
     });
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.once("error", (error) => fail(new RpcError(503, "WebAuthn signer failed: " + error.message)));
+    // Only the start of stderr is reported; the rest is drained and dropped.
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderrBytes >= MAX_STDERR_BYTES) return;
+      stderr.push(chunk.subarray(0, MAX_STDERR_BYTES - stderrBytes));
+      stderrBytes += chunk.length;
+    });
+    child.on("error", (error) => fail(new RpcError(503, "WebAuthn signer failed: " + error.message)));
+    // A signer that exits before reading its input breaks the pipe (EPIPE).
+    // Without a listener that error would crash the gateway; 'close' reports
+    // the failed ceremony instead.
+    child.stdin.on("error", () => undefined);
     child.once("close", (code) => {
       if (settled) return;
       if (code !== 0) {

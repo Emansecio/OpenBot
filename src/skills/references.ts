@@ -1,5 +1,5 @@
 import type { SkillCatalog } from "./catalog.js";
-import type { SkillReadResult } from "./contracts.js";
+import type { SkillInvocationPolicy, SkillReadResult } from "./contracts.js";
 
 /** Per-agent gate applied after the shared catalog has found a Skill. */
 export interface SkillAgentPolicy {
@@ -88,10 +88,6 @@ export function parseSkillReferences(richText: string | undefined): string[] {
   return found;
 }
 
-/** Alias kept explicit for callers that prefer the extractor terminology. */
-export const extractSkillReferenceIds = parseSkillReferences;
-export const extractSkillReferences = parseSkillReferences;
-
 /**
  * Parses the accessible textual fallback. It is intentionally anchored at the
  * first character, so a sentence containing `/skill` cannot gain privileges.
@@ -105,9 +101,17 @@ export function parseSkillCommand(prompt: string): ParsedSkillCommand | undefine
   return { skillId, prompt: (match[2] ?? "").trim() };
 }
 
-function isAllowed(id: string, policy: SkillAgentPolicy | undefined): boolean {
+/** Whether a bot's policy allows a catalog Skill; disabled ids compare case-insensitively. */
+export function isSkillAllowed(policy: SkillAgentPolicy | undefined, id: string): boolean {
   if (policy?.enabled === false) return false;
-  return !(policy?.disabledIds ?? []).some((candidate) => typeof candidate === "string" && normalizedId(candidate) === id);
+  const normalized = normalizedId(id);
+  return normalized !== undefined
+    && !(policy?.disabledIds ?? []).some((candidate) => typeof candidate === "string" && normalizedId(candidate) === normalized);
+}
+
+/** Whether the model may pick a Skill on its own (search results, use_skill, delegation). */
+export function isModelSelectable(invocation: SkillInvocationPolicy | undefined): boolean {
+  return invocation?.modelInvocable === true && invocation.autoSelect === true;
 }
 
 async function readSkill(
@@ -115,7 +119,7 @@ async function readSkill(
   id: string,
   policy: SkillAgentPolicy | undefined,
 ): Promise<SkillReadResult | undefined> {
-  if (!isAllowed(id, policy)) return undefined;
+  if (!isSkillAllowed(policy, id)) return undefined;
   const invocation = catalog.invocationPolicy(id);
   if (!invocation?.userInvocable) return undefined;
   if (catalog.readCachedValidated) return catalog.readCachedValidated(id);

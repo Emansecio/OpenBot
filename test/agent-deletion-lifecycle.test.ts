@@ -66,8 +66,11 @@ describe("agent creation and explicit cleanup", () => {
       .resolves.toMatchObject({ agent: { id: "partial", name: "Retry" } });
     const active = handle.homes!.pathFor("partial");
     writeFileSync(join(active, "Documents", "keep.txt"), "existing data");
-    vi.spyOn(atomic, "writeFileExclusive").mockRejectedValueOnce(new Error("existing welcome unavailable"));
-    await expect(handle.homes!.ensure("partial")).rejects.toThrow("existing welcome unavailable");
+    // The welcome file is seeded once, with the new home: ensuring an existing home writes nothing.
+    const seed = vi.spyOn(atomic, "writeFileExclusive");
+    await expect(handle.homes!.ensure("partial")).resolves.toMatchObject({ agentId: "partial" });
+    expect(seed).not.toHaveBeenCalled();
+    seed.mockRestore();
     expect(readFileSync(join(active, "Documents", "keep.txt"), "utf8")).toBe("existing data");
     expect(await handle.homes!.listQuarantineMetadata()).toEqual([]);
   });
@@ -110,8 +113,15 @@ describe("agent creation and explicit cleanup", () => {
       await rpc(handle, "createAgent")({ id, name: id }, context(handle));
       writeFileSync(join(handle.homes!.pathFor(id), "Documents", "data.bin"), Buffer.alloc(64 * 1024, 42));
     }
-    const snapshot = await handle.homes!.snapshot("purge-victim");
-    const survivorSnapshot = await handle.homes!.snapshot("purge-survivor");
+    // Legacy snapshots written by older versions are purged with the agent's data.
+    const legacySnapshot = async (id: string): Promise<{ path: string }> => {
+      const path = join(handle.homes!.root, ".snapshots", id, "1.obhome");
+      await fsp.mkdir(join(handle.homes!.root, ".snapshots", id), { recursive: true });
+      writeFileSync(path, "legacy snapshot");
+      return { path };
+    };
+    const snapshot = await legacySnapshot("purge-victim");
+    const survivorSnapshot = await legacySnapshot("purge-survivor");
     await rpc(handle, "deleteAgents")({ ids: ["purge-victim"] }, context(handle));
     const bytesBefore = await measureManagedDiskBytes([handle.homes!.root]);
     const purge = rpc(handle, "purgeDeletedAgentData");
@@ -127,7 +137,7 @@ describe("agent creation and explicit cleanup", () => {
     expect(existsSync(snapshot.path)).toBe(false);
     expect(existsSync(survivorSnapshot.path)).toBe(true);
     expect(existsSync(join(handle.homes!.pathFor("purge-survivor"), "Documents", "data.bin"))).toBe(true);
-    expect(await measureManagedDiskBytes([handle.homes!.root])).toBeLessThan(bytesBefore - 128 * 1024);
+    expect(await measureManagedDiskBytes([handle.homes!.root])).toBeLessThan(bytesBefore - 64 * 1024);
     await expect(purge({ agentId: "purge-victim", confirm: true }, context(handle)))
       .resolves.toMatchObject({ quarantinesRemoved: 0, snapshotsRemoved: 0 });
   });

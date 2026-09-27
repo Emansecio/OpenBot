@@ -1,20 +1,20 @@
+// Local Recovery Center for the checkout: status, data backup/verify/restore
+// and a redacted diagnostics bundle. No telemetry; everything stays local.
 import { promises as fs } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
-  assertManagedInstallRoot,
   atomicWriteJson,
-  canonicalizeInstallRoot,
-  defaultInstallRoot,
-  installLayout,
+  defaultDataRoot,
+  defaultLocalDataRoot,
   isMainModule,
   parseArgs,
   pathExists,
-  readInstallState,
-  stateReleaseId,
-} from "./release-common.mjs";
-import { assertGatewayStopped, createDataBackup, restoreDataBackup, verifyDataBackup } from "./update.mjs";
+} from "./common.mjs";
+import { DEFAULT_GATEWAY_URL, buildStamp, checkoutRootId, processStatePath, readHealth } from "./gateway-control.mjs";
+import { assertGatewayStopped, createDataBackup, restoreDataBackup, verifyDataBackup } from "./data-backup.mjs";
 
-const DEFAULT_GATEWAY_URL = "http://127.0.0.1:1340";
+const defaultRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DIAGNOSTIC_LOG_BYTES = 64 * 1024;
 
 export function redactDiagnosticText(value) {
@@ -33,53 +33,43 @@ function sanitizedValue(value, depth = 0) {
   return value;
 }
 
-async function managedInstall(options) {
-  const root = await canonicalizeInstallRoot(options.root ?? defaultInstallRoot(options.env ?? process.env));
-  const state = await readInstallState(root);
-  assertManagedInstallRoot(root, state);
-  if (!state.activeVersion) throw new Error(`Install has no active version: ${root}`);
-  if (typeof state.dataRoot !== "string" || !state.dataRoot.trim()
-      || typeof state.localDataRoot !== "string" || !state.localDataRoot.trim()) {
-    throw new Error(`Install state has no explicit data roots: ${root}`);
-  }
-  return { root, state, layout: installLayout(root) };
+function context(options) {
+  const env = options.env ?? process.env;
+  return {
+    root: resolve(options.root ?? defaultRoot),
+    dataRoot: resolve(options.dataRoot ?? defaultDataRoot(env)),
+    localDataRoot: resolve(options.localDataRoot ?? defaultLocalDataRoot(env)),
+    gatewayUrl: options.gatewayUrl ?? DEFAULT_GATEWAY_URL,
+    gatewayTimeoutMs: Number(options.gatewayTimeoutMs ?? 2_000),
+    env,
+  };
 }
 
-async function gatewayStatus(url) {
-  try {
-    const response = await fetch(`${url}/health`, { signal: AbortSignal.timeout(500) });
-    if (!response.ok) return { running: false };
-    const health = await response.json();
-    if (health?.ok !== true || !Number.isInteger(health.pid) || health.pid <= 0) return { running: false };
-    return { running: true, pid: health.pid, busy: health.isBusy === true, startedAt: health.startedAt ?? null };
-  } catch {
-    return { running: false };
-  }
+async function gatewayStatus(url, root) {
+  const health = await readHealth(url, { timeoutMs: 500 });
+  if (health == null) return { running: false };
+  return {
+    running: true,
+    pid: health.pid,
+    busy: health.isBusy === true,
+    startedAt: health.startedAt ?? null,
+    thisCheckout: health.rootId === checkoutRootId(root),
+    currentBuild: health.build === buildStamp(root),
+  };
 }
 
 export async function recoveryStatus(options = {}) {
-  const { root, state, layout } = await managedInstall(options);
-  const gatewayUrl = options.gatewayUrl ?? DEFAULT_GATEWAY_URL;
-  const activeRelease = join(layout.versions, stateReleaseId(state));
+  const { root, dataRoot, localDataRoot, gatewayUrl } = context(options);
   return sanitizedValue({
     ok: true,
     product: "OpenBot",
-    installRoot: root,
-    stateSchemaVersion: state.schemaVersion,
-    activeVersion: state.activeVersion,
-    activeBuildId: state.activeBuildId ?? null,
-    activeReleaseId: state.activeReleaseId ?? state.activeVersion,
-    activeContentSha256: state.activeContentSha256 ?? state.manifestSha256 ?? null,
-    previousVersion: state.previousVersion ?? null,
-    previousBuildId: state.previousBuildId ?? null,
-    previousReleaseId: state.previousReleaseId ?? state.previousVersion ?? null,
-    dataRoot: state.dataRoot ?? null,
-    localDataRoot: state.localDataRoot ?? null,
-    activeReleasePresent: await pathExists(activeRelease),
-    processStatePresent: await pathExists(layout.processState),
-    gateway: await gatewayStatus(gatewayUrl),
-    lastBackup: state.lastBackup ?? null,
-    lastFailure: state.lastFailure ?? null,
+    root,
+    dataRoot,
+    localDataRoot,
+    buildPresent: await pathExists(join(root, "dist", "entry.js")),
+    dataRootPresent: await pathExists(dataRoot),
+    processStatePresent: await pathExists(processStatePath(root)),
+    gateway: await gatewayStatus(gatewayUrl, root),
   });
 }
 
@@ -116,49 +106,38 @@ async function diagnosticLogs(root) {
 }
 
 export async function runRecoveryCommand(command, options = {}) {
+  const ctx = context(options);
+  const roots = { dataRoot: ctx.dataRoot, localDataRoot: ctx.localDataRoot, env: ctx.env };
+  const gatewayStopped = () => assertGatewayStopped({ url: ctx.gatewayUrl, timeoutMs: ctx.gatewayTimeoutMs, root: ctx.root });
+
+  if (command === "status") return recoveryStatus(options);
+
   if (command === "verify-backup") {
     if (!options.backup) throw new Error("--backup is required");
     const verified = await verifyDataBackup(options.backup);
     return { ok: true, verified: true, backup: { path: verified.root, manifest: sanitizedValue(verified.manifest) } };
   }
 
-  const { root, state } = await managedInstall(options);
-  const gatewayUrl = options.gatewayUrl ?? DEFAULT_GATEWAY_URL;
-  const gatewayTimeoutMs = Number(options.gatewayTimeoutMs ?? 2_000);
-  if (command === "status") return recoveryStatus({ ...options, root, gatewayUrl });
-
   if (command === "backup") {
-    await assertGatewayStopped(gatewayUrl, gatewayTimeoutMs);
-    const backup = await createDataBackup({
-      dataRoot: state.dataRoot,
-      localDataRoot: state.localDataRoot,
-      backupRoot: options.backupRoot,
-      activeVersion: state.activeVersion,
-      activeReleaseId: state.activeReleaseId ?? state.activeVersion,
-      env: options.env ?? process.env,
-    });
+    await gatewayStopped();
+    const backup = await createDataBackup({ ...roots, backupRoot: options.backupRoot });
     return { ok: true, backup: { path: backup.path, manifest: sanitizedValue(backup.manifest) } };
   }
 
   if (command === "restore") {
     if (options.yes !== true) throw new Error("Restore requires --yes");
     if (!options.backup) throw new Error("--backup is required");
-    await assertGatewayStopped(gatewayUrl, gatewayTimeoutMs);
-    await verifyDataBackup(options.backup);
-    const preRestoreBackup = await createDataBackup({
-      dataRoot: state.dataRoot,
-      localDataRoot: state.localDataRoot,
-      backupRoot: options.backupRoot,
-      activeVersion: state.activeVersion,
-      activeReleaseId: state.activeReleaseId ?? state.activeVersion,
-      env: options.env ?? process.env,
-    });
-    await restoreDataBackup(options.backup, {
-      dataRoot: state.dataRoot,
-      localDataRoot: state.localDataRoot,
-      env: options.env ?? process.env,
-    });
-    return { ok: true, restored: true, backup: resolve(options.backup), preRestoreBackup: { path: preRestoreBackup.path } };
+    await gatewayStopped();
+    const verified = await verifyDataBackup(options.backup);
+    const preRestoreBackup = await createDataBackup({ ...roots, backupRoot: options.backupRoot, label: "pre-restore" });
+    const restored = await restoreDataBackup(options.backup, { ...roots, verified });
+    return {
+      ok: true,
+      restored: true,
+      backup: verified.root,
+      preRestoreBackup: { path: preRestoreBackup.path },
+      ...(restored.leftovers.length > 0 ? { leftovers: restored.leftovers } : {}),
+    };
   }
 
   if (command === "diagnostics") {
@@ -167,8 +146,8 @@ export async function runRecoveryCommand(command, options = {}) {
       schemaVersion: 1,
       product: "OpenBot",
       createdAt: new Date().toISOString(),
-      status: await recoveryStatus({ ...options, root, gatewayUrl }),
-      logs: await diagnosticLogs(root),
+      status: await recoveryStatus(options),
+      logs: await diagnosticLogs(ctx.root),
     };
     await atomicWriteJson(resolve(options.output), sanitizedValue(bundle));
     return { ok: true, diagnostics: resolve(options.output) };
@@ -182,6 +161,8 @@ export async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv.slice(1));
   const result = await runRecoveryCommand(command, {
     root: args.root,
+    dataRoot: args["data-root"],
+    localDataRoot: args["local-data-root"],
     backup: args.backup,
     backupRoot: args["backup-root"],
     output: args.output,

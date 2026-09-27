@@ -1,13 +1,13 @@
-import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 // @ts-expect-error Native ESM launcher helper.
-import { ensureTaskbarShortcut } from "../scripts/setup-desktop-shortcut.mjs";
-// @ts-expect-error Native ESM release helper.
-import { createShortcut, removeOwnedElectronTaskbarAlias } from "../scripts/release-common.mjs";
+import { ensureTaskbarShortcut, ensureTaskbarShortcutCached } from "../scripts/setup-desktop-shortcut.mjs";
+// @ts-expect-error Native ESM script helper.
+import { createShortcut } from "../scripts/common.mjs";
 // @ts-expect-error Native ESM shortcut parser.
 import { getShortcutAppId, parseLnk } from "../scripts/shortcut-appid.mjs";
 
@@ -27,13 +27,20 @@ async function fixture(run: (options: { root: string; programsPath: string; elec
 const linkOptions = { arguments: "", appUserModelId: "OpenBot.Desktop", allowFallback: false };
 
 describe.skipIf(process.platform !== "win32")("Start-menu taskbar identity", () => {
-  it("removes the legacy Electron alias during installation", async () => {
+  it("skips the shell round trips while the confirmed registration is unchanged", async () => {
     await fixture(async options => {
-      const legacy = join(options.programsPath, "Electron.lnk");
       const canonical = join(options.programsPath, "OpenBot.lnk");
-      await createShortcut(options.electronPath, legacy, linkOptions);
-      expect(await removeOwnedElectronTaskbarAlias(canonical, { appUserModelId: "OpenBot.Desktop" })).toBe(true);
-      expect(existsSync(legacy)).toBe(false);
+      const stampPath = join(options.root, "logs", "taskbar-shortcut.json");
+      expect(await ensureTaskbarShortcutCached({ ...options, stampPath })).toMatchObject({ path: canonical, changed: true, cached: false });
+      expect(await ensureTaskbarShortcutCached({ ...options, stampPath })).toMatchObject({ path: canonical, changed: false, cached: true });
+      // A foreign Electron alias appearing next to it invalidates the stamp.
+      await createShortcut(options.electronPath, join(options.programsPath, "Electron.lnk"), linkOptions);
+      expect(await ensureTaskbarShortcutCached({ ...options, stampPath })).toMatchObject({ cached: false, legacyRemoved: true });
+      // So do a deleted link and a torn stamp file.
+      rmSync(canonical);
+      expect(await ensureTaskbarShortcutCached({ ...options, stampPath })).toMatchObject({ cached: false, changed: true });
+      writeFileSync(stampPath, "{");
+      expect(await ensureTaskbarShortcutCached({ ...options, stampPath })).toMatchObject({ cached: false, changed: false });
     });
   });
 

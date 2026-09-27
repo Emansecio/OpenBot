@@ -21,7 +21,6 @@ describe("SAFE_HOME_TOOLS", () => {
       "browser_screenshot",
       "browser_handoff",
       "browser_close",
-      "whatsapp",
     ]);
     expect(JSON.stringify(SAFE_HOME_TOOLS)).not.toMatch(/shell|"delete"/);
     const file = SAFE_HOME_TOOLS.find((tool) => tool.function.name === "file");
@@ -36,13 +35,6 @@ describe("SAFE_HOME_TOOLS", () => {
       oneOf: expect.arrayContaining([
         expect.objectContaining({ properties: expect.objectContaining({ op: { const: "write" } }), required: ["op", "path", "content"] }),
         expect.objectContaining({ properties: expect.objectContaining({ op: { const: "restore" } }), required: ["op", "trashId"] }),
-      ]),
-    });
-    const whatsapp = SAFE_HOME_TOOLS.find((tool) => tool.function.name === "whatsapp");
-    expect(whatsapp?.function.parameters).toMatchObject({
-      oneOf: expect.arrayContaining([
-        expect.objectContaining({ properties: expect.objectContaining({ op: { const: "send" } }), required: ["op", "chat", "text"] }),
-        expect.objectContaining({ properties: expect.objectContaining({ op: { const: "messages_list" } }), required: ["op", "chat"] }),
       ]),
     });
     for (const name of ["search_files", "search_text"]) {
@@ -67,27 +59,22 @@ describe("SAFE_HOME_TOOLS", () => {
     expect(HOME_SYSTEM_PROMPT).toMatch(/PowerShell/);
     expect(HOME_SYSTEM_PROMPT).toMatch(/process_run/);
     expect(HOME_SYSTEM_PROMPT).toMatch(/Browser tools are attached/);
-    expect(HOME_SYSTEM_PROMPT).toMatch(/whatsapp tool is attached/);
+    expect(HOME_SYSTEM_PROMPT).not.toMatch(/whatsapp|wacli/i);
     expect(HOME_SYSTEM_PROMPT).not.toMatch(/LOCALAPPDATA/i);
+    expect(HOME_SYSTEM_PROMPT).not.toMatch(/including AppData/i);
+    expect(HOME_SYSTEM_PROMPT).toMatch(/other bots' homes are off-limits/);
     const processRun = DEVELOPER_TOOLS.find((tool) => tool.function.name === "process_run");
     expect(processRun?.function.description).toMatch(/trusted host access/);
     expect(processRun?.function.description).toMatch(/absolute path on any mounted drive/);
   });
 
-  it("omits browser and WhatsApp from the full catalog unless the turn needs them", () => {
+  it("omits browser tools from the full catalog unless the turn needs them", () => {
     const core = selectTurnProviderTools(DEVELOPER_TOOLS, { prompt: "liste Documents" }).map((tool) => tool.function.name);
     expect(core).toEqual(["workspace_info", "file", "search_files", "search_text", "process_run"]);
     const web = selectTurnProviderTools(DEVELOPER_TOOLS, { prompt: "abra https://example.com" }).map((tool) => tool.function.name);
     expect(web).toEqual(expect.arrayContaining(["browser_open", "browser_snapshot", "process_run"]));
-    expect(web).not.toContain("whatsapp");
     const sticky = selectTurnProviderTools(DEVELOPER_TOOLS, { prompt: "continue", recentToolNames: ["browser_snapshot"] }).map((tool) => tool.function.name);
     expect(sticky).toContain("browser_click");
-    const chat = selectTurnProviderTools(DEVELOPER_TOOLS, { prompt: "leia o whatsapp" }).map((tool) => tool.function.name);
-    expect(chat).toContain("whatsapp");
-    expect(chat).not.toContain("browser_open");
-    expect(selectTurnProviderTools(
-      DEVELOPER_TOOLS.filter((tool) => tool.function.name === "file" || tool.function.name === "whatsapp"),
-      { prompt: "liste a home" },
-    ).map((tool) => tool.function.name)).toEqual(["file", "whatsapp"]);
+    expect(DEVELOPER_TOOLS.map((tool) => tool.function.name)).not.toContain("whatsapp");
   });
 });

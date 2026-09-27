@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConfigStore } from "../src/config/store.js";
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
 import { createProviderRegistry, type ProviderAdapter, type ProviderChatRequest } from "../src/providers/router.js";
-import { DEFAULT_AGENT_ID } from "../src/rpc/roster.js";
+import { DEFAULT_AGENT_ID } from "../src/rpc/roster.js";
 import { TempRoots } from "./helpers/temp-roots.js";
 
 const temp = new TempRoots();
@@ -29,7 +29,6 @@ function seedDefaultAgent(config: ConfigStore): void {
 function seedDefaultConfig(configPath: string): void {
   const config = new ConfigStore({ configPath });
   seedDefaultAgent(config);
-  config.close();
 }
 
 function isolatedRoots(dir: string) {
@@ -78,29 +77,19 @@ describe("startServer agent home", () => {
     registry.register(adapter);
 
     const homeRoot = join(workspacesRoot, DEFAULT_AGENT_ID);
-    const originalListen = Server.prototype.listen;
-    let homeExistedAtListen = false;
-    const listenSpy = vi.spyOn(Server.prototype, "listen").mockImplementation(function (this: Server, ...args) {
-      homeExistedAtListen = existsSync(join(homeRoot, ".openbot", "home.json"));
-      return Reflect.apply(originalListen, this, args) as Server;
+    // The port is bound first but answers 503 until startServer resolves, so
+    // the home must exist by then: no request is ever served without it.
+    const handle = await startServer(0, {
+      ...isolatedRoots(dir),
+      registry,
+      workspacesRoot,
+      storePath: join(dir, "store.db"),
+      configPath,
+      keystoreDir: join(dir, "keys"),
     });
-    const handle = await (async () => {
-      try {
-        return await startServer(0, {
-          ...isolatedRoots(dir),
-          registry,
-          workspacesRoot,
-          storePath: join(dir, "store.db"),
-          configPath,
-          keystoreDir: join(dir, "keys"),
-        });
-      } finally {
-        listenSpy.mockRestore();
-      }
-    })();
     handles.push(handle);
 
-    expect(homeExistedAtListen).toBe(true);
+    expect(existsSync(join(homeRoot, ".openbot", "home.json"))).toBe(true);
     expect(handle.executionBroker).toBeDefined();
     expect(handle.homes).toBeDefined();
     await handle.runner.sendPrompt({ agentId: DEFAULT_AGENT_ID, prompt: "escreve" });
@@ -171,10 +160,6 @@ describe("startServer agent home", () => {
     await writeFile(join(home.root, ".openbot", "grants.json"), `${JSON.stringify({
       version: 1,
       grants: { Documents: { access: "write" } },
-    }, null, 2)}\n`);
-    await writeFile(join(home.root, ".openbot", "policy.json"), `${JSON.stringify({
-      rules: [{ match: { tool: "file.*", path: "**" }, effect: "allow" }],
-      default: "allow",
     }, null, 2)}\n`);
     // Free the shared store/config before booting a second server.
     await stopServer(handle);
@@ -260,115 +245,6 @@ describe("startServer agent home", () => {
     expect(capabilities).toEqual({ ok: true, value: { local: false, remoteExecution: false, audioTranscription: false } });
     expect(await post("getAgentWhatsapp", { agentId: DEFAULT_AGENT_ID })).toEqual({ error: "unknown method: getAgentWhatsapp" });
     expect(await post("setAgentWhatsapp", { agentId: DEFAULT_AGENT_ID, permission: "never" })).toEqual({ error: "unknown method: setAgentWhatsapp" });
-  });
-
-  it("ask in host settings still writes in the private home", async () => {
-    const dir = await tempDir();
-    const config = new ConfigStore({ configPath: join(dir, "config.json") });
-    seedDefaultAgent(config);
-    config.setHostSettings({ ...config.snapshot().hostSettings, localToolPermission: "ask" });
-    const registry = createProviderRegistry();
-    let calls = 0;
-    registry.register({
-      name: "xai",
-      async streamChat(_request, emit) {
-        calls += 1;
-        if (calls === 1) {
-          emit({
-            type: "tool-call",
-            call: {
-              id: "a1",
-              type: "function",
-              function: {
-                name: "file",
-                arguments: JSON.stringify({
-                  op: "write",
-                  path: "Documents/ask.md",
-                  content: "ok",
-                  encoding: "utf8",
-                }),
-              },
-            },
-          });
-          return;
-        }
-        emit({ type: "delta", delta: "ok" });
-      },
-    });
-    const handle = await startServer(0, {
-      ...isolatedRoots(dir),
-      registry,
-      config,
-      workspacesRoot: join(dir, "workspaces"),
-      storePath: join(dir, "store.db"),
-      keystoreDir: join(dir, "keys"),
-    });
-    handles.push(handle);
-    const home = await handle.homes!.ensure(DEFAULT_AGENT_ID);
-    const sent = await handle.runner.sendPrompt({ agentId: DEFAULT_AGENT_ID, prompt: "escreve" });
-    expect(sent.accepted).toBe(true);
-    const deadline = Date.now() + 2_000;
-    let pending: string[] = [];
-    while (Date.now() < deadline) {
-      pending = handle.executionBroker?.pendingRequestIds() ?? [];
-      if (pending.length > 0) break;
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    expect(pending.length).toBeGreaterThan(0);
-    expect(handle.executionBroker?.resolve(pending[0]!, "allow")).toBe(true);
-    await handle.runner.flush(DEFAULT_AGENT_ID);
-    await expect(readFile(join(home.root, "Documents", "ask.md"), "utf8")).resolves.toBe("ok");
-  });
-
-  it("never in host settings disables home tools without asking", async () => {
-    const dir = await tempDir();
-    const config = new ConfigStore({ configPath: join(dir, "config.json") });
-    seedDefaultAgent(config);
-    config.setHostSettings({ ...config.snapshot().hostSettings, localToolPermission: "never" });
-    const requests: ProviderChatRequest[] = [];
-    const registry = createProviderRegistry();
-    registry.register({
-      name: "xai",
-      async streamChat(request, emit) {
-        requests.push(request);
-        if (requests.length === 1) {
-          emit({
-            type: "tool-call",
-            call: {
-              id: "n1",
-              type: "function",
-              function: {
-                name: "file",
-                arguments: JSON.stringify({
-                  op: "write",
-                  path: "Documents/blocked.md",
-                  content: "nope",
-                  encoding: "utf8",
-                }),
-              },
-            },
-          });
-          return;
-        }
-        emit({ type: "delta", delta: "recusado" });
-      },
-    });
-    const handle = await startServer(0, {
-      ...isolatedRoots(dir),
-      registry,
-      config,
-      workspacesRoot: join(dir, "workspaces"),
-      storePath: join(dir, "store.db"),
-      keystoreDir: join(dir, "keys"),
-    });
-    handles.push(handle);
-    const home = await handle.homes!.ensure(DEFAULT_AGENT_ID);
-    await handle.runner.sendPrompt({ agentId: DEFAULT_AGENT_ID, prompt: "escreve" });
-    await handle.runner.flush(DEFAULT_AGENT_ID);
-    await expect(readFile(join(home.root, "Documents", "blocked.md"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-    expect(handle.executionBroker?.pendingRequestIds()).toEqual([]);
-    expect(JSON.stringify(requests[1]?.messages)).toContain("permission_denied");
-    expect(JSON.stringify(requests[1]?.messages)).toContain("Local tools are disabled.");
   });
 
   it("disableAgentHome keeps chat-only bootstrap", async () => {

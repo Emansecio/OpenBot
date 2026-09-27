@@ -264,6 +264,10 @@ describe("Electron conversation/memory UI bridge", () => {
         expect(guardIndex).toBeLessThan(handler.indexOf("closeTaskStreams"));
       }
     }
+    // Task control RPCs require the owning agent; the handlers send the validated active one.
+    for (const [channel, method] of [["sand:async-task-abort", "abortAsyncTask"], ["sand:async-task-steer", "steerAsyncTask"]] as const) {
+      expect(ipcHandler(main, channel)).toContain(`callOpenBotProviderRpc("${method}", { agentId: next.agentId,`);
+    }
     expect(main).toContain("sanitizeAsyncTaskRecord");
     expect(main).toContain("closeTaskStreams");
     expect(main).toContain('headers["last-event-id"]');

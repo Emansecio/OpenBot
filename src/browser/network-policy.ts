@@ -47,15 +47,16 @@ const classifyIpv4 = (address: string): BlockedAddressReason | null => {
   const first = (value >>> 24) & 0xff;
   const second = (value >>> 16) & 0xff;
   const first16 = value >>> 16;
-  if (value === 0 || first === 0) return "unspecified";
+  const first24 = value >>> 8;
+  if (first === 0) return "unspecified";
   if (first === 127) return "loopback";
   if (value === IPV4_METADATA || value === IPV4_AZURE_PLATFORM) return "metadata";
   if (first === 169 && second === 254) return "link-local";
   if (first === 10 || (first === 172 && second >= 16 && second <= 31) || first16 === 0xc0a8) return "private";
   if (first === 100 && second >= 64 && second <= 127) return "private";
-  if (first === 192 && second === 0) return "reserved";
-  if (first === 192 && second === 0 && (value & 0xffff) === 2) return "reserved";
-  if (first === 192 && second === 2) return "reserved";
+  // 192.0.0.0/24 (IETF protocol assignments) and 192.0.2.0/24 (TEST-NET-1)
+  // only: the rest of 192.0.0.0/16 is public (e.g. WordPress.com at 192.0.78.x).
+  if (first24 === 0xc00000 || first24 === 0xc00002) return "reserved";
   if (first === 198 && second >= 18 && second <= 19) return "reserved";
   if (first === 198 && second === 51 && ((value >>> 8) & 0xff) === 100) return "reserved";
   if (first === 203 && second === 0 && ((value >>> 8) & 0xff) === 113) return "reserved";
@@ -141,6 +142,10 @@ const classifyIpv6 = (address: string): BlockedAddressReason | null => {
   if (startsWithBytes(bytes, [0xfe, 0x80], 10)) return "link-local";
   if (startsWithBytes(bytes, [0xff], 8)) return "multicast";
   if (startsWithBytes(bytes, [0x20, 0x01, 0x0d, 0xb8], 32)) return "reserved";
+  // 6to4 (2002::/16) and Teredo (2001::/32) tunnel to an embedded IPv4 that
+  // this host could route to its LAN; no public site needs them.
+  if (startsWithBytes(bytes, [0x20, 0x02], 16)) return "reserved";
+  if (startsWithBytes(bytes, [0x20, 0x01, 0x00, 0x00], 32)) return "reserved";
   return null;
 };
 
@@ -153,14 +158,14 @@ export const classifyIpAddress = (address: string): BlockedAddressReason | null 
   return "invalid";
 };
 
-export const isBlockedNetworkAddress = (address: string): boolean => classifyIpAddress(address) !== null;
-
 const normalizedHostname = (hostname: string): string => hostname.trim().toLowerCase().replace(/\.$/, "");
 
 /** Hostnames that should never reach DNS, even if a resolver is compromised. */
 export const isBlockedHostname = (hostname: string): boolean => {
   const normalized = normalizedHostname(hostname);
-  if (!normalized || normalized.length > 253 || /[^\da-z.-]/i.test(normalized)) return true;
+  // Underscores are valid in DNS labels and accepted by Chromium; the resolved
+  // addresses are still classified before any connection.
+  if (!normalized || normalized.length > 253 || /[^\da-z._-]/i.test(normalized)) return true;
   if (normalized === "localhost" || normalized.endsWith(".localhost") || normalized === "localhost.localdomain") return true;
   if (normalized.endsWith(".local") || normalized.endsWith(".internal")) return true;
   return new Set([
@@ -193,8 +198,48 @@ export const resolvePublicAddresses = async (hostname: string, resolver: DnsReso
   return answers;
 };
 
+/** getaddrinfo occupies a libuv pool thread (4 by default) until the OS answers. */
+const MAX_CONCURRENT_LOOKUPS = 2;
+const DNS_CACHE_TTL_MS = 30_000;
+const DNS_CACHE_MAX_ENTRIES = 256;
+let activeLookups = 0;
+const lookupWaiters: Array<() => void> = [];
+const dnsCache = new Map<string, { answers: readonly string[]; expiresAt: number }>();
+
+const acquireLookupSlot = async (): Promise<void> => {
+  if (activeLookups < MAX_CONCURRENT_LOOKUPS) {
+    activeLookups += 1;
+    return;
+  }
+  await new Promise<void>((resolve) => lookupWaiters.push(resolve));
+};
+
+const releaseLookupSlot = (): void => {
+  const next = lookupWaiters.shift();
+  if (next !== undefined) next();
+  else activeLookups -= 1;
+};
+
+/**
+ * The OS resolver (hosts file, corporate DNS suffixes), with at most
+ * {@link MAX_CONCURRENT_LOOKUPS} lookups in flight so a page flooding slow
+ * names cannot take every pool thread the gateway needs for disk and crypto.
+ * A slot is held until the lookup itself settles, not until a caller gives up.
+ * Answers are cached briefly; callers still classify every answer.
+ */
 export const defaultDnsResolver: DnsResolver = async (hostname) => {
+  const cached = dnsCache.get(hostname);
+  if (cached !== undefined && cached.expiresAt > Date.now()) return cached.answers;
   const { lookup } = await import("node:dns/promises");
-  const records = await lookup(hostname, { all: true, verbatim: true });
-  return records.map((record) => record.address);
+  await acquireLookupSlot();
+  let records: ReadonlyArray<{ address: string }>;
+  try {
+    records = await lookup(hostname, { all: true, verbatim: true });
+  } finally {
+    releaseLookupSlot();
+  }
+  const answers = records.map((record) => record.address);
+  if (dnsCache.size >= DNS_CACHE_MAX_ENTRIES) dnsCache.delete(dnsCache.keys().next().value!);
+  dnsCache.set(hostname, { answers, expiresAt: Date.now() + DNS_CACHE_TTL_MS });
+  return answers;
 };

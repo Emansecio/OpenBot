@@ -85,6 +85,7 @@ export function writeFileAtomicSync(path: string, data: string | Buffer, mode = 
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   let fd: number | undefined;
+  let renamed = false;
   try {
     fd = openSync(tmp, "wx", mode);
     writeAllSync(fd, data);
@@ -92,6 +93,7 @@ export function writeFileAtomicSync(path: string, data: string | Buffer, mode = 
     closeSync(fd);
     fd = undefined;
     renameWithRetrySync(tmp, path);
+    renamed = true;
     fsyncDir(dirname(path));
   } finally {
     if (fd !== undefined) {
@@ -101,7 +103,14 @@ export function writeFileAtomicSync(path: string, data: string | Buffer, mode = 
         // Liberação best-effort; o erro original prevalece.
       }
     }
-    rmSync(tmp, { force: true });
+    if (!renamed) {
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        // Limpeza best-effort: o mesmo bloqueio que impediu o rename não pode
+        // substituir o erro original.
+      }
+    }
   }
 }
 
@@ -140,8 +149,13 @@ async function fsyncDirAsync(dir: string): Promise<void> {
   }
 }
 
+export interface AtomicWriteHooks {
+  /** Runs after the temporary file is durable and before it replaces the target. */
+  beforeRename?: () => void | Promise<void>;
+}
+
 /** Variante assíncrona de {@link writeFileAtomicSync} — mesma garantia de durabilidade. */
-export async function writeFileAtomic(path: string, data: string | Buffer, mode = 0o600): Promise<void> {
+export async function writeFileAtomic(path: string, data: string | Buffer, mode = 0o600, hooks: AtomicWriteHooks = {}): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
@@ -152,6 +166,7 @@ export async function writeFileAtomic(path: string, data: string | Buffer, mode 
     await handle.sync();
     await handle.close();
     handle = undefined;
+    await hooks.beforeRename?.();
     await renameWithRetry(tmp, path);
     renamed = true;
     await fsyncDirAsync(dirname(path));

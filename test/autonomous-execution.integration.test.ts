@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { LocalExecutionBroker } from "../src/execution/broker.js";
 import type { ExecutionBackend, ExecutionRequest, ExecutionResult } from "../src/execution/contracts.js";
 import { AgentHomeStore } from "../src/execution/home.js";
+import { HomeWorkspaceBackend } from "../src/execution/home-backend.js";
 import { createSharedTools } from "../src/integrations/shared-tools.js";
 import { McpManager } from "../src/mcp/manager.js";
 import { createProviderRegistry, type ProviderChatRequest, type ProviderToolCall } from "../src/providers/router.js";
@@ -81,7 +82,7 @@ describe("autonomous practical execution", () => {
       catalog: new SkillCatalog({ roots: [{ path: skillRoot, source: "test" }] }),
     });
     const backend = new PracticalBackend();
-    const broker = new LocalExecutionBroker(backend, () => "always");
+    const broker = new LocalExecutionBroker(backend);
     const requests: ProviderChatRequest[] = [];
     const registry = createProviderRegistry();
     registry.register({
@@ -154,7 +155,7 @@ describe("autonomous practical execution", () => {
     const homes = await AgentHomeStore.create(join(root, "workspaces"));
     const homeA = await homes.ensure("bot-a");
     const homeB = await homes.ensure("bot-b");
-    const broker = new LocalExecutionBroker((agentId) => homes.backendFor(agentId), () => "always");
+    const broker = new LocalExecutionBroker(async (agentId) => HomeWorkspaceBackend.create((await homes.ensure(agentId)).root));
     const requests: ProviderChatRequest[] = [];
     const registry = createProviderRegistry();
     registry.register({
@@ -234,7 +235,7 @@ describe("autonomous practical execution", () => {
           const expected = typeof user === "string" && user.includes("ALPHA") ? "ALPHA-MCP" : "BETA-MCP";
           const result = request.messages.find((message) => message.role === "tool");
           if (result === undefined) {
-            emit({ type: "tool-call", call: call("same-mcp-id", "mcp__shared__echo", { value: expected }) });
+            emit({ type: "tool-call", call: call("same-mcp-id", "call_mcp_tool", { name: "mcp__shared__echo", arguments: { value: expected } }) });
           } else {
             if (!result.content.includes(expected)) throw new Error("MCP result crossed bot sessions");
             emit({ type: "delta", delta: `mcp-final:${expected}` });
@@ -344,7 +345,7 @@ describe("autonomous practical execution", () => {
     });
     const runner = createTurnRunner({
       registry,
-      executionBroker: new LocalExecutionBroker(backend, () => "always"),
+      executionBroker: new LocalExecutionBroker(backend),
       tools: [providerTool("file")],
       resolveProvider: () => ({ provider: "scripted", model: "fixture" }),
     });

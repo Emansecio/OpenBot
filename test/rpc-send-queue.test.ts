@@ -4,81 +4,14 @@ import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { createProviderRegistry, type ProviderChatRequest } from "../src/providers/router.js";
+import { createProviderRegistry, type ProviderChatRequest, defaultRegistry } from "../src/providers/router.js";
 import { createFakeAdapter } from "./mocks/fake-provider-adapter.js";
-import { createMemoryTranscriptStore, createTurnRunner, type TurnRunnerOptions } from "../src/rpc/send.js";
+import { createMemoryTranscriptStore, createTurnRunner, MAX_PROVIDER_TRANSCRIPT_MESSAGES, MAX_SEND_QUEUE_PER_AGENT } from "../src/rpc/send.js";
 import type { TranscriptEntry } from "../src/shared/contracts.js";
 import { MAX_LIVE_RESPONSE_BYTES } from "../src/rpc/stream-state.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
 import { AgentActivityStore } from "../src/rpc/activity.js";
-
-/** Coleta os eventos publicados pelo runner (pub fake — sem HTTP). */
-function collectPublish() {
-  const events: { channel: string; payload: unknown }[] = [];
-  return {
-    events,
-    publish: (channel: string, payload: unknown) => {
-      events.push({ channel, payload });
-    },
-  };
-}
-
-/** Relógio determinístico (entries com timestampMs estável e crescente). */
-function fixedClock() {
-  let t = 1_000;
-  return {
-    now: () => (t += 1),
-  };
-}
-
-function ids() {
-  let n = 0;
-  return { newId: () => `id:${++n}` };
-}
-
-function deferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((done) => { resolve = done; });
-  return { promise, resolve };
-}
-
-type RunnerOpts = Omit<TurnRunnerOptions, "now" | "newId"> & {
-  now?: () => number;
-  newId?: (role: "user" | "assistant") => string;
-};
-
-function makeRunner(opts: RunnerOpts = {}): {
-  runner: ReturnType<typeof createTurnRunner>;
-  events: ReturnType<typeof collectPublish>["events"];
-} {
-  const now = opts.now ?? fixedClock().now;
-  const newId = opts.newId ?? ids().newId;
-  const pub = collectPublish();
-  const runner = createTurnRunner({
-    registry: opts.registry,
-    store: opts.store,
-    config: opts.config,
-    systemPrompt: opts.systemPrompt,
-    resolveProvider: opts.resolveProvider,
-    publish: pub.publish,
-    now,
-    newId,
-    ledgerCap: opts.ledgerCap,
-  });
-  return { runner, events: pub.events };
-}
-
-/** Registra um adapter fake como "xai" (provider do modelo default do catálogo). */
-function fakeXai(deltas: string[] = ["resposta"]): {
-  registry: ReturnType<typeof createProviderRegistry>;
-  adapter: ReturnType<typeof createFakeAdapter>;
-} {
-  const registry = createProviderRegistry();
-  const adapter = createFakeAdapter("xai", { deltas });
-  registry.register(adapter);
-  return { registry, adapter };
-}
-
+import { collectPublish, fixedClock, ids, deferred, makeRunner, fakeXai } from "./helpers/turn-runner.js";
 
 describe("T10 fila exclusiva por agente (serialização)", () => {
   it("turns do MESMO agente serializam — um turno em curso por vez", async () => {
@@ -485,5 +418,50 @@ describe("T10 fila exclusiva por agente (serialização)", () => {
     release();
     await drain;
     expect(drained).toBe(true);
+  });
+});
+
+describe("send queue ceiling and generation state", () => {
+  it("rejects prompts above the per-agent queue ceiling", () => {
+    const registry = defaultRegistry;
+    const previous = registry.get("xai");
+    registry.register({
+      name: "xai",
+      async streamChat() {
+        await new Promise(() => undefined);
+      },
+    });
+    try {
+      const runner = createTurnRunner({ registry });
+      expect(MAX_SEND_QUEUE_PER_AGENT).toBeGreaterThan(0);
+      expect(MAX_PROVIDER_TRANSCRIPT_MESSAGES).toBeGreaterThan(0);
+      for (let i = 0; i < MAX_SEND_QUEUE_PER_AGENT; i += 1) {
+        expect(runner.sendPrompt({ agentId: "a", prompt: `p${i}` })).toBeInstanceOf(Promise);
+      }
+      expect(() => runner.sendPrompt({ agentId: "a", prompt: "overflow" })).toThrow(/fila cheia/);
+    } finally {
+      if (previous) registry.register(previous);
+    }
+  });
+
+  it("keeps cancelled generation state until committed deletion cleanup", async () => {
+    const runner = createTurnRunner();
+    runner.sendPrompt({ agentId: "deleted-agent", prompt: "queued", clientNonce: "nonce:1" });
+    expect(runner.cancelPrompt("deleted-agent").cancelled).toBe(true);
+    await runner.flush("deleted-agent");
+
+    const state = runner as unknown as {
+      agentGenerations: Map<string, number>;
+      queues: Map<string, unknown>;
+      pendingCounts: Map<string, number>;
+      queuedNonces: Map<string, Set<string>>;
+    };
+    expect(state.agentGenerations.has("deleted-agent")).toBe(true);
+    expect(state.queues.has("deleted-agent")).toBe(false);
+    expect(state.pendingCounts.has("deleted-agent")).toBe(false);
+    expect(state.queuedNonces.has("deleted-agent")).toBe(false);
+
+    runner.cleanupDeletedAgents(["deleted-agent"]);
+    expect(state.agentGenerations.has("deleted-agent")).toBe(false);
   });
 });

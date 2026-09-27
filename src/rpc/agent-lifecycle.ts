@@ -127,8 +127,12 @@ const AGENT_ID_FIELDS = [
   "targetAgentId",
 ] as const;
 
-/** Extract agent identities from first-party RPC contracts without accepting arbitrary nested data. */
-export function rpcAgentIds(method: string, body: unknown): string[] {
+/**
+ * Extract agent identities from first-party RPC contracts without accepting
+ * arbitrary nested data. `idIsAgent` marks methods whose `id` field is the
+ * agent (the roster's legacy alias for `agentId`).
+ */
+export function rpcAgentIds(method: string, body: unknown, idIsAgent = false): string[] {
   if (typeof body !== "object" || body === null || Array.isArray(body)) return [];
   const record = body as Record<string, unknown>;
   const ids: string[] = [];
@@ -136,7 +140,7 @@ export function rpcAgentIds(method: string, body: unknown): string[] {
     const value = record[field];
     if (typeof value === "string" && value.trim().length > 0) ids.push(value);
   }
-  if (method === "createAgent" && typeof record.id === "string" && record.id.trim().length > 0) {
+  if ((method === "createAgent" || idIsAgent) && typeof record.id === "string" && record.id.trim().length > 0) {
     ids.push(record.id);
   }
   return ids;

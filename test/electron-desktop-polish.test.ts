@@ -10,13 +10,15 @@ const visual = readFileSync(resolve(root, "scripts/visual-ui-verify.mjs"), "utf8
 
 describe("Electron desktop operational polish", () => {
   it("bundles the terminal renderer failure path before desktop bootstrap rejection", () => {
-    expect(main).toMatch(/console\.error\("\[openbot\] terminal renderer load failure", error6\);\r?\n    if \(mainWindow === window2\) mainWindow = void 0;\r?\n    if \(!window2\.isDestroyed\(\)\) window2\.destroy\(\);\r?\n    import_electron50\.app\.exit\(1\);\r?\n    throw error6;/u);
-    expect(main).toMatch(/app\.whenReady\(\)\.then\([\s\S]*\.catch\(\(error6\) => \{\r?\n  console\.error\("\[openbot\] desktop bootstrap failed", error6\);/u);
+    // Bundler-generated names (error6, window2, import_electron50) change on
+    // every rebuild; match the behaviour with captured identifiers instead.
+    expect(main).toMatch(/console\.error\("\[openbot\] terminal renderer load failure", (\w+)\);\r?\n    if \(mainWindow === (\w+)\) mainWindow = void 0;\r?\n    if \(!\2\.isDestroyed\(\)\) \2\.destroy\(\);\r?\n    \w+\.app\.exit\(1\);\r?\n    throw \1;/u);
+    expect(main).toMatch(/app\.whenReady\(\)\.then\([\s\S]*\.catch\(\((\w+)\) => \{\r?\n  console\.error\("\[openbot\] desktop bootstrap failed", \1\);/u);
   });
 
   it("bundles isolated temporary state, a dynamic port, and cleanup in the visual verifier", () => {
     expect(visual).toContain('mkdtempSync(join(tmpdir(), "openbot-visual-native-"))');
-    expect(visual).toContain("async function getFreePort()");
+    expect(visual).toContain("const cdpPort = await getFreePort();");
     expect(visual).toContain("`--remote-debugging-port=${cdpPort}`");
     expect(visual).toMatch(/taskkill[\s\S]{0,120}["']\/T["']/);
     expect(visual).toMatch(/if \(runRoot\) rmSync\(runRoot, \{[^}]*recursive: true[^}]*force: true[^}]*\}\);/u);

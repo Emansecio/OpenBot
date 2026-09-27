@@ -32,7 +32,7 @@ async function bootHome() {
   const homes = await AgentHomeStore.create(dir);
   const home = await homes.ensure("openbot-default");
   const backend = await HomeWorkspaceBackend.create(home.root);
-  const broker = new LocalExecutionBroker(backend, () => "always", () => {});
+  const broker = new LocalExecutionBroker(backend);
   const events: { channel: string; payload: Record<string, unknown> }[] = [];
   const store = createMemoryTranscriptStore();
   let calls = 0;
@@ -68,7 +68,7 @@ describe("tool-call lifecycle", () => {
     const broker = new LocalExecutionBroker({ execute: (request, signal) => {
       if (request.operation !== "process.run") throw new Error("unexpected operation");
       return native.run(lease, request, signal ?? new AbortController().signal);
-    } }, () => "always");
+    } });
     const secret = "synthetic-process-secret-829463";
     const store = createMemoryTranscriptStore();
     let calls = 0;
@@ -148,7 +148,7 @@ describe("tool-call lifecycle", () => {
     const runner = createTurnRunner({
       registry,
       store,
-      executionBroker: new LocalExecutionBroker(backend, () => "always", () => {}),
+      executionBroker: new LocalExecutionBroker(backend),
       tools: [{ type: "function", function: { name: "file", parameters: { type: "object" } } }],
       resolveProvider: () => ({ provider: "scripted", model: "fake" }),
     });
@@ -188,7 +188,7 @@ describe("tool-call lifecycle", () => {
     const runner = createTurnRunner({
       registry,
       store,
-      executionBroker: new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root), () => "always", () => {}),
+      executionBroker: new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root)),
       tools: [{ type: "function", function: { name: "file", parameters: { type: "object" } } }],
       resolveProvider: () => ({ provider: "scripted", model: "fake" }),
     });
@@ -221,7 +221,7 @@ describe("tool-call lifecycle", () => {
     const runner = createTurnRunner({
       registry,
       store,
-      executionBroker: new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root), () => "always", () => {}),
+      executionBroker: new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root)),
       tools: [{ type: "function", function: { name: "file", parameters: { type: "object" } } }],
       resolveProvider: () => ({ provider: "scripted", model: "fake" }),
     });
@@ -238,20 +238,14 @@ describe("tool-call lifecycle", () => {
     expect(cards.every((entry) => entry.status === "completed")).toBe(true);
   });
 
-  it("usa identidade de aprovação diferente quando o provider reutiliza o id em outro turno", async () => {
-    const dir = await temp.makeAsync("openbot-life-approval-id-");
+  it("usa identidade de execução diferente quando o provider reutiliza o id em outro turno", async () => {
+    const dir = await temp.makeAsync("openbot-life-execution-id-");
     const homes = await AgentHomeStore.create(dir);
     const home = await homes.ensure("openbot-default");
-    const approvals: string[] = [];
-    let broker!: LocalExecutionBroker;
-    broker = new LocalExecutionBroker(
-      await HomeWorkspaceBackend.create(home.root),
-      () => "ask",
-      (approval) => {
-        approvals.push(approval.requestId);
-        broker.resolve(approval.requestId, "allow", approval.agentId);
-      },
-    );
+    const requestIds: string[] = [];
+    const broker = new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root), {
+      audit: (entry) => { if (entry.kind === "decision") requestIds.push(entry.requestId); },
+    });
     const store = createMemoryTranscriptStore();
     let calls = 0;
     const registry = createProviderRegistry();
@@ -276,9 +270,9 @@ describe("tool-call lifecycle", () => {
     runner.sendPrompt({ agentId: "openbot-default", prompt: "segundo" });
     await runner.flush("openbot-default");
 
-    expect(approvals).toHaveLength(2);
-    expect(approvals[0]).not.toBe(approvals[1]);
-    expect(approvals.every((id) => id.endsWith("\0reused"))).toBe(true);
+    expect(requestIds).toHaveLength(2);
+    expect(requestIds[0]).not.toBe(requestIds[1]);
+    expect(requestIds.every((id) => id.endsWith("\0reused"))).toBe(true);
     expect(store.getEntries("openbot-default").filter((entry) => entry.kind === "tool-call" && entry.status === "completed")).toHaveLength(2);
   });
 
@@ -301,7 +295,7 @@ describe("tool-call lifecycle", () => {
     const result = await runToolLoop({
       agentId: "openbot-default",
       turnId: "turn-commit",
-      broker: new LocalExecutionBroker(backend, () => "always"),
+      broker: new LocalExecutionBroker(backend),
       request: { model: "fake", messages: [], tools: [fileProviderTool], signal: controller.signal },
       onEvent: () => undefined,
       onProgress: ({ entry }) => statuses.push(entry.status),
@@ -337,7 +331,7 @@ describe("tool-call lifecycle", () => {
     const runner = createTurnRunner({
       registry,
       store,
-      executionBroker: new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root), () => "always", () => {}),
+      executionBroker: new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root)),
       tools: [{ type: "function", function: { name: "file", parameters: { type: "object" } } }],
       resolveProvider: () => ({ provider: "scripted", model: "fake" }),
     });
@@ -353,11 +347,11 @@ describe("tool-call lifecycle", () => {
     const homes = await AgentHomeStore.create(dir);
     const home = await homes.ensure("openbot-default");
     await writeFile(join(home.root, "Documents", "ok.md"), "content");
-    const broker = new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root), () => "always", () => {});
+    const broker = new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root));
     const realExecute = broker.execute.bind(broker);
-    vi.spyOn(broker, "execute").mockImplementation(async (agentId, requestId, request, signal, options) => {
+    vi.spyOn(broker, "execute").mockImplementation(async (agentId, requestId, request, signal) => {
       if ((request as { path?: string }).path === "Documents/fail.md") throw new Error("broker blew up");
-      return realExecute(agentId, requestId, request, signal, options);
+      return realExecute(agentId, requestId, request, signal);
     });
     const statuses = new Map<string, string>();
     const toolRead = (id: string, path: string) => ({
@@ -387,33 +381,24 @@ describe("tool-call lifecycle", () => {
     expect(statuses.get("r-ok")).toBe("completed");
   });
 
-  it("re-executes a read after a write and keeps resumable occurrences distinct", async () => {
+  it("re-executes a read after a write instead of reusing the pre-write observation", async () => {
     const dir = await temp.makeAsync("openbot-life-rwr-");
     const homes = await AgentHomeStore.create(dir);
     const home = await homes.ensure("openbot-default");
     await writeFile(join(home.root, "Documents", "estado.md"), "v1");
-    const store = createMemoryTranscriptStore();
-    const scope = { agentId: "openbot-default", conversationId: "conversation-a", turnId: "turn-rwr", provider: "openai-compat", model: "openai-compatible" } as const;
-    const broker = new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root), () => "always", () => {});
+    const scope = { agentId: "openbot-default", conversationId: "conversation-a", turnId: "turn-rwr" } as const;
+    const broker = new LocalExecutionBroker(await HomeWorkspaceBackend.create(home.root));
     const toolRead = (id: string, path: string) => ({
       id,
       type: "function" as const,
       function: { name: "file", arguments: JSON.stringify({ op: "read", path }) },
     });
-    const effectIds: string[] = [];
     let deliveredToolJson = "";
     let round = 0;
     const result = await runToolLoop({
       agentId: scope.agentId,
-      conversationId: scope.conversationId,
       turnId: scope.turnId,
       broker,
-      resumableEffects: {
-        prepare: (effectId, fingerprintHash) => { effectIds.push(effectId); return store.prepareResumeEffect!(scope, effectId, fingerprintHash); },
-        markStarted: (effectId) => store.markResumeEffectStarted!(scope, effectId),
-        markUnsafe: (effectId) => store.markResumeEffectUnsafe!(scope, effectId),
-        complete: (effectId, fingerprintHash, res) => store.completeResumeEffect!(scope, effectId, fingerprintHash, res),
-      },
       request: { model: "fake", messages: [], tools: [fileProviderTool] },
       onEvent: () => undefined,
       async stream(request) {
@@ -428,9 +413,7 @@ describe("tool-call lifecycle", () => {
       },
     });
     expect(result.error).toBeUndefined();
+    // The second read ran after the write and delivered the new content.
     expect(deliveredToolJson).toContain("v2");
-    // read, write, read again — three distinct resumable effects.
-    expect(effectIds).toHaveLength(3);
-    expect(new Set(effectIds).size).toBe(3);
   });
 });

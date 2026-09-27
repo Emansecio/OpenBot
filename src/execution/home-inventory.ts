@@ -20,6 +20,11 @@ export interface HomeInventory {
   directories: number;
   bytes: number;
   entries: HomeInventoryEntry[];
+  /**
+   * False when something was left out: links (opaque, never followed), other
+   * special entries, files that changed while being hashed, or the listing
+   * stopped at its entry/byte limits.
+   */
   complete: boolean;
 }
 
@@ -27,7 +32,12 @@ export const DEFAULT_HOME_INVENTORY_MAX_ENTRIES = DEFAULT_WORKSPACE_QUOTA.maxEnt
 export const WORKSPACE_ACL_STAMP_NAME = ".openbot-acl-v1.json";
 const INVENTORY_HASH_CHUNK_BYTES = 64 * 1024;
 
-/** Lifecycle validation must work even when a home exceeds its storage quota. */
+/**
+ * Lifecycle validation must work even when a home exceeds its storage quota.
+ * Links inside the home (e.g. junctions made by package managers) are opaque:
+ * quarantine renames them and purges remove them without following, so they
+ * are neither descended into nor treated as unsafe.
+ */
 export async function validateHomeTree(root: string): Promise<void> {
   const visit = async (current: string, prefix: string): Promise<void> => {
     const metadata = await lstat(current);
@@ -39,7 +49,7 @@ export async function validateHomeTree(root: string): Promise<void> {
       const path = validateArchivePath(prefix ? `${prefix}/${child.name}` : child.name);
       const absolute = join(current, child.name);
       const info = await lstat(absolute);
-      if (info.isSymbolicLink()) throw new HomeArchiveError("unsafe_path", `Home contains a symbolic link: ${path}`);
+      if (info.isSymbolicLink()) continue;
       if (info.isDirectory()) {
         if (!isHomeTrashArchivePath(path)) await visit(absolute, path);
       } else if (!info.isFile()) {
@@ -104,36 +114,53 @@ export async function inventoryHome(
   let bytes = 0;
   let files = 0;
   let directories = 0;
+  // A report of the home, not a gate: what cannot be listed marks it
+  // incomplete instead of failing the lifecycle operation that asked for it.
+  let complete = true;
+  let truncated = false;
 
   const visit = async (current: string, prefix: string): Promise<void> => {
     abortIfRequested(signal);
     const children = await readdir(current, { withFileTypes: true });
     children.sort((left, right) => left.name.localeCompare(right.name));
     for (const child of children) {
+      if (truncated) return;
       abortIfRequested(signal);
       const path = validateArchivePath(prefix.length === 0 ? child.name : `${prefix}/${child.name}`);
       const absolute = join(current, child.name);
       const metadata = await lstat(absolute);
-      if (metadata.isSymbolicLink()) throw new HomeArchiveError("unsafe_path", `Home contains a symbolic link: ${path}`);
-      if (metadata.isDirectory()) {
+      if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
+        if (entries.length >= maxEntries) {
+          truncated = true;
+          return;
+        }
         directories += 1;
         entries.push({ path, type: "directory", size: 0 });
-        if (entries.length > maxEntries) throw new HomeArchiveError("invalid_archive", "Home contains too many entries.");
         if (isHomeTrashArchivePath(path)) continue;
         await visit(absolute, path);
       } else if (metadata.isFile()) {
-        if (metadata.size > maxBytes - bytes) throw new HomeArchiveError("invalid_archive", "Home exceeds the inventory size limit.");
-        const hashed = await hashFile(absolute, metadata, maxBytes - bytes, signal);
+        if (entries.length >= maxEntries || metadata.size > maxBytes - bytes) {
+          truncated = true;
+          return;
+        }
+        let hashed: { size: number; sha256: string };
+        try {
+          hashed = await hashFile(absolute, metadata, maxBytes - bytes, signal);
+        } catch (error) {
+          if (signal?.aborted || !(error instanceof HomeArchiveError)) throw error;
+          complete = false;
+          continue;
+        }
         bytes += hashed.size;
         files += 1;
         entries.push({ path, type: "file", size: hashed.size, sha256: hashed.sha256 });
-        if (entries.length > maxEntries) throw new HomeArchiveError("invalid_archive", "Home contains too many entries.");
       } else {
-        throw new HomeArchiveError("unsafe_path", `Home contains an unsupported filesystem entry: ${path}`);
+        // Links are opaque; other special entries are not part of the report.
+        complete = false;
       }
     }
   };
 
   await visit(root, "");
-  return { agentId, root, files, directories, bytes, entries, complete: true };
+  return { agentId, root, files, directories, bytes, entries, complete: complete && !truncated };
 }

@@ -4,6 +4,7 @@ import {
   DEFAULT_PROVIDER_MAX_ACTIVE,
   DEFAULT_PROVIDER_MAX_QUEUED,
   DEFAULT_PROVIDER_MAX_QUEUED_PER_AGENT,
+  ProviderAdmissionError,
   ProviderAdmissionScheduler,
   createProviderAdmissionFromEnv,
   providerAdmissionOptionsFromEnv,
@@ -76,6 +77,21 @@ describe("global provider admission", () => {
     const l3 = await a2; l3.release();
     expect(order).toEqual(["a1", "b1", "a2"]);
     expect(scheduler.metrics()).toMatchObject({ active: 0, waiting: 0 });
+  });
+
+  it("reports a maintenance wait timeout as retryable capacity pressure, not a permanent failure", async () => {
+    const registry = createProviderRegistry();
+    let calls = 0;
+    registry.register({ name: "reflection", async streamChat() { calls += 1; } });
+    const timedOut = {
+      acquire: async () => { throw new ProviderAdmissionError("wait-timeout", "provider admission excedeu a espera máxima na fila", true); },
+    } as unknown as ProviderAdmissionScheduler;
+    const result = await streamChat("reflection", { model: "fixture", messages: [], purpose: "memory-reflection" }, undefined, {
+      registry, admission: timedOut, agentId: "a",
+    });
+    // The reflection worker retries the job later instead of marking it dead.
+    expect(result.error).toMatchObject({ kind: "rate-limit", retryable: true, code: "PROVIDER_ADMISSION_WAIT_TIMEOUT" });
+    expect(calls).toBe(0);
   });
 
   it("normalizes agent queue rejection and does not retry through streamChat", async () => {

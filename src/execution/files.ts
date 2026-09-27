@@ -122,12 +122,14 @@ const copyFileContents = async (
   expected: FileMetadata,
   signal: AbortSignal | undefined,
   options: FileExecutorOptions,
+  flag: "w" | "wx" = "w",
 ): Promise<void> => {
   const sourceHandle = await openVerifiedFile(source, expected, options);
   let destinationHandle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    // createTemporaryPath reserves this unique name before the copy starts.
-    destinationHandle = await open(destination, "w", 0o600);
+    // createTemporaryPath reserves the top-level name before the copy starts;
+    // anything below it must be created fresh (`wx`).
+    destinationHandle = await open(destination, flag, 0o600);
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
     while (true) {
@@ -299,11 +301,18 @@ const readFile = async (
       throw new FileExecutionError("output_limit", MESSAGES.readLimit);
     }
 
-    // The extra byte detects a file that grows beyond the limit between stat
-    // and read while keeping allocation and I/O strictly bounded.
-    const buffer = Buffer.allocUnsafe(MAX_FILE_BYTES + 1);
+    // Sized from the stat plus one byte to notice growth. A file that grew
+    // since the stat widens the buffer, never past the limit plus the one
+    // byte that detects it, so allocation and I/O stay strictly bounded.
+    let buffer = Buffer.allocUnsafe(Math.min(before.size, MAX_FILE_BYTES) + 1);
     let bytesRead = 0;
-    while (bytesRead < buffer.byteLength) {
+    while (true) {
+      if (bytesRead === buffer.byteLength) {
+        if (buffer.byteLength > MAX_FILE_BYTES) break;
+        const wider = Buffer.allocUnsafe(Math.min(buffer.byteLength * 2, MAX_FILE_BYTES + 1));
+        buffer.copy(wider, 0, 0, bytesRead);
+        buffer = wider;
+      }
       abortIfRequested(signal);
       const result = await handle.read(buffer, bytesRead, buffer.byteLength - bytesRead, bytesRead);
       if (result.bytesRead === 0) break;
@@ -457,24 +466,27 @@ const copyTree = async (
   destination: string,
   signal: AbortSignal | undefined,
   options: FileExecutorOptions,
+  nested = false,
 ): Promise<void> => {
   const metadata = await lstat(source);
   if (metadata.isSymbolicLink()) throw new FileExecutionError("outside_workspace", MESSAGES.outsideWorkspace);
   abortIfRequested(signal);
   if (metadata.isFile()) {
-    await copyFileContents(source, destination, metadata, signal, options);
+    await copyFileContents(source, destination, metadata, signal, options, nested ? "wx" : "w");
     return;
   }
   if (!metadata.isDirectory()) throw new FileExecutionError("invalid_path", MESSAGES.invalidPath);
+  // Only the reserved top-level temporary may already exist. A nested entry
+  // that appears mid-copy (e.g. a planted junction) is tampering, not reuse.
   await fsMkdir(destination).catch((error: unknown) => {
-    if (fsErrorCode(error) !== "EEXIST") throw error;
+    if (nested || fsErrorCode(error) !== "EEXIST") throw error;
   });
   const handle = await openVerifiedDirectory(source, metadata, options);
   try {
     for await (const entry of handle) {
       abortIfRequested(signal);
       if (entry.isSymbolicLink()) throw new FileExecutionError("outside_workspace", MESSAGES.outsideWorkspace);
-      await copyTree(path.join(source, entry.name), path.join(destination, entry.name), signal, options);
+      await copyTree(path.join(source, entry.name), path.join(destination, entry.name), signal, options, true);
     }
   } finally {
     await handle.close().catch(() => undefined);
@@ -796,7 +808,9 @@ const trashFile = async (
   const payload = path.join(entry, "payload");
   const marker = path.join(entry, "meta.json");
   const markerContents = JSON.stringify({ version: 1, path: path.relative(workspace.root, source) });
-  const reservation = quota ? await quota.reserveDelta({ bytes: Buffer.byteLength(markerContents), files: 1, entries: trashPlan.missingEntries + 2 }, entry) : undefined;
+  // Trashing only frees measured space: the entry and marker live in the
+  // unmetered trash, so it reserves nothing and works even over the quota.
+  const reservation = quota ? await quota.reserveDelta({ bytes: 0, files: 0, entries: 0 }, entry) : undefined;
   let moved = false;
   let renamed = false;
   let preservedTrash = false;
@@ -820,6 +834,8 @@ const trashFile = async (
     await assertStablePath(trashRoot, trashRootMetadata);
     moved = true;
     reservation?.commit();
+    // The payload left the measured tree; recount before the next admission.
+    quota?.markUsageDirty();
     return { ok: true, operation: "file.trash", trashId };
   } catch (error) {
     if (renamed && !moved) {

@@ -139,6 +139,8 @@ export class RuntimeManager implements AgentRuntimeManager {
   private startupStopReason: StopReason | undefined;
   private runtimeGeneration = 0;
   private pendingAcquireCount = 0;
+  /** Agents currently waiting on the shared runtime (startup or acquire). */
+  private readonly waitingAgents = new Map<string, number>();
   private pendingAcquireWaiters: Array<() => void> = [];
   private recovery: Promise<RuntimeRecoveryResult> | undefined;
   private lastRecovery: { bootId: string; result: RuntimeRecoveryResult } | undefined;
@@ -200,7 +202,8 @@ export class RuntimeManager implements AgentRuntimeManager {
     this.recovery = (async () => {
       let result: RuntimeRecoveryResult;
       if (this.reconciler) {
-        result = await reconcileRuntimeLeases(this.journal!, bootId, this.reconciler, activeBoot);
+        // A restart after one lease's failed cleanup must not kill other agents' running commands.
+        result = await reconcileRuntimeLeases(this.journal!, bootId, this.reconciler, activeBoot, (record) => this.leases.has(record.leaseId));
       } else {
         let records: RuntimeLeaseRecord[];
         try {
@@ -217,11 +220,12 @@ export class RuntimeManager implements AgentRuntimeManager {
         const report = typeof diagnostics.getLastReport === "function"
           ? diagnostics.getLastReport()
           : { issues: [], quarantined: 0 };
-        const failed = records.length > 0 || report.issues.length > 0;
+        const orphans = records.filter((record) => !this.leases.has(record.leaseId));
+        const failed = orphans.length > 0 || report.issues.length > 0;
         result = {
-          inspected: records.length + report.issues.length,
+          inspected: orphans.length + report.issues.length,
           cleaned: 0,
-          failed: failed ? Math.max(1, records.length + report.issues.length) : 0,
+          failed: failed ? Math.max(1, orphans.length + report.issues.length) : 0,
           complete: !failed,
           ...(report.quarantined > 0 ? { quarantined: report.quarantined } : {}),
         };
@@ -239,6 +243,16 @@ export class RuntimeManager implements AgentRuntimeManager {
   }
 
   async ensure(agentId: string, mode: RuntimeMode, signal?: AbortSignal): Promise<RuntimeStatus> {
+    if (mode !== "developer") return this.ensureRuntime(agentId, mode, signal);
+    const release = this.holdWaiting(agentId);
+    try {
+      return await this.ensureRuntime(agentId, mode, signal);
+    } finally {
+      release();
+    }
+  }
+
+  private async ensureRuntime(agentId: string, mode: RuntimeMode, signal?: AbortSignal): Promise<RuntimeStatus> {
     this.assertAgentId(agentId);
     throwIfAborted(signal);
     if (this.deletedAgents.has(agentId)) throw new RuntimeManagerError("agent_fenced", "Agent runtime is fenced.");
@@ -273,16 +287,29 @@ export class RuntimeManager implements AgentRuntimeManager {
     if (this.startup) {
       const joinedStartup = this.startup;
       const observedGeneration = this.startupGeneration;
-      const status = await raceWithAbort(joinedStartup, signal);
-      if (this.shutdownStarted || this.runtimeState !== "stopped") return status;
-      if (this.startup) return raceWithAbort(this.startup, signal);
-      if (this.startupGeneration !== observedGeneration) return status;
+      await raceWithAbort(joinedStartup, signal);
+      if (this.shutdownStarted || this.runtimeState !== "stopped") return this.statusFor(agentId);
+      if (this.startup) {
+        await raceWithAbort(this.startup, signal);
+        return this.statusFor(agentId);
+      }
+      if (this.startupGeneration !== observedGeneration) return this.statusFor(agentId);
     }
 
-    return raceWithAbort(this.beginStartup(), signal);
+    await raceWithAbort(this.beginStartup(), signal);
+    return this.statusFor(agentId);
   }
 
   async acquire(agentId: string, capability: RuntimeCapability, signal?: AbortSignal): Promise<RuntimeLease> {
+    const release = this.holdWaiting(agentId);
+    try {
+      return await this.acquireLease(agentId, capability, signal);
+    } finally {
+      release();
+    }
+  }
+
+  private async acquireLease(agentId: string, capability: RuntimeCapability, signal?: AbortSignal): Promise<RuntimeLease> {
     this.assertAgentId(agentId);
     throwIfAborted(signal);
     if (this.shutdownStarted) throw new RuntimeManagerError("runtime_closed", "Runtime is closed.");
@@ -504,7 +531,9 @@ export class RuntimeManager implements AgentRuntimeManager {
     this.assertAgentId(agentId);
     const record = this.recordFor(agentId);
     if (reason === "agent-delete") record.fenced = true;
-    const canceledStartup = this.cancelStartup(reason);
+    // Another agent waiting on the runtime keeps its startup and admission.
+    const othersWaiting = [...this.waitingAgents.keys()].some((id) => id !== agentId);
+    const canceledStartup = othersWaiting ? undefined : this.cancelStartup(reason);
 
     const entries = [...this.leases.values()].filter((entry) => entry.agentId === agentId);
     let releaseError: unknown;
@@ -524,7 +553,7 @@ export class RuntimeManager implements AgentRuntimeManager {
       }
     }
 
-    if (this.leases.size === 0 && this.boot && !this.shutdownStarted) {
+    if (this.leases.size === 0 && !othersWaiting && this.boot && !this.shutdownStarted) {
       this.clearIdleStopTimer();
       try {
         await this.requestStop(reason);
@@ -578,7 +607,9 @@ export class RuntimeManager implements AgentRuntimeManager {
   releaseAgentFence(agentId: string): void {
     this.assertAgentId(agentId);
     this.deletedAgents.delete(agentId);
-    this.recordFor(agentId).fenced = false;
+    // A deleted agent has no record left; releasing its fence must not recreate one.
+    const record = this.agents.get(agentId);
+    if (record !== undefined) record.fenced = false;
   }
 
   async close(): Promise<void> {
@@ -744,6 +775,18 @@ export class RuntimeManager implements AgentRuntimeManager {
         throw new RuntimeManagerError("runtime_unhealthy", "Runtime lease journal cleanup failed.");
       }
     }
+  }
+
+  private holdWaiting(agentId: string): () => void {
+    this.waitingAgents.set(agentId, (this.waitingAgents.get(agentId) ?? 0) + 1);
+    let held = true;
+    return () => {
+      if (!held) return;
+      held = false;
+      const remaining = (this.waitingAgents.get(agentId) ?? 1) - 1;
+      if (remaining === 0) this.waitingAgents.delete(agentId);
+      else this.waitingAgents.set(agentId, remaining);
+    };
   }
 
   private beginPendingAcquire(): void {

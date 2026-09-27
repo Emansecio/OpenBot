@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -98,13 +98,26 @@ describe("HomeWorkspaceBackend", () => {
     await expect(readFile(outside, "utf8")).resolves.toBe("untouched");
   });
 
-  it("backendFor caches per agent and does not leak files", async () => {
+  it("skips a missing scope in a multi-scope search but reports not_found when none exists", async () => {
+    const dir = await temp.makeAsync("openbot-home-search-scopes-");
+    const store = await AgentHomeStore.create(dir);
+    const home = await store.ensure("agent-a");
+    await writeFile(join(home.root, "Documents", "note.txt"), "needle here");
+    await rm(join(home.root, "Projects"), { recursive: true, force: true });
+    const backend = await HomeWorkspaceBackend.create(home.root);
+    const search = (paths: string[]) => backend.execute({
+      operation: "command.run", command: "search.text", cwd: ".", params: { pattern: "needle", mode: "fixed", paths },
+    });
+    await expect(search(["Documents", "Projects"])).resolves.toMatchObject({ ok: true, stdout: "Documents/note.txt:1:needle here" });
+    await expect(search(["Projects", "Missing"])).resolves.toMatchObject({ ok: false, code: "not_found" });
+    await expect(search(["Projects"])).resolves.toMatchObject({ ok: false, code: "not_found" });
+  });
+
+  it("keeps each agent's home backend isolated", async () => {
     const dir = await temp.makeAsync("openbot-home-cache-");
     const store = await AgentHomeStore.create(dir);
-    const a = await store.backendFor("agent-a");
-    const b = await store.backendFor("agent-b");
-    expect(a).not.toBe(b);
-    expect(await store.backendFor("agent-a")).toBe(a);
+    const a = await HomeWorkspaceBackend.create((await store.ensure("agent-a")).root);
+    const b = await HomeWorkspaceBackend.create((await store.ensure("agent-b")).root);
     await a.execute({ operation: "file.write", path: "Documents/a.txt", content: "aaa", encoding: "utf8" });
     const listed = await b.execute({ operation: "file.list", path: "Documents" });
     expect(listed).toMatchObject({ ok: true });
@@ -142,7 +155,10 @@ describe("HomeWorkspaceBackend", () => {
     const dir = await temp.makeAsync("openbot-home-allow-");
     const store = await AgentHomeStore.create(dir);
     await store.ensure("openbot-default");
-    const broker = createAgentHomeBroker(store, { allowedAgentIds: ["openbot-default"] });
+    const broker = createAgentHomeBroker({
+      pathFor: (agentId) => store.pathFor(agentId),
+      backendFor: async (agentId) => HomeWorkspaceBackend.create((await store.ensure(agentId)).root),
+    }, { allowedAgentIds: ["openbot-default"] });
     await expect(broker.execute("health-agent", "r1", { operation: "file.list", path: "." })).resolves.toMatchObject({
       ok: false,
       code: "permission_denied",

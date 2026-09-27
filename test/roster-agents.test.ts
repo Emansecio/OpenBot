@@ -24,7 +24,6 @@ async function boot(onTestFinished: RegisterCleanup, seedDefault = true) {
   if (seedDefault) {
     const config = new ConfigStore({ configPath });
     config.update({ agents: [{ id: "openbot-default", name: "Local User", avatarId: "openbot-default" }] });
-    config.close();
   }
   handle = await startServer(0, {
     stateRoot: join(dir, "state"),
@@ -355,12 +354,16 @@ describe.concurrent("roster multi-agent", () => {
 
   it("remove a home recém-criada quando o commit do createAgent falha", async ({ onTestFinished }) => {
     const handle = await bootEmpty(onTestFinished);
+    // Fail every commit path: roster mutations use both update() and mutate().
     const originalUpdate = handle.config.update.bind(handle.config);
+    const originalMutate = handle.config.mutate.bind(handle.config);
     handle.config.update = (() => { throw new Error("config update failed"); });
+    handle.config.mutate = (() => { throw new Error("config update failed"); });
     try {
       expect((await post(handle, "createAgent", { id: "create-rollback", name: "Create rollback" })).status).toBe(500);
     } finally {
       handle.config.update = originalUpdate;
+      handle.config.mutate = originalMutate;
     }
 
     expect(existsSync(handle.homes!.pathFor("create-rollback"))).toBe(false);
@@ -371,12 +374,16 @@ describe.concurrent("roster multi-agent", () => {
   it("remove a home recém-criada quando o commit do duplicateAgent falha", async ({ onTestFinished }) => {
     const handle = await bootEmpty(onTestFinished);
     await post(handle, "createAgent", { id: "duplicate-source", name: "Duplicate source" });
+    // Fail every commit path: roster mutations use both update() and mutate().
     const originalUpdate = handle.config.update.bind(handle.config);
+    const originalMutate = handle.config.mutate.bind(handle.config);
     handle.config.update = (() => { throw new Error("config update failed"); });
+    handle.config.mutate = (() => { throw new Error("config update failed"); });
     try {
       expect((await post(handle, "duplicateAgent", { agentId: "duplicate-source" })).status).toBe(500);
     } finally {
       handle.config.update = originalUpdate;
+      handle.config.mutate = originalMutate;
     }
 
     const activeIds = handle.config.snapshot().agents.map((agent) => agent.id);

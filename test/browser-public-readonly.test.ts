@@ -67,4 +67,9 @@ describe("browser public read-only gate policy", () => {
     expect(classifyPublicReadonlyFailure(Object.assign(new Error("ERR_FAILED loading public URL"), { code: "ERR_FAILED" }))).toBe("RED");
     expect(classifyPublicReadonlyFailure(Object.assign(new Error("browser snapshot failed"), { code: "BROWSER_COMMAND_FAILED" }))).toBe("RED");
   });
+
+  it("treats OpenBot proxy and tunnel failures as RED, not as a missing network", () => {
+    expect(classifyPublicReadonlyFailure(new Error("ERR_TUNNEL_CONNECTION_FAILED (-111) loading 'https://example.com/'"))).toBe("RED");
+    expect(classifyPublicReadonlyFailure(new Error("ERR_PROXY_CONNECTION_FAILED (-130) loading 'https://example.com/'"))).toBe("RED");
+  });
 });

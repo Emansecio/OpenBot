@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ProtocolError } from "@modelcontextprotocol/client";
 import type { CallToolResult, ListToolsRequest, ListToolsResult, Tool } from "@modelcontextprotocol/client";
 import { createPinnedDnsLookup, McpManager, McpPolicyError, McpResultLimitError, McpValidationError, type McpClientSession } from "../src/mcp/manager.js";
-import { fromMcpProviderToolName, toMcpProviderToolName } from "../src/mcp/contracts.js";
+import { fromMcpProviderToolName, McpAbortedError, toMcpProviderToolName } from "../src/mcp/contracts.js";
 import type { McpHttpServerConfig, McpServerConfig } from "../src/mcp/contracts.js";
 import { MAX_MCP_RESULT_BYTES, MAX_MCP_SERVERS, MAX_MCP_TIMEOUT_MS, MAX_MCP_TOOLS } from "../src/mcp/security.js";
 
@@ -376,6 +376,59 @@ describe("McpManager", () => {
     await manager.close();
   });
 
+  it("lets a user refresh probe again without waiting out the failure backoff", async () => {
+    let online = false;
+    const connect = vi.fn(async () => {
+      if (!online) throw new Error("offline");
+      return fakeSession([tool("echo")]);
+    });
+    const manager = new McpManager({
+      servers: [server],
+      connector: connect,
+      policies: { bot: { enabled: true, serverAllowlist: ["demo"] } },
+    });
+    await expect(manager.listProviderTools("bot")).rejects.toThrow();
+    online = true;
+    await expect(manager.listProviderTools("bot")).rejects.toThrow();
+    expect(connect).toHaveBeenCalledTimes(1);
+    manager.refreshServers();
+    await expect(manager.listProviderTools("bot")).resolves.toHaveLength(1);
+    expect(connect).toHaveBeenCalledTimes(2);
+    await manager.close();
+  });
+
+  it("closes idle agent-scoped sessions but keeps shared ones and busy ones", async () => {
+    vi.useFakeTimers();
+    try {
+      const closed: string[] = [];
+      const manager = new McpManager({
+        servers: [{ ...server, id: "own", sessionScope: "agent" }, { ...server, id: "shared" }],
+        connector: async (config) => ({ ...fakeSession([tool("echo")]), async close() { closed.push(config.id); } }),
+        policies: { bot: { enabled: true, serverAllowlist: ["own", "shared"] } },
+      });
+      await manager.callProviderTool("bot", "mcp__own__echo", {});
+      await manager.callProviderTool("bot", "mcp__shared__echo", {});
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(closed).toEqual([]);
+      await vi.advanceTimersByTimeAsync(6 * 60_000);
+      expect(closed).toEqual(["own"]);
+      await manager.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts at registration only stdio commands the launch policy can run", () => {
+    const manager = new McpManager({ stdioAllowedCommands: ["node", "node.exe"] });
+    const stdio = (command: string): McpServerConfig => ({ id: "local", transport: "stdio", command, cwd: "C:\\mcp" });
+    expect(manager.stdioCommandRegistrable(stdio("node"))).toBe(true);
+    expect(manager.stdioCommandRegistrable(stdio(process.execPath))).toBe(true);
+    for (const command of ["npx", "npx.cmd", "python", "uvx", "cmd.exe", "C:\\tools\\node.exe", "..\\node"]) {
+      expect(manager.stdioCommandRegistrable(stdio(command))).toBe(false);
+    }
+    expect(manager.stdioCommandRegistrable(server)).toBe(true);
+  });
+
   it("invalidates a missing-secret negative cache when that secret changes", async () => {
     let secret: string | undefined;
     const resolveSecret = vi.fn(async () => {
@@ -520,7 +573,7 @@ describe("McpManager", () => {
     await large.close();
   });
 
-  it("waits for session close before reporting an aborted non-cooperative call", async () => {
+  it("waits for its own session to close before reporting an aborted non-cooperative call", async () => {
     let releaseCall!: (value: CallToolResult) => void;
     const callGate = new Promise<CallToolResult>((resolve) => { releaseCall = resolve; });
     let releaseClose!: () => void;
@@ -531,7 +584,7 @@ describe("McpManager", () => {
     const enteredClose = new Promise<void>((resolve) => { closeStarted = resolve; });
     const close = vi.fn(async () => { closeStarted(); await closeGate; });
     const manager = new McpManager({
-      servers: [server],
+      servers: [{ ...server, sessionScope: "agent" }],
       connector: async () => ({
         async listTools() { return { tools: [tool("slow")] }; },
         async callTool() { callStarted(); return callGate; },
@@ -558,6 +611,46 @@ describe("McpManager", () => {
     releaseClose();
     await expect(outcome).resolves.toBeInstanceOf(Error);
     expect(settled).toBe(true);
+    releaseCall(result("late"));
+    await manager.close();
+  });
+
+  it("cancels only the aborted request on a session shared with other bots", async () => {
+    let releaseCall!: (value: CallToolResult) => void;
+    const callGate = new Promise<CallToolResult>((resolve) => { releaseCall = resolve; });
+    let callStarted!: () => void;
+    const enteredCall = new Promise<void>((resolve) => { callStarted = resolve; });
+    let connects = 0;
+    let calls = 0;
+    const close = vi.fn(async () => {});
+    const manager = new McpManager({
+      servers: [server],
+      connector: async () => {
+        connects += 1;
+        return {
+          async listTools() { return { tools: [tool("slow")] }; },
+          async callTool() {
+            calls += 1;
+            if (calls === 1) { callStarted(); return callGate; }
+            return result("second");
+          },
+          close,
+        };
+      },
+      policies: {
+        bot: { enabled: true, serverAllowlist: ["demo"] },
+        other: { enabled: true, serverAllowlist: ["demo"] },
+      },
+      timeoutMs: 1_000,
+    });
+    const controller = new AbortController();
+    const invocation = manager.callProviderTool("bot", "mcp__demo__slow", {}, { signal: controller.signal });
+    await enteredCall;
+    controller.abort();
+    await expect(invocation).rejects.toBeInstanceOf(McpAbortedError);
+    expect(close).not.toHaveBeenCalled();
+    await expect(manager.callProviderTool("other", "mcp__demo__slow", {})).resolves.toEqual(result("second"));
+    expect(connects).toBe(1);
     releaseCall(result("late"));
     await manager.close();
   });

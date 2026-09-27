@@ -14,6 +14,26 @@ import { hashAgentId } from "../src/browser/browser-session-manager.js";
 import type { DispatchAsyncTaskInput, ProviderCapabilityGrant, SubagentBudget } from "../src/tasks/contracts.js";
 import { TempRoots } from "./helpers/temp-roots.js";
 
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = http.createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const port = typeof address === "object" && address !== null ? address.port : 0;
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+function bindAndRelease(port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const probe = http.createServer();
+    probe.once("error", reject);
+    probe.listen(port, "127.0.0.1", () => probe.close(() => resolve()));
+  });
+}
+
 const temp = new TempRoots();
 const handles: ServerHandle[] = [];
 
@@ -98,11 +118,11 @@ async function post(handle: ServerHandle, method: string, body: unknown): Promis
 
 
 describe("home lifecycle RPC", () => {
-  it("falha antes do boot do servidor quando o bootstrap ACL Windows falha", async () => {
+  it("não deixa o gateway servindo quando o bootstrap ACL Windows falha", async () => {
     const root = temp.make("openbot-home-acl-rpc-");
-    const listen = vi.spyOn(http.Server.prototype, "listen");
+    const port = await freePort();
 
-    await expect(startServer(0, {
+    await expect(startServer(port, {
       stateRoot: join(root, "state"),
       stateAcl: {
         platform: "win32",
@@ -110,7 +130,9 @@ describe("home lifecycle RPC", () => {
         runner: async () => ({ exitCode: 1, stderr: "icacls indisponível" }),
       },
     })).rejects.toThrow(/OpenBot state ACL failed.*icacls indisponível/i);
-    expect(listen).not.toHaveBeenCalled();
+    // The early bind (503 while starting) is released: nothing keeps the port.
+    await expect(bindAndRelease(port)).resolves.toBeUndefined();
+    expect(existsSync(join(root, "state", "store.db"))).toBe(false);
   });
 
   it("drena o browser antes de cada mutação de workspace protegida pelo fence", async () => {
@@ -380,5 +402,66 @@ describe("home lifecycle RPC", () => {
     expect(inventory).toMatchObject({ status: 200, json: { ok: true, value: [] } });
     const invalid = await post(handle, "restoreAgentHome", {});
     expect(invalid.status).toBe(400);
+  });
+});
+
+describe("home lifecycle RPC repair", () => {
+
+  it("limpa repair-required só após repair de home bem-sucedido", async () => {
+    const { handle } = await boot();
+    await post(handle, "createAgent", { id: "repair-clear", name: "Repair clear", runtimeMode: "developer" });
+    handle.runtimeManager.markAgentRepairRequired?.("repair-clear");
+    await expect(handle.runtimeManager.status("repair-clear", "developer")).resolves.toMatchObject({ state: "repair-required" });
+
+    expect((await post(handle, "repairAgentHome", { agentId: "repair-clear" })).status).toBe(200);
+    await expect(handle.runtimeManager.status("repair-clear", "developer")).resolves.toMatchObject({ state: "stopped" });
+  });
+
+  it("mantém repair-required quando repair ou restore de home falha", async () => {
+    const { handle } = await boot();
+    await post(handle, "createAgent", { id: "repair-stays", name: "Repair stays", runtimeMode: "developer" });
+    handle.runtimeManager.markAgentRepairRequired?.("repair-stays");
+    writeFileSync(join(handle.homes!.pathFor("repair-stays"), ".openbot", "home.json"), "not-json");
+
+    expect((await post(handle, "repairAgentHome", { agentId: "repair-stays" })).status).toBe(422);
+    await expect(handle.runtimeManager.status("repair-stays", "developer")).resolves.toMatchObject({ state: "repair-required" });
+    expect((await post(handle, "restoreAgentHome", { agentId: "repair-stays", quarantineId: "missing" })).status).not.toBe(200);
+    await expect(handle.runtimeManager.status("repair-stays", "developer")).resolves.toMatchObject({ state: "repair-required" });
+  });
+
+  it("preserva repair-required quando delete falha antes do commit", async () => {
+    const { handle } = await boot({
+      async teardownAgent(agentId) {
+        if (agentId === "delete-fails") throw new Error("browser teardown failed");
+      },
+      async purgeAgent() {},
+    });
+    await post(handle, "createAgent", { id: "delete-fails", name: "Delete fails", runtimeMode: "developer" });
+    handle.runtimeManager.markAgentRepairRequired?.("delete-fails");
+
+    expect((await post(handle, "deleteAgents", { ids: ["delete-fails"] })).status).toBe(503);
+    await expect(handle.runtimeManager.status("delete-fails", "developer")).resolves.toMatchObject({
+      state: "repair-required",
+      lastError: { code: "runtime_unhealthy" },
+    });
+    expect((await post(handle, "getAgent", { id: "delete-fails" })).status).toBe(200);
+  });
+
+  it("limpa repair-required após restore e agent-delete sem herdar ao recriar ID", async () => {
+    const { handle } = await boot();
+    await post(handle, "createAgent", { id: "restore-clear", name: "Restore clear", runtimeMode: "developer" });
+    expect((await post(handle, "deleteAgents", { ids: ["restore-clear"] })).status).toBe(200);
+    handle.runtimeManager.markAgentRepairRequired?.("restore-clear");
+    const quarantined = await handle.homes!.listQuarantine();
+    const entry = quarantined.find((candidate) => candidate.agentId === "restore-clear")!;
+
+    expect((await post(handle, "restoreAgentHome", { agentId: "restore-clear", quarantineId: entry.quarantineId })).status).toBe(200);
+    await expect(handle.runtimeManager.status("restore-clear", "developer")).resolves.toMatchObject({ state: "stopped" });
+
+    await post(handle, "createAgent", { id: "delete-clear", name: "Delete clear", runtimeMode: "developer" });
+    handle.runtimeManager.markAgentRepairRequired?.("delete-clear");
+    expect((await post(handle, "deleteAgents", { ids: ["delete-clear"] })).status).toBe(200);
+    expect((await post(handle, "createAgent", { id: "delete-clear", name: "Recreated", runtimeMode: "developer" })).status).toBe(200);
+    await expect(handle.runtimeManager.status("delete-clear", "developer")).resolves.toMatchObject({ state: "stopped" });
   });
 });

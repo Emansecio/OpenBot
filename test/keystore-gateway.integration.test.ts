@@ -16,16 +16,13 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { GATEWAY_HOST, startServer, stopServer, type ServerHandle } from "../src/main.js";
-import { providerApiKeyKey, type CryptoBackend,
-  injectElectronSafeStorage,
-  type ElectronSafeStorage } from "../src/keystore/backend.js";
+import { providerApiKeyKey, type CryptoBackend } from "../src/keystore/backend.js";
 import { createKeystore, DEFAULT_KEYSTORE_SCOPE, type Keystore } from "../src/keystore/index.js";
 
 let activeHandles: ServerHandle[] = [];
 let tmpDirs: string[] = [];
 
 afterEach(async () => {
-  injectElectronSafeStorage(null);
   const handles = activeHandles;
   activeHandles = [];
   await Promise.all(handles.map((h) => stopServer(h)));
@@ -34,12 +31,13 @@ afterEach(async () => {
   );
 });
 
-function makeFakeSafeStorage(): ElectronSafeStorage {
+/** Backend DPAPI simulado: persiste cifrado sem depender do perfil do Windows. */
+function makeFakeDpapi(): CryptoBackend {
   return {
-    isEncryptionAvailable: () => true,
-    encryptString: (plainText: string) =>
+    name: "fake-dpapi",
+    encrypt: (plainText: string) =>
       Buffer.from(`DPAPI-FAKE::${Buffer.from(plainText, "utf8").reverse().toString("base64")}`, "utf8"),
-    decryptString: (encrypted: Buffer) => {
+    decrypt: (encrypted: Buffer) => {
       const s = encrypted.toString("utf8");
       if (!s.startsWith("DPAPI-FAKE::")) throw new Error("payload desconhecido");
       return Buffer.from(s.slice("DPAPI-FAKE::".length), "base64").reverse().toString("utf8");
@@ -50,9 +48,9 @@ function makeFakeSafeStorage(): ElectronSafeStorage {
 async function bootPersistent(): Promise<ServerHandle> {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "openbot-ks-gw-"));
   tmpDirs.push(dir);
-  injectElectronSafeStorage(makeFakeSafeStorage());
   const handle = await startServer(0, {
     startedAt: "2026-08-11T00:00:00.000Z",
+    keystore: createKeystore({ dir, writeBackend: makeFakeDpapi() }),
     keystoreDir: dir,
     configPath: path.join(dir, "config.json"),
     storePath: path.join(dir, "store.db"),
@@ -168,7 +166,7 @@ describe("T4 gateway — setBoxSecrets (upsert/delete por provider)", () => {
     const parsed = JSON.parse(onDisk) as { scopes: Record<string, Record<string, { backend: string; data: string }>> };
     const entry = parsed.scopes[DEFAULT_KEYSTORE_SCOPE]?.[providerApiKeyKey("openai")];
     if (entry === undefined) throw new Error("openai secret was not persisted");
-    expect(entry.backend).toBe("electron-safe-storage");
+    expect(entry.backend).toBe("fake-dpapi");
   });
 
   it("upsert múltiplo + delete → {synced, upserted, deleted}", async () => {

@@ -14,10 +14,12 @@ describe("tool-card helpers", () => {
     expect(toolCallSummary("search_skills", '{"query":"testes"}')).toBe("search skills");
     expect(toolCallSummary("use_skill", '{"id":"tdd","secret":"do-not-show"}')).toBe("use skill tdd");
     expect(toolCallSummary("mcp__github__create_issue", '{"token":"do-not-show"}')).toBe("MCP github");
+    expect(toolCallSummary("search_mcp_tools", '{"query":"issues"}')).toBe("search MCP tools");
+    expect(toolCallSummary("call_mcp_tool", '{"name":"mcp__github__create_issue","arguments":{"token":"do-not-show"}}')).toBe("MCP github");
+    expect(toolCallSummary("call_mcp_tool", '{"name":"not-mcp"}')).toBe("call MCP tool");
     expect(toolCallSummary("browser_type", '{"text":"super-secret-password"}')).toBe("type in browser");
     expect(toolCallSummary("browser_navigate", '{"url":"https://user:pass@example.com/path?q=token#frag"}')).toBe("navigate https://example.com");
     expect(toolCallSummary("process_run", '{"executable":"python","argv":["app.py"],"stdin":"secret","env":{"API_KEY":"secret"}}')).toBe("run process");
-    expect(toolCallSummary("whatsapp", '{"op":"sweep"}')).toBe("whatsapp sweep");
     const result = toolCallResult(
       { ok: true, operation: "file.write", bytes: 3 },
       { operation: "file.write", path: "Documents/a.md", content: "abc", encoding: "utf8" },

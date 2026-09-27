@@ -7,26 +7,8 @@ import { AttachmentStagingStore, STAGED_PATH_PREFIX } from "../attachments/stagi
 import type { ConfigStore } from "../config/store.js";
 import type { MemoryStore } from "../memory/types.js";
 import { RpcError, type Gateway } from "../server/gateway.js";
+import { rpcRecord as record, rpcRequiredString as requiredString, rpcScopedAgentOrIdAlias as scopedAgent } from "./body.js";
 
-function record(body: unknown, method: string): Record<string, unknown> {
-  if (typeof body !== "object" || body === null || Array.isArray(body)) throw new RpcError(400, method + ": corpo deve ser um objeto");
-  return body as Record<string, unknown>;
-}
-
-function requiredString(body: Record<string, unknown>, name: string, method: string): string {
-  const value = body[name];
-  if (typeof value !== "string" || value.trim().length === 0) throw new RpcError(400, method + ": " + name + " é obrigatório");
-  return value.trim();
-}
-
-function scopedAgent(config: ConfigStore, body: Record<string, unknown>, method: string): string {
-  const explicit = typeof body.agentId === "string" ? body.agentId.trim() : "";
-  const alias = typeof body.id === "string" ? body.id.trim() : "";
-  const agentId = explicit.length > 0 ? explicit : alias.length > 0 ? alias : "";
-  if (agentId.length === 0) throw new RpcError(400, method + ": agentId é obrigatório");
-  if (!config.snapshot().agents.some((agent) => agent.id === agentId)) throw new RpcError(404, method + ": agente não encontrado");
-  return agentId;
-}
 
 function decodeBase64(value: string, method: string): Buffer {
   if (value.length === 0) throw new RpcError(400, method + ": bytesBase64 vazio");

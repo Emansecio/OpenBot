@@ -36,7 +36,7 @@ const base: ProviderChatRequest = {
   tools: TEST_TOOL_NAMES.map((name) => ({ type: "function", function: { name, parameters: { type: "object" } } })),
 };
 const tool = (id: string, name = "file", args = '{"op":"list","path":"."}') => ({ id, type: "function" as const, function: { name, arguments: args } });
-const broker = (backend: Backend) => new LocalExecutionBroker(backend, () => "always", () => {});
+const broker = (backend: Backend) => new LocalExecutionBroker(backend);
 
 
 describe("runToolLoop", () => {
@@ -103,7 +103,7 @@ describe("runToolLoop", () => {
           entry: { id: "wide", provider: "fake", displayName: "wide", contextWindow: 128_000, maxRequestBytes: 1_048_576 },
         } as never,
       },
-      broker: new LocalExecutionBroker(backend, () => "always"),
+      broker: new LocalExecutionBroker(backend),
       stream: async (request) => {
         if (request.tools?.length === 0) return { aborted: false, message: { role: "assistant", content: "fechado" } };
         providerRounds += 1;
@@ -512,7 +512,7 @@ describe("runToolLoop", () => {
     await runToolLoop({
       agentId: "a",
       request: { ...base, acceptsImages: true },
-      broker: new LocalExecutionBroker(imageBackend, () => "always"),
+      broker: new LocalExecutionBroker(imageBackend),
       stream: async (request) => {
         requests.push(request);
         return requests.length === 1
@@ -550,7 +550,7 @@ describe("runToolLoop", () => {
       },
     };
     const result = await runToolLoop({
-      agentId: "a", request: base, broker: new LocalExecutionBroker(backend, () => "always"),
+      agentId: "a", request: base, broker: new LocalExecutionBroker(backend),
       stream: async (request) => {
         requests.push(structuredClone(request));
         const calls = requests.length === 1 ? [tool("before", "browser_snapshot", "{}")]
@@ -1172,7 +1172,6 @@ describe("runToolLoop", () => {
         if (streams === 1) {
           emit({ type: "delta", delta: "Vou consultar o arquivo." });
           emit({ type: "tool-call", call: tool("buffered-call") });
-          emit({ type: "resume-cursor", cursor: "cursor-tool" });
           emit({ type: "done" });
           return { aborted: false, message: { role: "assistant", content: "", toolCalls: [tool("buffered-call")] } };
         }
@@ -1186,9 +1185,9 @@ describe("runToolLoop", () => {
 
     expect(result.message?.content).toBe("Resposta final.");
     expect(events.map((event) => event.type)).toEqual([
-      "tool-call", "resume-cursor", "done", "delta", "message", "done",
+      "tool-call", "done", "delta", "message", "done",
     ]);
-    expect(events.slice(0, 3).some((event) => event.type === "delta" || event.type === "message")).toBe(false);
+    expect(events.slice(0, 2).some((event) => event.type === "delta" || event.type === "message")).toBe(false);
   });
 
   it("libera texto e terminal done somente depois de uma rodada sem tools", async () => {

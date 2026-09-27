@@ -106,22 +106,19 @@ describe("streamed home archives", () => {
     expect((await stat(join(stage, "Projects", "empty.bin"))).size).toBe(0);
   });
 
-  it("reads v1 JSON hashes and mixed legacy/new snapshots without migrating user files", async () => {
+  it("reads and imports v1 JSON archives without migrating user files", async () => {
     const { root, store, home } = await fixture();
     await writeFile(join(home.root, "Documents", "keep.txt"), "legacy-state");
-    const first = await store.snapshot("portable");
-    expect(first.path).toMatch(/1\.obhome$/u);
+    const first = await exportHomeArchive(home.root, "portable", join(root, "1.obhome"));
     const legacy = await legacyDocument(home.root, first.manifest);
-    const legacyPath = join(dirname(first.path), "2.json");
+    const legacyPath = join(root, "2.json");
     await writeFile(legacyPath, JSON.stringify(legacy));
     const checked = await validateHomeArchive(legacyPath, "portable");
     expect(checked.version).toBe(1);
     expect(checked.manifest.entries.find((entry) => entry.path === "Documents/keep.txt")?.sha256).toBe(createHash("sha256").update("legacy-state").digest("hex"));
-    expect((await store.listSnapshots("portable")).map((entry) => entry.seq)).toEqual([1, 2]);
-    await writeFile(join(home.root, "Documents", "keep.txt"), "current-state");
-    const restored = await store.restoreSnapshot("portable", 2);
+    await store.remove("portable");
+    const restored = await store.importArchive("portable", legacyPath);
     expect(await readFile(join(restored.root, "Documents", "keep.txt"), "utf8")).toBe("legacy-state");
-    expect((await store.snapshot("portable")).seq).toBe(3);
     legacy.manifest.entries.find((entry) => entry.path === "Documents/keep.txt")!.sha256 = "0".repeat(64);
     await writeFile(join(root, "bad-legacy.json"), JSON.stringify(legacy));
     await expect(validateHomeArchive(join(root, "bad-legacy.json"), "portable")).rejects.toMatchObject({ code: "integrity_error" });

@@ -173,37 +173,34 @@ describe("bootstrap (T1)", () => {
     }
   });
 
-  it("fecha admission, waiters e leases ativos quando o listen falha", async () => {
+  it("com a porta ocupada falha antes de criar estado ou tocar a admission injetada", async () => {
     const occupied = await listen();
     const root = mkdtempSync(join(tmpdir(), "openbot-bootstrap-admission-listen-error-"));
     const admission = new ProviderAdmissionScheduler({ maxActive: 1, maxQueued: 1 });
     const active = await admission.acquire("preexisting");
-    const waiting = admission.acquire("queued").catch((error: unknown) => error);
+    const waiting = admission.acquire("queued");
     try {
       await expect(startServer(occupied.port, {
         ...isolated(root),
         providerAdmission: admission,
       })).rejects.toThrow(/já está em uso/);
-      // O lease ativo segura a fila até o shutdown do listen-failure dispensar
-      // o waiter — liberar por timer corria contra a duração do bootstrap.
-      expect(await waiting).toMatchObject({ code: "shutdown" });
+      // The port is bound before anything else: no store, config or token was
+      // created, and the caller's scheduler is untouched.
+      expect(existsSync(join(root, "store.db"))).toBe(false);
+      expect(existsSync(join(root, "config.json"))).toBe(false);
+      expect(admission.metrics()).toMatchObject({ active: 1, waiting: 1 });
       active.release();
-      await admission.drain();
-      expect(admission.metrics()).toMatchObject({ active: 0, waiting: 0 });
-      await expect(admission.acquire("after-failure")).rejects.toMatchObject({ code: "shutdown" });
+      const lease = await waiting;
+      lease.release();
+      await expect(admission.acquire("after-failure").then((next) => next.release())).resolves.toBeUndefined();
     } finally {
       active.release();
       await occupied.close();
-      // O reject do listen dispara no timeout enquanto o cleanup ainda solta o
-      // handle do SQLite — no Windows o unlink pode chegar antes do close.
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        try { rmSync(root, { recursive: true, force: true }); break; }
-        catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
-      }
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it("rejeita listen bounded e posterga stores enquanto lease não libera", async () => {
+  it("com a porta ocupada rejeita rápido e mantém store e MCP injetados abertos", async () => {
     const occupied = await listen();
     const root = mkdtempSync(join(tmpdir(), "openbot-bootstrap-admission-deferred-"));
     const admission = new ProviderAdmissionScheduler({ maxActive: 1, maxQueued: 1 });
@@ -243,12 +240,18 @@ describe("bootstrap (T1)", () => {
         providerAdmission: admission,
       })).rejects.toThrow(/já está em uso/);
       expect(Date.now() - startedAt).toBeLessThan(1_000);
-      expect(await waiting).toMatchObject({ code: "shutdown" });
-      expect(reflectionClose).toHaveBeenCalled();
+      // Nothing was built, so there is nothing to tear down: injected
+      // dependencies stay usable by their owner.
+      expect(reflectionClose).not.toHaveBeenCalled();
       expect(storeClosed).toBe(0);
       expect(mcpClosed).toBe(0);
+      expect(store.getEntries("agent-a")).toEqual([]);
+      expect(admission.metrics()).toMatchObject({ active: 1, waiting: 1 });
 
       active.release();
+      (await waiting as { release(): void }).release();
+      store.close();
+      await mcpManager.close();
       await Promise.all([storeClosedSignal, mcpClosedSignal]);
       expect(storeClosed).toBe(1);
       expect(mcpClosed).toBe(1);
@@ -353,11 +356,9 @@ describe("bootstrap (T1)", () => {
     handle.gateway.close = () => { calls.push("gateway"); gatewayClose(); };
     const storeClose = handle.store.close.bind(handle.store);
     handle.store.close = () => { calls.push("store"); storeClose(); };
-    const configClose = handle.config.close.bind(handle.config);
-    handle.config.close = () => { calls.push("config"); configClose(); };
     try {
       await expect(stopServer(handle)).rejects.toThrow("abort failed");
-      expect(calls).toEqual(expect.arrayContaining(["abort", "runtime", "mcp", "browser", "gateway", "store", "config"]));
+      expect(calls).toEqual(expect.arrayContaining(["abort", "runtime", "mcp", "browser", "gateway", "store"]));
       expect(handle.server.listening).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -387,8 +388,6 @@ describe("bootstrap (T1)", () => {
     handle.store.close = () => { count("store"); storeClose(); };
     const conversationClose = handle.conversationStore.close.bind(handle.conversationStore);
     handle.conversationStore.close = () => { count("conversation"); conversationClose(); };
-    const configClose = handle.config.close.bind(handle.config);
-    handle.config.close = () => { count("config"); configClose(); };
     const serverClose = handle.server.close.bind(handle.server);
     handle.server.close = ((callback?: (err?: Error) => void) => {
       count("server");
@@ -403,7 +402,7 @@ describe("bootstrap (T1)", () => {
       for (const value of calls.values()) expect(value).toBe(1);
       expect(calls).toEqual(new Map([
         ["abort", 1], ["runtime", 1], ["mcp", 1], ["gateway", 1],
-        ["store", 1], ["conversation", 1], ["config", 1], ["server", 1],
+        ["store", 1], ["conversation", 1], ["server", 1],
       ]));
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -440,20 +439,17 @@ describe("bootstrap (T1)", () => {
     }
     const storeClose = handle.store.close.bind(handle.store);
     handle.store.close = () => { calls.push("store"); storeClose(); };
-    const configClose = handle.config.close.bind(handle.config);
-    handle.config.close = () => { calls.push("config"); configClose(); };
     const shutdown = stopServer(handle, { turnTimeoutMs: 1 });
     await waitForCondition(() => !handle.server.listening, 1_000);
     expect(handle.server.listening).toBe(false);
     expect(calls).toEqual([]);
     releaseDrain();
     await expect(shutdown).rejects.toThrow("turn shutdown timed out");
-    expect(calls).toEqual(expect.arrayContaining(["reflection", "broker", "mcp", "browser", "runtime", "store", "config"]));
+    expect(calls).toEqual(expect.arrayContaining(["reflection", "broker", "mcp", "browser", "runtime", "store"]));
     const storeIndex = calls.indexOf("store");
     for (const dependency of ["reflection", "broker", "mcp", "browser", "runtime"]) {
       expect(calls.indexOf(dependency), `${dependency} before store`).toBeLessThan(storeIndex);
     }
-    expect(calls.indexOf("config")).toBeGreaterThan(storeIndex);
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -501,9 +497,6 @@ describe("bootstrap (T1)", () => {
     const storeClose = handle.store.close.bind(handle.store);
     manualClose.push(storeClose);
     handle.store.close = () => { calls.push("store"); storeClose(); };
-    const configClose = handle.config.close.bind(handle.config);
-    manualClose.push(configClose);
-    handle.config.close = () => { calls.push("config"); configClose(); };
     let shutdownError: unknown;
     try {
       await stopServer(handle, { turnTimeoutMs: 1, drainTimeoutMs: 20 });

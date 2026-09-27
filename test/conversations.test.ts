@@ -9,6 +9,7 @@ import { SqliteConversationStore } from "../src/conversations/store.js";
 import { SqliteMemoryStore } from "../src/memory/sqlite-store.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
 import { normalizeTranscriptEntry } from "../src/shared/contracts.js";
+import { ReactionStore } from "../src/reactions/store.js";
 
 describe("OpenBot conversation schema", () => {
   it("migrates a v2 database and assigns every legacy row to one conversation", () => {
@@ -546,6 +547,26 @@ describe("OpenBot conversation schema", () => {
       expect(store.updateAutoTitle("agent-a", autoOnly.id, "segunda não renomeia").title).toBe("primeira da conversa");
       expect(store.rename("agent-a", own.id, "Título manual")).toMatchObject({ title: "Título manual", titleSource: "manual" });
       expect(store.updateAutoTitle("agent-a", own.id, "não substituir")).toMatchObject({ title: "Título manual", titleSource: "manual" });
+      expect(() => store.rename("agent-a", own.id, "t".repeat(201))).toThrow(/200/);
+      expect(store.rename("agent-a", own.id, "t".repeat(200)).title).toHaveLength(200);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("derives auto titles as one bounded line with credentials masked", () => {
+    const store = new SqliteConversationStore({ path: ":memory:" });
+    try {
+      const multiline = store.create("agent-a");
+      expect(store.updateAutoTitle("agent-a", multiline.id, "  linha um\n\n  linha\tdois  ").title).toBe("linha um linha dois");
+      const long = store.create("agent-a");
+      const longTitle = store.updateAutoTitle("agent-a", long.id, "palavra ".repeat(40)).title;
+      expect([...longTitle].length).toBeLessThanOrEqual(80);
+      expect(longTitle.endsWith("…")).toBe(true);
+      const secret = store.create("agent-a");
+      const masked = store.updateAutoTitle("agent-a", secret.id, "use a chave sk-prod-abcdef1234567890 no deploy").title;
+      expect(masked).not.toContain("sk-prod-abcdef1234567890");
+      expect(masked).toContain("[REDACTED_SECRET]");
     } finally {
       store.close();
     }
@@ -575,29 +596,11 @@ describe("OpenBot conversation schema", () => {
     }
   });
 
-  it("purges resume checkpoints, effects and kickstart runs when a conversation is deleted", () => {
+  it("purges kickstart runs when a conversation is deleted", () => {
     const transcript = new SqliteTranscriptStore({ path: ":memory:" });
     try {
       const keep = transcript.conversationStore.ensureDefault("agent-a");
       const gone = transcript.conversationStore.create("agent-a", { title: "Apagar" });
-      const scope = {
-        agentId: "agent-a",
-        conversationId: gone.id,
-        turnId: "turn-gone",
-        provider: "openai-compat",
-        model: "openai-compatible",
-      } as const;
-      transcript.createResumeCheckpoint({
-        checkpointId: "checkpoint-gone",
-        ...scope,
-        cursor: "fixture-v1:gone:1",
-        safeSequenceId: 0,
-        completedEffectIds: [],
-        expiresAtMs: Date.now() + 60_000,
-        version: 1,
-        budget: { maxProviderAttempts: 2, providerAttemptsUsed: 0, maxToolRounds: 8, toolRoundsUsed: 0, maxToolCalls: 16, toolCallsUsed: 0 },
-      });
-      transcript.prepareResumeEffect(scope, "effect:v1:gone", "hash-gone");
       transcript.claimKickstartRun({
         agentId: "agent-a",
         clientNonce: "kick-gone",
@@ -610,9 +613,24 @@ describe("OpenBot conversation schema", () => {
       });
       transcript.conversationStore.activate("agent-a", keep.id);
       transcript.conversationStore.delete("agent-a", gone.id, { memoryPolicy: "delete-derived" });
-      expect(transcript.findResumeCheckpoint("agent-a", gone.id, "turn-gone")).toBeUndefined();
-      expect(transcript.getResumeEffect(scope, "effect:v1:gone")).toBeUndefined();
       expect(transcript.getKickstartRun("agent-a", "kick-gone")).toBeUndefined();
+    } finally {
+      transcript.close();
+    }
+  });
+
+  it("purges reactions of a deleted conversation and keeps other conversations' reactions", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    try {
+      const keep = transcript.conversationStore.ensureDefault("agent-a");
+      const gone = transcript.conversationStore.create("agent-a", { title: "Apagar" });
+      const reactions = new ReactionStore({ db: transcript.databaseForSharedStores(), resolveEntry: () => true });
+      reactions.add("agent-a", { conversationId: gone.id, entryId: "entry-gone", emoji: "x", nonce: "n-gone" });
+      reactions.add("agent-a", { conversationId: keep.id, entryId: "entry-keep", emoji: "x", nonce: "n-keep" });
+      transcript.conversationStore.activate("agent-a", keep.id);
+      transcript.conversationStore.delete("agent-a", gone.id, { memoryPolicy: "retain" });
+      expect(reactions.list("agent-a", gone.id)).toEqual([]);
+      expect(reactions.list("agent-a", keep.id).map((reaction) => reaction.entryId)).toEqual(["entry-keep"]);
     } finally {
       transcript.close();
     }
@@ -912,48 +930,7 @@ describe("OpenBot conversation schema", () => {
         db.close();
       }
 
-      const resumeScope = {
-        agentId: "agent-a",
-        conversationId: active.id,
-        turnId: "turn-resume",
-        provider: "xai",
-        model: "grok-4.6",
-      } as const;
-      const checkpoint = {
-        checkpointId: "checkpoint-resume",
-        ...resumeScope,
-        cursor: "fixture-v1:resume:1",
-        safeSequenceId: 101,
-        completedEffectIds: [],
-        expiresAtMs: Date.now() + 60_000,
-        version: 1,
-        budget: {
-          maxProviderAttempts: 2,
-          providerAttemptsUsed: 0,
-          maxToolRounds: 8,
-          toolRoundsUsed: 0,
-          maxToolCalls: 16,
-          toolCallsUsed: 0,
-        },
-      } as const;
-      expect(transcript.createResumeCheckpoint(checkpoint)).toBe(true);
-      transcript.prepareResumeEffect(resumeScope, "effect-pending", "hash-pending");
-      transcript.prepareResumeEffect(resumeScope, "effect-completed", "hash-completed");
-      transcript.completeResumeEffect(resumeScope, "effect-completed", "hash-completed", null);
-
       const snapshot = transcript.snapshotAgent("agent-a");
-      expect(snapshot.resumeCheckpoints).toEqual([expect.objectContaining({
-        checkpointId: checkpoint.checkpointId,
-        agentId: "agent-a",
-        conversationId: active.id,
-        turnId: "turn-resume",
-        completedEffectIds: [],
-      })]);
-      expect(snapshot.resumeEffects).toEqual(expect.arrayContaining([
-        expect.objectContaining({ effectId: "effect-pending", status: "prepared" }),
-        expect.objectContaining({ effectId: "effect-completed", status: "completed", result: null }),
-      ]));
-      expect(snapshot.resumeEffects.find((effect) => effect.effectId === "effect-pending")?.result).toBeUndefined();
       expect(snapshot.acceptedNonceRows).toEqual([{ agentId: "agent-a", conversationId: active.id, nonce: "accepted-1", acceptedAtMs: 1020 }]);
       expect(snapshot.pendingNonceRows).toEqual([{ agentId: "agent-a", conversationId: active.id, nonce: "pending-1", acceptedAtMs: 1030 }]);
       expect(snapshot.interactionDecisionRows).toEqual([{
@@ -988,8 +965,6 @@ describe("OpenBot conversation schema", () => {
         pendingNonceRows: [],
         interactionDecisionRows: [],
         turnAttemptRows: [],
-        resumeCheckpoints: [],
-        resumeEffects: [],
       });
       transcript.restoreAgent("agent-a", snapshot);
       const restored = transcript.snapshotAgent("agent-a");
@@ -1000,8 +975,6 @@ describe("OpenBot conversation schema", () => {
       expect(restored.pendingNonceRows).toEqual(snapshot.pendingNonceRows);
       expect(restored.interactionDecisionRows).toEqual(snapshot.interactionDecisionRows);
       expect(restored.turnAttemptRows).toEqual(snapshot.turnAttemptRows);
-      expect(restored.resumeCheckpoints).toEqual(snapshot.resumeCheckpoints);
-      expect(restored.resumeEffects).toEqual(snapshot.resumeEffects);
     } finally {
       transcript.close();
       conversations.close();

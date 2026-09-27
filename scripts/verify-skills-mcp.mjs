@@ -18,7 +18,8 @@ const focusedTests = [
 ];
 
 const steps = [
-  ["typecheck", ["run", "typecheck"]],
+  // Skipped when verify:readiness already typechecked (scripts/gate-prepare.mjs).
+  ["typecheck", ["exec", "--", "node", "scripts/gate-prepare.mjs", "typecheck"]],
   ["focused Skills/MCP tests", ["test", "--", ...focusedTests, "--maxWorkers=1", "--no-file-parallelism"]],
   ["core acceptance", ["run", "verify:core:acceptance"]],
   ["isolated desktop E2E", ["run", "verify:e2e:desktop"]],

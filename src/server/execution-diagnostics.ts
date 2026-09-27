@@ -10,7 +10,11 @@ export interface ExecutionDiagnosticsSources {
   workspaces(): Array<{ agentId: string; quota: ReturnType<AgentRuntimeBackend["quotaMetrics"]> }>;
 }
 
-/** Process-local, content-free counters. Reading them never starts work or scans disk. */
+/**
+ * Process-local, content-free counters. Reading them never starts work or
+ * scans disk. The event-loop figures (mean, max, p99) cover the whole process
+ * lifetime: they are not reset between snapshots.
+ */
 export class ExecutionDiagnostics {
   private readonly startedAt = performance.now();
   private readonly initialUtilization = performance.eventLoopUtilization();

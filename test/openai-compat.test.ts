@@ -34,20 +34,20 @@ import {
   OPENAI_COMPAT_PROVIDER_NAME,
   OpenAiCompatAdapter,
   isLoopbackHost,
-  openaiCompatApiKeyKey,
-  registerOpenAiCompatAdapter,
   validateCompatBaseUrl,
 } from "../src/providers/openai-compat.js";
 import { ApiError } from "../src/providers/openai-helpers.js";
 import { defaultRegistry, streamChat } from "../src/providers/router.js";
 import type { ProviderChatRequest, ProviderStreamEvent, RouterOptions } from "../src/providers/router.js";
 import { createKeystore } from "../src/keystore/index.js";
+import { providerApiKeyKey } from "../src/keystore/backend.js";
 import type { KeystoreOptions } from "../src/keystore/index.js";
 
 import {
   startMockProviderServer,
   type MockProviderServer,
 } from "./mocks/provider-server.js";
+import { COMPAT_PRESETS, compatKeyProvider, compatPresetEndpoints } from "../src/providers/compat-presets.js";
 
 type FetchInput = Parameters<typeof fetch>[0];
 
@@ -383,7 +383,7 @@ describe("T8 openai-compat — FIXTURE 1: baseURL loopback (endpoint custom simu
     expect(out.error).toBeUndefined();
     expect(out.message?.content).toBe("ok");
     // Namespace do contrato T4.
-    expect(openaiCompatApiKeyKey()).toBe("scoped:v1:provider:openai-compat:apiKey");
+    expect(providerApiKeyKey("openai-compat")).toBe("scoped:v1:provider:openai-compat:apiKey");
   });
 
   it("reuso dos helpers T6: corpo chat.completions com system inline + tools (contrato)", async () => {
@@ -580,12 +580,12 @@ describe("T8 openai-compat — abort encerra o stream", () => {
 });
 
 describe("T8 registro — adapter OpenAI-compat como 'openai-compat' no registry", () => {
-  it("registerOpenAiCompatAdapter registra com nome 'openai-compat' e streamChat resolve", async () => {
+  it("o adapter se registra com nome 'openai-compat' e streamChat resolve", async () => {
     const mock = await bootMock({ script: { deltas: ["registrado"] } });
-    const adapter = registerOpenAiCompatAdapter({ baseUrl: mock.baseUrl, apiKey: "sk-test" });
+    const adapter = new OpenAiCompatAdapter({ baseUrl: mock.baseUrl, apiKey: "sk-test" });
+    defaultRegistry.register(adapter);
 
-    expect(adapter).toBeDefined();
-    expect(adapter!.name).toBe("openai-compat");
+    expect(adapter.name).toBe("openai-compat");
     expect(OPENAI_COMPAT_PROVIDER_NAME).toBe("openai-compat");
     expect(defaultRegistry.has("openai-compat")).toBe(true);
     expect(defaultRegistry.get("openai-compat")).toBe(adapter);
@@ -596,11 +596,24 @@ describe("T8 registro — adapter OpenAI-compat como 'openai-compat' no registry
     expect(events.at(-1)?.type).toBe("done");
   });
 
-  it("sem baseURL → NÃO registra (retorna undefined) — boot sem baseURL custom não quebra", () => {
+  it("sem baseURL o adapter não pode ser criado — nada é registrado", () => {
     const before = defaultRegistry.names().length;
-    const adapter = registerOpenAiCompatAdapter({});
-    expect(adapter).toBeUndefined();
+    expect(() => new OpenAiCompatAdapter({})).toThrow(ApiError);
     expect(defaultRegistry.has("openai-compat")).toBe(false);
     expect(defaultRegistry.names().length).toBe(before);
+  });
+});
+
+describe("compat presets", () => {
+  it("maps ClinePass and Command Code URLs to their own keystore slots", () => {
+    expect(compatKeyProvider("https://api.cline.bot/api/v1/")).toBe("clinepass");
+    expect(compatKeyProvider("https://api.commandcode.ai/provider/v1")).toBe("commandcode");
+    expect(compatKeyProvider("http://127.0.0.1:1234/v1")).toBe("openai-compat");
+  });
+
+  it("exposes both presets as reachable discovery chips", () => {
+    expect(COMPAT_PRESETS.map((preset) => preset.id)).toEqual(["clinepass", "commandcode"]);
+    expect(compatPresetEndpoints().map((endpoint) => endpoint.id)).toEqual(["clinepass", "commandcode"]);
+    expect(compatPresetEndpoints().every((endpoint) => endpoint.reachable)).toBe(true);
   });
 });

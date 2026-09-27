@@ -26,13 +26,6 @@ export type ProcessNetworkProfile = "none" | "host";
 
 export type BrowserExecutionOperation = `browser.${BrowserCommandName}`;
 
-export const WHATSAPP_OPS = ["doctor", "sweep", "messages_list", "send", "download"] as const;
-export type WhatsappOp = (typeof WHATSAPP_OPS)[number];
-export const MAX_WHATSAPP_TEXT_BYTES = 16 * 1024;
-export const MAX_WHATSAPP_CHAT_BYTES = 256;
-export const MAX_WHATSAPP_OUTPUT_BYTES = 256 * 1024;
-export const MAX_WHATSAPP_TIMEOUT_MS = 60_000;
-
 export type BrowserExecutionRequest =
   | { operation: "browser.open"; url?: string }
   | { operation: "browser.navigate"; url: string }
@@ -78,15 +71,6 @@ export type ExecutionRequest =
       stdin?: string;
       timeoutMs: number;
       networkProfile: ProcessNetworkProfile;
-    }
-  | {
-      operation: "whatsapp";
-      op: WhatsappOp;
-      chat?: string;
-      limit?: number;
-      text?: string;
-      etapa?: string;
-      mediaId?: string;
     }
   | BrowserExecutionRequest;
 
@@ -163,17 +147,6 @@ export type ExecutionResult =
       stderr: string;
       exitCode: number | null;
       signal?: string;
-      durationMs: number;
-      stdoutTruncated: boolean;
-      stderrTruncated: boolean;
-    }
-  | {
-      ok: true;
-      operation: "whatsapp";
-      op: WhatsappOp;
-      stdout: string;
-      stderr: string;
-      exitCode: number | null;
       durationMs: number;
       stdoutTruncated: boolean;
       stderrTruncated: boolean;
@@ -277,43 +250,6 @@ const environmentValue = (value: unknown): Record<string, string> | undefined =>
   return output;
 };
 
-const whatsappOpValue = (value: unknown): WhatsappOp => {
-  if (typeof value !== "string" || !(WHATSAPP_OPS as readonly string[]).includes(value)) {
-    throw new ExecutionRequestError("whatsapp op is unsupported");
-  }
-  return value as WhatsappOp;
-};
-
-const whatsappChatValue = (value: unknown): string => {
-  if (
-    typeof value !== "string" ||
-    value.length === 0 ||
-    Buffer.byteLength(value) > MAX_WHATSAPP_CHAT_BYTES ||
-    value.includes("\0") ||
-    value.includes("\\") ||
-    value.includes("/") ||
-    /\s/u.test(value) ||
-    !/^[A-Za-z0-9._@+-]+$/u.test(value)
-  ) {
-    throw new ExecutionRequestError("chat is invalid");
-  }
-  return value;
-};
-
-const whatsappTextValue = (value: unknown, name: string): string => {
-  if (typeof value !== "string" || value.length === 0 || value.includes("\0") || Buffer.byteLength(value) > MAX_WHATSAPP_TEXT_BYTES) {
-    throw new ExecutionRequestError(`${name} is invalid`);
-  }
-  return value;
-};
-
-const whatsappLimitValue = (value: unknown): number => {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 50) {
-    throw new ExecutionRequestError("limit is invalid");
-  }
-  return value;
-};
-
 const timeoutValue = (value: unknown): number => {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0 || value > MAX_PROCESS_TIMEOUT_MS) {
     throw new ExecutionRequestError("timeoutMs is invalid");
@@ -388,48 +324,6 @@ export function parseExecutionRequest(value: unknown): ExecutionRequest {
         ...(input.stdin === undefined ? {} : { stdin: input.stdin }),
         timeoutMs: timeoutValue(input.timeoutMs),
         networkProfile,
-      };
-    }
-    case "whatsapp": {
-      exact(input, ["operation", "op", "chat", "limit", "text", "etapa", "mediaId"]);
-      const op = whatsappOpValue(input.op);
-      if (op === "doctor" || op === "sweep") {
-        if (input.chat !== undefined || input.limit !== undefined || input.text !== undefined || input.etapa !== undefined || input.mediaId !== undefined) {
-          throw new ExecutionRequestError("request contains unsupported fields");
-        }
-        return { operation: "whatsapp", op };
-      }
-      if (op === "messages_list") {
-        if (input.text !== undefined || input.etapa !== undefined || input.mediaId !== undefined) {
-          throw new ExecutionRequestError("request contains unsupported fields");
-        }
-        return {
-          operation: "whatsapp",
-          op,
-          chat: whatsappChatValue(input.chat),
-          ...(input.limit === undefined ? {} : { limit: whatsappLimitValue(input.limit) }),
-        };
-      }
-      if (op === "send") {
-        if (input.limit !== undefined || input.mediaId !== undefined) {
-          throw new ExecutionRequestError("request contains unsupported fields");
-        }
-        return {
-          operation: "whatsapp",
-          op,
-          chat: whatsappChatValue(input.chat),
-          text: whatsappTextValue(input.text, "text"),
-          ...(input.etapa === undefined ? {} : { etapa: whatsappTextValue(input.etapa, "etapa") }),
-        };
-      }
-      if (input.text !== undefined || input.etapa !== undefined || input.limit !== undefined) {
-        throw new ExecutionRequestError("request contains unsupported fields");
-      }
-      return {
-        operation: "whatsapp",
-        op,
-        chat: whatsappChatValue(input.chat),
-        ...(input.mediaId === undefined ? {} : { mediaId: whatsappTextValue(input.mediaId, "mediaId") }),
       };
     }
     case "command.run": {

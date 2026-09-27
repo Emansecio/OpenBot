@@ -110,7 +110,13 @@ export async function calculateWorkspaceUsage(
   return usage;
 }
 
-export type WorkspaceUsageCalculator = (root: string, maxEntries?: number) => Promise<WorkspaceUsage>;
+export type WorkspaceUsageCalculator = (root: string, maxEntries?: number, skip?: (relativeSlashPath: string) => boolean) => Promise<WorkspaceUsage>;
+
+/** Inside the `.openbot` scope, the bot trash is `trash/` — outside quota like everywhere else. */
+const skipScopeTrash = (relative: string): boolean => {
+  const lowered = relative.toLowerCase();
+  return lowered === "trash" || lowered.startsWith("trash/");
+};
 
 const FULL_SCAN_AFTER_COMMITS = 256;
 
@@ -268,7 +274,6 @@ export class WorkspaceQuota {
   private reservationTail: Promise<void> = Promise.resolve();
   private readonly scopes: Record<string, WorkspaceQuotaOptions>;
   private readonly scopeUsage = new Map<string, WorkspaceUsage>();
-  private readonly scopePaths = new Map<string, string>();
   private readonly scopeDirty = new Set<string>();
   private readonly pendingScope = new Map<string, QuotaDelta>();
 
@@ -382,12 +387,11 @@ export class WorkspaceQuota {
   }
 
   private async currentScopeUsageLocked(scope: string, directory: string): Promise<WorkspaceUsage> {
-    this.scopePaths.set(scope, directory);
     const cached = this.scopeUsage.get(scope);
     if (cached !== undefined && !this.scopeDirty.has(scope)) return { ...cached };
     let usage: WorkspaceUsage;
     try {
-      usage = await this.calculateUsage(directory, this.scopes[scope]!.maxEntries ?? this.options.maxEntries);
+      usage = await this.calculateUsage(directory, this.scopes[scope]!.maxEntries ?? this.options.maxEntries, scope === ".openbot" ? skipScopeTrash : undefined);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") usage = { bytes: 0, files: 0, directories: 0, entries: 0 };
       else throw error;
@@ -401,7 +405,7 @@ export class WorkspaceQuota {
     const limits = this.scopes[scope]!;
     const entriesLimit = limits.maxEntries === undefined ? "unlimited" : String(limits.maxEntries);
     return new WorkspaceQuotaError(
-      `Workspace quota exceeded in ${scope}: bytes ${usage.bytes}/${limits.maxBytes}, files ${usage.files}/${limits.maxFiles}, entries ${usage.entries}/${entriesLimit}. Delete files or empty the bot trash, then try again.`,
+      `Workspace quota exceeded in ${scope}: bytes ${usage.bytes}/${limits.maxBytes}, files ${usage.files}/${limits.maxFiles}, entries ${usage.entries}/${entriesLimit}. Move files to the bot trash or delete them, then try again.`,
     );
   }
 
@@ -475,6 +479,7 @@ export class WorkspaceQuota {
         },
         release,
         scopeContext,
+        destination,
       );
     } catch (error) {
       release();
@@ -494,7 +499,7 @@ export class WorkspaceQuota {
       const scopeContext = scope === undefined
         ? undefined
         : { name: scope.name, usage: await this.currentScopeUsageLocked(scope.name, scope.directory) };
-      return this.reserveDeltaLocked(usage, delta, delta, release, scopeContext);
+      return this.reserveDeltaLocked(usage, delta, delta, release, scopeContext, scopePath);
     } catch (error) {
       release();
       throw error;
@@ -514,8 +519,7 @@ export class WorkspaceQuota {
         !Number.isSafeInteger(delta.entries) || delta.entries < 0
       ) throw new WorkspaceQuotaError("Workspace quota delta is invalid.");
 
-      const usage = await this.currentUsageLocked();
-      this.assertUsage(usage);
+      await this.currentUsageLocked();
       const source = this.scopeFor(sourcePath);
       const destination = this.scopeFor(destinationPath);
       const differentScopes = source?.name !== destination?.name;
@@ -592,7 +596,12 @@ export class WorkspaceQuota {
             else this.pendingScope.set(destinationContext.name, remaining);
           }
         }
-        this.observation?.observer.invalidate();
+        if (commit) {
+          this.observation?.observer.touch(sourcePath);
+          this.observation?.observer.touch(destinationPath);
+        } else {
+          this.observation?.observer.invalidate();
+        }
         release();
       };
       return { commit: () => settle(true), cancel: () => settle(false) };
@@ -628,7 +637,7 @@ export class WorkspaceQuota {
   private quotaError(usage: WorkspaceUsage): WorkspaceQuotaError {
     const entriesLimit = this.options.maxEntries === undefined ? "unlimited" : String(this.options.maxEntries);
     return new WorkspaceQuotaError(
-      `Workspace quota exceeded: bytes ${usage.bytes}/${this.options.maxBytes}, files ${usage.files}/${this.options.maxFiles}, entries ${usage.entries}/${entriesLimit}. Delete files or empty the bot trash, then try again.`,
+      `Workspace quota exceeded: bytes ${usage.bytes}/${this.options.maxBytes}, files ${usage.files}/${this.options.maxFiles}, entries ${usage.entries}/${entriesLimit}. Move files to the bot trash or delete them, then try again.`,
     );
   }
 
@@ -651,6 +660,8 @@ export class WorkspaceQuota {
     committed: QuotaDelta,
     releaseLock: () => void,
     scope?: { name: string; usage: WorkspaceUsage },
+    /** Where the committed write landed, when a single path covers it. */
+    touched?: string,
   ): QuotaReservation {
     if (
       !Number.isSafeInteger(reserved.bytes) || reserved.bytes < 0 ||
@@ -667,12 +678,15 @@ export class WorkspaceQuota {
       entries: usage.entries + this.pendingEntries + reserved.entries,
       directories: usage.directories + Math.max(0, reserved.entries - reserved.files),
     };
-    if (
+    // A reservation that adds nothing (a smaller overwrite, a move to trash)
+    // passes even over the limit, so a bot over quota can still free space.
+    const grows = reserved.bytes > 0 || reserved.files > 0 || reserved.entries > 0;
+    if (grows && (
       projected.bytes > this.options.maxBytes ||
       projected.files > this.options.maxFiles ||
       (this.options.maxEntries !== undefined && projected.entries > this.options.maxEntries)
-    ) throw this.quotaError(projected);
-    if (scope !== undefined) {
+    )) throw this.quotaError(projected);
+    if (grows && scope !== undefined) {
       const projectedScope: WorkspaceUsage = {
         ...scope.usage,
         bytes: scope.usage.bytes + reserved.bytes,
@@ -731,8 +745,10 @@ export class WorkspaceQuota {
         }
       }
       // A structured write already adjusted the cache. Rebase the observer
-      // before it publishes again, rather than count the same write twice.
-      this.observation?.observer.invalidate();
+      // before it publishes again, rather than count the same write twice:
+      // a known path is reconciled alone, anything else forces a rescan.
+      if (commit && touched !== undefined) this.observation?.observer.touch(touched);
+      else this.observation?.observer.invalidate();
       releaseLock();
     };
     return { commit: () => settle(true), cancel: () => settle(false) };

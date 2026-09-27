@@ -47,7 +47,7 @@ describe("Gateway SSE backpressure", () => {
     const harness = gateway as unknown as {
       sseClients: Set<TestSseClient>;
       flushSse(client: TestSseClient): void;
-      writeSse(client: TestSseClient, frame: string, heartbeat?: boolean): void;
+      writeSse(client: TestSseClient, frame: string, bytes?: number, heartbeat?: boolean): void;
     };
     harness.sseClients.add(client);
     response.on("drain", () => harness.flushSse(client));
@@ -59,7 +59,7 @@ describe("Gateway SSE backpressure", () => {
     expect(response.writes).toHaveLength(1);
     expect(client.pending).toHaveLength(1);
 
-    harness.writeSse(client, ":ping\n\n", true);
+    harness.writeSse(client, ":ping\n\n", undefined, true);
     expect(response.destroyCalls).toBe(0);
     expect(response.writes).toHaveLength(1);
     expect(client.pending).toHaveLength(1);

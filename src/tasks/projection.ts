@@ -17,7 +17,8 @@ import type {
   NativeAsyncTaskProjectionProgress,
   NativeAsyncTaskProjectionResult,
 } from "../shared/contracts.js";
-import type { AsyncTaskRecord, AsyncTaskResult } from "./contracts.js";
+import type { AsyncTaskRecord } from "./contracts.js";
+import { utf8Prefix } from "../shared/utf8.js";
 
 /**
  * Live outbox event enriched with the native projection. Extends the durable
@@ -45,18 +46,6 @@ export const PROJECTION_RESULT_TEXT_MAX_BYTES = 4_096;
 export const PROJECTION_RESULT_REF_MAX_BYTES = 2_048;
 
 const LET_ANSI_CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u;
-
-function utf8Prefix(value: string, maxBytes: number): string {
-  let result = "";
-  let bytes = 0;
-  for (const character of value) {
-    const characterBytes = Buffer.byteLength(character, "utf8");
-    if (bytes + characterBytes > maxBytes) break;
-    result += character;
-    bytes += characterBytes;
-  }
-  return result;
-}
 
 function boundedText(value: unknown, fallback: string, maxBytes: number): string {
   const raw = typeof value === "string" ? value.normalize("NFC") : fallback;
@@ -165,11 +154,4 @@ export function projectAsyncTaskForRenderer(record: AsyncTaskRecord, steerable =
 /** Converts a list of durable records, preserving SQLite order. */
 export function projectAsyncTaskListForRenderer(records: readonly AsyncTaskRecord[], canSteer?: (record: AsyncTaskRecord) => boolean): NativeAsyncTaskProjectionItem[] {
   return records.map((record) => projectAsyncTaskForRenderer(record, canSteer?.(record) ?? record.status === "running"));
-}
-
-/** Derives a bounded inline-result preview used by bridge sanitizers. */
-export function projectLimitedResultText(result: AsyncTaskResult | null | undefined, maxBytes = PROJECTION_RESULT_TEXT_MAX_BYTES): string {
-  if (result === null || result === undefined) return "";
-  if (result.kind === "ref") return result.resultRef;
-  return boundedText(result.text, "", maxBytes);
 }

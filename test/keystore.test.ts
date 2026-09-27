@@ -6,8 +6,7 @@
  *   - NENHUMA chave aparece em claro no disco (scan do arquivo sand-secrets.json);
  *   - fallback em memória: sem keyring, upsert/reveal/delete/list funcionam e
  *     nada é gravado em disco;
- *   - migração de registros legados (DPAPI) quando o safeStorage volta;
- *   - waitForEncryptedStorage (espelho do original, spec §3.3);
+ *   - leitura somente-leitura de registros legados `electron-safe-storage`;
  *   - API por provider com validação de nome/valor.
  */
 
@@ -17,27 +16,36 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { providerApiKeyKey,
-  injectElectronSafeStorage,
-  nodeLegacyBackend,
-  type ElectronSafeStorage } from "../src/keystore/backend.js";
-import { createKeystore, DEFAULT_KEYSTORE_SCOPE, type Keystore, writeSecretsFile,defaultKeystoreDir,defaultSecretsFile } from "../src/keystore/index.js";
+import { providerApiKeyKey, type CryptoBackend, localFileBackend } from "../src/keystore/backend.js";
+import { createKeystore, DEFAULT_KEYSTORE_SCOPE, type Keystore, defaultKeystoreDir, defaultSecretsFile } from "../src/keystore/index.js";
+import { randomBytes } from "node:crypto";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 // ── helpers de teste ─────────────────────────────────────────────────────
 
-/** SafeStorage FAKE determinístico — simula o DPAPI do Windows (testes). */
-function makeFakeSafeStorage(): ElectronSafeStorage {
-  // prefixo + reverse: cifra "determinística" suficiente para os testes de
-  // round-trip e de scan (nunca contém o plaintext).
+/**
+ * Backend FAKE determinístico — simula o DPAPI do Windows (testes). Prefixo +
+ * reverse: cifra suficiente para round-trip e scan (nunca contém o plaintext).
+ */
+function makeFakeDpapi(name = "fake-dpapi"): CryptoBackend {
   return {
-    isEncryptionAvailable: () => true,
-    encryptString: (plainText: string) =>
+    name,
+    encrypt: (plainText: string) =>
       Buffer.from(`DPAPI-FAKE::${Buffer.from(plainText, "utf8").reverse().toString("base64")}`, "utf8"),
-    decryptString: (encrypted: Buffer) => {
+    decrypt: (encrypted: Buffer) => {
       const s = encrypted.toString("utf8");
       if (!s.startsWith("DPAPI-FAKE::")) throw new Error("payload desconhecido");
       return Buffer.from(s.slice("DPAPI-FAKE::".length), "base64").reverse().toString("utf8");
     },
+  };
+}
+
+/** Leitor somente-leitura de registros `electron-safe-storage` gravados com o fake. */
+function legacyReader(fake: CryptoBackend): CryptoBackend {
+  return {
+    name: "electron-safe-storage",
+    encrypt: () => { throw new Error("legado é somente leitura"); },
+    decrypt: (payload: Buffer) => fake.decrypt(payload),
   };
 }
 
@@ -124,10 +132,6 @@ describe("T4 keystore — fallback em memória (Node puro, sem keyring)", () => 
     await expect(ks.upsert("openai", "x".repeat(9000))).rejects.toThrow(/muito longa/);
   });
 
-  it("waitForEncryptedStorage → false (sem keyring, nada legado em disco)", async () => {
-    expect(await ks.waitForEncryptedStorage(50)).toBe(false);
-  });
-
   it("namespace da chave: scoped:v1:provider:<name>:apiKey", async () => {
     expect(providerApiKeyKey("openai")).toBe("scoped:v1:provider:openai:apiKey");
     expect(providerApiKeyKey("openai-compat")).toBe(
@@ -136,24 +140,24 @@ describe("T4 keystore — fallback em memória (Node puro, sem keyring)", () => 
   });
 });
 
-describe("T4 keystore — persistência criptografada (safeStorage/DPAPI injetado)", () => {
+describe("T4 keystore — persistência criptografada (backend DPAPI simulado)", () => {
   let dir: string;
   let ks: Keystore;
+  const fake = makeFakeDpapi();
+  const open = (): Keystore => createKeystore({ dir, writeBackend: fake });
 
   beforeEach(async () => {
     dir = await makeDir();
-    injectElectronSafeStorage(makeFakeSafeStorage());
-    ks = createKeystore({ dir });
+    ks = open();
   });
 
   afterEach(async () => {
-    injectElectronSafeStorage(null);
     await cleanup();
   });
 
   it("round-trip persistente: upsert → reveal; arquivo criado com registros cifrados", async () => {
     await ks.upsert("openai", "sk-ant-1234567890");
-    expect(ks.getWriteBackendName()).toBe("electron-safe-storage");
+    expect(ks.getWriteBackendName()).toBe("fake-dpapi");
     expect(ks.isPersistent()).toBe(true);
     expect(fs.existsSync(ks.getFile())).toBe(true);
 
@@ -186,7 +190,7 @@ describe("T4 keystore — persistência criptografada (safeStorage/DPAPI injetad
     for (const s of secrets) {
       const entry = defaultScope[providerApiKeyKey(s.provider)]!;
       expect(entry).toBeDefined();
-      expect(entry.backend).toBe("electron-safe-storage");
+      expect(entry.backend).toBe("fake-dpapi");
       expect(typeof entry.data).toBe("string");
       expect(entry.data).not.toContain(s.key);
     }
@@ -194,14 +198,14 @@ describe("T4 keystore — persistência criptografada (safeStorage/DPAPI injetad
 
   it("re-leitura: nova instância lê do disco (persistência entre sessões)", async () => {
     await ks.upsert("openai", "sk-persistente-777");
-    const ks2 = createKeystore({ dir });
+    const ks2 = open();
     expect(await ks2.reveal("openai")).toBe("sk-persistente-777");
     expect(await ks2.list()).toEqual(["openai"]);
   });
 
   it("hidrata a cache de redaction de registros cifrados antes do primeiro reveal", async () => {
     await ks.upsert("openai", "sk-hydrate-777");
-    const ks2 = createKeystore({ dir });
+    const ks2 = open();
     expect(ks2.sensitiveValues()).toEqual([]);
     ks2.hydrateSensitiveValues();
     expect(ks2.sensitiveValues()).toContain("sk-hydrate-777");
@@ -210,7 +214,7 @@ describe("T4 keystore — persistência criptografada (safeStorage/DPAPI injetad
   it("hidratação recusa arquivo de segredos corrompido com erro claro e sem sobrescrevê-lo", () => {
     const file = path.join(dir, "sand-secrets.json");
     fs.writeFileSync(file, "{\"version\":2,\"scopes\":{", "utf8");
-    const ks2 = createKeystore({ dir });
+    const ks2 = open();
     expect(() => ks2.hydrateSensitiveValues()).toThrow(/sand-secrets\.json não é um objeto JSON válido/);
     expect(fs.readFileSync(file, "utf8")).toBe("{\"version\":2,\"scopes\":{");
   });
@@ -218,7 +222,7 @@ describe("T4 keystore — persistência criptografada (safeStorage/DPAPI injetad
   it("delete remove do disco; instância nova não vê mais a chave", async () => {
     await ks.upsert("openai", "sk-para-deletar");
     expect(await ks.delete("openai")).toBe(true);
-    const ks2 = createKeystore({ dir });
+    const ks2 = open();
     expect(await ks2.reveal("openai")).toBeNull();
   });
 
@@ -236,43 +240,37 @@ describe("T4 keystore — persistência criptografada (safeStorage/DPAPI injetad
   });
 
   it("preserva upserts concorrentes de instâncias distintas", async () => {
-    const other = createKeystore({ dir });
+    const other = open();
 
     await Promise.all([
       ks.upsert("openai", "sk-first-instance"),
       other.upsert("xai", "xai-second-instance"),
     ]);
 
-    const reopened = createKeystore({ dir });
+    const reopened = open();
     expect(await reopened.reveal("openai")).toBe("sk-first-instance");
     expect(await reopened.reveal("xai")).toBe("xai-second-instance");
   });
 });
 
-describe("T4 keystore — legado DPAPI sem keyring (somente leitura)", () => {
+describe("T4 keystore — legado electron-safe-storage (somente leitura)", () => {
   let dir: string;
-  let fake: ElectronSafeStorage;
+  const fake = makeFakeDpapi("electron-safe-storage");
 
   beforeEach(async () => {
     dir = await makeDir();
-    fake = makeFakeSafeStorage();
-    // Sessão "Electron": grava com safeStorage real (fake DPAPI).
-    injectElectronSafeStorage(fake);
-    const first = createKeystore({ dir });
+    // Sessão antiga: registros gravados com a tag `electron-safe-storage`.
+    const first = createKeystore({ dir, writeBackend: fake });
     await first.upsert("openai", "sk-legado-dpapi-42");
-    // Sessão "Node puro": sem keyring para ESCREVER.
-    injectElectronSafeStorage(null);
   });
 
   afterEach(async () => {
-    injectElectronSafeStorage(null);
     await cleanup();
   });
 
-  it("registro DPAPI continua legível via ponte legada; novos writes NUNCA gravam plaintext", async () => {
-    // Ponte de LEITURA para blobs DPAPI gravados por sessão Electron (o main
-    // injeta o safeStorage; aqui simulamos com nodeLegacyBackend + fake).
-    const ks = createKeystore({ dir, legacyReadBackend: nodeLegacyBackend(fake) });
+  it("registro legado continua legível via leitor dedicado; novos writes NUNCA gravam plaintext", async () => {
+    // Sessão atual em memória, com leitor somente-leitura dos blobs legados.
+    const ks = createKeystore({ dir, legacyReadBackend: legacyReader(fake) });
     expect(ks.getWriteBackendName()).toBe("memory");
     expect(await ks.reveal("openai")).toBe("sk-legado-dpapi-42");
     expect(await ks.list()).toEqual(["openai"]);
@@ -288,26 +286,20 @@ describe("T4 keystore — legado DPAPI sem keyring (somente leitura)", () => {
     expect(blob.startsWith("DPAPI-FAKE::")).toBe(true);
   });
 
-  it("waitForEncryptedStorage reporta aguardando keyring quando há legado", async () => {
-    const ks = createKeystore({ dir, pollIntervalMs: 20 });
-    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
-    try {
-      expect(await ks.waitForEncryptedStorage(45)).toBe(false); // timeout sem keyring
-      expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), 20);
-    } finally {
-      timeoutSpy.mockRestore();
-    }
-  });
-
   it("delete remove o registro persistido mesmo em fallback memória", async () => {
-    const ks = createKeystore({ dir, legacyReadBackend: nodeLegacyBackend(fake) });
+    const ks = createKeystore({ dir, legacyReadBackend: legacyReader(fake) });
     expect(await ks.delete("openai")).toBe(true);
-    const ks2 = createKeystore({ dir, legacyReadBackend: nodeLegacyBackend(fake) });
+    const ks2 = createKeystore({ dir, legacyReadBackend: legacyReader(fake) });
     expect(await ks2.reveal("openai")).toBeNull();
   });
 
-  it("sem ponte: registro legado fica indecifrável (erro claro) — nunca vaza plaintext", async () => {
-    const ks = createKeystore({ dir });
+  it("sem leitor compatível: registro legado fica indecifrável (erro claro) — nunca vaza plaintext", async () => {
+    const unavailable: CryptoBackend = {
+      name: "electron-safe-storage",
+      encrypt: () => { throw new Error("legado é somente leitura"); },
+      decrypt: () => { throw new Error("perfil DPAPI indisponível"); },
+    };
+    const ks = createKeystore({ dir, legacyReadBackend: unavailable });
     await expect(ks.reveal("openai")).rejects.toThrow(/decifrar/);
   });
 });
@@ -315,12 +307,16 @@ describe("T4 keystore — legado DPAPI sem keyring (somente leitura)", () => {
 describe("T4 keystore — chave-mestra local", () => {
   const withoutMemoryFallback = <T>(run: () => T): T => {
     const previous = process.env.OPENBOT_KEYSTORE_MEMORY;
+    const previousBackend = process.env.OPENBOT_KEYSTORE_BACKEND;
     delete process.env.OPENBOT_KEYSTORE_MEMORY;
+    process.env.OPENBOT_KEYSTORE_BACKEND = "local-file";
     try {
       return run();
     } finally {
       if (previous === undefined) delete process.env.OPENBOT_KEYSTORE_MEMORY;
       else process.env.OPENBOT_KEYSTORE_MEMORY = previous;
+      if (previousBackend === undefined) delete process.env.OPENBOT_KEYSTORE_BACKEND;
+      else process.env.OPENBOT_KEYSTORE_BACKEND = previousBackend;
     }
   };
 
@@ -446,43 +442,62 @@ describe("T4 keystore — utilidades", () => {
   });
 });
 
-describe("T4 keystore — writeSecretsFile", () => {
+describe("T4 keystore — formato do arquivo", () => {
   afterEach(async () => {
-    vi.restoreAllMocks();
     await cleanup();
   });
 
-  it("remove o temporário quando a escrita falha e preserva o destino", async () => {
+  it("recusa uma versão desconhecida em vez de lê-la como legado vazio", async () => {
     const dir = await makeDir();
     const file = path.join(dir, "sand-secrets.json");
-    const previous = '{"old":{"backend":"memory","data":"old"}}\n';
-    await fs.promises.writeFile(file, previous, "utf8");
-    const writeFailure = new Error("injected write failure");
-    const originalOpen = fs.promises.open.bind(fs.promises);
-    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
-      const handle = await originalOpen(...args);
-      if (String(args[0]).endsWith(".tmp")) {
-        handle.writeFile = async () => { throw writeFailure; };
-      }
-      return handle;
-    });
+    const future = JSON.stringify({ version: 3, scopes: { [DEFAULT_KEYSTORE_SCOPE]: { x: { backend: "memory", data: "AAAA" } } } });
+    fs.writeFileSync(file, future, "utf8");
+    const ks = createKeystore({ dir, writeBackend: makeFakeDpapi() });
 
-    await expect(writeSecretsFile(file, { next: { backend: "memory", data: "next" } })).rejects.toBe(writeFailure);
-    openSpy.mockRestore();
-
-    expect(await fs.promises.readFile(file, "utf8")).toBe(previous);
-    const names = await fs.promises.readdir(dir);
-    expect(names.filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    await expect(ks.reveal("openai")).rejects.toThrow(/versão não suportada: 3/);
+    await expect(ks.upsert("openai", "sk-nao-sobrescreve")).rejects.toThrow(/versão não suportada/);
+    expect(fs.readFileSync(file, "utf8")).toBe(future);
   });
 
-  it("não remove o destino depois do rename bem-sucedido", async () => {
+  it("lista providers a partir de uma única leitura do arquivo", async () => {
     const dir = await makeDir();
-    const file = path.join(dir, "sand-secrets.json");
-    const unlinkSpy = vi.spyOn(fs.promises, "unlink");
+    const fake = makeFakeDpapi();
+    const writer = createKeystore({ dir, writeBackend: fake });
+    await writer.upsert("openai", "sk-a");
+    await writer.upsert("xai", "xai-b");
+    const readSpy = vi.spyOn(fs.promises, "readFile");
+    try {
+      const reader = createKeystore({ dir, writeBackend: fake });
+      expect(await reader.list()).toEqual(["openai", "xai"]);
+      const secretReads = () => readSpy.mock.calls.filter(([file]) => String(file).endsWith("sand-secrets.json")).length;
+      expect(secretReads()).toBe(1);
+      // list() decrypted both entries; reveal is now served from the process cache.
+      expect(await reader.reveal("xai")).toBe("xai-b");
+      expect(secretReads()).toBe(1);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+});
 
-    await writeSecretsFile(file, { next: { backend: "memory", data: "next" } });
+describe("local-file backend persistence", () => {
+  const temp = new TempRoots();
+  afterEach(async () => {
+    await temp.cleanup();
+  });
 
-    expect(unlinkSpy).not.toHaveBeenCalled();
-    expect(await fs.promises.readFile(file, "utf8")).toContain('"next"');
+  it("persists across keystore instances and deletes from disk", async () => {
+    const dir = temp.make("openbot-keystore-local-file-");
+    const key = randomBytes(32);
+    const first = createKeystore({ dir, writeBackend: localFileBackend(key) });
+    expect(first.isPersistent()).toBe(true);
+    await first.upsert("xai", "xai-persist-1");
+    const raw = fs.readFileSync(first.getFile(), "utf8");
+    expect(raw).not.toContain("xai-persist-1");
+    const second = createKeystore({ dir, writeBackend: localFileBackend(key) });
+    expect(await second.reveal("xai")).toBe("xai-persist-1");
+    expect(await second.delete("xai")).toBe(true);
+    const third = createKeystore({ dir, writeBackend: localFileBackend(key) });
+    expect(await third.reveal("xai")).toBeNull();
   });
 });

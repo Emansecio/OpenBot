@@ -1,14 +1,15 @@
 import { randomBytes } from "node:crypto";
-import type { Stats } from "node:fs";
 import { lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import type { ProviderTool } from "../providers/router.js";
-import type { ToolCallExecutor, ToolExecutionContext, ToolExecutionResult } from "../execution/tool-loop.js";
-import { InvalidSkillError, validateSkillDocument, type SkillCatalog } from "./catalog.js";
+import { parseToolArguments, toolFailure, type ToolCallExecutor, type ToolExecutionContext, type ToolExecutionResult } from "../execution/tool-loop.js";
+import { assertNoLinkComponentsAsync, InvalidSkillError, skillPathContainedBy, validateSkillDocument, type SkillCatalog } from "./catalog.js";
 import { DEFAULT_SKILL_CATALOG_LIMITS, OPENBOT_SKILL_ROOT_SOURCE, type SkillRoot } from "./contracts.js";
 import {
   DEFAULT_SKILL_CONTEXT_BYTES,
+  isModelSelectable,
+  isSkillAllowed,
   resolveSkillContext,
   type ResolvedSkillContext,
   type SkillAgentPolicy,
@@ -75,9 +76,6 @@ const SAVE_SKILL_TOOL: ProviderTool = {
   },
 };
 
-/** Alias useful to callers that expose the provider tool list under camelCase. */
-export const skillTools = SKILL_TOOLS;
-
 const SKILL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 const DEFAULT_SEARCH_RESULTS = 20;
 const MAX_SEARCH_QUERY_CHARACTERS = 256;
@@ -95,20 +93,6 @@ export interface SkillDispatcherOptions {
   authoringSource?: string;
 }
 
-function object(value: unknown): Record<string, unknown> | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  return value as Record<string, unknown>;
-}
-
-function parseArguments(raw: string): Record<string, unknown> | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw) as unknown;
-  } catch {
-    return undefined;
-  }
-  return object(parsed);
-}
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const expected = new Set(keys);
@@ -120,13 +104,7 @@ function normalizedId(value: string): string | undefined {
 }
 
 function failure(operation: string, message: string, code = "validation"): ToolExecutionResult {
-  return {
-    handled: true,
-    ok: false,
-    content: "",
-    error: message,
-    result: { ok: false, operation, code, message },
-  };
+  return toolFailure(operation, code, message);
 }
 
 function success(operation: string, content: string): ToolExecutionResult {
@@ -135,11 +113,6 @@ function success(operation: string, content: string): ToolExecutionResult {
 
 function callName(context: ToolExecutionContext): string {
   return (context.call).function.name;
-}
-
-function isReparsePoint(stats: Stats): boolean {
-  const candidate = stats as Stats & { isReparsePoint?: () => boolean };
-  return typeof candidate.isReparsePoint === "function" && candidate.isReparsePoint();
 }
 
 function composeSkillDocument(args: {
@@ -156,10 +129,22 @@ function composeSkillDocument(args: {
   return `${lines.join("\n")}\n`;
 }
 
+const linkFailure = (): ToolExecutionResult =>
+  failure("skills.save", "skill path contains a symlink, junction, or reparse point", "policy");
+
+/** Canonical path of an existing path whose whole chain is free of links; undefined otherwise. */
+async function linkFreeRealPath(path: string): Promise<string | undefined> {
+  try {
+    return await assertNoLinkComponentsAsync(resolve(path));
+  } catch {
+    return undefined;
+  }
+}
+
 async function assertWritablePath(path: string): Promise<ToolExecutionResult | undefined> {
   try {
     const stats = await lstat(path);
-    if (stats.isSymbolicLink() || isReparsePoint(stats)) {
+    if (stats.isSymbolicLink()) {
       return failure("skills.save", "skill path contains a symlink, junction, or reparse point", "policy");
     }
   } catch {
@@ -207,7 +192,7 @@ export class SkillDispatcher {
     if (!this.canHandle(name)) return { handled: false };
     const operation = name === "use_skill" ? "skills.use" : name === "save_skill" ? "skills.save" : "skills.search";
     if (context.signal?.aborted) return failure(operation, "skill operation aborted", "aborted");
-    const args = parseArguments(context.call.function.arguments);
+    const args = parseToolArguments(context.call.function.arguments);
     if (args === undefined) return failure(operation, "tool arguments must be a JSON object");
     try {
       if (name === "search_skills") return this.search(context.agentId, args);
@@ -246,9 +231,7 @@ export class SkillDispatcher {
   }
 
   private allowed(agentId: string, id: string): boolean {
-    const policy = this.policy(agentId);
-    if (policy?.enabled === false) return false;
-    return !(policy?.disabledIds ?? []).some((candidate) => typeof candidate === "string" && normalizedId(candidate) === id);
+    return isSkillAllowed(this.policy(agentId), id);
   }
 
   private search(agentId: string, args: Record<string, unknown>): ToolExecutionResult {
@@ -265,12 +248,7 @@ export class SkillDispatcher {
     if (policy?.enabled === false) return success("skills.search", "[]");
     const results = this.catalog
       .list(args.query.trim())
-      .filter((entry) => {
-        const id = normalizedId(entry.id);
-        return id !== undefined && !(policy?.disabledIds ?? []).some((candidate) => typeof candidate === "string" && normalizedId(candidate) === id)
-          && this.catalog.invocationPolicy(id)?.modelInvocable === true
-          && this.catalog.invocationPolicy(id)?.autoSelect === true;
-      })
+      .filter((entry) => isSkillAllowed(policy, entry.id) && isModelSelectable(this.catalog.invocationPolicy(entry.id)))
       .slice(0, limit);
     return success("skills.search", JSON.stringify(results));
   }
@@ -352,6 +330,10 @@ export class SkillDispatcher {
 
     const skillDir = join(this.authoringRoot.path, id);
     const skillFile = join(skillDir, "SKILL.md");
+    // The authoring root was validated at startup; it must still be link-free
+    // now, or a root swapped for a junction would redirect the write.
+    const rootRealPath = await linkFreeRealPath(this.authoringRoot.path);
+    if (rootRealPath === undefined) return linkFailure();
     const dirPolicy = await assertWritablePath(skillDir);
     if (dirPolicy !== undefined) return dirPolicy;
     const filePolicy = await assertWritablePath(skillFile);
@@ -359,16 +341,22 @@ export class SkillDispatcher {
     if (signal?.aborted) return failure("skills.save", "skill operation aborted", "aborted");
 
     await mkdir(skillDir, { recursive: true });
-    // Revalidate after mkdir: the pre-check above races an attacker with
-    // write access to the profile root swapping the directory for a symlink.
-    const dirPolicyAfterMkdir = await assertWritablePath(skillDir);
-    if (dirPolicyAfterMkdir !== undefined) return dirPolicyAfterMkdir;
+    // Revalidate after mkdir and again before committing: the pre-check above
+    // races an attacker with write access to the profile swapping the root or
+    // the directory for a link. The whole chain must stay link-free and inside
+    // the authoring root.
+    const insideRoot = async (): Promise<boolean> => {
+      const dirRealPath = await linkFreeRealPath(skillDir);
+      return dirRealPath !== undefined && skillPathContainedBy(rootRealPath, dirRealPath);
+    };
+    if (!await insideRoot()) return linkFailure();
     if (signal?.aborted) return failure("skills.save", "skill operation aborted", "aborted");
     const tempFile = join(skillDir, `SKILL.md.tmp-${randomBytes(8).toString("hex")}`);
     let committed = false;
     try {
       await writeFile(tempFile, text, { encoding: "utf8", flag: "wx", signal });
       if (signal?.aborted) return failure("skills.save", "skill operation aborted", "aborted");
+      if (!await insideRoot()) return linkFailure();
       await rename(tempFile, skillFile);
       committed = true;
     } catch (error) {
@@ -394,14 +382,4 @@ export class SkillDispatcher {
 
 export function createSkillDispatcher(options: SkillDispatcherOptions): SkillDispatcher {
   return new SkillDispatcher(options);
-}
-
-export function createSkillToolExecutor(options: SkillDispatcherOptions): ToolCallExecutor {
-  return new SkillDispatcher(options).executor();
-}
-
-export function createSkillTurnContextResolver(options: SkillDispatcherOptions):
-  (agentId: string, args: { prompt: string; richText?: string }) => Promise<string> {
-  const dispatcher = new SkillDispatcher(options);
-  return async (agentId, args) => dispatcher.resolveTurnContext(agentId, args);
 }

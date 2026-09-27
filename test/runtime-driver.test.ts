@@ -3,12 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { WslCommandResult, WslCommandRunner } from "../src/execution/runtime/wsl/provisioner.js";
-import { createDefaultWslRuntimeDriver } from "../src/execution/runtime/wsl/driver.js";
-import { createManagedRuntimeLayout } from "../src/execution/runtime/wsl/installer.js";
 import { RuntimeManager, RuntimeManagerError } from "../src/execution/runtime/manager.js";
 import { LocalProcessRunner, LocalRuntimeDriver } from "../src/execution/runtime/local/driver.js";
-import { WslProcessBackend } from "../src/execution/runtime/wsl/process-backend.js";
+import { RuntimeProcessBackend } from "../src/execution/runtime/process-backend.js";
 import { LocalExecutionBroker } from "../src/execution/broker.js";
 import { MAX_PROCESS_OUTPUT_BYTES } from "../src/execution/contracts.js";
 import type { RuntimeLease } from "../src/execution/runtime/contracts.js";
@@ -19,141 +16,14 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-class FakeRunner implements WslCommandRunner {
-  readonly calls: string[][] = [];
-  responses: WslCommandResult[] = [];
-  async run(args: readonly string[]): Promise<WslCommandResult> {
-    this.calls.push([...args]);
-    return this.responses.shift() ?? { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
-  }
-}
-
-const bootJson = JSON.stringify({ runtimeBootId: "boot-1", runtimeVersion: "1.0.0", imageDigest: `sha256:${"a".repeat(64)}` });
-
-describe("default WSL runtime driver", () => {
-  it("não toca Ubuntu pessoal quando OpenBotRuntime não está instalada", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-driver-missing-"));
-    roots.push(root);
-    const runner = new FakeRunner();
-    runner.responses = [
-      { exitCode: 0, stdout: Buffer.from("Default Version: 2\n"), stderr: Buffer.alloc(0) },
-      { exitCode: 0, stdout: Buffer.from("Ubuntu\n"), stderr: Buffer.alloc(0) },
-    ];
-    const driver = createDefaultWslRuntimeDriver({ runtimeRoot: root, runner });
-
-    await expect(driver.start()).rejects.toMatchObject({ code: "runtime_unavailable" } satisfies Partial<RuntimeManagerError>);
-    expect(runner.calls).toEqual([["--status"], ["--list", "--quiet"]]);
-    expect(runner.calls.flat()).not.toContain("Ubuntu");
-  });
-
-  it("importa automaticamente somente um pacote guest staged e revalida a distro gerenciada", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-driver-staged-"));
-    roots.push(root);
-    const layout = await createManagedRuntimeLayout(root);
-    const archive = join(layout.staging, "openbot-runtime-package.tar");
-    await writeFile(archive, "archive");
-    await writeFile(join(layout.staging, "manifest.json"), JSON.stringify({
-      schemaVersion: 1,
-      runtimeVersion: "1.0.0",
-      supervisorVersion: "0.1.0",
-      supervisorDigest: `sha256:${"c".repeat(64)}`,
-      rootfsDigest: `sha256:${"d".repeat(64)}`,
-    }));
-    const runner = new FakeRunner();
-    runner.responses = [
-      { exitCode: 0, stdout: Buffer.from("Default Version: 2\n"), stderr: Buffer.alloc(0) },
-      { exitCode: 0, stdout: Buffer.from("Ubuntu\n"), stderr: Buffer.alloc(0) },
-      { exitCode: 0, stdout: Buffer.from("Ubuntu\n"), stderr: Buffer.alloc(0) }, // transactional install --list
-      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // import candidate
-      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ supervisorVersion: "0.1.0", supervisorDigest: `sha256:${"c".repeat(64)}` })), stderr: Buffer.alloc(0) }, // candidate version
-      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ runtimeBootId: "candidate-boot", runtimeVersion: "1.0.0", imageDigest: `sha256:${"d".repeat(64)}` })), stderr: Buffer.alloc(0) }, // candidate start
-      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ ok: true })), stderr: Buffer.alloc(0) }, // candidate health
-      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // terminate candidate
-      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // import final
-      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ supervisorVersion: "0.1.0", supervisorDigest: `sha256:${"c".repeat(64)}` })), stderr: Buffer.alloc(0) }, // final version
-      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ runtimeBootId: "final-boot", runtimeVersion: "1.0.0", imageDigest: `sha256:${"d".repeat(64)}` })), stderr: Buffer.alloc(0) }, // final start
-      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ ok: true })), stderr: Buffer.alloc(0) }, // final health
-      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // terminate candidate
-      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, // unregister candidate
-      { exitCode: 0, stdout: Buffer.from("Default Version: 2\n"), stderr: Buffer.alloc(0) },
-      { exitCode: 0, stdout: Buffer.from("OpenBotRuntime\n"), stderr: Buffer.alloc(0) },
-      { exitCode: 0, stdout: Buffer.from(bootJson), stderr: Buffer.alloc(0) },
-    ];
-    const driver = createDefaultWslRuntimeDriver({ runtimeRoot: root, runner });
-
-    await expect(driver.start()).resolves.toMatchObject({ runtimeBootId: "boot-1" });
-    expect(runner.calls).toContainEqual(["--import", "OpenBotRuntimeCandidate", expect.stringContaining("distro-candidate"), archive, "--version", "2"]);
-    expect(runner.calls).toContainEqual(["--import", "OpenBotRuntime", layout.distro, archive, "--version", "2"]);
-    expect(runner.calls).toContainEqual(["-d", "OpenBotRuntimeCandidate", "--user", "root", "--", "/usr/lib/openbot/supervisor", "--protocol-version", "1", "version"]);
-    expect(runner.calls).toContainEqual(["-d", "OpenBotRuntime", "--user", "root", "--", "/usr/lib/openbot/supervisor", "--protocol-version", "1", "version"]);
-    expect(runner.calls.flat()).not.toContain("Ubuntu-24.04");
-  });
-
-  it("inicia, faz health e encerra somente OpenBotRuntime por argumentos estruturados", async () => {
-    const root = await mkdtemp(join(tmpdir(), "openbot-driver-ready-"));
-    roots.push(root);
-    const runner = new FakeRunner();
-    runner.responses = [
-      { exitCode: 0, stdout: Buffer.from("Default Version: 2\n"), stderr: Buffer.alloc(0) },
-      { exitCode: 0, stdout: Buffer.from("OpenBotRuntime\n"), stderr: Buffer.alloc(0) },
-      { exitCode: 0, stdout: Buffer.from(bootJson), stderr: Buffer.alloc(0) },
-      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ ok: true })), stderr: Buffer.alloc(0) },
-      { exitCode: 0, stdout: Buffer.from(JSON.stringify({ ok: true })), stderr: Buffer.alloc(0) },
-      { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) },
-    ];
-    const driver = createDefaultWslRuntimeDriver({ runtimeRoot: root, runner });
-    const boot = await driver.start();
-    expect(boot.runtimeBootId).toBe("boot-1");
-    await expect(driver.health(boot)).resolves.toEqual({ ok: true });
-    await driver.stop("shutdown");
-    expect(runner.calls.slice(2).map((args) => args.slice(0, 4))).toEqual([
-      ["-d", "OpenBotRuntime", "--user", "root"],
-      ["-d", "OpenBotRuntime", "--user", "root"],
-      ["-d", "OpenBotRuntime", "--user", "root"],
-      ["--terminate", "OpenBotRuntime"],
-    ]);
-    expect(runner.calls.flat()).not.toContain("Ubuntu");
-  });
-
-  it("propaga uma distro live aleatória somente pelo seam explicitamente habilitado", async () => {
-    vi.stubEnv("OPENBOT_RUNTIME_WSL_LIVE_TEST", "1");
-    const root = await mkdtemp(join(tmpdir(), "openbot-driver-live-seam-"));
-    roots.push(root);
-    const distro = "OpenBotRuntimeLive-12345678-1234-1234-1234-123456789abc";
-    const runner = new FakeRunner();
-    runner.responses = [
-      { exitCode: 0, stdout: Buffer.from("Default Version: 2\n"), stderr: Buffer.alloc(0) },
-      { exitCode: 0, stdout: Buffer.from(`${distro}\n`), stderr: Buffer.alloc(0) },
-      { exitCode: 0, stdout: Buffer.from(bootJson), stderr: Buffer.alloc(0) },
-    ];
-
-    const driver = createDefaultWslRuntimeDriver({ runtimeRoot: root, runner, distroName: distro });
-    await expect(driver.start()).resolves.toMatchObject({ runtimeBootId: "boot-1" });
-    expect(runner.calls).toContainEqual([
-      "-d", distro, "--user", "root", "--", "/usr/lib/openbot/supervisor", "--protocol-version", "1", "start",
-    ]);
-  });
-
-  it("recusa a distro live sem a flag de ambiente", async () => {
-    vi.stubEnv("OPENBOT_RUNTIME_WSL_LIVE_TEST", "0");
-    const root = await mkdtemp(join(tmpdir(), "openbot-driver-live-closed-"));
-    roots.push(root);
-    expect(() => createDefaultWslRuntimeDriver({
-      runtimeRoot: root,
-      runner: new FakeRunner(),
-      distroName: "OpenBotRuntimeLive-12345678-1234-1234-1234-123456789abc",
-    })).toThrow(/not permitted/i);
-  });
-});
-
 describe("trusted local runtime", () => {
   it("preserves bounded, redacted partial output and disk effects through timeout and output-limit failures", async () => {
     const root = await mkdtemp(join(tmpdir(), "openbot-local-partial-"));
     roots.push(root);
     const driver = new LocalRuntimeDriver();
     const manager = new RuntimeManager({ driver });
-    const backend = new WslProcessBackend({ agentId: "agent-a", manager, runner: driver.processRunner("agent-a", root) });
-    const broker = new LocalExecutionBroker(backend, () => "always");
+    const backend = new RuntimeProcessBackend({ agentId: "agent-a", manager, runner: driver.processRunner("agent-a", root) });
+    const broker = new LocalExecutionBroker(backend);
     try {
       const result = await broker.execute("agent-a", "timeout", {
         operation: "process.run", executable: process.execPath,
@@ -198,7 +68,7 @@ describe("trusted local runtime", () => {
     } finally { await manager.close(); }
   });
 
-  it("returns an honest failure when the child closes stdin before consuming it", async () => {
+  it("reports the exit of a child that closes stdin before consuming it", async () => {
     const root = await mkdtemp(join(tmpdir(), "openbot-local-stdin-"));
     roots.push(root);
     const driver = new LocalRuntimeDriver();
@@ -208,7 +78,20 @@ describe("trusted local runtime", () => {
       await expect(driver.processRunner("agent-a", root).run(lease, {
         operation: "process.run", executable: process.execPath, argv: ["-e", "process.exit(0)"], cwd: ".",
         stdin: "x".repeat(1024 * 1024), timeoutMs: 3000, networkProfile: "host",
-      }, new AbortController().signal)).resolves.toMatchObject({ ok: false, code: "io_error", message: expect.stringContaining("stdin") });
+      }, new AbortController().signal)).resolves.toMatchObject({ ok: true, exitCode: 0 });
+    } finally { await manager.close(); }
+  });
+
+  it("explains that a bare command name only resolves to an .exe when the process cannot start", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-local-missing-"));
+    roots.push(root);
+    const driver = new LocalRuntimeDriver();
+    const manager = new RuntimeManager({ driver });
+    try {
+      const lease = await manager.acquire("agent-a", { kind: "process.run", networkProfile: "host" });
+      await expect(driver.processRunner("agent-a", root).run(lease, {
+        operation: "process.run", executable: "openbot-definitely-missing-tool", argv: [], cwd: ".", timeoutMs: 5000, networkProfile: "host",
+      }, new AbortController().signal)).resolves.toMatchObject({ ok: false, code: "io_error", message: expect.stringContaining("npm.cmd") });
     } finally { await manager.close(); }
   });
 

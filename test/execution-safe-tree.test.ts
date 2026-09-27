@@ -8,6 +8,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
+    link: vi.fn(actual.link),
     open: vi.fn(actual.open),
     rename: vi.fn(actual.rename),
     rm: vi.fn(actual.rm),
@@ -21,6 +22,7 @@ const roots: string[] = [];
 afterEach(async () => {
   const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
   vi.mocked(fsp.rename).mockImplementation(actual.rename);
+  vi.mocked(fsp.link).mockImplementation(actual.link);
   vi.mocked(fsp.rm).mockImplementation(actual.rm);
   vi.mocked(fsp.open).mockImplementation(actual.open);
   await Promise.all(roots.splice(0).map((entry) => actual.rm(entry, { recursive: true, force: true })));
@@ -35,7 +37,7 @@ describe("renameOrCopy", () => {
     const destination = join(root, "dest.txt");
     await writeFile(source, "payload-bytes");
 
-    vi.mocked(fsp.rename).mockImplementationOnce(async () => {
+    vi.mocked(fsp.link).mockImplementationOnce(async () => {
       throw Object.assign(new Error("cross-device"), { code: "EXDEV" });
     });
     vi.mocked(fsp.rm).mockImplementation(async (target, options) => {
@@ -51,6 +53,19 @@ describe("renameOrCopy", () => {
     });
     await expect(readFile(destination, "utf8")).resolves.toBe("payload-bytes");
     await expect(readFile(source, "utf8")).resolves.toBe("payload-bytes");
+  });
+
+  it("não sobrescreve um arquivo que surgiu no destino ao mover", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-no-replace-"));
+    roots.push(root);
+    const source = join(root, "source.txt");
+    const destination = join(root, "report.pdf");
+    await writeFile(source, "moved");
+    await writeFile(destination, "user-saved-meanwhile");
+
+    await expect(renameOrCopy(source, destination)).rejects.toMatchObject({ name: "SafeTreeError", code: "invalid_path" });
+    await expect(readFile(destination, "utf8")).resolves.toBe("user-saved-meanwhile");
+    await expect(readFile(source, "utf8")).resolves.toBe("moved");
   });
 
   it("fecha a origem quando a abertura do destino falha", async () => {

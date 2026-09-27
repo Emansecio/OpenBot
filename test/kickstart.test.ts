@@ -16,6 +16,7 @@ import {
 import { registerRosterHandlers } from "../src/rpc/roster.js";
 import { Gateway } from "../src/server/gateway.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
+import { fakeConfig } from "./helpers/fake-config.js";
 
 const kickstart = (agentId = "agent-a", clientNonce = "nonce-a") => ({
   agentId,
@@ -52,14 +53,13 @@ describe("P2.8 kickstart opt-in", () => {
       provider: "openai-compat",
       model: "openai-compatible",
     };
-    const config = {
-      snapshot: () => ({ agents: [agent], profile: {} }),
+    const config = fakeConfig({ agents: [agent], profile: {} }, {
       update: () => ({ agents: [agent] }),
       mutate: (mutator: (current: { agents: Array<typeof agent>; profile: Record<string, never> }) => Partial<{ agents: Array<typeof agent>; profile: Record<string, never> }>) => {
         const current = { agents: [agent], profile: {} };
         return { ...current, ...mutator(current) };
       },
-    };
+    });
     let optInCalls = 0;
     registerRosterHandlers(gateway, config as any, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, async () => {
       optInCalls += 1;
@@ -110,19 +110,17 @@ describe("P2.8 kickstart opt-in", () => {
       }));
       const store = createMemoryTranscriptStore();
       store.conversationStore!.ensureDefault("agent-a");
-      const config = {
-        snapshot: () => ({
-          agents: [{ id: "agent-a", name: "Agent A", avatarId: "fixture", provider: "xai", model: "grok-4.6", runtimeMode: "lite" }],
-          profile: {}, activeProvider: "xai", globalModel: "grok-4.6",
-        }),
-      };
+      const config = fakeConfig({
+        agents: [{ id: "agent-a", name: "Agent A", avatarId: "fixture", provider: "xai", model: "grok-4.6", runtimeMode: "lite" }],
+        profile: {}, activeProvider: "xai", globalModel: "grok-4.6",
+      });
       const gateway = new Gateway();
       const { runner } = registerRpcHandlers(gateway, {
         store,
         registry,
         keystore,
         config: config as never,
-        homes: { inventory: async () => ({}) } as never,
+        homes: { assertReady: async () => undefined } as never,
         runtimeManager: { status: async () => ({ state: "lite-ready" }) } as never,
       });
 
@@ -157,6 +155,35 @@ describe("P2.8 kickstart opt-in", () => {
     expect(store.getEntries("agent-a")).toHaveLength(0);
     expect(published).toHaveLength(0);
     expect(store.getKickstartRun?.("agent-a", "nonce-a")).toMatchObject({ status: "completed", result: { text: "Olá" } });
+  });
+
+  it("limita gravações de progresso por delta e persiste o texto final completo", async () => {
+    let nowMs = 1_000;
+    const { runner, store } = fixtureRunner({
+      async streamChat(_request, emit) {
+        for (let index = 0; index < 500; index += 1) emit({ type: "delta", delta: "x".repeat(20) });
+        nowMs += 1_000;
+        emit({ type: "delta", delta: "y" });
+        nowMs += 1_000;
+        emit({ type: "delta", delta: "z" });
+      },
+    }, { now: () => nowMs });
+    const update = store.updateKickstartRun!.bind(store);
+    const progressWrites: string[] = [];
+    store.updateKickstartRun = (agentId, clientNonce, patch) => {
+      if (patch.status === undefined && patch.result !== undefined) progressWrites.push(patch.result.text);
+      return update(agentId, clientNonce, patch);
+    };
+
+    await runner.kickstartAgent(kickstart());
+    await runner.flush("agent-a");
+
+    // First delta (durable observableOutput), then one throttled write carrying the capped
+    // text once the clock moved; the capped text no longer changes, so "z" writes nothing.
+    expect(progressWrites.map((text) => text.length)).toEqual([20, 4096]);
+    const run = store.getKickstartRun?.("agent-a", "nonce-a");
+    expect(run).toMatchObject({ status: "completed", observableOutput: true });
+    expect(run?.result?.text).toBe("x".repeat(4096));
   });
 
   it("marca partial como interrupted e nunca faz replay pelo mesmo nonce", async () => {

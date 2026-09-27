@@ -17,7 +17,7 @@ function scopedAgent(config: ConfigStore, body: Record<string, unknown>, method:
   const alias = typeof body.id === "string" ? body.id.trim() : "";
   const agentId = explicit.length > 0 ? explicit : alias.length > 0 ? alias : "";
   if (agentId.length === 0) throw new RpcError(400, method + ": agentId é obrigatório");
-  if (!config.snapshot().agents.some((agent) => agent.id === agentId)) throw new RpcError(404, method + ": agente não encontrado");
+  if (!config.hasAgent(agentId)) throw new RpcError(404, method + ": agente não encontrado");
   return agentId;
 }
 

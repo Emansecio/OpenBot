@@ -69,29 +69,6 @@ const normalizeSearch = (name: string, args: Record<string, unknown>): unknown =
   return { operation: "command.run", command: "search.text", cwd: args.cwd, params: { pattern: args.pattern, mode: args.mode, paths: args.paths } };
 };
 
-const normalizeWhatsapp = (args: Record<string, unknown>): unknown => {
-  exactArgs(args, ["op", "chat", "limit", "text", "etapa", "mediaId"]);
-  const op = args.op;
-  if (op === "doctor" || op === "sweep") {
-    const extras = ["chat", "limit", "text", "etapa", "mediaId"]
-      .filter((key) => args[key] !== undefined);
-    if (extras.length > 0) {
-      throw new ExecutionRequestError(
-        `request contains unsupported fields; whatsapp ${op} accepts only the op field; remove ${extras.join(", ")}`,
-      );
-    }
-  }
-  return {
-    operation: "whatsapp",
-    op,
-    chat: args.chat,
-    limit: args.limit,
-    text: args.text,
-    etapa: args.etapa,
-    mediaId: args.mediaId,
-  };
-};
-
 const normalizeProcess = (args: Record<string, unknown>): unknown => {
   const allowed = new Set(["executable", "argv", "cwd", "env", "stdin", "timeoutMs", "networkProfile"]);
   rejectUnsupportedFields(args, allowed);
@@ -180,7 +157,6 @@ export function toolCallToExecutionRequest(call: ProviderToolCall): ToolRequestP
       case "search_files":
       case "search_text": input = normalizeSearch(call.function.name, args); break;
       case "process_run": input = normalizeProcess(args); break;
-      case "whatsapp": input = normalizeWhatsapp(args); break;
       case "browser_open":
       case "browser_navigate":
       case "browser_snapshot":

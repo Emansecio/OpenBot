@@ -1,10 +1,12 @@
 import {
-  appendFileSync,
+  closeSync,
   existsSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   renameSync,
   rmSync,
-  statSync,
+  writeSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
@@ -50,6 +52,11 @@ function boundedLine(value: string, maxBytes: number): Buffer {
   return Buffer.concat([line.subarray(0, Math.max(0, maxBytes - suffix.length)), suffix]);
 }
 
+/**
+ * Appends to one file kept open, tracking its size in memory: a line costs one
+ * write instead of an exists/stat/open/write/close round. Each logger must be
+ * the only writer of its file (the supervisor and the worker log separately).
+ */
 export function createLocalFileLogger(options: LocalFileLoggerOptions): LocalFileLogger {
   const path = resolve(options.path);
   const maxBytes = Number(options.maxBytes ?? 2 * 1024 * 1024);
@@ -59,17 +66,49 @@ export function createLocalFileLogger(options: LocalFileLoggerOptions): LocalFil
   mkdirSync(dirname(path), { recursive: true });
   const now = options.now ?? (() => new Date());
   const secrets = options.secrets ?? [];
+  let fd: number | undefined;
+  let size = 0;
+  const openLog = (): number => {
+    fd = openSync(path, "a");
+    size = fstatSync(fd).size;
+    return fd;
+  };
+  const closeLog = (): void => {
+    if (fd === undefined) return;
+    try { closeSync(fd); } catch { /* already closed */ }
+    fd = undefined;
+  };
   return {
     write(level, message) {
       const safeLevel = String(level).replaceAll(/[^A-Z]/giu, "").slice(0, 10) || "INFO";
       const safeMessage = redactLogText(message, secrets);
       const entry = boundedLine(`${now().toISOString()} ${safeLevel} ${safeMessage}`, maxBytes);
-      const currentBytes = existsSync(path) ? statSync(path).size : 0;
-      if (currentBytes + entry.length > maxBytes) rotate(path, backups);
-      appendFileSync(path, entry);
+      let handle = fd ?? openLog();
+      if (size + entry.length > maxBytes) {
+        // Windows cannot rename a file this process still holds open.
+        closeLog();
+        rotate(path, backups);
+        handle = openLog();
+      }
+      try {
+        writeSync(handle, entry);
+      } catch {
+        // A deleted or broken handle: reopen once and retry.
+        closeLog();
+        handle = openLog();
+        writeSync(handle, entry);
+      }
+      size += entry.length;
     },
   };
 }
+
+export interface LocalLogFileNames {
+  standard: string;
+  errors: string;
+}
+
+const GATEWAY_LOG_FILES: LocalLogFileNames = { standard: "gateway.log", errors: "gateway-error.log" };
 
 function formatArgument(value: unknown): string {
   if (value instanceof Error) return value.stack ?? value.message;
@@ -84,6 +123,7 @@ function formatArgument(value: unknown): string {
 export function installLocalFileLoggerFromEnvironment(
   env: NodeJS.ProcessEnv = process.env,
   target: Pick<Console, "log" | "info" | "warn" | "error"> = console,
+  names: LocalLogFileNames = GATEWAY_LOG_FILES,
 ): { installed: boolean; restore(): void } {
   const logDir = env.OPENBOT_LOG_DIR?.trim();
   if (!logDir) return { installed: false, restore() {} };
@@ -96,8 +136,10 @@ export function installLocalFileLoggerFromEnvironment(
   let standard: LocalFileLogger;
   let errors: LocalFileLogger;
   try {
-    standard = createLocalFileLogger({ path: join(logDir, "gateway.log"), maxBytes, backups, secrets });
-    errors = createLocalFileLogger({ path: join(logDir, "gateway-error.log"), maxBytes, backups, secrets });
+    standard = createLocalFileLogger({ path: join(logDir, names.standard), maxBytes, backups, secrets });
+    errors = names.errors === names.standard
+      ? standard
+      : createLocalFileLogger({ path: join(logDir, names.errors), maxBytes, backups, secrets });
   } catch {
     return { installed: false, restore() {} };
   }

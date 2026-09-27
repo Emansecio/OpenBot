@@ -25,8 +25,6 @@ import { randomUUID } from "node:crypto";
 import type { ReasoningEffort } from "../shared/contracts.js";
 import type { ProviderUsage } from "./usage.js";
 import { ProviderAdmissionError, type ProviderAdmissionLease, type ProviderAdmissionScheduler } from "./admission.js";
-import { resolveProviderCapabilities } from "./capabilities.js";
-import { ResumeProtocolError, validateOpaqueResumeCursor } from "./resume.js";
 
 /** Papel de uma mensagem no diálogo normalizado (espelho do transcript). */
 export type ProviderMessageRole = "system" | "user" | "assistant" | "tool";
@@ -88,7 +86,7 @@ export interface ProviderChatRequest {
   /** Modelo global único resolvido pelo catálogo (T13); id como em models.ts. */
   model: string;
   /** Local-only purpose tag. Never serialized into the provider JSON body. */
-  purpose?: "turn" | "memory-reflection" | "async-task" | "kickstart" | "resume";
+  purpose?: "turn" | "memory-reflection" | "async-task" | "kickstart";
   /** System prompt montado pelo turn runner (T10). */
   system?: string;
   /** Histórico do diálogo (transcript) até o turno atual. */
@@ -103,8 +101,6 @@ export interface ProviderChatRequest {
   reasoningEffort?: ReasoningEffort;
   /** AbortSignal: cancelamento do stream (abort encerra com `error` abortado). */
   signal?: AbortSignal;
-  /** Local-only resume input. Adapters receive it only through `resumeChat`. */
-  resume?: { cursor: string };
 }
 
 /**
@@ -146,11 +142,6 @@ export type ProviderStreamEvent =
   | {
       type: "tool-result";
       result: ProviderToolResult;
-    }
-  | {
-      type: "resume-cursor";
-      /** Opaque provider cursor at a durable provider boundary. */
-      cursor: string;
     }
   | {
       type: "done";
@@ -352,12 +343,6 @@ export interface ProviderAdapter {
     req: ProviderChatRequest,
     emit: (event: ProviderStreamEvent) => void,
   ): Promise<void>;
-  /** Optional real cursor-resume entrypoint. Unsupported adapters omit it. */
-  resumeChat?(
-    req: Omit<ProviderChatRequest, "resume">,
-    cursor: string,
-    emit: (event: ProviderStreamEvent) => void,
-  ): Promise<void>;
   /** Optional lifecycle: releases owned executions/controllers on shutdown. */
   close?(): void | Promise<void>;
 }
@@ -416,9 +401,18 @@ export class DeltaAccumulator {
     this._text += delta;
   }
 
-  /** Registra uma tool call (ordem de chegada preservada). */
-  addToolCall(call: ProviderToolCall): void {
+  /**
+   * Registra uma tool call (ordem de chegada preservada). Um reenvio idêntico
+   * (mesmo id, nome e argumentos) na mesma resposta é artefato do stream, não
+   * uma nova chamada: retorna false para não executá-la nem publicá-la de novo.
+   */
+  addToolCall(call: ProviderToolCall): boolean {
+    if (call.id.length > 0 && this.toolCalls.some((known) => known.id === call.id
+      && known.function.name === call.function.name && known.function.arguments === call.function.arguments)) {
+      return false;
+    }
     this.toolCalls.push(call);
+    return true;
   }
 
   /** Constrói a mensagem COMPLETA com o texto acumulado até aqui. */
@@ -445,8 +439,6 @@ export interface StreamChatResult {
   aborted: boolean;
   /** true quando o stream terminou com erro (não-retryable ou retryable). */
   error?: ProviderError;
-  /** Last bounded opaque cursor emitted at a provider boundary. */
-  cursor?: string;
 }
 
 export interface ProviderAttempt {
@@ -533,12 +525,9 @@ async function streamChatInternal(
   opts: RouterOptions = {},
 ): Promise<StreamChatResult> {
   const registry = opts.registry ?? defaultRegistry;
-  const resumeRequested = req.resume !== undefined;
-  const maxRetries = resumeRequested
-    ? 0
-    : Number.isInteger(opts.maxRetries)
-      ? Math.max(0, Math.min(2, opts.maxRetries as number))
-      : 2;
+  const maxRetries = Number.isInteger(opts.maxRetries)
+    ? Math.max(0, Math.min(2, opts.maxRetries as number))
+    : 2;
   const sleep = opts.sleep ?? retrySleep;
   let observerFailed = false;
   let observerFailure: unknown;
@@ -574,29 +563,6 @@ async function streamChatInternal(
     const err = new ProviderError("stream aborted before start", { kind: "aborted", code: "ABORT_ERR" });
     if (!emit({ type: "error", error: err })) return observerErrorResult();
     return { aborted: true, error: err };
-  }
-
-  const capability = req.modelResolution?.entry.provider === providerName && req.modelResolution.entry.id === req.model
-    ? req.modelResolution.capabilities : resolveProviderCapabilities(providerName, req.model);
-  let resumeCursor: string | undefined;
-  if (resumeRequested) {
-    try {
-      resumeCursor = validateOpaqueResumeCursor(req.resume?.cursor);
-    } catch (error) {
-      const resumeError = error instanceof ResumeProtocolError
-        ? new ProviderError(error.message, { kind: "validation", code: error.code })
-        : new ProviderError("invalid resume cursor", { kind: "validation", code: "invalid_cursor" });
-      if (!emit({ type: "error", error: resumeError })) return observerErrorResult();
-      return { aborted: false, error: resumeError };
-    }
-    if (capability.resume !== "cursor" || typeof adapter.resumeChat !== "function") {
-      const err = new ProviderError("provider does not support cursor resume", {
-        kind: "validation",
-        code: "resume_unavailable",
-      });
-      if (!emit({ type: "error", error: err })) return observerErrorResult();
-      return { aborted: false, error: err };
-    }
   }
 
   const accumulator = new DeltaAccumulator();
@@ -657,53 +623,7 @@ async function streamChatInternal(
           };
           try { opts.onTransportStart?.(protocol); } catch { /* status observation cannot change inference */ }
         };
-        const requestForAdapter = resumeRequested
-          ? (() => {
-            const { resume: _resume, ...withoutResume } = effectiveRequest;
-            return withoutResume;
-          })()
-          : effectiveRequest;
-        const stream = resumeRequested
-          ? adapter.resumeChat!(requestForAdapter, resumeCursor!, (event) => {
-            switch (event.type) {
-              case "usage":
-                usage = { ...usage, ...event.usage };
-                forward(event);
-                break;
-              case "resume-cursor":
-                if (capability.resume !== "cursor") throw new ProviderError("resume cursor emitted without capability", { kind: "validation", code: "invalid_cursor" });
-                resumeCursor = validateOpaqueResumeCursor(event.cursor);
-                forward({ type: "resume-cursor", cursor: resumeCursor });
-                break;
-              case "delta":
-                observedOutput = true;
-                accumulator.appendText(event.delta);
-                forward({ type: "delta", delta: event.delta });
-                break;
-              case "tool-call":
-                observedOutput = true;
-                accumulator.addToolCall(event.call);
-                forward({ type: "tool-call", call: event.call });
-                break;
-              case "tool-result":
-                observedOutput = true;
-                forward({ type: "tool-result", result: event.result });
-                break;
-              case "reasoning-start":
-              case "reasoning-progress":
-              case "reasoning-end":
-                forward({
-                  type: event.type,
-                  ...(event.summary !== undefined ? { summary: event.summary } : {}),
-                } as Extract<ProviderStreamEvent, { type: "reasoning-start" | "reasoning-progress" | "reasoning-end" }>);
-                break;
-              case "message":
-              case "done":
-              case "error":
-                break;
-            }
-          })
-          : adapter.streamChat(requestForAdapter, (event) => {
+        const stream = adapter.streamChat(effectiveRequest, (event) => {
           switch (event.type) {
             case "usage":
               usage = { ...usage, ...event.usage };
@@ -719,17 +639,11 @@ async function streamChatInternal(
               break;
             case "tool-call":
               observedOutput = true;
-              accumulator.addToolCall(event.call);
-              forward({ type: "tool-call", call: event.call });
+              if (accumulator.addToolCall(event.call)) forward({ type: "tool-call", call: event.call });
               break;
             case "tool-result":
               observedOutput = true;
               forward({ type: "tool-result", result: event.result });
-              break;
-            case "resume-cursor":
-              if (capability.resume !== "cursor") throw new ProviderError("resume cursor emitted without capability", { kind: "validation", code: "invalid_cursor" });
-              resumeCursor = validateOpaqueResumeCursor(event.cursor);
-              forward({ type: "resume-cursor", cursor: resumeCursor });
               break;
             // P2.4 reasoning: forward canonical events unchanged (the consumer
             // gates them by the declared capability). Reasoning is never counted
@@ -748,7 +662,7 @@ async function streamChatInternal(
             case "error":
               break;
           }
-          });
+        });
         await stream;
         finishAttempt();
         break;
@@ -757,7 +671,10 @@ async function streamChatInternal(
         if (observerFailed) return observerErrorResult();
         const classified = err instanceof ProviderAdmissionError
           ? new ProviderError(err.message, {
-            kind: err.code === "queue-full" || err.code === "agent-queue-full" ? "rate-limit" : err.code === "aborted" ? "aborted" : "unknown",
+            // A retryable admission refusal (full queue, maintenance wait
+            // timeout) is capacity pressure: callers such as the reflection
+            // worker must see it as retryable, not as a permanent failure.
+            kind: err.code === "aborted" ? "aborted" : err.retryable ? "rate-limit" : "unknown",
             code: `PROVIDER_ADMISSION_${err.code.replaceAll("-", "_").toUpperCase()}`,
           })
           : classifyProviderError(err);
@@ -809,14 +726,14 @@ async function streamChatInternal(
       // `done` SEMPRE fecha um stream bem-sucedido (spec §3.1/§3.2): o consumidor
       // usa `done` como confirmação de término após a `message` completa.
       if (!emit({ type: "done" })) return observerErrorResult();
-      return { aborted: false, message, ...(resumeCursor === undefined ? {} : { cursor: resumeCursor }) };
+      return { aborted: false, message };
     }
     if (!emit({ type: "done" })) return observerErrorResult();
-    return { aborted: false, ...(resumeCursor === undefined ? {} : { cursor: resumeCursor }) };
+    return { aborted: false };
   } catch (err) {
     if (observerFailed) return observerErrorResult();
     // Abort do consumidor → erro `aborted` (não retryable), nunca "network".
-    if (req.signal?.aborted || (isAbortError(err) && req.signal?.aborted)) {
+    if (req.signal?.aborted) {
       const abortedErr = new ProviderError("stream aborted", {
         kind: "aborted",
         code: "ABORT_ERR",

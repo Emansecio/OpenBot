@@ -45,6 +45,8 @@ export interface ProviderOAuthManagerOptions {
   callbackHost?: string;
   callbackPort?: number;
   onConnectionChanged?: (provider: ProviderOAuthName) => void;
+  /** How long an unfinished browser login keeps its callback port. Default 10 min. */
+  loginTimeoutMs?: number;
 }
 
 const OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -55,6 +57,7 @@ const XAI_DEVICE_URL = "https://auth.x.ai/oauth2/device/code";
 const XAI_TOKEN_URL = "https://auth.x.ai/oauth2/token";
 const CODEX_CLAIM = "https://api.openai.com/auth";
 const REFRESH_SKEW_MS = 60_000;
+const DEFAULT_LOGIN_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_OAUTH_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_OAUTH_REQUEST_TIMEOUT_MS = 2_147_483_647;
 
@@ -114,11 +117,16 @@ function isTransientOAuthFailure(status: number | undefined, oauthError: string 
 function delay(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) return reject(new Error("Login cancelled"));
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener("abort", () => {
+    const onAbort = (): void => {
       clearTimeout(timer);
       reject(new Error("Login cancelled"));
-    }, { once: true });
+    };
+    // Every poll adds a listener; drop it when the wait ends normally.
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -148,6 +156,7 @@ export class ProviderOAuthManager {
   private readonly requestTimeoutMs: number;
   private readonly callbackHost: string;
   private readonly callbackPort: number;
+  private readonly loginTimeoutMs: number;
   private readonly onConnectionChanged?: ProviderOAuthManagerOptions["onConnectionChanged"];
   private readonly refreshing = new Map<string, Promise<ProviderOAuthCredential>>();
   private readonly pending = new Map<ProviderOAuthName, PendingLogin>();
@@ -158,6 +167,14 @@ export class ProviderOAuthManager {
    */
   private readonly mutationLocks = new Map<ProviderOAuthName, Promise<void>>();
   private readonly generations = new Map<ProviderOAuthName, number>();
+  /**
+   * Rejection marker as last read or written here (null when absent). This
+   * manager is the only writer of the marker, and the keystore only caches
+   * present entries, so without this every credential read would reread the
+   * secrets file just to learn the marker is still absent.
+   */
+  private readonly rejectionMarkers = new Map<ProviderOAuthName, string | null>();
+  private rejectionMarkerWrites = 0;
 
   constructor(options: ProviderOAuthManagerOptions) {
     this.keystore = options.keystore;
@@ -168,6 +185,7 @@ export class ProviderOAuthManager {
     this.requestTimeoutMs = oauthRequestTimeout(options.requestTimeoutMs);
     this.callbackHost = options.callbackHost ?? "127.0.0.1";
     this.callbackPort = options.callbackPort ?? 1455;
+    this.loginTimeoutMs = options.loginTimeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS;
   }
 
   async start(provider: ProviderOAuthName): Promise<ProviderOAuthStatus> {
@@ -207,6 +225,19 @@ export class ProviderOAuthManager {
     return { provider, state: "connected", ...(credential.accountId ? { accountId: credential.accountId } : {}) };
   }
 
+  /**
+   * Ends every in-flight login: aborts the device poll, closes the local
+   * callback server and invalidates late responses. Stored credentials stay.
+   */
+  close(): void {
+    for (const [provider, pending] of this.pending) {
+      this.bumpGeneration(provider);
+      pending.controller.abort();
+      pending.server?.close();
+    }
+    this.pending.clear();
+  }
+
   async cancel(provider: ProviderOAuthName): Promise<ProviderOAuthStatus> {
     await this.withMutationLock(provider, () => {
       // Invalidate every in-flight login, including the initial device/token
@@ -225,7 +256,7 @@ export class ProviderOAuthManager {
     await this.withMutationLock(provider, async () => {
       this.bumpGeneration(provider);
       await this.keystore.delete(storageKey(provider));
-      await this.keystore.delete(`${storageKey(provider)}-rejection`);
+      await this.setRejectionMarker(provider, null);
       this.onConnectionChanged?.(provider);
     });
     return { provider, state: "disconnected" };
@@ -267,7 +298,7 @@ export class ProviderOAuthManager {
       if (current?.access !== failed.access || current.refresh !== failed.refresh) return false;
       this.bumpGeneration(provider);
       await this.keystore.delete(storageKey(provider));
-      await this.keystore.delete(`${storageKey(provider)}-rejection`);
+      await this.setRejectionMarker(provider, null);
       this.onConnectionChanged?.(provider);
       return true;
     });
@@ -336,7 +367,7 @@ export class ProviderOAuthManager {
     await this.withMutationLock(provider, async () => {
       const current = await this.read(provider);
       if (!current || current.access !== accessToken) return;
-      await this.keystore.upsert(`${storageKey(provider)}-rejection`, createHash("sha256").update(accessToken).digest("hex"));
+      await this.setRejectionMarker(provider, createHash("sha256").update(accessToken).digest("hex"));
     });
   }
 
@@ -435,6 +466,11 @@ export class ProviderOAuthManager {
       server.close();
       return this.statusLocal("openai");
     }
+    // An abandoned browser login must not hold the callback port (and report
+    // "pending") forever; like the xAI device code, it expires.
+    const expiry = setTimeout(() => this.setError("openai", new Error("O login OpenAI expirou; inicie a conexão novamente."), generation, server), this.loginTimeoutMs);
+    expiry.unref?.();
+    server.once("close", () => clearTimeout(expiry));
     return { ...status };
   }
 
@@ -617,7 +653,7 @@ export class ProviderOAuthManager {
       const value = record(JSON.parse(raw));
       if (value?.type !== "oauth") return undefined;
       const access = requiredString(value.access, "access");
-      const rejected = await this.keystore.reveal(`${storageKey(provider)}-rejection`)
+      const rejected = await this.rejectionMarker(provider)
         === createHash("sha256").update(access).digest("hex");
       return {
         type: "oauth",
@@ -641,9 +677,31 @@ export class ProviderOAuthManager {
       || previous.access !== credential.access
       || previous.refresh !== credential.refresh
       || previous.accountId !== credential.accountId;
-    if (identityChanged) await this.keystore.delete(`${storageKey(provider)}-rejection`);
+    if (identityChanged) await this.setRejectionMarker(provider, null);
     const previousId = previous?.connectionId ?? (previous ? createHash("sha256").update(previous.refresh).digest("hex") : undefined);
     if (previousId !== credential.connectionId || previous?.accountId !== credential.accountId) this.onConnectionChanged?.(provider);
+  }
+
+  private async rejectionMarker(provider: ProviderOAuthName): Promise<string | null> {
+    const cached = this.rejectionMarkers.get(provider);
+    if (cached !== undefined) return cached;
+    const writes = this.rejectionMarkerWrites;
+    const marker = await this.keystore.reveal(`${storageKey(provider)}-rejection`);
+    // A write that raced this read owns the cache entry.
+    if (writes === this.rejectionMarkerWrites) this.rejectionMarkers.set(provider, marker);
+    return marker;
+  }
+
+  private async setRejectionMarker(provider: ProviderOAuthName, marker: string | null): Promise<void> {
+    // Forget first: a failed write leaves the next read to consult the keystore.
+    this.rejectionMarkerWrites += 1;
+    this.rejectionMarkers.delete(provider);
+    const key = `${storageKey(provider)}-rejection`;
+    if (marker === null) await this.keystore.delete(key);
+    else await this.keystore.upsert(key, marker);
+    // Bumped on both sides so no read overlapping the write can cache.
+    this.rejectionMarkerWrites += 1;
+    this.rejectionMarkers.set(provider, marker);
   }
 
   private setError(provider: ProviderOAuthName, error: unknown, generation?: number, server?: Server): void {

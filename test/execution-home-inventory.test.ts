@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import { open, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { inventoryHome } from "../src/execution/home-inventory.js";
+import { inventoryHome, validateHomeTree } from "../src/execution/home-inventory.js";
 import { TempRoots } from "./helpers/temp-roots.js";
 
 const tempRoots = new TempRoots();
@@ -17,14 +17,14 @@ const temp = async (): Promise<string> => {
 };
 
 describe("inventoryHome", () => {
-  it("recusa arquivo acima do orçamento antes de abrir seu conteúdo", async () => {
+  it("para no arquivo acima do orçamento sem abrir seu conteúdo e marca o inventário incompleto", async () => {
     const root = await temp();
     const file = join(root, "large.bin");
     await writeFile(file, Buffer.alloc(64));
     const probe = await open(file, "r");
     const read = vi.spyOn(Object.getPrototypeOf(probe), "read");
     try {
-      await expect(inventoryHome(root, "agent-a", 100, 16)).rejects.toMatchObject({ code: "invalid_archive" });
+      await expect(inventoryHome(root, "agent-a", 100, 16)).resolves.toMatchObject({ files: 0, bytes: 0, entries: [], complete: false });
       expect(read).not.toHaveBeenCalled();
     } finally {
       read.mockRestore();
@@ -47,7 +47,7 @@ describe("inventoryHome", () => {
     });
   });
 
-  it("rejeita mutação detectada durante o streaming do hash", async () => {
+  it("não registra hash de arquivo alterado durante o streaming e marca o inventário incompleto", async () => {
     const root = await temp();
     const file = join(root, "changing.bin");
     await writeFile(file, Buffer.alloc(128 * 1024, 1));
@@ -65,12 +65,25 @@ describe("inventoryHome", () => {
       return result;
     }) as unknown as typeof prototype.read);
     try {
-      await expect(inventoryHome(root, "agent-a")).rejects.toMatchObject({ code: "io_error" });
+      await expect(inventoryHome(root, "agent-a")).resolves.toMatchObject({ files: 0, entries: [], complete: false });
     } finally {
       read.mockRestore();
       await probe.close();
     }
     await expect(readFile(file)).resolves.toEqual(Buffer.alloc(128 * 1024, 2));
+  });
+
+  it("trata junctions como opacas: não segue, não lista e não recusa a home", async () => {
+    const root = await temp();
+    const outside = await temp();
+    await writeFile(join(outside, "outside.txt"), "fora");
+    await mkdir(join(root, "Projects"));
+    await writeFile(join(root, "Projects", "own.txt"), "dentro");
+    await symlink(outside, join(root, "Projects", "node_modules"), "junction");
+    await expect(validateHomeTree(root)).resolves.toBeUndefined();
+    const inventory = await inventoryHome(root, "agent-a");
+    expect(inventory.entries.map((entry) => entry.path)).toEqual(["Projects", "Projects/own.txt"]);
+    expect(inventory.complete).toBe(false);
   });
 
   it("interrompe antes de enumerar quando o sinal já foi cancelado", async () => {

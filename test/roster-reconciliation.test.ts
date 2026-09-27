@@ -231,7 +231,6 @@ describe("roster/home reconciliation", () => {
     const configPath = join(root, "config.json");
     const seed = new ConfigStore({ configPath });
     seed.update({ agents: [{ id: "openbot-default", name: "Local User", avatarId: "openbot-default" }] });
-    seed.close();
     const gateway = createGateway();
     registerRosterHandlers(gateway, seed);
     const update = vi.spyOn(seed, "update");

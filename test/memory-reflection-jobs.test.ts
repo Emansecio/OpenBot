@@ -5,6 +5,7 @@ import { MemoryReflectionWorker, applyReflectionResult } from "../src/memory/ref
 import { SqliteMemoryStore } from "../src/memory/sqlite-store.js";
 import { SqliteConversationStore } from "../src/conversations/store.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
+import { reflectionFailureNotice } from "../src/memory/reflection-wiring.js";
 
 const HUMAN_FROM_USER = { name: "You", authId: "local-user" } as const;
 
@@ -710,5 +711,15 @@ describe("memory core", () => {
       db.close();
       vi.useRealTimers();
     }
+  });
+});
+
+describe("reflection failure notices", () => {
+  it("tells a busy provider apart from a broken connection", () => {
+    for (const code of ["timeout", "admission_queue_full", "provider_rate-limit", "provider_server"]) {
+      expect(reflectionFailureNotice(code, "xai", "grok")).toContain("adiada");
+    }
+    expect(reflectionFailureNotice("provider_auth", "xai", "grok")).toContain("Verifique a conexão");
+    expect(reflectionFailureNotice("reflection_input_too_large", "xai", "grok")).toContain("histórico foi preservado");
   });
 });

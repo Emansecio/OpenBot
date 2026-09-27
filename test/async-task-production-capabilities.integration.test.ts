@@ -55,7 +55,7 @@ async function startFixture(): Promise<{ handle: ServerHandle; backend: SharedFa
   const handle = await startServer(0, {
     configPath: join(root, "config.json"), stateRoot: join(root, "state"), runtimeRoot: join(root, "runtime"),
     browserRoot: join(root, "browser"), keystoreDir: join(root, "keystore"), storePath: join(root, "store.db"),
-    executionBroker: new LocalExecutionBroker(backend, () => "always"),
+    executionBroker: new LocalExecutionBroker(backend),
     asyncTaskBrowserOrigins: ["https://example.com"], allowUnauthenticatedLocalGateway: true,
   });
   handles.push(handle);

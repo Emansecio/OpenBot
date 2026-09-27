@@ -11,6 +11,7 @@ import {
   providerRequestBodyBytes,
   selectCompleteMessageGroups,
   truncateProviderText,
+  MODEL_CONTEXT_TRUNCATION_MARKER,
   resolveModelCapabilities,
   validateModelCatalogEntry,
 } from "../src/memory/model-context.js";
@@ -174,6 +175,16 @@ describe("model-aware context", () => {
     const tool = truncateProviderText("[[OPENBOT_UNTRUSTED_TOOL_HISTORY_BEGIN]]\n" + "x".repeat(100), 100, tokenizer);
     expect(attachment).toContain("[[OPENBOT_UNTRUSTED_ATTACHMENT_END]]");
     expect(tool).toContain("[[OPENBOT_UNTRUSTED_TOOL_HISTORY_END]]");
+  });
+
+  it("truncates multibyte text to the longest whole-code-point prefix that fits", () => {
+    const tokenizer = createContextTokenizer("bytes");
+    const markerBytes = Buffer.byteLength(MODEL_CONTEXT_TRUNCATION_MARKER, "utf8");
+    const truncated = truncateProviderText("\u{1F600}".repeat(100), 200, tokenizer);
+    const prefix = truncated.slice(0, truncated.length - MODEL_CONTEXT_TRUNCATION_MARKER.length);
+    expect(truncated.endsWith(MODEL_CONTEXT_TRUNCATION_MARKER)).toBe(true);
+    expect(prefix).toBe("\u{1F600}".repeat(Math.floor((200 - markerBytes) / 4)));
+    expect(Buffer.byteLength(truncated, "utf8")).toBeLessThanOrEqual(200);
   });
 
   it("enforces the final byte cap for multimodal base64 payloads", () => {

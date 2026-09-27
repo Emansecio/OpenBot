@@ -34,7 +34,7 @@ const base: ProviderChatRequest = {
   tools: TEST_TOOL_NAMES.map((name) => ({ type: "function", function: { name, parameters: { type: "object" } } })),
 };
 const tool = (id: string, name = "file", args = '{"op":"list","path":"."}') => ({ id, type: "function" as const, function: { name, arguments: args } });
-const broker = (backend: Backend) => new LocalExecutionBroker(backend, () => "always", () => {});
+const broker = (backend: Backend) => new LocalExecutionBroker(backend);
 
 
 

@@ -22,8 +22,8 @@ if (-not (Test-Path -LiteralPath $ShortcutPath -PathType Leaf)) {
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($ShortcutPath)
 $shortcutLauncher = [IO.Path]::GetFullPath([string]$shortcut.TargetPath)
-if ([IO.Path]::GetExtension($shortcutLauncher) -inotmatch '^\.(vbs|exe)$' -or -not [string]::IsNullOrWhiteSpace([string]$shortcut.Arguments)) {
-    throw 'Shortcut must target the OpenBot VBS or EXE directly, without arguments'
+if ([IO.Path]::GetExtension($shortcutLauncher) -ine '.vbs' -or -not [string]::IsNullOrWhiteSpace([string]$shortcut.Arguments)) {
+    throw 'Shortcut must target the OpenBot VBS directly, without arguments'
 }
 $shortcutFolder = (New-Object -ComObject Shell.Application).Namespace((Split-Path -Parent $ShortcutPath))
 $shortcutItem = $shortcutFolder.ParseName((Split-Path -Leaf $ShortcutPath))
@@ -35,79 +35,12 @@ if (-not (Test-Path -LiteralPath $shortcutLauncher -PathType Leaf)) {
 }
 
 $repoLauncher = [IO.Path]::GetFullPath((Join-Path $scriptDir 'openbot-desktop.vbs'))
-$launcherRoot = [IO.Path]::GetFullPath((Split-Path -Parent $shortcutLauncher))
-$installedLauncher = [IO.Path]::GetFullPath((Join-Path $launcherRoot 'OpenBot.vbs'))
-$installedExe = [IO.Path]::GetFullPath((Join-Path $launcherRoot 'OpenBot.exe'))
-$workingDirectory = [IO.Path]::GetFullPath([string]$shortcut.WorkingDirectory)
-$isRepoShortcut = $shortcutLauncher.Equals($repoLauncher, [StringComparison]::OrdinalIgnoreCase)
-$isInstalledShortcut = ($shortcutLauncher.Equals($installedLauncher, [StringComparison]::OrdinalIgnoreCase) -or
-    $shortcutLauncher.Equals($installedExe, [StringComparison]::OrdinalIgnoreCase)) -and
-    $workingDirectory.Equals($launcherRoot, [StringComparison]::OrdinalIgnoreCase) -and
-    (Test-Path -LiteralPath (Join-Path $launcherRoot 'OpenBot.cmd') -PathType Leaf) -and
-    (Test-Path -LiteralPath (Join-Path $launcherRoot 'state.json') -PathType Leaf)
-
-if ($isRepoShortcut) {
-    $launcherCommand = Join-Path $scriptDir 'openbot-desktop.cmd'
-    $gatewayScript = Join-Path $repoRoot 'dist\main.js'
-    $logsRoot = Join-Path $repoRoot 'logs'
-} elseif ($isInstalledShortcut) {
-    $state = Get-Content -LiteralPath (Join-Path $launcherRoot 'state.json') -Raw | ConvertFrom-Json
-    if ($null -eq $state.PSObject.Properties['product'] -or [string]$state.product -cne 'OpenBot') {
-        throw 'Installed shortcut state has an unexpected product identity'
-    }
-    if ($null -eq $state.PSObject.Properties['installRoot'] -or
-        -not [IO.Path]::GetFullPath([string]$state.installRoot).Equals($launcherRoot, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Installed shortcut state does not belong to the launcher root'
-    }
-    if ($null -eq $state.PSObject.Properties['activeVersion'] -or [string]::IsNullOrWhiteSpace([string]$state.activeVersion)) {
-        throw 'Installed shortcut state does not declare an active version'
-    }
-    $activeReleaseId = if ($null -ne $state.PSObject.Properties['activeReleaseId'] -and
-        -not [string]::IsNullOrWhiteSpace([string]$state.activeReleaseId)) {
-        [string]$state.activeReleaseId
-    } else {
-        [string]$state.activeVersion
-    }
-    $versionsRoot = [IO.Path]::GetFullPath((Join-Path $launcherRoot 'versions')).TrimEnd('\')
-    $releaseRoot = [IO.Path]::GetFullPath((Join-Path $versionsRoot $activeReleaseId))
-    $versionsPrefix = $versionsRoot + [IO.Path]::DirectorySeparatorChar
-    if (-not $releaseRoot.StartsWith($versionsPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Installed shortcut active version escapes the managed versions root'
-    }
-    $preflightOutput = @(& (Get-Command node -ErrorAction Stop).Source (Join-Path $scriptDir 'launch.mjs') --preflight --root $releaseRoot 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Installed shortcut active release failed the canonical preflight: $($preflightOutput -join [Environment]::NewLine)"
-    }
-    try {
-        $preflight = ($preflightOutput -join [Environment]::NewLine) | ConvertFrom-Json
-    } catch {
-        throw "Installed shortcut preflight returned invalid evidence: $($_.Exception.Message)"
-    }
-    if ($preflight.ok -ne $true -or $null -eq $preflight.manifest) {
-        throw 'Installed shortcut preflight did not return a valid manifest'
-    }
-    $manifest = $preflight.manifest
-    if ($null -eq $manifest.PSObject.Properties['product'] -or [string]$manifest.product -cne 'OpenBot' -or
-        $null -eq $manifest.PSObject.Properties['appId'] -or [string]$manifest.appId -cne 'local.openbot' -or
-        $null -eq $manifest.PSObject.Properties['version'] -or [string]$manifest.version -cne [string]$state.activeVersion -or
-        $null -eq $manifest.PSObject.Properties['releaseId'] -or [string]$manifest.releaseId -cne $activeReleaseId -or
-        $null -eq $manifest.PSObject.Properties['buildId'] -or
-        $null -eq $state.PSObject.Properties['activeBuildId'] -or
-        [string]$manifest.buildId -cne [string]$state.activeBuildId -or
-        $null -eq $manifest.PSObject.Properties['entrypoint'] -or [string]$manifest.entrypoint -cne 'OpenBot.cmd' -or
-        $null -eq $manifest.PSObject.Properties['contentSha256'] -or
-        $null -eq $state.PSObject.Properties['activeContentSha256'] -or
-        [string]$manifest.contentSha256 -cne [string]$state.activeContentSha256 -or
-        $null -eq $state.PSObject.Properties['manifestSha256'] -or
-        [string]$manifest.contentSha256 -cne [string]$state.manifestSha256) {
-        throw 'Installed shortcut active release identity does not match install state'
-    }
-    $launcherCommand = Join-Path $launcherRoot 'OpenBot.cmd'
-    $gatewayScript = Join-Path $releaseRoot 'app\dist\main.js'
-    $logsRoot = Join-Path $launcherRoot 'logs'
-} else {
-    throw "Shortcut does not target a recognized OpenBot hidden launcher: $shortcutLauncher"
+if (-not $shortcutLauncher.Equals($repoLauncher, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Shortcut does not target this checkout's hidden launcher: $shortcutLauncher"
 }
+$launcherCommand = Join-Path $scriptDir 'openbot-desktop.cmd'
+$gatewayScript = Join-Path $repoRoot 'dist\entry.js'
+$logsRoot = Join-Path $repoRoot 'logs'
 if (-not (Test-Path -LiteralPath $gatewayScript -PathType Leaf)) {
     throw "Shortcut gateway entrypoint does not exist: $gatewayScript"
 }
@@ -210,9 +143,6 @@ try {
     $launcherProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
         $_.Name -ieq 'cmd.exe' -and (([string]$_.CommandLine).IndexOf($launcherCommand, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
             [int]$_.ParentProcessId -eq $primary.Id)
-    }
-    if ([IO.Path]::GetExtension($shortcutLauncher) -ieq '.exe' -and @($launcherProcesses).Count -eq 0) {
-        throw 'Executable launcher child was not found for console visibility verification'
     }
     foreach ($launcherInfo in $launcherProcesses) {
         $launcherProcess = Get-Process -Id ([int]$launcherInfo.ProcessId) -ErrorAction SilentlyContinue

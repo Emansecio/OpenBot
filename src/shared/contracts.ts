@@ -497,33 +497,3 @@ export interface NativeAsyncTaskProjectionEvent {
   readonly reason?: string;
 }
 
-/** Immutable summary of a client cursor for one projection channel. */
-export interface NativeAsyncTaskClientCursor {
-  readonly channel: NativeAsyncTaskProjectionChannel;
-  readonly epoch: string;
-  readonly sequence: number;
-}
-
-/**
- * Pure client state machine for a projection channel (P2.2 reconnect). A
- * snapshot replaces the whole local list; an update upserts by `id` and only
- * advances a monotonic sequence; stale/gap/ahead/epoch-mismatch frames are
- * rejected or marked as requiring an authoritative resync from SQLite. It
- * never merges snapshots and never creates duplicate task identities.
- */
-export interface NativeAsyncTaskClientState {
-  readonly agentId: string;
-  readonly channel: NativeAsyncTaskProjectionChannel;
-  readonly items: readonly NativeAsyncTaskProjectionItem[];
-  readonly epoch: string | null;
-  readonly sequence: number;
-  readonly eventsApplied: number;
-  readonly resyncRequired: boolean;
-}
-
-export interface NativeAsyncTaskClientStateTransition {
-  readonly state: NativeAsyncTaskClientState;
-  readonly handled: boolean;
-  readonly resyncRequired: boolean;
-  readonly reason: string | null;
-}

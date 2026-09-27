@@ -31,75 +31,15 @@ import { describe, expect, it, vi } from "vitest";
 import { createProviderRegistry, type ProviderChatRequest } from "../src/providers/router.js";
 import { createKeystore } from "../src/keystore/index.js";
 import { XaiAdapter } from "../src/providers/xai.js";
-import { createFakeAdapter } from "./mocks/fake-provider-adapter.js";
-import { MAX_PROVIDER_TEXT_CONTEXT_BYTES, createMemoryTranscriptStore, createTurnRunner, type TurnRunnerOptions, type TranscriptStore } from "../src/rpc/send.js";
+import { MAX_PROVIDER_TEXT_CONTEXT_BYTES, createMemoryTranscriptStore, createTurnRunner, type TranscriptStore } from "../src/rpc/send.js";
 import {
   canonicalProviderRequestBytes,
   providerRequestBodyBytes,
   resolveModelCapabilities,
 } from "../src/memory/model-context.js";
-
-/** Coleta os eventos publicados pelo runner (pub fake — sem HTTP). */
-function collectPublish() {
-  const events: { channel: string; payload: unknown }[] = [];
-  return {
-    events,
-    publish: (channel: string, payload: unknown) => {
-      events.push({ channel, payload });
-    },
-  };
-}
-
-/** Relógio determinístico (entries com timestampMs estável e crescente). */
-function fixedClock() {
-  let t = 1_000;
-  return {
-    now: () => (t += 1),
-  };
-}
-
-function ids() {
-  let n = 0;
-  return { newId: () => `id:${++n}` };
-}
-
-type RunnerOpts = Omit<TurnRunnerOptions, "now" | "newId"> & {
-  now?: () => number;
-  newId?: (role: "user" | "assistant") => string;
-};
-
-function makeRunner(opts: RunnerOpts = {}): {
-  runner: ReturnType<typeof createTurnRunner>;
-  events: ReturnType<typeof collectPublish>["events"];
-} {
-  const now = opts.now ?? fixedClock().now;
-  const newId = opts.newId ?? ids().newId;
-  const pub = collectPublish();
-  const runner = createTurnRunner({
-    registry: opts.registry,
-    store: opts.store,
-    config: opts.config,
-    systemPrompt: opts.systemPrompt,
-    resolveProvider: opts.resolveProvider,
-    publish: pub.publish,
-    now,
-    newId,
-    ledgerCap: opts.ledgerCap,
-  });
-  return { runner, events: pub.events };
-}
-
-/** Registra um adapter fake como "xai" (provider do modelo default do catálogo). */
-function fakeXai(deltas: string[] = ["resposta"]): {
-  registry: ReturnType<typeof createProviderRegistry>;
-  adapter: ReturnType<typeof createFakeAdapter>;
-} {
-  const registry = createProviderRegistry();
-  const adapter = createFakeAdapter("xai", { deltas });
-  registry.register(adapter);
-  return { registry, adapter };
-}
-
+import type { TranscriptEntry } from "../src/shared/contracts.js";
+import { SqliteTranscriptStore } from "../src/store/index.js";
+import { makeRunner, fakeXai } from "./helpers/turn-runner.js";
 
 describe("T10 TranscriptStore injetável (T11 pluga o sqlite)", () => {
   it("store custom é usado para transcript e ledger — runner não sabe do storage", async () => {
@@ -270,5 +210,117 @@ describe("T10 TranscriptStore injetável (T11 pluga o sqlite)", () => {
     expect(bodyBytes).toBeLessThanOrEqual(MAX_PROVIDER_TEXT_CONTEXT_BYTES);
     expect(bodyBytes).toBeGreaterThan(MAX_PROVIDER_TEXT_CONTEXT_BYTES - 512);
     expect(bodyBytes).toBeGreaterThan(canonical + 25);
+  });
+});
+
+describe("tool-call lookups without full transcript scans", () => {
+  it("uses an optional local tool-call lookup without scanning getEntries", () => {
+    const store = createMemoryTranscriptStore();
+    const pending = {
+      kind: "tool-call" as const,
+      id: "tool-entry",
+      localToolCallId: "turn:tool-entry",
+      name: "file",
+      summary: "read Documents/note.txt",
+      status: "pending" as const,
+    };
+    store.append("agent", [pending]);
+    const getEntries = vi.spyOn(store, "getEntries").mockImplementation(() => {
+      throw new Error("full transcript scan");
+    });
+    const runner = createTurnRunner({ store });
+    const publishToolCall = (runner as unknown as {
+      publishToolCall: (agentId: string, entry: Extract<TranscriptEntry, { kind: "tool-call" }>) => void;
+    }).publishToolCall.bind(runner);
+
+    publishToolCall("agent", { ...pending, status: "running" });
+
+    expect(getEntries).not.toHaveBeenCalled();
+    expect(store.findToolCallByLocalId?.("agent", "turn:tool-entry")).toMatchObject({ status: "running" });
+  });
+
+  it("uses the SQLite local tool-call index without scanning getEntries", () => {
+    const store = new SqliteTranscriptStore({ path: ":memory:" });
+    try {
+      const pending = {
+        kind: "tool-call" as const,
+        id: "sqlite-tool-entry",
+        localToolCallId: "turn:sqlite-tool-entry",
+        name: "file",
+        summary: "read Documents/note.txt",
+        status: "pending" as const,
+      };
+      store.append("agent", [pending]);
+      const getEntries = vi.spyOn(store, "getEntries").mockImplementation(() => {
+        throw new Error("full transcript scan");
+      });
+      const runner = createTurnRunner({ store });
+      const publishToolCall = (runner as unknown as {
+        publishToolCall: (agentId: string, entry: Extract<TranscriptEntry, { kind: "tool-call" }>) => void;
+      }).publishToolCall.bind(runner);
+
+      publishToolCall("agent", { ...pending, status: "running" });
+
+      expect(getEntries).not.toHaveBeenCalled();
+      expect(store.findToolCallByLocalId("agent", "turn:sqlite-tool-entry")).toMatchObject({ status: "running" });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("publishes the completed tool snapshot through the durable tail without scanning getEntries", () => {
+    const store = new SqliteTranscriptStore({ path: ":memory:" });
+    try {
+      store.append("agent", Array.from({ length: 2_000 }, (_, index) => ({
+        kind: "message" as const,
+        id: `history:${index}`,
+        role: index % 2 === 0 ? "user" as const : "assistant" as const,
+        content: `h${index}`,
+        timestampMs: index,
+        streaming: false,
+      })));
+      const pending = {
+        kind: "tool-call" as const,
+        id: "sqlite-tool-complete",
+        localToolCallId: "turn:sqlite-tool-complete",
+        name: "file",
+        summary: "read Documents/note.txt",
+        status: "pending" as const,
+      };
+      store.append("agent", [pending]);
+      let tailReads = 0;
+      const openDurableAgentTail = store.openDurableAgentTail.bind(store);
+      store.getEntries = () => {
+        throw new Error("full transcript scan");
+      };
+      store.openDurableAgentTail = (agentId, limit, beforeSeq, conversationId) => {
+        tailReads += 1;
+        return openDurableAgentTail(agentId, limit, beforeSeq, conversationId);
+      };
+      const events: Array<{ channel: string; payload: unknown }> = [];
+      const runner = createTurnRunner({
+        store,
+        publish: (channel, payload) => {
+          events.push({ channel, payload });
+        },
+      });
+      const publishToolCall = (runner as unknown as {
+        publishToolCall: (agentId: string, entry: Extract<TranscriptEntry, { kind: "tool-call" }>) => void;
+      }).publishToolCall.bind(runner);
+
+      publishToolCall("agent", {
+        ...pending,
+        status: "completed",
+        result: { ok: true, operation: "file.read", path: "Documents/note.txt", bytes: 1 },
+      });
+
+      const snapshot = events.find((event) => event.channel === "transcript" && (event.payload as { type?: string }).type === "snapshot")
+        ?.payload as { entries: TranscriptEntry[]; truncated?: boolean; method?: string } | undefined;
+      expect(tailReads).toBe(1);
+      expect(snapshot?.entries.at(-1)).toMatchObject({ id: "sqlite-tool-complete", status: "completed" });
+      expect(snapshot).toMatchObject({ truncated: true, method: "openAgentTail" });
+    } finally {
+      store.close();
+    }
   });
 });

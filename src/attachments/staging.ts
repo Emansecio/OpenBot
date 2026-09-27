@@ -205,6 +205,8 @@ export class AttachmentStagingStore {
     listExpired: Database.Statement;
     listByAgent: Database.Statement;
     deleteByAgent: Database.Statement;
+    listByConversation: Database.Statement;
+    deleteById: Database.Statement;
   };
 
   constructor(options: { db: Database.Database; root: string; nowFn?: () => number; fileSystem?: StagingFileSystem }) {
@@ -234,6 +236,8 @@ export class AttachmentStagingStore {
       listExpired: s("SELECT * FROM attachment_staging WHERE state != 'discarded' AND expires_at_ms <= ?"),
       listByAgent: s("SELECT * FROM attachment_staging WHERE agent_id = ?"),
       deleteByAgent: s("DELETE FROM attachment_staging WHERE agent_id = ?"),
+      listByConversation: s("SELECT * FROM attachment_staging WHERE agent_id = ? AND conversation_id = ?"),
+      deleteById: s("DELETE FROM attachment_staging WHERE id = ? AND agent_id = ?"),
     };
   }
 
@@ -316,7 +320,8 @@ export class AttachmentStagingStore {
         await writeFileExclusive(storedPath, bytes);
         const now = this.nowFn();
         this.statements.insert.run(id, agentId, input.conversationId ?? null, filename, detected.kind, storedPath, bytes.length, sha256Of(bytes), now, now + STAGING_LIFETIME_MS);
-        return fromRow(this.statements.getById.get(id) as StagingRow, this.root);
+        // The row stores only the kind; the exact image type comes from the bytes.
+        return { ...fromRow(this.statements.getById.get(id) as StagingRow, this.root), mime: detected.mime };
       } catch (error) {
         await this.deleteBytes(id, storedPath);
         throw error;
@@ -379,6 +384,27 @@ export class AttachmentStagingStore {
     });
   }
 
+  /**
+   * Removes a deleted conversation's attachments, bytes first. A row whose
+   * bytes cannot be removed stays referenced rather than orphaning them.
+   */
+  async purgeConversation(agentId: string, conversationId: string): Promise<number> {
+    return this.withAgentStageLock(agentId, async () => {
+      const rows = this.statements.listByConversation.all(agentId, conversationId) as StagingRow[];
+      let removed = 0;
+      for (const row of rows) {
+        try {
+          await this.deleteBytes(row.id, fromRow(row, this.root).storedPath, true);
+        } catch {
+          continue;
+        }
+        this.statements.deleteById.run(row.id, agentId);
+        removed += 1;
+      }
+      return removed;
+    });
+  }
+
   private async revalidate(record: StagedAttachmentRecord): Promise<Buffer | null> {
     if (record.state === "discarded") return null;
     if (this.nowFn() > record.expiresAtMs) return null;
@@ -433,10 +459,12 @@ export class AttachmentStagingStore {
         if (totalBytes > MAX_ATTACHMENTS_TOTAL_BYTES) { outcome.skipped.push({ ref: raw, reason: "limite agregado de bytes" }); break; }
         let text: string | undefined;
         let imageDataUrl: string | undefined;
+        // The row stores only the kind; a JPEG/GIF/WebP must not be declared as PNG.
+        const mime = detectAttachmentKind(bytes)?.mime ?? record.mime;
         if (record.kind === "text" || record.kind === "pdf") {
           text = record.kind === "pdf" ? extractPdfText(bytes) : bytes.toString("utf8");
         } else if (options.providerSupportsImages) {
-          imageDataUrl = "data:" + record.mime + ";base64," + bytes.toString("base64");
+          imageDataUrl = "data:" + mime + ";base64," + bytes.toString("base64");
         } else {
           outcome.skipped.push({ ref: raw, reason: "unsupported_feature" }); continue;
         }
@@ -449,7 +477,7 @@ export class AttachmentStagingStore {
         if (record.kind !== "image" && !options.deferConsumption) await this.deleteBytes(id, record.storedPath);
 
         outcome.attachments.push({
-          id, filename: record.filename, kind: record.kind, mime: record.mime,
+          id, filename: record.filename, kind: record.kind, mime,
           sizeBytes: record.sizeBytes, sha256: record.sha256,
           ...(text !== undefined ? { text } : {}),
           ...(imageDataUrl !== undefined ? { imageDataUrl } : {}),

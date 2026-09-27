@@ -543,6 +543,13 @@ describe("AsyncTaskRuntime", () => {
       runtime.start();
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(claim).not.toHaveBeenCalled();
+      // Idle worker: with no unfinished task there is nothing to expire either.
+      expect(expiry).not.toHaveBeenCalled();
+      // Once a task exists (for a bot outside this roster), expiry runs paced,
+      // not on every 1 ms poll, and still no claim is opened for idle bots.
+      store.dispatch(input());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(claim).not.toHaveBeenCalled();
       expect(expiry).toHaveBeenCalledTimes(1);
     } finally {
       await runtime.stop();
@@ -676,5 +683,25 @@ describe("AsyncTaskRuntime", () => {
     expect(runtime.isIdle()).toBe(true);
     expect(store.getTask(task.taskId)?.status).toBe("cancelled");
     store.close();
+  });
+
+  it("prunes only finished task history older than the cutoff", async () => {
+    let clock = 2_100;
+    const store = new AsyncTaskStore({ path: ":memory:", sensitiveValues: () => [], now: () => clock });
+    try {
+      const finished = store.dispatch(input()).task;
+      const runtime = new AsyncTaskRuntime({ store, agentIds: () => ["agent-a"], pollIntervalMs: 1, now: () => clock, execute: async () => ({ result: "done", usage: { providerCalls: 0 } }) });
+      runtime.start();
+      await eventually(() => store.getTask(finished.taskId)?.status ?? "missing", "completed");
+      await runtime.stop();
+      const pending = store.dispatch(input()).task;
+      clock = 3_000;
+      expect(store.pruneHistory(3_000)).toBe(1);
+      expect(store.getTask(finished.taskId)).toBeNull();
+      expect(store.getTask(pending.taskId)).toMatchObject({ status: "queued" });
+      expect(store.hasActiveWork()).toBe(true);
+    } finally {
+      store.close();
+    }
   });
 });

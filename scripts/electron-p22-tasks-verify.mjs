@@ -1,32 +1,19 @@
 import { spawn,execFile } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync, existsSync, readdirSync } from "node:fs";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createServer } from "node:net";
 import { promisify } from "node:util";
 
 import { runP22TasksFixture } from "./electron-p22-fixture.mjs";
+import { getFreePort, sleep } from "./e2e-runtime.mjs";
+import { resolveElectronExecutable } from "./electron-executable.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(process.env.OPENBOT_ROOT || fileURLToPath(new URL("..", import.meta.url)));
-const requireFromProject = createRequire(join(repoRoot, "package.json"));
-const exe = process.env.ELECTRON_EXE || requireFromProject("electron");
+const exe = resolveElectronExecutable(repoRoot);
 const electronMain = process.env.OPENBOT_ELECTRON_MAIN || join(repoRoot, "scripts", "openbot-electron.cjs");
 const backendFixture = join(repoRoot, "scripts", "electron-p23-backend-fixture.mjs");
-
-function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
-
-async function getFreePort() {
-  const server = createServer();
-  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
-  const address = server.address();
-  const port = typeof address === "object" && address ? address.port : 0;
-  await new Promise((resolve) => server.close(resolve));
-  if (!port) throw new Error("Could not allocate a free CDP port");
-  return port;
-}
 
 async function waitCdp(cdpUrl, timeoutMs = 30000) {
   const start = Date.now();

@@ -6,59 +6,10 @@ import { describe, expect, it } from "vitest";
 
 import { createProviderRegistry } from "../src/providers/router.js";
 import { createFakeAdapter } from "./mocks/fake-provider-adapter.js";
-import { createMemoryTranscriptStore, createTurnRunner, type TurnRunnerOptions } from "../src/rpc/send.js";
+import { createMemoryTranscriptStore, createTurnRunner } from "../src/rpc/send.js";
 import type { TranscriptEntry } from "../src/shared/contracts.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
-
-/** Coleta os eventos publicados pelo runner (pub fake — sem HTTP). */
-function collectPublish() {
-  const events: { channel: string; payload: unknown }[] = [];
-  return {
-    events,
-    publish: (channel: string, payload: unknown) => {
-      events.push({ channel, payload });
-    },
-  };
-}
-
-/** Relógio determinístico (entries com timestampMs estável e crescente). */
-function fixedClock() {
-  let t = 1_000;
-  return {
-    now: () => (t += 1),
-  };
-}
-
-function ids() {
-  let n = 0;
-  return { newId: () => `id:${++n}` };
-}
-
-type RunnerOpts = Omit<TurnRunnerOptions, "now" | "newId"> & {
-  now?: () => number;
-  newId?: (role: "user" | "assistant") => string;
-};
-
-function makeRunner(opts: RunnerOpts = {}): {
-  runner: ReturnType<typeof createTurnRunner>;
-  events: ReturnType<typeof collectPublish>["events"];
-} {
-  const now = opts.now ?? fixedClock().now;
-  const newId = opts.newId ?? ids().newId;
-  const pub = collectPublish();
-  const runner = createTurnRunner({
-    registry: opts.registry,
-    store: opts.store,
-    config: opts.config,
-    systemPrompt: opts.systemPrompt,
-    resolveProvider: opts.resolveProvider,
-    publish: pub.publish,
-    now,
-    newId,
-    ledgerCap: opts.ledgerCap,
-  });
-  return { runner, events: pub.events };
-}
+import { collectPublish, makeRunner, fakeXai } from "./helpers/turn-runner.js";
 
 /** Todas as entries dos eventos appended do canal transcript. */
 function allAppended(events: ReturnType<typeof collectPublish>["events"]): TranscriptEntry[] {
@@ -66,18 +17,6 @@ function allAppended(events: ReturnType<typeof collectPublish>["events"]): Trans
     .filter((e) => e.channel === "transcript" && (e.payload as { type: string }).type === "appended")
     .map((e) => (e.payload as { entry: TranscriptEntry }).entry);
 }
-
-/** Registra um adapter fake como "xai" (provider do modelo default do catálogo). */
-function fakeXai(deltas: string[] = ["resposta"]): {
-  registry: ReturnType<typeof createProviderRegistry>;
-  adapter: ReturnType<typeof createFakeAdapter>;
-} {
-  const registry = createProviderRegistry();
-  const adapter = createFakeAdapter("xai", { deltas });
-  registry.register(adapter);
-  return { registry, adapter };
-}
-
 
 describe("T10 eventos SSE transcript — snapshot no início / appended no tail", () => {
   it("snapshot com o histórico existente ANTES do turno (reset do cliente)", async () => {
@@ -131,6 +70,14 @@ describe("T10 eventos SSE transcript — snapshot no início / appended no tail"
       .toBeLessThanOrEqual(256 * 1024);
     expect(allAppended(events).some((entry) => entry.kind === "message" && entry.role === "user" && entry.content === "p"))
       .toBe(true);
+    // The trim is exact: the newest entries that fit are all kept, and one
+    // more (older) entry would overflow the frame.
+    const frameBytes = (payload: unknown) => Buffer.byteLength(`data: ${JSON.stringify({ channel: "transcript", payload })}\n\n`, "utf8");
+    const firstKept = snapshot!.entries[0] as { id: string };
+    const olderIndex = Number(firstKept.id.split(":")[1]) - 1;
+    const older = store.getEntries("a").find((entry) => (entry as { id?: string }).id === `history:${olderIndex}`);
+    expect(older).toBeDefined();
+    expect(frameBytes({ ...snapshot, entries: [older, ...snapshot!.entries] })).toBeGreaterThan(256 * 1024);
   });
 
   it("appended: mensagem do usuário + resposta textual única do assistente", async () => {
@@ -329,7 +276,6 @@ describe("T10 eventos SSE transcript — snapshot no início / appended no tail"
     expect(appendedIdx).toBeGreaterThan(0);
   });
 });
-
 
 describe("T10 — stream incremental reusa o mesmo id", () => {
   it("openAgentTail expõe o preview live mais recente antes da persistência periódica", async () => {

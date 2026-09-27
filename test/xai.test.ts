@@ -29,8 +29,6 @@ import {
   XAI_API_BASE_URL,
   XAI_PROVIDER_NAME,
   XaiAdapter,
-  registerXaiAdapter,
-  xaiApiKeyKey,
 } from "../src/providers/xai.js";
 import {
   OpenAiToolCallAccumulator,
@@ -42,6 +40,7 @@ import { classifyProviderError, defaultRegistry, streamChat } from "../src/provi
 import type { ProviderChatRequest, ProviderStreamEvent } from "../src/providers/router.js";
 import { MODEL_CATALOG } from "../src/config/models.js";
 import { createKeystore } from "../src/keystore/index.js";
+import { providerApiKeyKey } from "../src/keystore/backend.js";
 import type { KeystoreOptions } from "../src/keystore/index.js";
 
 import {
@@ -103,7 +102,7 @@ function collectEvents(
 describe("T7 xAI — identidade do provider e endpoint OpenAI-compatible", () => {
   it("nome canônico 'xai' + namespace keystore scoped:v1:provider:xai:apiKey", () => {
     expect(XAI_PROVIDER_NAME).toBe("xai");
-    expect(xaiApiKeyKey()).toBe("scoped:v1:provider:xai:apiKey");
+    expect(providerApiKeyKey("xai")).toBe("scoped:v1:provider:xai:apiKey");
   });
 
   it("endpoint default é api.x.ai/v1 (API OpenAI-compatible), sem fetch — só configuração", () => {
@@ -269,7 +268,7 @@ describe("T7 xAI — chave via keystore (namespace scoped:v1:provider:xai:apiKey
     expect(out.error).toBeUndefined();
     expect(out.message?.content).toBe("ok");
     // Namespace do contrato T4.
-    expect(xaiApiKeyKey()).toBe("scoped:v1:provider:xai:apiKey");
+    expect(providerApiKeyKey("xai")).toBe("scoped:v1:provider:xai:apiKey");
   });
 
   it("chave ausente na keystore → error auth (permanente, não retryable)", async () => {
@@ -390,9 +389,10 @@ describe("T7 xAI — reuso dos helpers compartilhados de T6 (openai-helpers)", (
 });
 
 describe("T7 registro — adapter xAI como 'xai' no registry do roteador", () => {
-  it("registerXaiAdapter registra com nome 'xai' e streamChat resolve", async () => {
+  it("o adapter se registra com nome 'xai' e streamChat resolve", async () => {
     const mock = await bootMock({ script: { deltas: ["registrado"] } });
-    const adapter = registerXaiAdapter({ baseUrl: mock.baseUrl, apiKey: "xai-test" });
+    const adapter = new XaiAdapter({ baseUrl: mock.baseUrl, apiKey: "xai-test" });
+    defaultRegistry.register(adapter);
 
     expect(adapter.name).toBe("xai");
     expect(defaultRegistry.has("xai")).toBe(true);

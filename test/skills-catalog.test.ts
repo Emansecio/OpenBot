@@ -6,10 +6,11 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SkillCatalog } from "../src/skills/catalog.js";
 import { TempRoots } from "./helpers/temp-roots.js";
@@ -245,5 +246,41 @@ Instructions
     linkDirectory(join(outside, "replacement"), original);
 
     expect(catalog.read("replace-me")).toBeUndefined();
+  });
+
+  it("picks up skills added or edited on disk without an explicit refresh", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const path = root();
+      skill(path, "notes", frontmatter("Notes", "Take notes"));
+      const catalog = new SkillCatalog({ roots: [{ path, source: "test" }] });
+      skill(path, "notes", frontmatter("Notes", "Take structured meeting notes"));
+      skill(path, "deploy", frontmatter("Deploy", "Ship a release"));
+      // Within the check interval the last index is served as is.
+      expect(catalog.list().map((entry) => entry.description)).toEqual(["Take notes"]);
+      vi.setSystemTime(Date.now() + 5_000);
+      expect(catalog.list().map((entry) => [entry.id, entry.description])).toEqual([
+        ["deploy", "Ship a release"],
+        ["notes", "Take structured meeting notes"],
+      ]);
+      expect(catalog.readCached("notes")?.description).toBe("Take structured meeting notes");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts a root spelled with Windows 8.3 short names", (context) => {
+    if (process.platform !== "win32") return context.skip();
+    const parent = root();
+    const longDirectory = join(parent, "long skill directory name");
+    mkdirSync(longDirectory);
+    skill(longDirectory, "notes", frontmatter("Notes", "Take notes"));
+    const shortPath = spawnSync("cmd.exe", ["/d", "/c", `for %I in ("${longDirectory}") do @echo %~sI`], { encoding: "utf8", windowsVerbatimArguments: true })
+      .stdout.trim();
+    // 8.3 name generation can be disabled per volume.
+    if (!shortPath || shortPath.toLowerCase() === longDirectory.toLowerCase()) return context.skip();
+    const catalog = new SkillCatalog({ roots: [{ path: shortPath, source: "test" }] });
+    expect(catalog.list().map((entry) => entry.id)).toEqual(["notes"]);
+    expect(catalog.read("notes")?.content).toContain("Instructions");
   });
 });

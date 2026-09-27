@@ -116,7 +116,6 @@ async function fixture(): Promise<{ root: string; configPath: string; workspaces
   const configPath = join(root, "config.json");
   const config = new ConfigStore({ configPath });
   config.update({ agents: [{ id: "browser-agent", name: "Browser Agent", avatarId: "browser-agent" }] });
-  config.close();
   return { root, configPath, workspacesRoot: join(root, "workspaces") };
 }
 

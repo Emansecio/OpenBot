@@ -10,7 +10,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 
 import { ConfigStore } from "../src/config/store.js";
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
-import { AgentLifecycleFence, waitForDeletionDrain } from "../src/rpc/agent-lifecycle.js";
+import { AgentLifecycleFence, rpcAgentIds, waitForDeletionDrain } from "../src/rpc/agent-lifecycle.js";
 import { reconcileAgentDeletions } from "../src/rpc/agent-deletion-reconciliation.js";
 import type { RpcHandler } from "../src/server/gateway.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
@@ -149,7 +149,6 @@ describe("durable agent deletion reconciliation", () => {
     } finally {
       warning.mockRestore();
       store.close();
-      config.close();
     }
   });
 
@@ -226,6 +225,9 @@ describe("durable agent deletion reconciliation", () => {
       kind: "message", id: "preserved", role: "user", content: "preserve me", timestampMs: 1,
     }], conversation.id);
     first.store.beginAgentDeletion(["rollback-victim"], 20);
+    // The deletion had started: its durable fences were written before the crash.
+    first.asyncTaskStore.fenceAgent("rollback-victim");
+    first.a2aStore.fenceAgent("rollback-victim");
     handles.pop();
     await stopServer(first);
 
@@ -234,5 +236,20 @@ describe("durable agent deletion reconciliation", () => {
     expect(restarted.store.pendingAgentDeletions()).toEqual([]);
     expect(restarted.store.getEntries("rollback-victim", conversation.id))
       .toContainEqual(expect.objectContaining({ id: "preserved", content: "preserve me" }));
+    // The bot kept its roster entry, so it must not stay blocked for tasks or A2A.
+    expect(restarted.asyncTaskStore.isAgentFenced("rollback-victim")).toBe(false);
+    expect(restarted.a2aStore.isAgentFenced("rollback-victim")).toBe(false);
+  });
+
+  it("fences roster calls that name the agent through the legacy id alias", () => {
+    // Roster methods treat `id` as the agent; elsewhere it names other things.
+    expect(rpcAgentIds("updateAgent", { id: "bot-a" }, true)).toEqual(["bot-a"]);
+    expect(rpcAgentIds("updateAgent", { id: "bot-a" })).toEqual([]);
+    expect(rpcAgentIds("removeMcpServer", { id: "server-a" })).toEqual([]);
+    expect(rpcAgentIds("createAgent", { id: "bot-new" })).toEqual(["bot-new"]);
+    const fence = new AgentLifecycleFence();
+    void fence.beginDeletion(["bot-a"]);
+    expect(() => fence.run(rpcAgentIds("updateAgent", { id: "bot-a" }, true), () => "late")).toThrow(/sendo excluído/);
+    fence.endDeletion(["bot-a"]);
   });
 });

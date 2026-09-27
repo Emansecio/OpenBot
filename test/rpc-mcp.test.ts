@@ -232,6 +232,49 @@ describe("MCP RPC adapter", () => {
     expect(gateway.publish).toHaveBeenCalledWith("mcp-servers", expect.objectContaining({ type: "removed", id: "local" }));
   });
 
+  it("removes a server that bots allow and drops only that server from their policies", async () => {
+    const config = configWithServer();
+    config.update({
+      mcpServers: [
+        ...config.snapshot().mcpServers!,
+        { id: "local", transport: "http", url: "http://127.0.0.1:4545/mcp" },
+      ],
+    });
+    config.update({
+      agents: [{
+        ...config.snapshot().agents[0]!,
+        integrations: { mcp: {
+          enabled: true,
+          serverAllowlist: ["remote", "local"],
+          toolAllowlist: ["remote/search", "mcp__local__echo"],
+          toolDenylist: ["local/delete", "search"],
+        } },
+      }],
+    });
+    const manager = managerWithTools();
+    for (const server of config.snapshot().mcpServers!) manager.setServer(server);
+    const handlers = register({ config, mcpManager: manager });
+
+    expect(await handlers.get("removeMcpServer")!({ id: "local" }, {} as never)).toEqual({ removed: true, id: "local" });
+    expect(config.snapshot().mcpServers?.map((server) => server.id)).toEqual(["remote"]);
+    expect(config.snapshot().agents[0]!.integrations?.mcp).toEqual({
+      enabled: true,
+      serverAllowlist: ["remote"],
+      toolAllowlist: ["remote/search"],
+      toolDenylist: ["search"],
+    });
+    expect(manager.getAgentPolicy("bot-a").serverAllowlist).toEqual(["remote"]);
+  });
+
+  it("refuses stdio launchers that can never run, with an explicit reason", async () => {
+    const config = configWithServer();
+    const handlers = register({ config, mcpManager: new McpManager({ stdioAllowedCommands: ["node", "node.exe"] }) });
+    await expect(handlers.get("upsertMcpServer")!({
+      server: { id: "local", transport: "stdio", command: "npx", args: ["-y", "some-mcp"], cwd: root() },
+    }, {} as never)).rejects.toMatchObject({ status: 400, message: expect.stringContaining("npx, python e uvx") });
+    expect(config.snapshot().mcpServers?.map((server) => server.id)).toEqual(["remote"]);
+  });
+
   it("rolls back both config and manager when replacing a live server fails", async () => {
     const config = configWithServer();
     const manager = managerWithTools();

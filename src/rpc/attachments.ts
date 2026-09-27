@@ -1,5 +1,6 @@
 import { lstat, open, realpath } from "node:fs/promises";
 import { basename, extname, resolve, sep } from "node:path";
+import { neutralizeContextMarkers, redactSecrets } from "../shared/context-text.js";
 
 export const MAX_TEXT_ATTACHMENT_BYTES = 256 * 1024;
 export const MAX_PDF_ATTACHMENT_BYTES = 2 * 1024 * 1024;
@@ -159,9 +160,11 @@ export function formatAttachmentContext(extracted: readonly ExtractedAttachment[
   if (extracted.length === 0) return "";
   const blocks: string[] = [];
   for (const item of extracted) {
-    const header = `[[OPENBOT_UNTRUSTED_ATTACHMENT_BEGIN]]\nname: ${JSON.stringify(item.name)}`;
+    // File names and contents are untrusted: they cannot forge block markers,
+    // and credentials in them are masked before reaching the provider.
+    const header = `[[OPENBOT_UNTRUSTED_ATTACHMENT_BEGIN]]\nname: ${neutralizeContextMarkers(JSON.stringify(item.name))}`;
     if (item.text !== undefined) {
-      blocks.push(`${header}\ncontent:\n${item.text}\n[[OPENBOT_UNTRUSTED_ATTACHMENT_END]]`);
+      blocks.push(`${header}\ncontent:\n${neutralizeContextMarkers(redactSecrets(item.text))}\n[[OPENBOT_UNTRUSTED_ATTACHMENT_END]]`);
     } else if (item.skipped) {
       blocks.push(`${header}\nnot read: ${item.skipped}\n[[OPENBOT_UNTRUSTED_ATTACHMENT_END]]`);
     }

@@ -237,7 +237,7 @@ describe("HomeWorkspaceBackend user files", () => {
       .resolves.toMatchObject({ ok: true, stdout: expect.stringContaining("shared://Documents/hit.txt") });
   });
 
-  it("counts shared trash against the home quota surface and omits payloads from inventory", async () => {
+  it("moves shared files into the unmetered bot trash even at the quota limit and omits payloads from inventory", async () => {
     const profile = await seedProfile();
     await writeFile(join(profile, "Downloads", "keep.bin"), "payload");
     const store = await AgentHomeStore.create(await tempDir("openbot-user-inv-"));
@@ -245,22 +245,15 @@ describe("HomeWorkspaceBackend user files", () => {
     const backend = await HomeWorkspaceBackend.create(home.root, { userProfile: profile });
 
     const baseline = await backend.quota.usage();
-    const trashReservationBytes = Buffer.byteLength("payload")
-      + Buffer.byteLength(JSON.stringify({ version: 1, path: "shared://Downloads/keep.bin" }));
     const quotaBound = await HomeWorkspaceBackend.create(home.root, {
       userProfile: profile,
-      quota: {
-        maxBytes: baseline.bytes + trashReservationBytes - 1,
-        maxFiles: baseline.files + 2,
-        maxEntries: baseline.entries + 3,
-      },
+      // Bytes and files at the limit; the first trash still creates the .openbot/trash directory.
+      quota: { maxBytes: baseline.bytes, maxFiles: baseline.files, maxEntries: baseline.entries + 5 },
     });
-    await expect(quotaBound.execute({ operation: "file.trash", path: "shared://Downloads/keep.bin" }))
-      .rejects.toThrow(/quota exceeded/i);
-    await expect(readFile(join(profile, "Downloads", "keep.bin"), "utf8")).resolves.toBe("payload");
-
-    const trashed = await backend.execute({ operation: "file.trash", path: "shared://Downloads/keep.bin" });
+    const trashed = await quotaBound.execute({ operation: "file.trash", path: "shared://Downloads/keep.bin" });
     expect(trashed).toMatchObject({ ok: true });
+    await expect(readFile(join(profile, "Downloads", "keep.bin"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await quotaBound.quota.usage()).toMatchObject({ bytes: baseline.bytes, files: baseline.files });
     const inventory = await inventoryHome(home.root, "agent-a");
     expect(inventory.entries.some((entry) => entry.path.toLowerCase().startsWith(".openbot/trash/") && entry.path.toLowerCase() !== ".openbot/trash")).toBe(false);
   });

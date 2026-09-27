@@ -81,7 +81,6 @@ describe("model catalog", () => {
       await set({ agentId: "alpha", serviceTier: "priority" });
       const reopened = new ConfigStore({ configPath, allowUnverifiedModels: true });
       expect(reopened.snapshot().agents.map(a => a.serviceTier)).toEqual(["priority", undefined]);
-      reopened.close();
       await runner.sendPrompt({ agentId: "alpha", prompt: "Consulte o relógio", clientNonce: "fast-turn" });
       await runner.flush("alpha");
       expect(requests.map(r => r.modelResolution?.serviceTier)).toEqual(["priority", "priority"]);
@@ -90,8 +89,36 @@ describe("model catalog", () => {
       await runner.sendPrompt({ agentId: "alpha", prompt: "Continue", clientNonce: "standard-turn" });
       await runner.flush("alpha");
       expect(requests.at(-1)?.modelResolution?.serviceTier).toBe("default");
-    } finally { store.close(); config.close(); catalog.close(); }
+    } finally { store.close(); catalog.close(); }
   });
+  it("does not rediscover for a Fast send once the saved catalog confirms the tier", async () => {
+    const directory = root();
+    let clock = 1_000_000;
+    const discover = vi.fn(async () => [{ id: "gpt-6-astra", serviceTiers: ["priority" as const], supportedReasoningEfforts: ["medium" as const] }]);
+    const catalog = new ModelCatalogService({ now: () => clock, sources: { openai: { connectionKey: async () => connection, discover } } });
+    await catalog.get("openai");
+    expect(discover).toHaveBeenCalledTimes(1);
+    const config = new ConfigStore({ configPath: join(directory, "config.json"), allowUnverifiedModels: true });
+    config.modelCatalog = catalog;
+    config.update({ agents: [{ id: "alpha", name: "alpha", avatarId: "default", provider: "openai" as const, model: "gpt-6-astra", serviceTier: "priority" as const }] });
+    const store = new SqliteTranscriptStore({ path: join(directory, "store.db") });
+    const requests: ProviderChatRequest[] = [];
+    const registry = createProviderRegistry();
+    registry.register({ name: "openai", async streamChat(request, emit) { requests.push(request); emit({ type: "delta", delta: "ok" }); } });
+    const runner = createTurnRunner({ config, registry, store });
+    try {
+      // Older than the 30 s UI freshness: the old path rediscovered here (for
+      // OpenAI that spawns the Codex app-server) before accepting the prompt.
+      clock += 60_000;
+      expect(catalog.hasServiceTier("openai", "gpt-6-astra", "priority")).toBe(true);
+      await runner.sendPrompt({ agentId: "alpha", prompt: "oi", clientNonce: "fast-stale" });
+      await runner.flush("alpha");
+      expect(requests.map(r => r.modelResolution?.serviceTier)).toEqual(["priority"]);
+      expect(discover).toHaveBeenCalledTimes(1);
+      expect(catalog.hasServiceTier("openai", "gpt-6-astra", "default")).toBe(false);
+    } finally { store.close(); catalog.close(); }
+  });
+
   it("makes discovered Astra selectable with pinned Codex capabilities and reasoning", async () => {
     const catalog = new ModelCatalogService({ sources: { openai: {
       connectionKey: async () => connection,
@@ -113,7 +140,7 @@ describe("model catalog", () => {
     const config = new ConfigStore({ configPath, allowUnverifiedModels: true });
     config.modelCatalog = catalog;
     config.update({ agents: [{ id: "catalog-bot", name: "Catalog bot", avatarId: "default", provider: "xai", model: "grok-4.6" }] });
-    config.close(); catalog.close();
+    catalog.close();
     const restored = new ModelCatalogService({ directory: join(directory, "catalog"), sources });
     await restored.initialize();
     const reopened = new ConfigStore({ configPath, allowUnverifiedModels: true });
@@ -144,7 +171,7 @@ describe("model catalog", () => {
       await runner.sendPrompt({ agentId: "catalog-bot", prompt: "Outra mensagem", clientNonce: "catalog-turn-2" });
       await runner.flush("catalog-bot");
       expect(requests[2]?.modelResolution?.entry.contextWindow).toBe(128000);
-    } finally { store.close(); restored.close(); reopened.close(); }
+    } finally { store.close(); restored.close(); }
   });
 
   it("deduplicates, forces refresh, retains stale state, restores cache and invalidates connection", async () => {

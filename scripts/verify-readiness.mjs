@@ -10,7 +10,14 @@ import { fileURLToPath } from "node:url";
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ANSI = /\u001b\[[0-?]*[ -/]*[@-~]/gu;
-const LIVE_SKIP_FILES = ["test/home-acl.test.ts", "test/keystore-dpapi-live.test.ts", "test/host-whatsapp.test.ts"];
+// Opt-in live tests the standard suite skips; ACL and DPAPI run later in their
+// own gates, desktop live is the separate verify:desktop-live.
+const LIVE_SKIP_FILES = [
+  "test/home-acl.test.ts",
+  "test/keystore-dpapi-live.test.ts",
+  "test/desktop-tray-live.test.ts",
+  "test/desktop-ui-regressions-live.test.ts",
+];
 const DEFAULT_TIMEOUT_MS = 20 * 60_000;
 const ownedProcessRootPids = new Set();
 
@@ -46,39 +53,38 @@ export const READINESS_GATES = Object.freeze([
   },
   {
     id: 5,
-    label: "core acceptance, chat resilience e Skills/MCP",
+    label: "chat resilience, Skills/MCP e core acceptance",
     commands: [
-      npmStep("core acceptance", ["run", "verify:core:acceptance"]),
       npmStep("chat resilience", ["run", "verify:chat-resilience"]),
+      // verify:skills-mcp runs verify:core:acceptance itself.
       npmStep("Skills/MCP", ["run", "verify:skills-mcp"], { timeoutMs: 30 * 60_000 }),
     ],
   },
   {
     id: 6,
-    label: "Local Exec e approvals",
-    commands: [npmStep("Local Exec approvals", ["test", "--", "test/execution-approval.test.ts", "test/local-exec-gateway.integration.test.ts", "--maxWorkers=1", "--no-file-parallelism"])],
+    label: "Local Exec",
+    commands: [npmStep("Local Exec", ["test", "--", "test/execution-broker.test.ts", "test/local-exec-gateway.integration.test.ts", "--maxWorkers=1", "--no-file-parallelism"])],
   },
   {
     id: 7,
-    label: "browser Electron offline e público somente leitura",
-    commands: [
-      npmStep("browser Electron offline", ["run", "verify:e2e:browser"]),
-      npmStep("browser público somente leitura", ["run", "verify:browser:public-readonly"]),
-    ],
+    label: "browser Electron offline",
+    // The public read-only gate needs the internet; it is opt-in
+    // (verify:browser:public-readonly), so a verdict never depends on the network.
+    commands: [npmStep("browser Electron offline", ["run", "verify:e2e:browser"])],
   },
   {
     id: 8,
-    label: "desktop clean-profile repetível",
+    label: "desktop clean-profile repetível e UI Electron",
     commands: [
       npmStep("clean-profile round 1", ["run", "verify:clean-profile"]),
       npmStep("clean-profile round 2", ["run", "verify:clean-profile"]),
+      npmStep("Electron UI", ["run", "verify:e2e:electron-ui"]),
     ],
   },
   { id: 9, label: "ACL live", commands: [npmStep("ACL live", ["run", "verify:acl:live"])] },
-  { id: 10, label: "WSL live", commands: [npmStep("WSL live", ["run", "verify:runtime-wsl-live"], { timeoutMs: 30 * 60_000 })] },
-  { id: 11, label: "release lifecycle", commands: [npmStep("release lifecycle", ["run", "verify:release-lifecycle"])] },
+  { id: 10, label: "launcher desktop", commands: [npmStep("launcher desktop", ["run", "verify:launcher"])] },
   {
-    id: 12,
+    id: 11,
     label: "DPAPI CurrentUser live e restart",
     commands: [
       npmStep("DPAPI artifacts", ["run", "verify:dpapi-artifacts"]),
@@ -90,8 +96,9 @@ export const READINESS_GATES = Object.freeze([
       }),
     ],
   },
-  { id: 13, label: "inventário final", commands: [] },
+  { id: 12, label: "inventário final", commands: [] },
 ]);
+const FINAL_GATE = READINESS_GATES.at(-1);
 
 function npmStep(label, args, options = {}) {
   return Object.freeze({ label, args: Object.freeze(args), ...options });
@@ -241,12 +248,10 @@ async function main() {
   const tempRoot = await mkdtemp(join(parentTemp, "openbot-readiness-"));
   assertOwnedTempRoot(tempRoot, parentTemp);
   const realAppData = resolve(originalEnv.APPDATA || join(homedir(), "AppData", "Roaming"));
-  const realLocalAppData = resolve(originalEnv.LOCALAPPDATA || join(homedir(), "AppData", "Local"));
   const sensitivePaths = [join(realAppData, "OpenBot", "sand-secrets.json"), join(realAppData, "OpenBot", ".master.key")];
   const sensitiveBefore = await fingerprintPaths(sensitivePaths);
-  const packageOverride = originalEnv.OPENBOT_GUEST_PACKAGE || join(realLocalAppData, "OpenBot", "runtime", "staging", "openbot-runtime-package.tar");
-  const childEnv = buildIsolatedEnvironment(originalEnv, tempRoot, packageOverride);
-  const initial = await captureInventory({ tempRoot, realLocalAppData });
+  const childEnv = buildIsolatedEnvironment(originalEnv, tempRoot);
+  const initial = await captureInventory({ tempRoot });
   const results = [];
   let terminalStatus = initialInventoryStatus(initial);
 
@@ -257,7 +262,7 @@ async function main() {
     results.push({ id: 0, label: "inventário inicial", status: terminalStatus, detail: initialInventoryIssues(initial) });
   } else {
     for (const gate of READINESS_GATES.slice(0, -1)) {
-      const environmentBlock = await gateEnvironmentBlock(gate.id, { packageOverride });
+      const environmentBlock = await gateEnvironmentBlock(gate.id);
       if (environmentBlock) {
         const result = { id: gate.id, label: gate.label, status: "BLOCKED_ENV", reason: environmentBlock, commands: [] };
         results.push(result);
@@ -266,7 +271,7 @@ async function main() {
         break;
       }
 
-      console.log(`[verify:readiness] GATE ${gate.id}/13 ${gate.label}`);
+      console.log(`[verify:readiness] GATE ${gate.id}/${FINAL_GATE.id} ${gate.label}`);
       const result = await runGate(gate, childEnv);
       results.push(result);
       if (result.status !== "GREEN") {
@@ -279,9 +284,9 @@ async function main() {
   await rm(join(tempRoot, ".readiness-cache"), { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   await pruneEmptyDirectories(tempRoot);
   const sensitiveAfter = await fingerprintPaths(sensitivePaths);
-  const finalInventory = await captureInventory({ tempRoot, realLocalAppData, ownedProcessPids: [...ownedProcessRootPids] });
-  const finalEvaluation = evaluateFinalInventory({ initial, finalInventory, sensitiveBefore, sensitiveAfter });
-  results.push({ id: 13, label: "inventário final", ...finalEvaluation });
+  const finalInventory = await captureInventory({ tempRoot, ownedProcessPids: [...ownedProcessRootPids] });
+  const finalEvaluation = evaluateFinalInventory({ finalInventory, sensitiveBefore, sensitiveAfter });
+  results.push({ id: FINAL_GATE.id, label: FINAL_GATE.label, ...finalEvaluation });
   if (finalEvaluation.status !== "GREEN") terminalStatus = "RED";
 
   let cleanup = "diagnostic-root-preserved";
@@ -384,7 +389,7 @@ async function terminateOwnedChild(pid) {
   try { process.kill(pid, "SIGTERM"); } catch { /* already exited */ }
 }
 
-export function buildIsolatedEnvironment(source, tempRoot, packageOverride) {
+export function buildIsolatedEnvironment(source, tempRoot) {
   const env = { ...source };
   for (const key of Object.keys(env)) {
     const normalizedKey = key.replaceAll(/[^A-Za-z0-9]+/gu, "_");
@@ -399,29 +404,24 @@ export function buildIsolatedEnvironment(source, tempRoot, packageOverride) {
     TMP: tempRoot,
     APPDATA: join(tempRoot, "AppData", "Roaming"),
     LOCALAPPDATA: join(tempRoot, "AppData", "Local"),
-    OPENBOT_SHORTCUT_ROOT: join(tempRoot, "Shortcuts"),
-    OPENBOT_GUEST_PACKAGE: packageOverride,
     NODE_DISABLE_COMPILE_CACHE: "1",
     NPM_CONFIG_CACHE: join(tempRoot, ".readiness-cache", "npm"),
     NPM_CONFIG_UPDATE_NOTIFIER: "false",
     NO_COLOR: "1",
     FORCE_COLOR: "0",
+    // Gates 2 and 3 typecheck and build first; later gates skip repeating it
+    // (scripts/gate-prepare.mjs). A failing gate stops the run before them.
+    OPENBOT_GATE_PREPARED: "1",
   });
   return env;
 }
 
-async function gateEnvironmentBlock(gateId, { packageOverride }) {
+async function gateEnvironmentBlock(gateId) {
   if (gateId === 9) {
     if (process.platform !== "win32") return "ACL live requires Windows";
     if (!await commandExists("icacls.exe")) return "icacls.exe is unavailable";
   }
-  if (gateId === 10) {
-    if (process.platform !== "win32") return "WSL live requires Windows";
-    if (!await commandExists("wsl.exe")) return "wsl.exe is unavailable";
-    if (!await pathExists(packageOverride)) return `runtime guest package unavailable: ${packageOverride}`;
-    if (!await pathExists(join(dirname(packageOverride), "manifest.json"))) return "runtime guest manifest is unavailable";
-  }
-  if (gateId === 12 && process.platform !== "win32") return "DPAPI CurrentUser live requires Windows";
+  if (gateId === 11 && process.platform !== "win32") return "DPAPI CurrentUser live requires Windows";
   return null;
 }
 
@@ -435,25 +435,14 @@ async function commandExists(command) {
   }
 }
 
-async function captureInventory({ tempRoot, realLocalAppData, ownedProcessPids = [] }) {
-  const [port1340Free, wsl, rootProcesses, tempEntries, localOperationLocks, staleReadinessRoots] = await Promise.all([
+async function captureInventory({ tempRoot, ownedProcessPids = [] }) {
+  const [port1340Free, rootProcesses, tempEntries, staleReadinessRoots] = await Promise.all([
     isPortFree(1340),
-    getWslInventory(),
     getRootProcesses(tempRoot, ownedProcessPids),
     listTree(tempRoot),
-    findOperationLocks(join(realLocalAppData, "OpenBot")),
     listStaleReadinessRoots(tempRoot),
   ]);
-  return {
-    port1340Free,
-    wsl,
-    transientDistros: wsl.names.filter((name) => /^OpenBotRuntimeLive-/u.test(name)),
-    rootProcesses,
-    tempEntries,
-    operationLocks: tempEntries.filter((entry) => isOperationLockName(basename(entry))),
-    localOperationLocks,
-    staleReadinessRoots,
-  };
+  return { port1340Free, rootProcesses, tempEntries, staleReadinessRoots };
 }
 
 function initialInventoryStatus(inventory) {
@@ -465,21 +454,15 @@ function initialInventoryIssues(inventory) {
   if (!inventory.port1340Free) issues.push("port 1340 is occupied before the run");
   if (inventory.rootProcesses.length > 0) issues.push("TempRoot process exists before the run");
   if (inventory.tempEntries.length > 0) issues.push("fresh TempRoot is not empty");
-  if (inventory.transientDistros.length > 0) issues.push("pre-existing OpenBotRuntimeLive distro found");
-  if (inventory.localOperationLocks.length > 0) issues.push("pre-existing OpenBot operation.lock found");
   if (inventory.staleReadinessRoots.length > 0) issues.push("stale readiness TempRoot found");
   return issues;
 }
 
-function evaluateFinalInventory({ initial, finalInventory, sensitiveBefore, sensitiveAfter }) {
+function evaluateFinalInventory({ finalInventory, sensitiveBefore, sensitiveAfter }) {
   const issues = [];
   if (!finalInventory.port1340Free) issues.push("port 1340 remains occupied");
   if (finalInventory.rootProcesses.length > 0) issues.push("owned process remains alive");
   if (finalInventory.tempEntries.length > 0) issues.push("TempRoot contains residual entries");
-  if (finalInventory.operationLocks.length > 0) issues.push("operation.lock remains in TempRoot");
-  if (!sameJson([...initial.wsl.names].sort(), [...finalInventory.wsl.names].sort())) issues.push("WSL distro names changed");
-  if (finalInventory.transientDistros.length > 0) issues.push("temporary WSL distro remains registered");
-  if (!sameJson(initial.localOperationLocks, finalInventory.localOperationLocks)) issues.push("real LocalAppData operation.lock inventory changed");
   if (!sameJson(sensitiveBefore, sensitiveAfter)) issues.push("real AppData keystore sentinel changed");
   if (finalInventory.staleReadinessRoots.length > 0) issues.push("stale readiness TempRoot remains");
   return { status: issues.length === 0 ? "GREEN" : "RED", issues };
@@ -505,17 +488,6 @@ async function isPortFree(port) {
     server.once("error", () => resolvePromise(false));
     server.listen({ host: "127.0.0.1", port, exclusive: true }, () => server.close(() => resolvePromise(true)));
   });
-}
-
-async function getWslInventory() {
-  if (process.platform !== "win32") return { available: false, names: [], error: "not-windows" };
-  try {
-    const { stdout } = await execFileAsync("wsl.exe", ["--list", "--quiet"], { windowsHide: true, timeout: 20_000, encoding: "utf8" });
-    const names = stdout.replaceAll("\0", "").split(/\r?\n/u).map((line) => line.trim().replace(/^\*\s*/u, "")).filter(Boolean);
-    return { available: true, names, error: null };
-  } catch (error) {
-    return { available: false, names: [], error: error.message.slice(0, 256) };
-  }
 }
 
 export async function getRootProcesses(tempRoot, ownedProcessPids = []) {
@@ -567,31 +539,6 @@ async function listTree(root) {
   }
   await visit(root);
   return entries.sort();
-}
-
-const isOperationLockName = (name) => /(?:^operation\.lock$|\.openbot-operation\.lock(?:\.stale-.+)?$)/iu.test(name);
-
-export async function findOperationLocks(root, options = {}) {
-  if (!await pathExists(root)) return [];
-  const readDirectory = options.readDirectory ?? readdir;
-  const matches = [];
-  async function visit(current, depth) {
-    if (depth > 10 || matches.length >= 100) return;
-    let entries;
-    try {
-      entries = await readDirectory(current, { withFileTypes: true });
-    } catch (error) {
-      if (error?.code === "ENOENT") return;
-      throw error;
-    }
-    for (const item of entries) {
-      const path = join(current, item.name);
-      if (isOperationLockName(item.name)) matches.push(path);
-      if (item.isDirectory() && !item.isSymbolicLink() && !isOperationLockName(item.name)) await visit(path, depth + 1);
-    }
-  }
-  await visit(root, 0);
-  return matches.sort();
 }
 
 export async function listStaleReadinessRoots(currentRoot) {

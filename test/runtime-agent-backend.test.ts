@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AgentHomeStore } from "../src/execution/home.js";
 import type { AgentRuntimeManager, RuntimeLease } from "../src/execution/runtime/contracts.js";
-import type { RuntimeProcessRunner } from "../src/execution/runtime/wsl/process-backend.js";
+import type { RuntimeProcessRunner } from "../src/execution/runtime/process-backend.js";
 import { AgentRuntimeBackend } from "../src/execution/runtime/agent-backend.js";
 import { TempRoots } from "./helpers/temp-roots.js";
 
@@ -50,6 +50,62 @@ describe("AgentRuntimeBackend", () => {
       content: "12345",
       encoding: "utf8",
     })).resolves.toMatchObject({ ok: false, operation: "file.write", code: "quota_exceeded" });
+  });
+
+  it("conta um download externo na quota e remove o que a estoura", async () => {
+    const root = await temp.makeAsync("openbot-agent-backend-download-");
+    await mkdir(join(root, "Documents"));
+    await mkdir(join(root, "Downloads"));
+    const backend = await AgentRuntimeBackend.create({
+      agentId: "agent-a",
+      homeRoot: root,
+      manager: {
+        ensure: vi.fn(),
+        acquire: vi.fn(async () => lease()),
+        status: vi.fn(),
+        stop: vi.fn(),
+        repair: vi.fn(),
+        close: vi.fn(),
+      },
+      runner: { run: vi.fn() },
+      quota: { maxBytes: 64, maxFiles: 100, maxEntries: 100 },
+    });
+
+    const kept = join(root, "Downloads", "small.txt");
+    await writeFile(kept, "0123456789");
+    await expect(backend.admitExternalFile(kept)).resolves.toBe(true);
+    const tooLarge = join(root, "Downloads", "large.txt");
+    await writeFile(tooLarge, "x".repeat(100));
+    await expect(backend.admitExternalFile(tooLarge)).resolves.toBe(false);
+    await expect(readFile(tooLarge)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(kept, "utf8")).resolves.toBe("0123456789");
+    // The removed download no longer blocks the file tools.
+    await expect(backend.execute({ operation: "file.write", path: "Documents/note.txt", content: "ok", encoding: "utf8" }))
+      .resolves.toMatchObject({ ok: true });
+    await expect(backend.admitExternalFile(join(root, "..", "outside.txt"))).rejects.toThrow(/outside the agent home/u);
+  });
+
+  it("aplica também o limite próprio da pasta Downloads a um download externo", async () => {
+    const root = await temp.makeAsync("openbot-agent-backend-download-scope-");
+    await mkdir(join(root, "Downloads"));
+    const backend = await AgentRuntimeBackend.create({
+      agentId: "agent-a",
+      homeRoot: root,
+      manager: {
+        ensure: vi.fn(),
+        acquire: vi.fn(async () => lease()),
+        status: vi.fn(),
+        stop: vi.fn(),
+        repair: vi.fn(),
+        close: vi.fn(),
+      },
+      runner: { run: vi.fn() },
+      quota: { maxBytes: 10_000, maxFiles: 100, maxEntries: 100, scopes: { downloads: { maxBytes: 50, maxFiles: 10 } } },
+    });
+    const overFolder = join(root, "Downloads", "report.pdf");
+    await writeFile(overFolder, "x".repeat(100));
+    await expect(backend.admitExternalFile(overFolder)).resolves.toBe(false);
+    await expect(readFile(overFolder)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("roteia arquivos para a home e process.run para o sandbox do mesmo agente", async () => {

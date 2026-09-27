@@ -1,15 +1,17 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
-import { ensureDefaultConversation, legacyConversationId, migrateOpenBotSchema } from "../store/schema.js";
+import { ensureDefaultConversation, ensureOpenBotSchema, legacyConversationId } from "../store/schema.js";
 import { SqliteMemoryStore } from "../memory/sqlite-store.js";
+import { redactSecrets } from "../shared/context-text.js";
 
 export const DEFAULT_CONVERSATION_TITLE = "Nova conversa";
 export const DEFAULT_CONVERSATION_PAGE_LIMIT = 50;
 export const MAX_CONVERSATION_PAGE_LIMIT = 200;
+export const MAX_CONVERSATION_TITLE_CHARS = 200;
+const AUTO_TITLE_CHARS = 80;
 
 export type ConversationTitleSource = "auto" | "manual";
 export type ConversationMemoryPolicy = "delete-derived" | "retain";
@@ -25,9 +27,6 @@ export interface Conversation {
   updatedAtMs: number;
   lastMessageAtMs: number | null;
 }
-
-export type ConversationRecord = Conversation;
-export type AgentConversation = Conversation;
 
 export interface SqliteConversationStoreOptions {
   path: string;
@@ -100,7 +99,21 @@ function validateTitle(title: string): string {
   if (typeof title !== "string" || title.trim().length === 0) {
     throw new Error("title deve ser uma string não vazia");
   }
-  return title.trim();
+  const trimmed = title.trim();
+  if ([...trimmed].length > MAX_CONVERSATION_TITLE_CHARS) {
+    throw new Error(`title deve ter no máximo ${MAX_CONVERSATION_TITLE_CHARS} caracteres`);
+  }
+  return trimmed;
+}
+
+/**
+ * The title a conversation takes from its first message: a single line with
+ * credentials masked, cut to a sidebar-sized length.
+ */
+export function autoConversationTitle(firstUserText: string): string {
+  const line = redactSecrets(firstUserText.replace(/\s+/gu, " ").trim());
+  const chars = [...line];
+  return chars.length <= AUTO_TITLE_CHARS ? line : `${chars.slice(0, AUTO_TITLE_CHARS - 1).join("").trimEnd()}…`;
 }
 
 function validatePageLimit(limit: number): number {
@@ -193,7 +206,7 @@ export class SqliteConversationStore {
         this.db.pragma("synchronous = NORMAL");
         this.db.pragma("busy_timeout = 5000");
       }
-      migrateOpenBotSchema(this.db);
+      ensureOpenBotSchema(this.db);
       const memoryStore = opts.memoryStore ?? new SqliteMemoryStore({ path: opts.path, database: this.db, secretValues: opts.secretValues });
       if (!memoryStore.sharesDatabase(this.db)) {
         throw new Error("conversation store: memoryStore deve usar a mesma conexão SQLite");
@@ -371,7 +384,7 @@ export class SqliteConversationStore {
     validateAgentId(agentId);
     validateConversationId(conversationId);
     this.ensureOpen();
-    const text = typeof firstUserText === "string" ? firstUserText.trim() : "";
+    const text = typeof firstUserText === "string" ? autoConversationTitle(firstUserText) : "";
     const update = this.db.transaction(() => {
       const row = this.readOwned(agentId, conversationId);
       if (row.title_source === "manual" || text.length === 0 || !isAutoPlaceholderTitle(row.title)) return;
@@ -469,9 +482,8 @@ export class SqliteConversationStore {
         "interaction_decisions",
         "turn_attempts",
         "turn_completions",
-        "turn_checkpoints",
-        "turn_effects",
         "kickstart_runs",
+        "reactions",
       ] as const) {
         this.db.prepare(`DELETE FROM ${table} WHERE agent_id = ? AND conversation_id = ?`).run(agentId, conversationId);
       }
@@ -534,7 +546,7 @@ export class SqliteConversationStore {
     this.ensureOpen();
     const clear = this.db.transaction(() => {
       this.db.prepare("DELETE FROM agent_conversation_state WHERE agent_id = ?").run(agentId);
-      for (const table of ["transcript_entries", "accepted_nonces", "pending_nonces", "interaction_decisions", "turn_attempts", "turn_completions"] as const) {
+      for (const table of ["prompt_queue", "transcript_entries", "accepted_nonces", "pending_nonces", "interaction_decisions", "turn_attempts", "turn_completions", "kickstart_runs"] as const) {
         this.db.prepare(`DELETE FROM ${table} WHERE agent_id = ?`).run(agentId);
       }
       this.db.prepare("DELETE FROM agent_conversations WHERE agent_id = ?").run(agentId);
@@ -547,12 +559,4 @@ export class SqliteConversationStore {
     if (this.ownsDatabase) this.db.close();
     this.closed = true;
   }
-}
-
-export function defaultConversationStorePath(): string {
-  const explicitRoot = process.env.OPENBOT_DATA_ROOT?.trim();
-  if (explicitRoot) return path.join(explicitRoot, "store.db");
-  const appData = process.env.APPDATA;
-  if (appData && appData.length > 0) return path.join(appData, "OpenBot", "store.db");
-  return path.join(os.homedir(), "AppData", "Roaming", "OpenBot", "store.db");
 }

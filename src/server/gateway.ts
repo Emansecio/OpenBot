@@ -6,7 +6,7 @@
  *   POST /api/<method>      RPC com tabela de rota EXPLÍCITA — método desconhecido → 404
  *                           (mesmo sendo POST, é "rota desconhecida", não método HTTP);
  *                           erro de handler → 500 {error}; payload inválido → 400 {error}
- *   GET  /health            {ok,pid,isBusy,activeAgentId,startedAt}
+ *   GET  /health            {ok,pid,isBusy,activeAgentId,startedAt,rootId?,build?}
  *   POST /prepare-upgrade   ativa quiescência e informa os turnos em curso
  *   POST /shutdown          solicita shutdown gracioso após responder 202
  *   GET  /avatars/<id>      placeholder (SVG monograma; Content-Type image/svg+xml)
@@ -40,11 +40,13 @@ import type {
   TranscriptEventOrder,
 } from "../shared/contracts.js";
 import { tokenFromRequest } from "./auth.js";
+import { servicePid } from "./gateway-supervisor.js";
+import type { BuildIdentity } from "./build-identity.js";
 import type { HealthResponse, PrepareUpgradeResponse } from "./types.js";
 
 /** Intervalo do heartbeat do SSE (plano §3 T3: `:ping` a cada 15s). */
 export const SSE_HEARTBEAT_MS = 15_000;
-/** `retry:` enviado no início do stream SSE (fixture golden sse-events.json). */
+/** `retry:` enviado no início do stream SSE. */
 export const SSE_RETRY_MS = 1000;
 const SSE_MAX_PENDING_BYTES = 256 * 1024;
 const SSE_MAX_CLIENTS = 32;
@@ -52,6 +54,8 @@ const SSE_MAX_CLIENTS = 32;
 export const SSE_MAX_FRAME_BYTES = 256 * 1024;
 /** Aceita gzip para respostas com este tamanho ou maior. */
 export const GZIP_MIN_BYTES = 1024;
+/** Loopback transfer is cheap; the fastest level keeps most of the size win for a fraction of the CPU. */
+const GZIP_LEVEL = 1;
 
 export interface GatewayDeliveryReceipt {
   readonly accepted: boolean;
@@ -102,7 +106,6 @@ const LOOPBACK_HOSTS = new Set([
  */
 export const RPC_METHOD_TABLE = new Set<string>([
   "sendPrompt",
-  "resumePrompt",
   "searchTranscript",
   "addReaction",
   "removeReaction",
@@ -190,7 +193,6 @@ export const RPC_METHOD_TABLE = new Set<string>([
   "respondToWidget",
   "dismissWidget",
   "submitSecret",
-  "resolveLocalToolPermission",
   "resolveAutoReviewApproval",
   "setBoxSecrets",
   "getBoxSecretsStatus",
@@ -227,7 +229,7 @@ export const QUIESCENCE_ALLOWED_RPC_METHODS = new Set<string>([
   "promptAcceptanceStatus", "listAgents", "getAgent", "getAgentTranscriptTail", "openAgentTail",
   "getConversationOutline", "getMemorySettings", "listMemories", "listMemoriesPage", "getMemoryStatus", "searchMemoryHistory",
   "listConversations", "getActiveConversation", "getAgentWorkflows", "getAvailableSkills",
-  "listMcpServers", "listMcpTools", "getSubagents", "getAsyncTasks", "listAsyncTasks", "getAsyncTask", "dispatchAsyncTask", "steerAsyncTask", "abortAsyncTask", "settleAsyncTask", "getAvailableModels", "getProviderModelCatalog",
+  "listMcpServers", "listMcpTools", "getSubagents", "getAsyncTasks", "listAsyncTasks", "getAsyncTask", "abortAsyncTask", "getAvailableModels", "getProviderModelCatalog",
   "getAgentDefaultModel", "countAgents", "searchAgents", "getLocalProfile", "getActiveProvider",
   "getProviderConfig", "getForeverBoxStatus", "getLocalRuntimeStatus", "getExecutionDiagnostics",
   "isAgentNetworkEnabled", "isGlobalSearchEnabled", "isEgressTunnelAvailable", "getComputerCapabilities",
@@ -243,6 +245,8 @@ export interface GatewayDeps {
 export interface GatewayOptions {
   /** Marca de tempo do boot (String ISO). Default: momento da criação. */
   startedAt?: string;
+  /** Checkout/build identity reported by /health for the desktop launcher. */
+  buildIdentity?: BuildIdentity;
   /** Canais SSE habilitados para o stream /api/events (T10+). */
   sseChannels?: ReadonlySet<string>;
   /** Intervalo do heartbeat `:ping` (ms). Default: SSE_HEARTBEAT_MS (15s). */
@@ -393,11 +397,58 @@ function sendJson(
   status: number,
   body: unknown,
 ): void {
-  const payload = JSON.stringify(body);
   if (res.writableEnded) return;
   res.statusCode = status;
   res.setHeader("content-type", "application/json; charset=utf-8");
-  res.end(payload);
+  res.setHeader("cache-control", "no-store");
+  res.end(JSON.stringify(body));
+}
+
+/** Byte size of `[a,b,...]` from the byte sizes of its serialized items. */
+function arrayBytes(itemBytes: readonly number[], from = 0, to = itemBytes.length): number {
+  let total = 2 + Math.max(0, to - from - 1);
+  for (let index = from; index < to; index += 1) total += itemBytes[index]!;
+  return total;
+}
+
+/**
+ * Greedy split of `items` into consecutive chunks whose frame stays within
+ * `maxBytes`, measured arithmetically: `emptyFrameBytes()` is the frame with
+ * an empty list, so a chunk costs that plus its array bytes minus "[]".
+ * Items too large for a frame on their own are passed to `oversized`.
+ */
+function chunkItemsByFrameBytes(
+  items: readonly unknown[],
+  emptyFrameBytes: () => number,
+  maxBytes: number,
+  oversized: (item: unknown) => void,
+): unknown[][] {
+  const chunks: unknown[][] = [];
+  let chunk: unknown[] = [];
+  let chunkBytes = 0;
+  for (const item of items) {
+    const itemBytes = Buffer.byteLength(JSON.stringify(item) ?? "null", "utf8");
+    const base = emptyFrameBytes() - 2;
+    const withItem = base + 2 + chunkBytes + (chunk.length > 0 ? 1 : 0) + itemBytes;
+    if (withItem <= maxBytes) {
+      chunkBytes += (chunk.length > 0 ? 1 : 0) + itemBytes;
+      chunk.push(item);
+      continue;
+    }
+    if (chunk.length > 0) {
+      chunks.push(chunk);
+      chunk = [];
+      chunkBytes = 0;
+    }
+    if (base + 2 + itemBytes <= maxBytes) {
+      chunk = [item];
+      chunkBytes = itemBytes;
+    } else {
+      oversized(item);
+    }
+  }
+  if (chunk.length > 0) chunks.push(chunk);
+  return chunks;
 }
 
 class RequestBodyError extends Error {
@@ -421,6 +472,7 @@ export class Gateway {
   private readonly handlers = new Map<string, RpcHandler>();
   private readonly sseClients = new Set<SseClient>();
   private readonly startedAt: string;
+  private readonly buildIdentity?: BuildIdentity;
   private readonly sseChannels: ReadonlySet<string>;
   private readonly sseHeartbeatMs: number;
   private readonly gatewayToken: string;
@@ -437,6 +489,7 @@ export class Gateway {
 
   constructor(opts: GatewayOptions = {}, deps: GatewayDeps = {}) {
     this.startedAt = opts.startedAt ?? new Date().toISOString();
+    this.buildIdentity = opts.buildIdentity;
     this.sseChannels = opts.sseChannels ?? new Set<string>();
     this.sseHeartbeatMs = opts.sseHeartbeatMs ?? SSE_HEARTBEAT_MS;
     this.gatewayToken = opts.gatewayToken ?? "";
@@ -478,16 +531,17 @@ export class Gateway {
    * streams ativos — usado pelas mesas RPC de T10+ para emitir snapshot/appended.
    */
   publish(channel: string, payload: unknown): GatewayDeliveryReceipt {
-    const clients = [...this.sseClients].filter(
-      (client) => {
-        if (client.res.destroyed || (client.channels !== null && !client.channels.has(channel))) return false;
-        if ((channel === "transcript" || channel === "reasoning") && client.agentId !== null) {
-          return isRecord(payload) && payload.agentId === client.agentId;
-        }
-        if (channel !== "async-tasks" && channel !== "subagents" && channel !== "a2a") return true;
-        return client.agentId !== null && isRecord(payload) && payload.agentId === client.agentId;
-      },
-    );
+    const payloadAgentId = isRecord(payload) ? payload.agentId : undefined;
+    const agentScoped = channel === "async-tasks" || channel === "subagents" || channel === "a2a";
+    const clients: SseClient[] = [];
+    for (const client of this.sseClients) {
+      if (client.res.destroyed || (client.channels !== null && !client.channels.has(channel))) continue;
+      if ((channel === "transcript" || channel === "reasoning") && client.agentId !== null) {
+        if (payloadAgentId === client.agentId) clients.push(client);
+        continue;
+      }
+      if (!agentScoped || (client.agentId !== null && payloadAgentId === client.agentId)) clients.push(client);
+    }
     // Evita inclusive executar toJSON de payloads caros quando ninguém ouvirá.
     if (clients.length === 0) return { accepted: false, eligibleClients: 0, acceptedClients: 0, rejectedClients: 0 };
     const source = isRecord(payload) ? payload : undefined;
@@ -500,8 +554,9 @@ export class Gateway {
         ? `${channel}:${source.epoch}:${source.sequence}`
         : undefined;
     let frame = `${eventId === undefined ? "" : `id: ${eventId}\n`}data: ${JSON.stringify({ channel, payload } satisfies SseEvent)}\n\n`;
+    let frameBytes = Buffer.byteLength(frame);
     let oversized = false;
-    if (Buffer.byteLength(frame) > SSE_MAX_FRAME_BYTES) {
+    if (frameBytes > SSE_MAX_FRAME_BYTES) {
       oversized = true;
       // Um snapshot inteiro pode ser muito maior que o limite do transporte.
       // Mantenha a conexão viva e dê ao cliente uma instrução explícita para
@@ -510,35 +565,46 @@ export class Gateway {
         channel,
         payload: resyncPayload(channel, payload),
       } satisfies SseEvent)}\n\n`;
-      if (Buffer.byteLength(frame) > SSE_MAX_FRAME_BYTES) return { accepted: false, eligibleClients: clients.length, acceptedClients: 0, rejectedClients: clients.length };
+      frameBytes = Buffer.byteLength(frame);
+      if (frameBytes > SSE_MAX_FRAME_BYTES) return { accepted: false, eligibleClients: clients.length, acceptedClients: 0, rejectedClients: clients.length };
     }
-    const overflowFrame = `data: ${JSON.stringify({
+    // Only a client already backed up past its budget needs the resync frame.
+    let overflowFrame: string | undefined;
+    const overflow = (): string => overflowFrame ??= `data: ${JSON.stringify({
       channel,
       payload: resyncPayload(channel, payload, "backpressure"),
     } satisfies SseEvent)}\n\n`;
     let acceptedClients = 0;
-    for (const client of clients) if (this.writeSse(client, frame, false, overflowFrame)) acceptedClients += 1;
+    for (const client of clients) if (this.writeSse(client, frame, frameBytes, false, overflow)) acceptedClients += 1;
     return { accepted: !oversized && acceptedClients === clients.length && clients.length > 0, eligibleClients: clients.length, acceptedClients: oversized ? 0 : acceptedClients, rejectedClients: oversized ? clients.length : clients.length - acceptedClients };
   }
 
-  private writeSse(client: SseClient, frame: string, heartbeat = false, overflowFrame?: string): boolean {
+  /**
+   * Writes or queues one frame. Returns true when the frame will reach the
+   * client: written into the socket buffer (even past its high-water mark) or
+   * queued behind a blocked one. Returns false only when the frame is dropped,
+   * including when a backed-up queue is replaced by a resync instruction.
+   */
+  private writeSse(client: SseClient, frame: string, bytes = Buffer.byteLength(frame), heartbeat = false, overflowFrame?: () => string): boolean {
     if (client.res.destroyed) return false;
-    const bytes = Buffer.byteLength(frame);
     if (bytes > SSE_MAX_FRAME_BYTES) return false;
     if (!client.blocked) {
       client.blocked = !client.res.write(frame);
-      return !client.blocked;
+      return true;
     }
     if (heartbeat) return false;
     if (client.pendingBytes + bytes > SSE_MAX_PENDING_BYTES) {
-      if (overflowFrame === undefined || Buffer.byteLength(overflowFrame) > SSE_MAX_PENDING_BYTES) return false;
-      client.pending = [overflowFrame];
-      client.pendingBytes = Buffer.byteLength(overflowFrame);
+      const resync = overflowFrame?.();
+      if (resync === undefined) return false;
+      const resyncBytes = Buffer.byteLength(resync);
+      if (resyncBytes > SSE_MAX_PENDING_BYTES) return false;
+      client.pending = [resync];
+      client.pendingBytes = resyncBytes;
       return false;
     }
     client.pending.push(frame);
     client.pendingBytes += bytes;
-    return false;
+    return true;
   }
 
   private flushSse(client: SseClient): void {
@@ -560,9 +626,12 @@ export class Gateway {
     this.state.quiescing = true;
   }
 
-  /** Reverts a quiescence started by a shutdown that failed; allows retry. */
-  cancelQuiescence(): void {
-    this.state.quiescing = false;
+  /**
+   * After a failed shutdown the server stays quiescing: a partial stop (SSE
+   * and admission already closed) cannot be undone, so mutations keep being
+   * refused. Only a new /shutdown attempt is allowed.
+   */
+  private allowShutdownRetry(): void {
     this.shutdownScheduled = false;
     this.shutdownCallbackScheduled = false;
   }
@@ -632,7 +701,7 @@ export class Gateway {
       : path.startsWith("/webauthn/")
         ? this.webauthnHandler
         : undefined;
-    if (bridge !== undefined || path.startsWith("/local-exec/") || path.startsWith("/webauthn/")) {
+    if (path.startsWith("/local-exec/") || path.startsWith("/webauthn/")) {
       if (method !== "POST") {
         sendJson(res, 405, { error: "method-not-allowed" });
         return;
@@ -641,6 +710,12 @@ export class Gateway {
       if (!this.tokenGuard(req, res)) return;
       if (bridge === undefined) {
         sendJson(res, 501, { error: "not-implemented" });
+        return;
+      }
+      // Commands and file writes must not race the broker teardown of a shutdown.
+      if (this.state.quiescing) {
+        req.resume();
+        this.sendJsonMaybeGzip(res, 503, { ok: false, failure: "gateway quiescing" } satisfies RpcEnvelopeFailure);
         return;
       }
       let body: unknown;
@@ -684,11 +759,12 @@ export class Gateway {
     const { isBusy, activeAgentId, busyAgentIds } = this.deps.getStatus();
     const body: HealthResponse = {
       ok: true,
-      pid: process.pid,
+      pid: servicePid(),
       isBusy,
       activeAgentId: activeAgentId ?? null,
       busyAgentIds: busyAgentIds ?? [],
       startedAt: this.startedAt,
+      ...this.buildIdentity,
     };
     sendJson(res, 200, body);
   }
@@ -714,11 +790,9 @@ export class Gateway {
       const scheduleShutdown = () => {
         if (this.shutdownCallbackScheduled) return;
         this.shutdownCallbackScheduled = true;
-        queueMicrotask(() => {
-          void Promise.resolve().then(() => this.shutdownHandler!()).catch((error) => {
-            console.error("[openbot] graceful shutdown failed:", error);
-            this.cancelQuiescence();
-          });
+        void Promise.resolve().then(() => this.shutdownHandler!()).catch((error) => {
+          console.error("[openbot] graceful shutdown failed:", error);
+          this.allowShutdownRetry();
         });
       };
       res.once("finish", scheduleShutdown);
@@ -821,6 +895,11 @@ export class Gateway {
           ? null
           : allChannels
         : new Set(requestedNames.filter((name) => allChannels.size === 0 || allChannels.has(name)));
+    // Before any snapshot work: a full server must not pay for SQLite reads it will not send.
+    if (this.sseClients.size >= SSE_MAX_CLIENTS) {
+      sendJson(res, 429, { error: "too-many-sse-clients" });
+      return;
+    }
     const projectionChannels = (["async-tasks", "subagents", "a2a"] as const).filter((channel) => channels?.has(channel) ?? false);
     const lastEventId = typeof req.headers["last-event-id"] === "string" ? req.headers["last-event-id"] : undefined;
     const projectionSnapshots = projectionAgentId === null
@@ -837,11 +916,6 @@ export class Gateway {
       return;
     }
 
-    if (this.sseClients.size >= SSE_MAX_CLIENTS) {
-      sendJson(res, 429, { error: "too-many-sse-clients" });
-      return;
-    }
-
     res.statusCode = 200;
     res.setHeader("content-type", "text/event-stream");
     res.setHeader("cache-control", "no-cache, no-transform");
@@ -851,6 +925,13 @@ export class Gateway {
 
     const client: SseClient = { res, channels, agentId: projectionAgentId, blocked: false, pending: [], pendingBytes: 0 };
     this.sseClients.add(client);
+    let ping: ReturnType<typeof setInterval> | undefined;
+    // Registered with the client: a failure while building the snapshots
+    // below destroys the response, and this still releases the slot.
+    res.on("close", () => {
+      if (ping !== undefined) clearInterval(ping);
+      this.sseClients.delete(client);
+    });
     res.on("drain", () => this.flushSse(client));
     let initialFrame = `retry: ${SSE_RETRY_MS}\n\n`;
     const transcriptSnapshot = (channels === null || channels.has("transcript")) && projectionAgentId !== null
@@ -870,9 +951,27 @@ export class Gateway {
           resyncRequired: true,
           reason,
         };
-        const entries = [...transcriptSnapshot.entries];
-        while (entries.length > 0 && Buffer.byteLength(`data: ${JSON.stringify({ channel: "transcript", payload: { ...base, entries } } satisfies SseEvent)}\n\n`, "utf8") > SSE_MAX_FRAME_BYTES) entries.shift();
-        const payload = { ...base, entries, ...(entries.length < transcriptSnapshot.entries.length ? { truncated: true, method: "openAgentTail" } : {}) };
+        // Keep the newest entries that fit one frame. Each entry is serialized
+        // once; the frame size is computed arithmetically, never re-stringified.
+        const all = transcriptSnapshot.entries;
+        const itemBytes = all.map((entry) => Buffer.byteLength(JSON.stringify(entry) ?? "null", "utf8"));
+        const frameBytesFor = (extra: Record<string, unknown>, from: number): number =>
+          Buffer.byteLength(`data: ${JSON.stringify({ channel: "transcript", payload: { ...base, entries: [], ...extra } } satisfies SseEvent)}\n\n`, "utf8")
+          - 2 + arrayBytes(itemBytes, from);
+        let from = 0;
+        if (frameBytesFor({}, 0) > SSE_MAX_FRAME_BYTES) {
+          const truncatedFields = { truncated: true, method: "openAgentTail" };
+          from = all.length;
+          let size = frameBytesFor(truncatedFields, all.length);
+          while (from > 0) {
+            const next = size + itemBytes[from - 1]! + (from < all.length ? 1 : 0);
+            if (next > SSE_MAX_FRAME_BYTES) break;
+            size = next;
+            from -= 1;
+          }
+        }
+        const entries = all.slice(from);
+        const payload = { ...base, entries, ...(from > 0 ? { truncated: true, method: "openAgentTail" } : {}) };
         // The reconnect snapshot deliberately has no ordered namespace. The
         // next live event re-establishes the authoritative per-agent
         // `transcript:${agentId}` cursor; a synthetic `:resync` replica would
@@ -941,28 +1040,23 @@ export class Gateway {
           for (const channel of taskProjectionChannels) {
             const snapshot = taskSnapshots[channel];
             if (snapshot === undefined) continue;
-            const chunked: unknown[][] = [];
-            let chunk: unknown[] = [];
             let needsFixedResync = false;
             const frameFor = (itemsValue: unknown[], truncatedValue = snapshot.truncated === true): string => `data: ${JSON.stringify({ channel, payload: { type: "snapshot", resyncRequired: true, reason: "frame-chunked", agentId: projectionAgentId!, ...(snapshot.parentAgentId === undefined ? {} : { parentAgentId: snapshot.parentAgentId }), channel, epoch: snapshot.epoch, sequence: snapshot.sequence, cursor: { channel, epoch: snapshot.epoch, sequence: snapshot.sequence }, snapshotPart: 0, snapshotParts: 1, truncated: truncatedValue, [channel === "async-tasks" ? "tasks" : "subagents"]: itemsValue } } satisfies SseEvent)}\n\n`;
-            for (const item of snapshot.items) {
-              const candidate = [...chunk, item];
-              if (Buffer.byteLength(frameFor(candidate)) <= SSE_MAX_FRAME_BYTES) { chunk = candidate; continue; }
-              if (chunk.length > 0) { chunked.push(chunk); chunk = []; }
-              if (Buffer.byteLength(frameFor([item])) <= SSE_MAX_FRAME_BYTES) chunk = [item];
-              else {
-                const sourceItem = isRecord(item) ? item : {};
-                const rawId = sourceItem.id ?? sourceItem.taskId;
-                const placeholder = {
-                  id: typeof rawId === "string" && rawId.length > 0 ? rawId.slice(0, 256) : "unknown",
-                  agentId: projectionAgentId!.slice(0, 256),
-                  truncated: true,
-                };
-                if (Buffer.byteLength(frameFor([placeholder])) <= SSE_MAX_FRAME_BYTES) chunk = [placeholder];
-                else needsFixedResync = true;
-              }
-            }
-            if (chunk.length > 0 || (chunked.length === 0 && !needsFixedResync)) chunked.push(chunk);
+            const emptyFrameBytes = Buffer.byteLength(frameFor([]));
+            // An item too large for any frame becomes a small placeholder that
+            // starts its own chunk, as the item itself would have.
+            const items: unknown[] = snapshot.items.map((item) => {
+              if (emptyFrameBytes - 2 + arrayBytes([Buffer.byteLength(JSON.stringify(item) ?? "null", "utf8")]) <= SSE_MAX_FRAME_BYTES) return item;
+              const sourceItem = isRecord(item) ? item : {};
+              const rawId = sourceItem.id ?? sourceItem.taskId;
+              return {
+                id: typeof rawId === "string" && rawId.length > 0 ? rawId.slice(0, 256) : "unknown",
+                agentId: projectionAgentId!.slice(0, 256),
+                truncated: true,
+              };
+            });
+            const chunked = chunkItemsByFrameBytes(items, () => emptyFrameBytes, SSE_MAX_FRAME_BYTES, () => { needsFixedResync = true; });
+            if (chunked.length === 0 && !needsFixedResync) chunked.push([]);
             // The renderer replaces task state on every snapshot frame, so a
             // multi-frame task snapshot would silently discard earlier parts.
             // Keep one bounded recent window and mark it truncated instead.
@@ -999,8 +1093,6 @@ export class Gateway {
           : cursor.sequence < snapshot.sequence
             ? "cursor-stale-or-gap"
             : cursor.sequence > snapshot.sequence ? "cursor-ahead" : "cursor-current";
-      const chunks: unknown[][] = [];
-      let chunk: unknown[] = [];
       let truncated = false;
       const frameFor = (items: unknown[], part: number, parts: number, wasTruncated: boolean): string => {
         const payload = {
@@ -1012,39 +1104,24 @@ export class Gateway {
         };
         return `${part === 0 ? `id: ${projectionChannel}:${snapshot.epoch}:${snapshot.sequence}\n` : ""}data: ${JSON.stringify({ channel: projectionChannel, payload } satisfies SseEvent)}\n\n`;
       };
-      for (const item of snapshot.items) {
-        const candidate = [...chunk, item];
-        if (Buffer.byteLength(frameFor(candidate, 0, 1, truncated)) <= SSE_MAX_FRAME_BYTES) {
-          chunk = candidate;
-          continue;
-        }
-        if (chunk.length > 0) {
-          chunks.push(chunk);
-          chunk = [];
-        }
-        if (Buffer.byteLength(frameFor([item], 0, 1, false)) <= SSE_MAX_FRAME_BYTES) {
-          chunk = [item];
-        } else {
-          truncated = true;
-        }
-      }
-      if (chunk.length > 0 || chunks.length === 0) chunks.push(chunk);
+      const chunks = chunkItemsByFrameBytes(
+        snapshot.items,
+        () => Buffer.byteLength(frameFor([], 0, 1, truncated)),
+        SSE_MAX_FRAME_BYTES,
+        () => { truncated = true; },
+      );
+      if (chunks.length === 0) chunks.push([]);
       const parts = chunks.length;
       for (let part = 0; part < parts; part += 1) snapshotFrames.push(frameFor(chunks[part]!, part, parts, truncated));
     }
     this.writeSse(client, initialFrame);
     for (const frame of snapshotFrames) this.writeSse(client, frame);
 
-    const ping = setInterval(() => {
+    ping = setInterval(() => {
       if (res.destroyed) return;
-      this.writeSse(client, ":ping\n\n", true);
+      this.writeSse(client, ":ping\n\n", undefined, true);
     }, this.sseHeartbeatMs);
     ping.unref();
-
-    res.on("close", () => {
-      clearInterval(ping);
-      this.sseClients.delete(client);
-    });
   }
 
   private async handleRpc(
@@ -1152,8 +1229,8 @@ export class Gateway {
     status: number,
     body: unknown,
   ): void {
-    const payload = JSON.stringify(body);
     if (res.writableEnded) return;
+    const payload = JSON.stringify(body);
     res.statusCode = status;
     res.setHeader("content-type", "application/json; charset=utf-8");
     res.setHeader("cache-control", "no-store");
@@ -1168,7 +1245,7 @@ export class Gateway {
     }
 
     res.setHeader("content-encoding", "gzip");
-    const gz = zlib.createGzip();
+    const gz = zlib.createGzip({ level: GZIP_LEVEL });
     gz.on("error", () => {
       if (!res.headersSent) {
         res.removeHeader("content-encoding");
@@ -1187,20 +1264,4 @@ export function createGateway(
   deps?: GatewayDeps,
 ): Gateway {
   return new Gateway(opts, deps);
-}
-
-/**
- * Cria um listener HTTP cru para os 2 stubs T1 (sobe/derruba o socket na porta
- * fixa), usado por `startServer` em src/main.ts — o gateway em si é montado
- * por `createGateway().createHandler()`.
- */
-export function createNotImplementedHandler(): (
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-) => void {
-  return (_req, res) => {
-    if (res.writableEnded) return;
-    res.writeHead(501, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "not-implemented" }));
-  };
 }

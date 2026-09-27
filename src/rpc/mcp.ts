@@ -7,7 +7,9 @@ import type {
   McpServerConfig,
 } from "../mcp/contracts.js";
 import type { ConfigStore, LocalAgent, OpenBotConfig } from "../config/store.js";
-import { ConfigConflictError, resolveAgentMcpPolicy } from "../config/store.js";
+import { ConfigConflictError, mcpToolRuleServerId, resolveAgentMcpPolicy } from "../config/store.js";
+import { DEFAULT_MCP_LIST_CONCURRENCY } from "../mcp/security.js";
+import { utf8Prefix } from "../shared/utf8.js";
 import type { Gateway, RpcHandler } from "../server/gateway.js";
 import { RpcError } from "../server/gateway.js";
 
@@ -78,11 +80,23 @@ function safeFailure(error: unknown, status: number, message: string): RpcError 
 }
 
 function truncateUtf8(value: string): string {
-  const bytes = Buffer.from(value, "utf8");
-  if (bytes.byteLength <= MAX_DESCRIPTION_BYTES) return value;
-  let end = MAX_DESCRIPTION_BYTES - 3;
-  while ((bytes[end]! & 0xc0) === 0x80) end--;
-  return `${bytes.subarray(0, end).toString("utf8")}...`;
+  if (Buffer.byteLength(value, "utf8") <= MAX_DESCRIPTION_BYTES) return value;
+  return `${utf8Prefix(value, MAX_DESCRIPTION_BYTES - 3)}...`;
+}
+
+/**
+ * A bot policy without any reference to a removed server. An emptied tool
+ * allowlist stays an empty list: it allowed nothing else before, and must not
+ * turn into "allow every tool".
+ */
+function policyWithoutServer(policy: McpAgentPolicy, serverId: string): McpAgentPolicy {
+  const other = (id: string | undefined): boolean => id === undefined || id.toLowerCase() !== serverId.toLowerCase();
+  return {
+    ...policy,
+    ...(policy.serverAllowlist === undefined ? {} : { serverAllowlist: policy.serverAllowlist.filter((id) => other(id)) }),
+    ...(policy.toolAllowlist === undefined ? {} : { toolAllowlist: policy.toolAllowlist.filter((rule) => other(mcpToolRuleServerId(rule))) }),
+    ...(policy.toolDenylist === undefined ? {} : { toolDenylist: policy.toolDenylist.filter((rule) => other(mcpToolRuleServerId(rule))) }),
+  };
 }
 
 function publicServer(config: McpServerConfig, status: McpServerRpcView["status"], extras: Partial<McpServerRpcView> = {}): McpServerRpcView {
@@ -184,16 +198,20 @@ export function registerMcpHandlers(gateway: Gateway, options: McpRpcOptions = {
     const enabled = servers.filter((server) => serverAllowed(policy, server.id));
     if (enabled.length === 0) return servers.map((server) => publicServer(server, "disabled"));
     const probed = new Map<string, { status: "available" | "error"; toolCount?: number }>();
-    for (const server of enabled) {
-      try {
-        const tools = await mcpManager.listProviderToolsForServer(agentId, server.id);
-        probed.set(server.id.toLowerCase(), { status: "available", toolCount: toolsForServer(tools, server.id) });
-      } catch {
-        // Probe each server independently: one dead connector must not turn
-        // healthy servers into false negatives in the chat/settings surface.
-        probed.set(server.id.toLowerCase(), { status: "error" });
+    let next = 0;
+    const probeWorker = async (): Promise<void> => {
+      for (let server = enabled[next++]; server !== undefined; server = enabled[next++]) {
+        try {
+          const tools = await mcpManager.listProviderToolsForServer(agentId, server.id);
+          probed.set(server.id.toLowerCase(), { status: "available", toolCount: toolsForServer(tools, server.id) });
+        } catch {
+          // Probe each server independently: one dead connector must not turn
+          // healthy servers into false negatives in the chat/settings surface.
+          probed.set(server.id.toLowerCase(), { status: "error" });
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(DEFAULT_MCP_LIST_CONCURRENCY, enabled.length) }, probeWorker));
     return servers.map((server) => {
       if (!serverAllowed(policy, server.id)) return publicServer(server, "disabled");
       const result = probed.get(server.id.toLowerCase());
@@ -226,6 +244,8 @@ export function registerMcpHandlers(gateway: Gateway, options: McpRpcOptions = {
     } else {
       for (const agent of current.agents) managerSyncPolicy(mcpManager, current, agent.id);
     }
+    // A user-requested refresh must not wait out the failure backoff.
+    mcpManager?.refreshServers();
     return listMcpServers({ ...(agentId === undefined ? {} : { agentId }) }, ctx);
   };
 
@@ -263,6 +283,9 @@ export function registerMcpHandlers(gateway: Gateway, options: McpRpcOptions = {
     }
     if (!config) throw new RpcError(503, "MCP: configuração indisponível");
     const serverId = requiredString((rawServer as Record<string, unknown>).id, "server.id");
+    if (mcpManager && !mcpManager.stdioCommandRegistrable(rawServer as McpServerConfig)) {
+      throw new RpcError(400, "MCP: comando stdio não permitido; use node (npx, python e uvx não são suportados)");
+    }
     let previousConfigServer: McpServerConfig | undefined;
     let after: OpenBotConfig;
     try {
@@ -319,26 +342,36 @@ export function registerMcpHandlers(gateway: Gateway, options: McpRpcOptions = {
     const id = requiredString(record.id ?? record.serverId, "serverId");
     if (!config) throw new RpcError(503, "MCP: configuração indisponível");
     let removedServer: McpServerConfig | undefined;
+    let previousAgents: LocalAgent[] | undefined;
     let after: OpenBotConfig | undefined;
     try {
       after = config.mutate((current) => {
         const servers = serverList(current as OpenBotConfig);
+        previousAgents = [...current.agents];
         removedServer = servers.find((server) => server.id.toLowerCase() === id.toLowerCase());
         if (removedServer === undefined) throw new RpcError(404, "MCP: servidor não encontrado");
-        return { mcpServers: servers.filter((server) => server.id.toLowerCase() !== id.toLowerCase()) };
+        // Bots that allowed the server lose only that access, in the same revision.
+        return {
+          mcpServers: servers.filter((server) => server.id.toLowerCase() !== id.toLowerCase()),
+          agents: current.agents.map((agent) => agent.integrations?.mcp === undefined
+            ? agent
+            : { ...agent, integrations: { ...agent.integrations, mcp: policyWithoutServer(agent.integrations.mcp, id) } }),
+        };
       });
       mcpManager?.removeServer(id);
     } catch (error) {
       if (error instanceof RpcError) throw error;
-      if (removedServer !== undefined && after !== undefined) {
+      if (removedServer !== undefined && after !== undefined && previousAgents !== undefined) {
         try {
           config.mutate((current) => ({
             mcpServers: [...serverList(current as OpenBotConfig), removedServer!],
+            agents: previousAgents!,
           }), { expectedRevision: after.revision ?? 0 });
         } catch { /* keep newer config; startup/refresh resynchronizes manager */ }
       }
       throw new RpcError(400, "MCP: servidor não pôde ser removido");
     }
+    for (const agent of after.agents) managerSyncPolicy(mcpManager, after, agent.id);
     gateway.publish("mcp-servers", { type: "removed", id });
     return { removed: true, id };
   };

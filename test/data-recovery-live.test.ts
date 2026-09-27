@@ -54,7 +54,7 @@ describe("real local data recovery", () => {
     const record = await staging.stageBytes("agent-a", { filename: "marker.txt", bytes: Buffer.from("attachment-marker") });
     source.close();
     // @ts-expect-error executable local update helper has no declaration file.
-    const { createDataBackup, restoreDataBackup } = await import("../scripts/update.mjs");
+    const { createDataBackup, restoreDataBackup } = await import("../scripts/data-backup.mjs");
     const backup = await createDataBackup({ dataRoot, localDataRoot, backupRoot: join(base, "backups") });
     const destination = join(base, "destination");
     await restoreDataBackup(backup.root, { dataRoot: destination, localDataRoot: join(base, "restored-local") });
@@ -85,7 +85,7 @@ describe("real local data recovery", () => {
     await writeFile(join(localDataRoot, "workspaces", "bot-a", "Documents", "note.txt"), "workspace-original");
 
     // @ts-expect-error executable local update helper has no declaration file.
-    const { createDataBackup, restoreDataBackup, verifyDataBackup } = await import("../scripts/update.mjs");
+    const { createDataBackup, restoreDataBackup, verifyDataBackup } = await import("../scripts/data-backup.mjs");
     const backup = await createDataBackup({ dataRoot, localDataRoot, backupRoot, activeVersion: "1.0.0" });
     await expect(verifyDataBackup(backup.root)).resolves.toMatchObject({ ok: true, root: backup.root });
 
@@ -119,7 +119,7 @@ describe("real local data recovery", () => {
     await mkdir(dataRoot, { recursive: true });
     await writeFile(join(dataRoot, "openbot-config.json"), "original");
     // @ts-expect-error executable local update helper has no declaration file.
-    const { createDataBackup, verifyDataBackup } = await import("../scripts/update.mjs");
+    const { createDataBackup, verifyDataBackup } = await import("../scripts/data-backup.mjs");
     const backup = await createDataBackup({ dataRoot, localDataRoot, backupRoot: join(base, "backups") });
     await writeFile(join(backup.root, "roaming", "openbot-config.json"), "tampered");
 

@@ -8,6 +8,7 @@ import { MemoryReflectionWorker, applyReflectionResult } from "../src/memory/ref
 import { SqliteMemoryStore } from "../src/memory/sqlite-store.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
 import { OPENBOT_SCHEMA_VERSION } from "../src/store/schema.js";
+import { USER_PROFILE_AGENT_ID } from "../src/memory/types.js";
 
 function chat(store: SqliteTranscriptStore, agentId: string, temporary = false): string {
   return store.conversationStore.create(agentId, { temporary }).id;
@@ -197,18 +198,8 @@ describe("memory core", () => {
       text: "entrada posicional",
       trust: "verified_tool",
     }, { kind: "admin" });
-    const aliasResult = memory.upsert({
-      id: "alias-id",
-      agentId: "agent-a",
-      authority: { kind: "admin" },
-      kind: "fact",
-      canonicalKey: "alias-authority",
-      text: "entrada pelo alias",
-      trust: "verified_tool",
-    });
     expect(objectResult).toMatchObject({ agentId: "agent-a", kind: "fact", text: "entrada por objeto" });
     expect(positionalResult).toMatchObject({ agentId: "agent-a", kind: "fact", text: "entrada posicional" });
-    expect(aliasResult).toMatchObject({ agentId: "agent-a", kind: "fact", text: "entrada pelo alias" });
 
     const automaticAuthority = { kind: "automatic", conversationId: "conversation-a", evidenceIds: [] } as const;
     expect(() => memory.upsertMemory({
@@ -574,19 +565,277 @@ describe("memory core", () => {
       model: "grok-4.6",
       fromSequenceId: 0,
       throughSequenceId: 1,
-      entries: [{ kind: "message", id: "e1", role: "user", content: "contexto" }],
+      entries: [
+        { kind: "message", id: "e1", role: "user", content: "contexto" },
+        { kind: "tool-call", id: "t1", name: "file", summary: "read", status: "completed" },
+      ],
     }, { operations: [
       { op: "upsert", memory: { kind: "identity", canonicalKey: "role", text: "sou dev", trust: "verified_tool", sourceEntryIds: ["e1"] } },
       { op: "upsert", memory: { kind: "fact", canonicalKey: "key", text: "apiKey=sk-123456789012345", trust: "verified_tool", sourceEntryIds: ["e1"] } },
-      { op: "upsert", memory: { kind: "fact", canonicalKey: "safe", text: "resultado verificado", trust: "verified_tool", sourceEntryIds: ["e1"] } },
+      { op: "upsert", memory: { kind: "fact", canonicalKey: "safe", text: "resultado verificado", trust: "verified_tool", sourceEntryIds: ["t1"] } },
     ] });
     expect(result.memories).toHaveLength(2);
     expect(result.rejected.map((item) => item.code)).toEqual(["secret"]);
     expect(transcript.memoryStore.listMemories("agent-a")).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kind: "identity", canonicalKey: "role", text: "sou dev", trust: "verified_tool" }),
-      expect.objectContaining({ canonicalKey: "safe", text: "resultado verificado" }),
+      // The model cannot self-assert verification: a user message is an observation.
+      expect.objectContaining({ kind: "identity", canonicalKey: "role", text: "sou dev", trust: "external_observation" }),
+      // A completed tool result backs "verified_tool".
+      expect.objectContaining({ canonicalKey: "safe", text: "resultado verificado", trust: "verified_tool" }),
     ]));
     expect(JSON.stringify(transcript.memoryStore.snapshotAgent("agent-a"))).not.toContain("sk-123456789012345");
     transcript.close();
+  });
+
+  it("rejects only the candidate the store refuses and keeps the rest of the reflection", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:", secretValues: () => ["opaque-known-credential-5c3a1f"] });
+    try {
+      const conversationId = chat(transcript, "agent-a");
+      const result = applyReflectionResult(transcript.memoryStore, {
+        agentId: "agent-a",
+        conversationId,
+        provider: "xai",
+        model: "grok-4.6",
+        fromSequenceId: 0,
+        throughSequenceId: 1,
+        entries: [{ kind: "message", id: "e1", role: "user", content: "contexto" }],
+      }, { operations: [
+        { op: "upsert", memory: { kind: "fact", canonicalKey: "opaque", text: "valor opaque-known-credential-5c3a1f", trust: "verified_tool", sourceEntryIds: ["e1"] } },
+        { op: "upsert", memory: { kind: "fact", canonicalKey: "fine", text: "fato comum", trust: "verified_tool", sourceEntryIds: ["e1"] } },
+      ] });
+      expect(result.rejected).toEqual([expect.objectContaining({ index: 0, code: "policy" })]);
+      expect(transcript.memoryStore.listMemories("agent-a").map((memory) => memory.canonicalKey)).toEqual(["fine"]);
+    } finally {
+      transcript.close();
+    }
+  });
+
+  it("limits explicit-mode memories to the messages that asked to remember", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    try {
+      const conversationId = chat(transcript, "agent-a");
+      const result = applyReflectionResult(transcript.memoryStore, {
+        agentId: "agent-a",
+        conversationId,
+        provider: "xai",
+        model: "grok-4.6",
+        fromSequenceId: 0,
+        throughSequenceId: 2,
+        entries: [
+          { kind: "message", id: "ask", role: "user", content: "lembre que eu gosto de chá verde", fromUser: { name: "Usuário", authId: "local" } },
+          { kind: "message", id: "chat", role: "user", content: "meu carro é azul", fromUser: { name: "Usuário", authId: "local" } },
+        ],
+      }, { operations: [
+        { op: "upsert", memory: { kind: "preference", canonicalKey: "tea", text: "gosta de chá verde", trust: "external_observation", sourceEntryIds: ["ask"] } },
+        { op: "upsert", memory: { kind: "fact", canonicalKey: "car", text: "carro azul", trust: "external_observation", sourceEntryIds: ["chat"] } },
+      ] }, { explicitEvidenceOnly: true });
+      expect(result.rejected).toEqual([expect.objectContaining({ index: 1, code: "explicit_scope" })]);
+      expect(transcript.memoryStore.listMemories("agent-a").map((memory) => memory.canonicalKey)).toEqual(["tea"]);
+    } finally {
+      transcript.close();
+    }
+  });
+});
+
+describe("memory lifecycle and privacy", () => {
+  const ref = (conversationId: string, entryId: string) => ({ conversationId, entryId });
+  const revisionTexts = (transcript: SqliteTranscriptStore, memoryId: string): string[] => (
+    transcript.databaseForSharedStores()
+      .prepare("SELECT snapshot_json FROM memory_revisions WHERE memory_id = ?")
+      .all(memoryId) as Array<{ snapshot_json: string }>
+  ).map((row) => row.snapshot_json);
+
+  it("returns a released job to pending without spending an attempt", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    try {
+      const conversationId = chat(transcript, "agent-a");
+      const job = transcript.memoryStore.enqueueJob({ agentId: "agent-a", conversationId, fromSequenceId: 0, throughSequenceId: 1 });
+      const claimed = transcript.memoryStore.claimJob("agent-a", job.id)!;
+      expect(claimed.status).toBe("running");
+      const released = transcript.memoryStore.releaseJob("agent-a", job.id)!;
+      expect(released.status).toBe("pending");
+      expect(released.attempts).toBe(claimed.attempts - 1);
+    } finally {
+      transcript.close();
+    }
+  });
+
+  it("keeps attempts and backoff when a newer turn widens a retrying job, and moves it to the current provider", () => {
+    let now = 1_000;
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    const store = new SqliteMemoryStore({ path: ":memory:", database: transcript.databaseForSharedStores(), now: () => now });
+    try {
+      const conversationId = chat(transcript, "agent-a");
+      const job = store.enqueueJob({ agentId: "agent-a", conversationId, provider: "xai", model: "grok-old", fromSequenceId: 0, throughSequenceId: 1 });
+      store.claimJob("agent-a", job.id);
+      const retried = store.retryJob("agent-a", job.id, { code: "timeout" })!;
+      expect(retried.status).toBe("retry");
+      now += 10;
+      const same = store.enqueueJob({ agentId: "agent-a", conversationId, provider: "openai", model: "gpt-new", fromSequenceId: 0, throughSequenceId: 1 });
+      expect(same).toMatchObject({ id: job.id, provider: "xai", model: "grok-old" });
+      const widened = store.enqueueJob({ agentId: "agent-a", conversationId, provider: "openai", model: "gpt-new", fromSequenceId: 0, throughSequenceId: 4 });
+      expect(widened).toMatchObject({
+        id: job.id,
+        status: "retry",
+        attempts: retried.attempts,
+        nextAttemptAtMs: retried.nextAttemptAtMs,
+        provider: "openai",
+        model: "gpt-new",
+        throughSequenceId: 4,
+      });
+    } finally {
+      store.close();
+      transcript.close();
+    }
+  });
+
+  it("leaves archived conversations out of cross-chat history search", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    try {
+      const live = chat(transcript, "agent-a");
+      const archived = chat(transcript, "agent-a");
+      transcript.append("agent-a", [{ kind: "message", id: "live", role: "user", content: "cidade laranja viva", timestampMs: 1 }], live);
+      transcript.append("agent-a", [{ kind: "message", id: "old", role: "user", content: "cidade laranja arquivada", timestampMs: 2 }], archived);
+      transcript.conversationStore.activate("agent-a", live);
+      transcript.conversationStore.archive("agent-a", archived);
+      const crossChat = transcript.memoryStore.searchHistory("agent-a", "laranja", { includeMemories: false });
+      expect(crossChat.map((result) => result.conversationId)).toEqual([live]);
+      const scoped = transcript.memoryStore.searchHistory("agent-a", "laranja", { includeMemories: false, conversationId: archived });
+      expect(scoped.map((result) => result.conversationId)).toEqual([archived]);
+    } finally {
+      transcript.close();
+    }
+  });
+
+  it("accepts a user edit of a retained memory whose source conversation was deleted", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    try {
+      const keep = chat(transcript, "agent-a");
+      const gone = chat(transcript, "agent-a");
+      const memory = transcript.memoryStore.upsertMemory("agent-a", {
+        kind: "fact",
+        canonicalKey: "retained-fact",
+        text: "fato retido",
+        trust: "verified_tool",
+        sourceConversationId: gone,
+        sourceEntryIds: [ref(gone, "entry-1")],
+      }, { kind: "admin" });
+      transcript.conversationStore.activate("agent-a", keep);
+      transcript.conversationStore.delete("agent-a", gone, { memoryPolicy: "retain" });
+      const retained = transcript.memoryStore.getMemory("agent-a", memory.id)!;
+      const edited = transcript.memoryStore.upsertMemory("agent-a", {
+        id: retained.id,
+        kind: retained.kind,
+        canonicalKey: retained.canonicalKey,
+        text: "fato retido editado",
+        trust: "user",
+        sourceConversationId: retained.sourceConversationId,
+        sourceEntryIds: retained.sourceEntryIds,
+      }, { kind: "user", expectedRevision: retained.revision });
+      expect(edited.text).toBe("fato retido editado");
+      expect(() => transcript.memoryStore.upsertMemory("agent-a", {
+        kind: "fact",
+        canonicalKey: "new-from-deleted",
+        text: "novo fato",
+        trust: "user",
+        sourceConversationId: gone,
+      }, { kind: "user" })).toThrow(/conversation/);
+    } finally {
+      transcript.close();
+    }
+  });
+
+  it("purges the text of memories derived from a deleted conversation but keeps their forget in force", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    try {
+      const keep = chat(transcript, "agent-a");
+      const gone = chat(transcript, "agent-a");
+      const onlyGone = transcript.memoryStore.upsertMemory("agent-a", {
+        kind: "fact", canonicalKey: "only-gone", text: "texto privado apagado", trust: "verified_tool",
+        sourceConversationId: gone, sourceEntryIds: [ref(gone, "g1")],
+      }, { kind: "admin" });
+      const shared = transcript.memoryStore.upsertMemory("agent-a", {
+        kind: "fact", canonicalKey: "shared", text: "versão antiga privada", trust: "verified_tool",
+        sourceConversationId: keep, sourceEntryIds: [ref(keep, "k1")],
+      }, { kind: "admin" });
+      const sharedNow = transcript.memoryStore.upsertMemory("agent-a", {
+        id: shared.id, kind: "fact", canonicalKey: "shared", text: "versão atual", trust: "verified_tool",
+        sourceConversationId: keep, sourceEntryIds: [ref(keep, "k1"), ref(gone, "g2")],
+      }, { kind: "admin", expectedRevision: shared.revision });
+      transcript.conversationStore.activate("agent-a", keep);
+      transcript.conversationStore.delete("agent-a", gone, { memoryPolicy: "delete-derived" });
+
+      const forgotten = transcript.memoryStore.getMemory("agent-a", onlyGone.id)!;
+      expect(forgotten.status).toBe("forgotten");
+      expect(forgotten.text).not.toContain("privado");
+      expect(revisionTexts(transcript, onlyGone.id).join("\n")).not.toContain("privado");
+
+      const survivor = transcript.memoryStore.getMemory("agent-a", sharedNow.id)!;
+      expect(survivor).toMatchObject({ status: "active", text: "versão atual", sourceConversationId: keep });
+      expect(survivor.sourceEntryIds).toEqual([ref(keep, "k1")]);
+      expect(revisionTexts(transcript, sharedNow.id).join("\n")).not.toContain("antiga privada");
+    } finally {
+      transcript.close();
+    }
+  });
+
+  it("prunes old history without lifting a forget and purges old tombstone text", () => {
+    let now = 1_000;
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    const store = new SqliteMemoryStore({ path: ":memory:", database: transcript.databaseForSharedStores(), now: () => now });
+    try {
+      const conversationId = chat(transcript, "agent-a");
+      const kept = store.upsertMemory("agent-a", {
+        kind: "fact", canonicalKey: "kept", text: "primeira", trust: "verified_tool",
+        sourceConversationId: conversationId, sourceEntryIds: [ref(conversationId, "e1")],
+      }, { kind: "admin" });
+      now += 10;
+      store.upsertMemory("agent-a", {
+        id: kept.id, kind: "fact", canonicalKey: "kept", text: "segunda", trust: "verified_tool",
+        sourceConversationId: conversationId, sourceEntryIds: [ref(conversationId, "e1")],
+      }, { kind: "admin", expectedRevision: kept.revision });
+      const doomed = store.upsertMemory("agent-a", {
+        kind: "fact", canonicalKey: "doomed", text: "esquecido privado", trust: "verified_tool",
+        sourceConversationId: conversationId, sourceEntryIds: [ref(conversationId, "e2")],
+      }, { kind: "admin" });
+      store.forgetMemory("agent-a", doomed.id, { kind: "user" }, "user-delete");
+      const forgottenRevisions = revisionTexts(transcript, doomed.id).length;
+      now += 10;
+
+      expect(store.pruneHistory(now)).toBeGreaterThan(0);
+
+      expect(revisionTexts(transcript, kept.id)).toHaveLength(1);
+      expect(revisionTexts(transcript, doomed.id)).toHaveLength(forgottenRevisions);
+      expect(store.getMemory("agent-a", doomed.id)?.text).not.toContain("privado");
+      expect(revisionTexts(transcript, doomed.id).join("\n")).not.toContain("privado");
+      expect(() => store.upsertMemory("agent-a", {
+        kind: "fact", canonicalKey: "recreated", text: "recriado", trust: "verified_tool",
+        sourceConversationId: conversationId, sourceEntryIds: [ref(conversationId, "e2")],
+      }, { kind: "automatic", conversationId, evidenceIds: ["e2"] })).toThrow(/esquecida/);
+    } finally {
+      store.close();
+      transcript.close();
+    }
+  });
+
+  it("forgets and purges shared-profile memories sourced only from a deleted bot's conversations", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    try {
+      const conversationId = chat(transcript, "agent-a");
+      const profile = transcript.memoryStore.upsertMemory(USER_PROFILE_AGENT_ID, {
+        kind: "preference", canonicalKey: "profile-from-a", text: "prefere respostas privadas", trust: "verified_tool",
+        sourceConversationId: conversationId, sourceEntryIds: [ref(conversationId, "p1")],
+      }, { kind: "admin" });
+      const unrelated = transcript.memoryStore.upsertMemory(USER_PROFILE_AGENT_ID, {
+        kind: "preference", canonicalKey: "profile-manual", text: "idioma português", trust: "user",
+        sourceConversationId: null,
+      }, { kind: "admin" });
+      transcript.clear("agent-a");
+      const scrubbed = transcript.memoryStore.getMemory(USER_PROFILE_AGENT_ID, profile.id)!;
+      expect(scrubbed.status).toBe("forgotten");
+      expect(scrubbed.text).not.toContain("privadas");
+      expect(transcript.memoryStore.getMemory(USER_PROFILE_AGENT_ID, unrelated.id)).toMatchObject({ status: "active", text: "idioma português" });
+    } finally {
+      transcript.close();
+    }
   });
 });

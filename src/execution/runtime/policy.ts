@@ -20,7 +20,7 @@ export function parseRuntimeCapability(value: unknown): RuntimeCapability {
 }
 
 export function runtimeCapabilityForRequest(request: ExecutionRequest): RuntimeCapability {
-  if (request.operation !== "process.run") throw new Error("execution operation does not require the WSL runtime");
+  if (request.operation !== "process.run") throw new Error("execution operation does not require the process runtime");
   return parseRuntimeCapability({ kind: "process.run", networkProfile: request.networkProfile });
 }
 

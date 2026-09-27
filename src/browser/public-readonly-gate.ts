@@ -93,7 +93,12 @@ export function assertPublicReadonlyCommand(command: BrowserCommand): BrowserCom
   }
 }
 
-/** Classify external reachability failures without turning them into GREEN. */
+/**
+ * Classify external reachability failures without turning them into GREEN.
+ * Proxy and tunnel failures are RED: OpenBot's own egress proxy produces them
+ * (a policy denial arrives as ERR_TUNNEL_CONNECTION_FAILED), so they signal a
+ * product regression rather than a missing network.
+ */
 export function classifyPublicReadonlyFailure(error: unknown): PublicReadonlyStatus {
   const code = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
     ? error.code
@@ -104,7 +109,7 @@ export function classifyPublicReadonlyFailure(error: unknown): PublicReadonlySta
     code === "dns_timeout" ||
     code === "no-addresses" ||
     code === "upstream_timeout" ||
-    /dns resolution timed out|target has no dns answers|upstream connection failed|network is unreachable|err_name_not_resolved|err_internet_disconnected|err_network_changed|err_connection_|err_timed_out|err_tunnel_connection_failed|err_proxy_connection_failed|err_ssl_|err_cert_|certificate|tls/iu.test(haystack)
+    /dns resolution timed out|target has no dns answers|upstream connection failed|network is unreachable|err_name_not_resolved|err_internet_disconnected|err_network_changed|err_connection_|err_timed_out|err_ssl_|err_cert_|certificate|tls/iu.test(haystack)
   ) {
     return "BLOCKED_ENV";
   }

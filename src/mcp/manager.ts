@@ -12,7 +12,6 @@ import {
 } from "@modelcontextprotocol/client";
 import { Agent, fetch as undiciFetch } from "undici";
 import net from "node:net";
-import path from "node:path";
 import { DEFAULT_INHERITED_ENV_VARS, StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import type { ProviderTool } from "../providers/router.js";
 import {
@@ -57,6 +56,7 @@ import {
   type ValidatedStdioConfig,
   validateMcpServerConfig,
   validateMcpToolMetadata,
+  stdioCommandRegistrable,
   validateStdioConfig,
   type StdioSecurityOptions,
 } from "./security.js";
@@ -190,6 +190,9 @@ interface CachedSession {
   readonly controller: AbortController;
   pending: boolean;
   waiters: number;
+  /** Requests currently running on the connected session. */
+  inUse: number;
+  lastUsedAt: number;
   closing?: Promise<void>;
 }
 
@@ -207,7 +210,25 @@ interface CachedToolList {
   failureKind?: string;
 }
 
+/** A listed tool that passed metadata validation, with its provider-facing name. */
+interface ValidatedTool {
+  readonly tool: Tool;
+  readonly providerName: string;
+}
+
+/** Validation results of one listing, computed once and shared by every cache hit. */
+interface ListingIndex {
+  readonly serverId: string;
+  /** First valid definition per provider name, in listing order. */
+  readonly valid: readonly ValidatedTool[];
+  /** First definition per tool name; null when that definition is invalid. */
+  readonly byName: ReadonlyMap<string, ValidatedTool | null>;
+}
+
 const MCP_NEGATIVE_CACHE_BACKOFF_MS = [5_000, 30_000, 120_000] as const;
+/** Agent-scoped sessions (one process per bot and server) are closed after this idle period. */
+const MCP_AGENT_SESSION_IDLE_MS = 10 * 60_000;
+const MCP_IDLE_SWEEP_INTERVAL_MS = 60_000;
 const MAX_MCP_TOOL_PAGES = MAX_MCP_TOOLS;
 const negativeCacheKind = (error: unknown): string => error instanceof McpTimeoutError
   ? "timeout"
@@ -241,10 +262,7 @@ const remainingBudget = (deadlineAt: number): number => {
  * when an `env` object is supplied.  Explicitly shadow every inherited key,
  * then add only the values required by the configured server.
  */
-const minimalStdioEnvironment = (
-  supplied: Record<string, string> | undefined,
-  command: string,
-): Record<string, string> => {
+const minimalStdioEnvironment = (supplied: Record<string, string> | undefined): Record<string, string> => {
   const env: Record<string, string> = {};
   for (const key of DEFAULT_INHERITED_ENV_VARS) env[key] = "";
   // Windows' child-process loader needs these system locations to start a
@@ -255,17 +273,8 @@ const minimalStdioEnvironment = (
     if (value !== undefined) env[key] = value;
   }
   if (supplied !== undefined) Object.assign(env, supplied);
-
-  // Named executables need PATH for process resolution.  Restrict it to the
-  // current Node installation when the approved command is Node; absolute
-  // commands do not need PATH at all.  Other named commands should be
-  // configured by absolute path so no broad host PATH is inherited.
-  const commandName = path.basename(command).toLowerCase();
-  if (!/^[A-Za-z]:[\\/]/u.test(command) && !command.startsWith("/") &&
-    new Set(["node", "node.exe", path.basename(process.execPath).toLowerCase()]).has(commandName)) {
-    env.PATH = path.dirname(process.execPath);
-    if (process.platform === "win32") env.Path = env.PATH;
-  }
+  // Launch commands are always absolute (validateStdioConfig), so no PATH is
+  // inherited for process resolution.
   return env;
 };
 
@@ -353,6 +362,10 @@ export class McpManager {
   private readonly closeTimeoutMs: number;
   private readonly toolCacheTtlMs: number;
   private readonly maxListConcurrency: number;
+  /** A cached listing is shared by every hit; measure and validate it once. */
+  private readonly listingBytes = new WeakMap<ListToolsResult, number>();
+  private readonly listingIndexes = new WeakMap<ListToolsResult, ListingIndex>();
+  private idleSweep?: ReturnType<typeof setInterval>;
   private closed = false;
   private closePromise?: Promise<void>;
 
@@ -395,6 +408,15 @@ export class McpManager {
       typeof arg !== "string" || arg.includes("\0") || Buffer.byteLength(arg, "utf8") > MAX_MCP_ARG_BYTES)) {
       throw new McpValidationError("MCP stdio args are invalid");
     }
+  }
+
+  /**
+   * Whether a new or edited server's launch command can ever run under this
+   * manager's allowlist. Loading an existing config does not use it, so a
+   * previously saved server never blocks startup; it fails at use instead.
+   */
+  stdioCommandRegistrable(config: McpServerConfig): boolean {
+    return config.transport !== "stdio" || stdioCommandRegistrable(config.command, this.stdioSecurity.allowedCommands ?? []);
   }
 
   setServer(config: McpServerConfig): void {
@@ -455,12 +477,8 @@ export class McpManager {
     }
     this.policies.delete(agentId);
     const key = agentKey(agentId);
-    for (const [cacheKey, entry] of this.sessions) {
-      if (entry.agentKey !== key) continue;
-      this.sessions.delete(cacheKey);
-      entry.controller.abort(new McpAbortedError());
-      entry.closing ??= entry.promise.then((session) => this.closeSession(session));
-      void entry.closing.catch(() => {});
+    for (const entry of [...this.sessions.values()]) {
+      if (entry.agentKey === key) this.evictSession(entry);
     }
     for (const [cacheKey, entry] of this.toolLists) {
       if (entry.agentKey !== key) continue;
@@ -478,12 +496,36 @@ export class McpManager {
   }
 
   private invalidateServerSessions(key: string): void {
-    for (const [cacheKey, entry] of this.sessions) {
-      if (entry.serverKey !== key) continue;
-      this.sessions.delete(cacheKey);
-      entry.controller.abort(new McpAbortedError());
-      entry.closing ??= entry.promise.then((session) => this.closeSession(session));
-      void entry.closing.catch(() => {});
+    for (const entry of [...this.sessions.values()]) {
+      if (entry.serverKey === key) this.evictSession(entry);
+    }
+  }
+
+  /** Remove a cached session and close it in the background once it has connected. */
+  private evictSession(entry: CachedSession): void {
+    if (this.sessions.get(entry.cacheKey) === entry) this.sessions.delete(entry.cacheKey);
+    entry.controller.abort(new McpAbortedError());
+    entry.closing ??= entry.promise.then((session) => this.closeSession(session));
+    void entry.closing.catch(() => {});
+  }
+
+  /**
+   * Forget settled tool listings, including their failure backoff, so the next
+   * listing probes the server again. In-flight listings and live sessions are
+   * kept: a refresh must not fail the callers already waiting on them.
+   */
+  refreshServers(serverId?: string): void {
+    const key = serverId === undefined ? undefined : serverKey(serverId);
+    for (const [cacheKey, entry] of this.toolLists) {
+      if ((key === undefined || entry.serverKey === key) && !entry.pending) this.toolLists.delete(cacheKey);
+    }
+  }
+
+  /** Close agent-scoped sessions that have been idle for a while; shared sessions stay open. */
+  private sweepIdleSessions(now = Date.now()): void {
+    for (const entry of [...this.sessions.values()]) {
+      if (entry.agentKey === undefined || entry.pending || entry.waiters > 0 || entry.inUse > 0) continue;
+      if (now - entry.lastUsedAt >= MCP_AGENT_SESSION_IDLE_MS) this.evictSession(entry);
     }
   }
 
@@ -548,7 +590,7 @@ export class McpManager {
     return resolveSecretRefs(values, this.secretResolver);
   }
 
-  private async connect(config: McpServerConfig, signal: AbortSignal): Promise<McpClientSession> {
+  private async connect(config: McpServerConfig, signal: AbortSignal, onClosed: () => void): Promise<McpClientSession> {
     let session: McpClientSession | undefined;
     let closedSession = false;
     try {
@@ -559,7 +601,7 @@ export class McpManager {
         ...(context.env === undefined ? {} : { env: context.env }),
       };
       session = this.connector === undefined
-        ? await this.connectWithSdk(config, context)
+        ? await this.connectWithSdk(config, context, onClosed)
         : await this.connector(structuredClone(config), connectorContext);
       if (!session || typeof session.listTools !== "function" || typeof session.callTool !== "function" || typeof session.close !== "function") {
         throw new McpValidationError("MCP connector returned an invalid session");
@@ -593,8 +635,20 @@ export class McpManager {
       controller,
       pending: true,
       waiters: 0,
+      inUse: 0,
+      lastUsedAt: Date.now(),
     };
-    entry.promise = this.connect(config, controller.signal).then(
+    // A session whose transport closes on its own (crashed process, dropped
+    // stream) is evicted at once, so the next request reconnects instead of
+    // failing on the dead session first.
+    const onClosed = (): void => {
+      if (this.sessions.get(key) === entry) this.evictSession(entry);
+    };
+    if (entry.agentKey !== undefined && this.idleSweep === undefined) {
+      this.idleSweep = setInterval(() => this.sweepIdleSessions(), MCP_IDLE_SWEEP_INTERVAL_MS);
+      this.idleSweep.unref?.();
+    }
+    entry.promise = this.connect(config, controller.signal, onClosed).then(
       (session) => {
         entry.pending = false;
         return session;
@@ -691,7 +745,7 @@ export class McpManager {
   private async fetchServerTools(config: McpServerConfig, agentId: string, sourceSignal?: AbortSignal): Promise<ListToolsResult> {
     const timeoutMs = config.timeoutMs ?? this.defaultTimeoutMs;
     const deadlineAt = Date.now() + timeoutMs;
-    let entry: CachedSession | undefined;
+    let entry: CachedSession;
     let session: McpClientSession;
     try {
       const acquired = await this.runWithDeadline(
@@ -710,37 +764,43 @@ export class McpManager {
     let cursor: string | undefined;
     let pageCount = 0;
     let listingBytes = 0;
-    while (true) {
-      if (sourceSignal !== undefined) throwIfAborted(sourceSignal);
-      if (pageCount >= MAX_MCP_TOOL_PAGES) throw new McpValidationError("MCP tool page count exceeds the limit");
-      const pageTimeoutMs = remainingBudget(deadlineAt);
-      let listed: ListToolsResult;
-      try {
-        listed = await this.runWithDeadline((signal) => session.listTools(
-          cursor === undefined ? undefined : { cursor },
-          { signal, timeout: pageTimeoutMs, maxTotalTimeout: pageTimeoutMs },
-        ), pageTimeoutMs, sourceSignal);
-      } catch (error) {
-        if (entry !== undefined && isSessionTransportFailure(error)) await this.invalidateSession(entry, session);
-        throw sanitizeExternalError(error, "MCP tool listing failed");
-      }
-      pageCount += 1;
-      if (!Array.isArray(listed.tools)) throw new McpValidationError("MCP tool list is invalid");
-      if (listed.tools.length > MAX_MCP_TOOLS - tools.length) throw new McpValidationError("MCP tool count exceeds the limit");
-      const pageBytes = jsonBytes(listed);
-      if (pageBytes > maxResultBytes || listingBytes > maxResultBytes - pageBytes) {
-        throw new McpResultLimitError("MCP tool list exceeds the byte limit");
-      }
-      listingBytes += pageBytes;
-      tools.push(...listed.tools);
-      if (jsonBytes({ tools }) > maxResultBytes) throw new McpResultLimitError("MCP tool list exceeds the byte limit");
+    entry.inUse += 1;
+    try {
+      while (true) {
+        if (sourceSignal !== undefined) throwIfAborted(sourceSignal);
+        if (pageCount >= MAX_MCP_TOOL_PAGES) throw new McpValidationError("MCP tool page count exceeds the limit");
+        const pageTimeoutMs = remainingBudget(deadlineAt);
+        let listed: ListToolsResult;
+        try {
+          listed = await this.runWithDeadline((signal) => session.listTools(
+            cursor === undefined ? undefined : { cursor },
+            { signal, timeout: pageTimeoutMs, maxTotalTimeout: pageTimeoutMs },
+          ), pageTimeoutMs, sourceSignal);
+        } catch (error) {
+          if (isSessionTransportFailure(error)) await this.invalidateSession(entry, session);
+          throw sanitizeExternalError(error, "MCP tool listing failed");
+        }
+        pageCount += 1;
+        if (!Array.isArray(listed.tools)) throw new McpValidationError("MCP tool list is invalid");
+        if (listed.tools.length > MAX_MCP_TOOLS - tools.length) throw new McpValidationError("MCP tool count exceeds the limit");
+        const pageBytes = jsonBytes(listed);
+        if (pageBytes > maxResultBytes || listingBytes > maxResultBytes - pageBytes) {
+          throw new McpResultLimitError("MCP tool list exceeds the byte limit");
+        }
+        listingBytes += pageBytes;
+        tools.push(...listed.tools);
+        if (jsonBytes({ tools }) > maxResultBytes) throw new McpResultLimitError("MCP tool list exceeds the byte limit");
 
-      const nextCursor = listed.nextCursor;
-      if (nextCursor === undefined) return { tools };
-      if (typeof nextCursor !== "string") throw new McpValidationError("MCP pagination cursor is invalid");
-      if (seenCursors.has(nextCursor)) throw new McpValidationError("MCP pagination cursor repeated");
-      seenCursors.add(nextCursor);
-      cursor = nextCursor;
+        const nextCursor = listed.nextCursor;
+        if (nextCursor === undefined) return { tools };
+        if (typeof nextCursor !== "string") throw new McpValidationError("MCP pagination cursor is invalid");
+        if (seenCursors.has(nextCursor)) throw new McpValidationError("MCP pagination cursor repeated");
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
+      }
+    } finally {
+      entry.inUse -= 1;
+      entry.lastUsedAt = Date.now();
     }
   }
 
@@ -808,7 +868,12 @@ export class McpManager {
     try {
       const timeoutMs = deadlineAt === undefined ? limits.timeoutMs : remainingBudget(deadlineAt);
       const listed = await this.runWithDeadline(() => cache.promise, timeoutMs, limits.signal);
-      if (jsonBytes(listed) > limits.maxResultBytes) throw new McpResultLimitError("MCP tool list exceeds the byte limit");
+      let bytes = this.listingBytes.get(listed);
+      if (bytes === undefined) {
+        bytes = jsonBytes(listed);
+        this.listingBytes.set(listed, bytes);
+      }
+      if (bytes > limits.maxResultBytes) throw new McpResultLimitError("MCP tool list exceeds the byte limit");
       return listed;
     } catch (error) {
       throw sanitizeExternalError(error, "MCP tool listing failed");
@@ -828,26 +893,43 @@ export class McpManager {
     if (!this.serverAllowed(policy, config.id)) return [];
     const listed = await this.listServerTools(config, agentId, options, deadlineAt);
     const output: McpProviderTool[] = [];
-    const seen = new Set<string>();
-    for (const tool of listed.tools) {
+    for (const { tool, providerName } of this.listingIndex(config, listed).valid) {
       if (output.length >= MAX_MCP_TOOLS) break;
-      try {
-        validateMcpToolMetadata(tool);
-        const providerName = toMcpProviderToolName(config.id, tool.name);
-        if (!this.toolAllowed(policy, config.id, tool.name)) continue;
-        if (seen.has(providerName)) continue;
-        seen.add(providerName);
-        output.push({
-          type: "function",
-          function: { name: providerName, ...(tool.description === undefined ? {} : { description: tool.description }), parameters: toolParameters(tool) },
-          serverId: config.id,
-          toolName: tool.name,
-        });
-      } catch {
-        // Tool names are untrusted server data; invalid names are omitted.
-      }
+      if (!this.toolAllowed(policy, config.id, tool.name)) continue;
+      output.push({
+        type: "function",
+        function: { name: providerName, ...(tool.description === undefined ? {} : { description: tool.description }), parameters: toolParameters(tool) },
+        serverId: config.id,
+        toolName: tool.name,
+      });
     }
     return output;
+  }
+
+  private listingIndex(config: McpServerConfig, listed: ListToolsResult): ListingIndex {
+    const cached = this.listingIndexes.get(listed);
+    if (cached !== undefined && cached.serverId === config.id) return cached;
+    const valid: ValidatedTool[] = [];
+    const byName = new Map<string, ValidatedTool | null>();
+    const seen = new Set<string>();
+    for (const tool of listed.tools) {
+      let validated: ValidatedTool | null = null;
+      try {
+        // Tool names are untrusted server data; invalid definitions are omitted.
+        validateMcpToolMetadata(tool);
+        validated = { tool, providerName: toMcpProviderToolName(config.id, tool.name) };
+      } catch {
+        validated = null;
+      }
+      if (typeof tool.name === "string" && !byName.has(tool.name)) byName.set(tool.name, validated);
+      if (validated !== null && !seen.has(validated.providerName)) {
+        seen.add(validated.providerName);
+        valid.push(validated);
+      }
+    }
+    const index: ListingIndex = { serverId: config.id, valid, byName };
+    this.listingIndexes.set(listed, index);
+    return index;
   }
 
   async listProviderToolsForServer(agentId: string, serverId: string, options?: McpListOptions): Promise<McpProviderTool[]> {
@@ -925,9 +1007,10 @@ export class McpManager {
     const limits = asCallOptions(options, config.timeoutMs ?? this.defaultTimeoutMs, config.maxResultBytes ?? this.defaultMaxResultBytes);
     const deadlineAt = Date.now() + limits.timeoutMs;
     const listed = await this.listServerTools(config, agentId, options, deadlineAt);
-    const definition = listed.tools.find((tool) => tool.name === toolName);
-    if (definition === undefined) throw new McpValidationError(`MCP tool ${providerName} is not available`);
-    try { validateMcpToolMetadata(definition); } catch { throw new McpValidationError("MCP tool definition is invalid"); }
+    const indexed = this.listingIndex(config, listed).byName.get(toolName);
+    if (indexed === undefined) throw new McpValidationError(`MCP tool ${providerName} is not available`);
+    if (indexed === null) throw new McpValidationError("MCP tool definition is invalid");
+    const definition = indexed.tool;
     let entry!: CachedSession;
     let session: McpClientSession;
     try {
@@ -946,17 +1029,23 @@ export class McpManager {
       toolDefinition: definition,
     };
     let result: CallToolResult;
+    entry.inUse += 1;
     try {
       result = await this.runWithDeadline((signal) => session.callTool({ name: toolName, arguments: arguments_ }, { ...callOptions, signal }), callTimeoutMs, limits.signal);
     } catch (error) {
-      // Timeouts also invalidate: a session whose SDK ignored the abort may
-      // still hold the orphaned call; the next caller reconnects instead of
-      // reusing the wedged transport. invalidateSession never evicts a newer
-      // entry installed concurrently.
-      if (isSessionTransportFailure(error) || error instanceof McpTimeoutError || limits.signal?.aborted === true) {
+      // A broken transport is always replaced. A timeout or caller abort
+      // cancels only this request (the protocol sends a cancellation): a
+      // session shared with other bots stays open for their calls, while a
+      // bot's own session is reconnected in case the server ignored the
+      // cancellation. invalidateSession never evicts a newer entry.
+      const cancelled = error instanceof McpTimeoutError || limits.signal?.aborted === true;
+      if (isSessionTransportFailure(error) || (cancelled && config.sessionScope === "agent")) {
         await this.invalidateSession(entry, session);
       }
       throw sanitizeExternalError(error, "MCP tool call failed");
+    } finally {
+      entry.inUse -= 1;
+      entry.lastUsedAt = Date.now();
     }
     if (jsonBytes(result) > limits.maxResultBytes) throw new McpResultLimitError();
     return result;
@@ -966,8 +1055,16 @@ export class McpManager {
     return this.callProviderTool(agentId, providerName, args, options);
   }
 
-  private async connectWithSdk(config: McpServerConfig, context: ResolvedConnectorContext): Promise<McpClientSession> {
+  private async connectWithSdk(config: McpServerConfig, context: ResolvedConnectorContext, onClosed: () => void): Promise<McpClientSession> {
     const client = new Client({ name: "OpenBot", version: "0.1.0" });
+    // Set once the handshake succeeded; a close before that is a failed connect.
+    let connected = false;
+    let releaseResources: () => Promise<void> = async () => {};
+    client.onclose = () => {
+      if (!connected) return;
+      void releaseResources();
+      onClosed();
+    };
     if (config.transport === "http") {
       const validated = await resolveAndValidateHttpEndpoint(config.url, this.dnsLookup);
       const dispatcher = pinnedHttpDispatcher(validated.url, validated.addresses);
@@ -1008,6 +1105,8 @@ export class McpManager {
       } finally {
         context.signal?.removeEventListener("abort", abortHandshake);
       }
+      releaseResources = closeResources;
+      connected = true;
       return {
         listTools: client.listTools.bind(client),
         callTool: client.callTool.bind(client),
@@ -1033,7 +1132,7 @@ export class McpManager {
         command: staged.command,
         args: launch.args,
         cwd: launch.cwd,
-        env: minimalStdioEnvironment(context.env, launch.command),
+        env: minimalStdioEnvironment(context.env),
         stderr: "ignore",
         maxBufferSize: config.maxResultBytes ?? this.defaultMaxResultBytes,
       });
@@ -1067,6 +1166,9 @@ export class McpManager {
     } finally {
       context.signal?.removeEventListener("abort", abortHandshake);
     }
+    // An exited child also releases its staged executable snapshot.
+    releaseResources = closeTransport;
+    connected = true;
     return {
       listTools: client.listTools.bind(client),
       callTool: client.callTool.bind(client),
@@ -1090,6 +1192,8 @@ export class McpManager {
   }
 
   private async closeInternal(): Promise<void> {
+    if (this.idleSweep !== undefined) clearInterval(this.idleSweep);
+    this.idleSweep = undefined;
     const pending = [...this.sessions.values()];
     this.sessions.clear();
     for (const cached of pending) cached.controller.abort(new McpAbortedError());

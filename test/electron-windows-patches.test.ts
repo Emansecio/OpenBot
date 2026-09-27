@@ -3,14 +3,15 @@ import { resolve, win32 } from "node:path";
 import { runInNewContext } from "node:vm";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
+// @ts-expect-error executable launcher helpers have no declaration file.
+import { electronArguments, electronEnvironment } from "../scripts/launch.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const main = readFileSync(resolve(root, "client/extracted/dist/electron-main/main.cjs"), "utf8");
 const settings = readFileSync(resolve(root, "client/extracted/dist/renderer/assets/openbot-local-settings.js"), "utf8");
 const preload = readFileSync(resolve(root, "client/extracted/dist/electron-preload/preload.cjs"), "utf8");
 const launcher = readFileSync(resolve(root, "scripts/openbot-desktop.cmd"), "utf8");
-const gatewayHealth = readFileSync(resolve(root, "scripts/gateway-health.mjs"), "utf8");
-const gatewayStarter = readFileSync(resolve(root, "scripts/start-gateway.mjs"), "utf8");
+const launchSource = readFileSync(resolve(root, "scripts/launch.mjs"), "utf8");
 const hiddenLauncher = readFileSync(resolve(root, "scripts/openbot-desktop.vbs"), "utf8");
 const shortcutSmoke = readFileSync(resolve(root, "scripts/smoke-shortcut.ps1"), "utf8");
 const cleanProfile = readFileSync(resolve(root, "scripts/verify-clean-profile.mjs"), "utf8");
@@ -28,7 +29,7 @@ function between(source: string, start: string, end: string): string {
 
 
 describe("Electron/Windows local integration patches", () => {
-  it.each([false, true])("sets the window and taskbar identity before loading main (installed=%s)", installed => {
+  it.each([false, true])("sets the window and taskbar identity before loading main (retired install variables=%s)", installed => {
     const bootstrap = readFileSync(resolve(root, "scripts/openbot-electron.cjs"), "utf8");
     const events: string[] = [];
     const windowImage = { isEmpty: () => false };
@@ -55,15 +56,16 @@ describe("Electron/Windows local integration patches", () => {
       },
     });
     expect(events).toEqual(["OpenBot", "OpenBot.Desktop", "main"]);
-    const expectedIcon = installed ? "C:\\Installed\\versions\\v1\\assets\\openbot.ico" : "C:\\OpenBot Test\\assets\\openbot.ico";
+    const expectedIcon = "C:\\OpenBot Test\\assets\\openbot.ico";
     expect(icon).toBe(windowImage);
     expect(loadedImages).toEqual([expectedIcon.replace(/\.ico$/, ".png"), expectedIcon]);
     expect(details).toEqual({
       appId: "OpenBot.Desktop", appIconPath: expectedIcon, appIconIndex: 0,
-      relaunchCommand: installed ? '"C:\\Windows\\System32\\wscript.exe" "C:\\Installed\\OpenBot.vbs"' : '"C:\\Windows\\System32\\wscript.exe" "C:\\OpenBot Test\\scripts\\openbot-desktop.vbs"',
+      relaunchCommand: '"C:\\Windows\\System32\\wscript.exe" "C:\\OpenBot Test\\scripts\\openbot-desktop.vbs"',
       relaunchDisplayName: "OpenBot",
     });
-    expect(launcher).toContain('"%CD%\\scripts\\openbot-electron.cjs"');
+    expect(electronArguments({ root: "C:\\OpenBot Test", userData: "C:\\profile", logsRoot: "C:\\logs" }).at(-1))
+      .toBe(win32.join("C:\\OpenBot Test", "scripts", "openbot-electron.cjs"));
   });
 
   it.each([".ico", ".png"])("refuses missing %s branding instead of using Electron defaults", extension => {
@@ -84,10 +86,10 @@ describe("Electron/Windows local integration patches", () => {
     expect(mainLoaded).toBe(false);
   });
 
-  it("confirms Start-menu taskbar registration before starting the gateway", () => {
-    expect(launcher).toContain('setup-desktop-shortcut.mjs" --taskbar-only');
-    expect(launcher.indexOf('setup-desktop-shortcut.mjs" --taskbar-only')).toBeLessThan(launcher.indexOf('set "GATEWAY_STARTED=0"'));
-    expect(launcher).toMatch(/--taskbar-only\r?\nif errorlevel 1 \([\s\S]*?exit \/b 1/);
+  it("confirms the Start-menu taskbar registration as part of every launch", () => {
+    // Behaviour (failure stops the launch and its gateway) is covered in desktop-launcher.test.ts.
+    expect(launchSource).toContain("ensureTaskbarShortcutCached({ root, electronPath })");
+    expect(readFileSync(resolve(root, "scripts/setup-desktop-shortcut.mjs"), "utf8")).toContain('args["taskbar-only"] ? ensureTaskbarShortcut()');
   });
 
   it("routes maintained desktop verification through the branded production entrypoint", () => {
@@ -100,8 +102,6 @@ describe("Electron/Windows local integration patches", () => {
       expect(source, script).toMatch(/(?:const electronMain|\$electronMain)[^\r\n]*openbot-electron\.cjs/);
       if (script === "e2e-desktop-run.ps1") expect(source).toContain("Stop-OwnTree -ProcessId $electronProcess.Id -ExpectedCommandPart $electronMain -ExpectedRoot $userData");
     }
-    expect(readFileSync(resolve(root, "scripts/visual-electron.cmd"), "utf8"))
-      .toContain('scripts\\openbot-electron.cjs');
     expect(packageJson.scripts["desktop:shortcut"]).toBe("node scripts/setup-desktop-shortcut.mjs");
     expect(packageJson.scripts["verify:desktop-identity"]).toContain("test/desktop-identity.test.ts");
   });
@@ -271,8 +271,10 @@ describe("Electron/Windows local integration patches", () => {
   it("keeps unpackaged HTTP development controls explicit and out of local mode", () => {
     const devWiring = between(main, "function registerDevWiring(deps)", "// src/electron-main/downloads/download-path.ts");
     expect(devWiring).toMatch(/if \(!deps\.isPackaged && process\.env\[SAND_DEV_CAPABILITY_ENV\] === "1" && process\.env\.OPENBOT_LOCAL_GATEWAY !== "1"\) \{\r?\n    startDevControlServer\(/u);
-    expect(launcher).toContain('set "SAND_DEV_CAPABILITY="');
-    expect(launcher).toContain('set "SAND_DEV_CONTROL_PORT="');
+    const desktopEnv = electronEnvironment({ SAND_DEV_CAPABILITY: "1", SAND_DEV_CONTROL_PORT: "62150" }, { root: "C:\\Repo", url: "http://127.0.0.1:1340", userData: "C:\\u" });
+    expect(desktopEnv).not.toHaveProperty("SAND_DEV_CAPABILITY");
+    expect(desktopEnv).not.toHaveProperty("SAND_DEV_CONTROL_PORT");
+    expect(desktopEnv.OPENBOT_LOCAL_GATEWAY).toBe("1");
     expect(cleanProfile).toContain("const devControlPort = await freePort(0)");
     expect(cleanProfile).toContain("SAND_DEV_CONTROL_PORT: String(devControlPort)");
     expect(cleanProfile).toContain("await assertDevControlPortFree(electron.devControlPort)");
@@ -364,56 +366,25 @@ describe("Electron/Windows local integration patches", () => {
     expect(preload).toContain('invoke("sand:local-profile-set", profile)');
   });
 
-  it("uses health readiness and owns only the gateway process it starts", () => {
-    expect(launcher).toContain("/health");
-    expect(launcher).toContain('set "ELECTRON_RUN_AS_NODE="');
-    expect(launcher).toContain('set "GATEWAY_STARTED=0"');
-    expect(launcher).toContain('set "GATEWAY_STARTED=1"');
-    expect(launcher).toContain('set "GATEWAY_ADOPTED=1"');
-    expect(gatewayStarter).toContain("waitForReady: true");
-    expect(gatewayStarter).toContain("gatewayEvidenceMatches(evidence, pid, installRoot)");
-    expect(launcher).toContain('start-gateway.mjs"');
-    expect(gatewayHealth).toContain("health.pid === expectedPid");
-    expect(gatewayHealth).toContain("queryProcessEvidence(health.pid)");
-    expect(gatewayHealth).toContain("expectedGatewayScript.toLowerCase()");
-    expect(gatewayHealth).toContain('AbortSignal.timeout(1_000)');
-    expect(gatewayStarter).toContain("OPENBOT_LOG_DIR: logs");
-    expect(gatewayStarter).toContain('stdio: "ignore"');
-    expect(gatewayStarter).toContain("detached: true");
-    expect(gatewayStarter).toContain("gateway.unref()");
+  it("launches hidden through one Node launcher and never kills from the shell", () => {
     expect(hiddenLauncher).toContain('BuildPath(scriptsDirectory, "openbot-desktop.cmd")');
     expect(hiddenLauncher).toContain("shell.Run(command, 0, True)");
     expect(hiddenLauncher).toContain("fileSystem.GetTempName");
     expect(hiddenLauncher).toContain("MsgBox");
-    expect(launcher).toContain('set "SAND_HOST_GATEWAY_URL="');
-    expect(launcher).toContain('set "SAND_HOST_GATEWAY_URL=http://127.0.0.1:1340"');
-    expect(launcher).toContain('set "SAND_DEV_BOX_CONTROL_PLANE=0"');
-    expect(launcher.indexOf('set "SAND_HOST_GATEWAY_URL="')).toBeLessThan(
-      launcher.indexOf('set "SAND_HOST_GATEWAY_URL=http://127.0.0.1:1340"'),
-    );
-    expect(launcher.indexOf('set "SAND_HOST_GATEWAY_URL=http://127.0.0.1:1340"')).toBeLessThan(
-      launcher.indexOf('"%ELECTRON_PATH%" --user-data-dir='),
-    );
-    expect(launcher).toContain('set "SAND_HOST_GATEWAY_TOKEN="');
-    expect(launcher).toContain('set "VITE_DEV_SERVER_URL="');
-    expect(launcher).toContain('set "OPENBOT_ROOT=%CD%"');
-    expect(gatewayStarter).toContain("dirname(dirname(fileURLToPath(import.meta.url)))");
-    expect(launcher).toMatch(/if errorlevel 1 \([\s\S]{0,300}exit \/b 1/);
-    const operationalLauncher = launcher.split(/\r?\n/u).filter((line) => !/^\s*rem\b/iu.test(line)).join("\n");
-    expect(operationalLauncher).toMatch(/start-gateway\.mjs" --root[\s\S]{0,500}if not defined GATEWAY_PID[\s\S]{0,150}exit \/b 1/iu);
-    expect(operationalLauncher).toMatch(/shutdown-gateway\.mjs" --root[\s\S]{0,300}--remove-state/iu);
-    expect(operationalLauncher).toMatch(/if\s+"?%GATEWAY_STARTED%"?\s*==\s*"1"[\s\S]{0,300}shutdown-gateway\.mjs/iu);
-    expect(operationalLauncher).not.toMatch(/gateway-health\.mjs"\s+(?:check|pid)\b/iu);
-    expect(operationalLauncher).not.toMatch(/\btaskkill(?:\.exe)?\b/iu);
-    expect(launcher).toContain('set "ELECTRON_STDIO_LOG=%CD%\\logs\\electron-secondary-%RANDOM%-%RANDOM%.log"');
-    expect(launcher).toMatch(/if "%ELECTRON_EXIT%"=="23" \([\s\S]{0,160}del \/q "%ELECTRON_STDIO_LOG%"/);
-    expect(launcher).not.toMatch(/^timeout /im);
+    const operational = launcher.split(/\r?\n/u).filter((line) => !/^\s*rem\b/iu.test(line)).join("\n");
+    expect(operational).toContain('node "%CD%\\scripts\\launch.mjs" %*');
+    expect(operational).toMatch(/if errorlevel 1 \([\s\S]{0,200}exit \/b 5/u);
+    expect(operational).not.toMatch(/\btaskkill(?:\.exe)?\b|^timeout /imu);
+    // Readiness is proven through /health of this checkout; ownership lives in gateway-control.mjs.
+    expect(launchSource).toContain("waitForGateway(url, child.pid, { watch, rootId");
+    expect(launchSource).toContain('detached: true');
+    expect(launchSource).toContain("child.unref()");
   });
 
-  it("validates an installed shortcut identity, proves port release by binding, and verifies cleanup", () => {
-    expect(shortcutSmoke).toContain("state.installRoot");
-    expect(shortcutSmoke).toMatch(/launch\.mjs'\) --preflight --root \$releaseRoot/);
-    expect(shortcutSmoke).toContain("manifest.contentSha256 -cne [string]$state.manifestSha256");
+  it("validates the checkout shortcut identity, proves port release by binding, and verifies cleanup", () => {
+    expect(shortcutSmoke).toContain("Shortcut does not target this checkout's hidden launcher");
+    expect(shortcutSmoke).toContain(String.raw`$gatewayScript = Join-Path $repoRoot 'dist\entry.js'`);
+    expect(shortcutSmoke).not.toMatch(/state\.json|launch\.mjs'\) --preflight/u);
     expect(shortcutSmoke).toContain("$portProbe.Server.ExclusiveAddressUse = $true");
     expect(shortcutSmoke).toMatch(/\$portProbe\.Start\(\)[\s\S]{0,120}\$portReleased = \$true/);
     expect(shortcutSmoke).not.toMatch(/Invoke-RestMethod[\s\S]{0,200}\$portReleased = \$true/);

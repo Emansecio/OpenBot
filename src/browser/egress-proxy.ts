@@ -2,14 +2,15 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import {
   createServer,
   request as defaultHttpRequest,
+  STATUS_CODES,
   type IncomingMessage,
   type RequestOptions,
   type Server,
   type ServerResponse,
 } from "node:http";
 import { request as defaultHttpsRequest } from "node:https";
-import { connect as defaultConnect, isIP, type NetConnectOpts, type Socket } from "node:net";
-import { Transform, type TransformCallback } from "node:stream";
+import { connect as defaultConnect, isIP, type LookupFunction, type NetConnectOpts, type Socket } from "node:net";
+import { pipeline, Transform, type TransformCallback } from "node:stream";
 import {
   defaultDnsResolver,
   classifyIpAddress,
@@ -26,7 +27,9 @@ const DEFAULT_MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 128 * 1024 * 1024;
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
-const MAX_TIMEOUT_MS = 5 * 60_000;
+/** A connected tunnel or streaming response may stay quiet this long (WebSocket, SSE, HTTP/2). */
+const DEFAULT_TUNNEL_IDLE_TIMEOUT_MS = 5 * 60_000;
+const MAX_TIMEOUT_MS = 60 * 60_000;
 
 export type ProxyHttpRequest = typeof defaultHttpRequest;
 export type ProxyHttpsRequest = typeof defaultHttpsRequest;
@@ -39,15 +42,15 @@ export interface EgressProxyOptions {
   port?: number;
   /** Optional test/deployment token. Generated tokens are preferred. */
   token?: string;
-  /** Set false only for local loopback-only clients that cannot send proxy auth. */
-  requireAuthorization?: boolean;
   resolve?: DnsResolver;
   connectTimeoutMs?: number;
+  /** Idle limit before a request is under way (headers, request body). */
   idleTimeoutMs?: number;
+  /** Idle limit once a tunnel is connected or a response is streaming. */
+  tunnelIdleTimeoutMs?: number;
   maxHeaderBytes?: number;
   maxRequestBytes?: number;
   maxResponseBytes?: number;
-  maxConnections?: number;
   httpRequest?: ProxyHttpRequest;
   httpsRequest?: ProxyHttpsRequest;
   connect?: ProxyConnect;
@@ -150,8 +153,21 @@ const writeProxyError = (response: ServerResponse, statusCode: number, reason: s
 const writeConnectError = (socket: Socket, statusCode: number, reason: string): void => {
   if (!socket.destroyed) {
     const challenge = statusCode === 407 ? 'Proxy-Authenticate: Basic realm="OpenBot"\r\n' : "";
-    socket.end(`HTTP/1.1 ${statusCode} ${statusCode === 407 ? "Proxy Authentication Required" : statusCode === 403 ? "Forbidden" : "Bad Gateway"}\r\n${challenge}Connection: close\r\nContent-Length: ${Buffer.byteLength(reason)}\r\n\r\n${reason}`);
+    socket.end(`HTTP/1.1 ${statusCode} ${STATUS_CODES[statusCode] ?? "Error"}\r\n${challenge}Connection: close\r\nContent-Length: ${Buffer.byteLength(reason)}\r\n\r\n${reason}`);
   }
+};
+
+/**
+ * Connects to the already validated addresses only, trying each in turn
+ * (happy eyeballs) instead of just the first. The name is never resolved again.
+ */
+const pinnedLookup = (addresses: readonly string[]): LookupFunction => (_hostname, options, callback) => {
+  const records = addresses.map((address) => ({ address, family: isIP(address) }));
+  if ((options as { all?: boolean }).all === true) {
+    (callback as (error: null, records: Array<{ address: string; family: number }>) => void)(null, records);
+    return;
+  }
+  (callback as (error: null, address: string, family: number) => void)(null, records[0]!.address, records[0]!.family);
 };
 
 class ByteLimitTransform extends Transform {
@@ -171,16 +187,10 @@ class ByteLimitTransform extends Transform {
   }
 }
 
-const responseHeaders = (headers: IncomingMessage["headers"]): Record<string, string | string[]> => {
-  const output: Record<string, string | string[]> = {};
-  const removed = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"]);
-  for (const [name, value] of Object.entries(headers)) {
-    if (value === undefined || removed.has(name.toLowerCase())) continue;
-    output[name] = value;
-  }
-  output.connection = "close";
-  return output;
-};
+const responseHeaders = (headers: IncomingMessage["headers"]): Record<string, string | string[]> => ({
+  ...stripHopByHopHeaders(headers),
+  connection: "close",
+});
 
 const contentLength = (headers: IncomingMessage["headers"]): number | null => {
   const raw = headers["content-length"];
@@ -192,10 +202,10 @@ const contentLength = (headers: IncomingMessage["headers"]): number | null => {
 
 export class EgressProxy {
   readonly token: string;
-  private readonly requireAuthorization: boolean;
   private readonly resolver: DnsResolver;
   private readonly connectTimeoutMs: number;
   private readonly idleTimeoutMs: number;
+  private readonly tunnelIdleTimeoutMs: number;
   private readonly maxHeaderBytes: number;
   private readonly maxRequestBytes: number;
   private readonly maxResponseBytes: number;
@@ -215,10 +225,10 @@ export class EgressProxy {
     if (!Number.isInteger(this.configuredPort) || this.configuredPort < 0 || this.configuredPort > 65_535) throw new TypeError("Proxy port is invalid");
     this.token = options.token ?? randomBytes(32).toString("base64url");
     if (this.token.length < 43 || /[\r\n]/.test(this.token)) throw new TypeError("Proxy token is too weak");
-    this.requireAuthorization = options.requireAuthorization ?? true;
     this.resolver = options.resolve ?? defaultDnsResolver;
     this.connectTimeoutMs = toPositiveInteger(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS, MAX_TIMEOUT_MS);
     this.idleTimeoutMs = toPositiveInteger(options.idleTimeoutMs, DEFAULT_IDLE_TIMEOUT_MS, MAX_TIMEOUT_MS);
+    this.tunnelIdleTimeoutMs = toPositiveInteger(options.tunnelIdleTimeoutMs, DEFAULT_TUNNEL_IDLE_TIMEOUT_MS, MAX_TIMEOUT_MS);
     this.maxHeaderBytes = toPositiveInteger(options.maxHeaderBytes, DEFAULT_MAX_HEADER_BYTES);
     this.maxRequestBytes = toPositiveInteger(options.maxRequestBytes, DEFAULT_MAX_REQUEST_BYTES);
     this.maxResponseBytes = toPositiveInteger(options.maxResponseBytes, DEFAULT_MAX_RESPONSE_BYTES);
@@ -228,8 +238,14 @@ export class EgressProxy {
     this.server = createServer({ maxHeaderSize: this.maxHeaderBytes }, (request, response) => {
       void this.handleHttp(request, response);
     });
-    this.server.requestTimeout = this.idleTimeoutMs;
+    // Headers must arrive within the idle limit; a request body is bounded by
+    // socket inactivity instead of a total time, so slow uploads still finish.
+    this.server.requestTimeout = 0;
     this.server.headersTimeout = this.idleTimeoutMs;
+    // After listen(), accept failures (EMFILE) must not become an uncaught error.
+    this.server.on("error", (error) => {
+      if (this.listeningAddress !== null) console.warn(`[openbot] egress proxy error: ${error.message}`);
+    });
     this.server.on("connect", (request, socket, head) => {
       void this.handleConnect(request, socket as Socket, head);
     });
@@ -243,9 +259,6 @@ export class EgressProxy {
     this.server.on("clientError", (_error, socket) => {
       if (!socket.destroyed) socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 11\r\n\r\nBad Request");
     });
-    if (options.maxConnections !== undefined) {
-      this.server.maxConnections = toPositiveInteger(options.maxConnections, 1);
-    }
   }
 
   get address(): EgressProxyAddress | null {
@@ -309,7 +322,6 @@ export class EgressProxy {
   }
 
   private authorized(request: RequestLike): boolean {
-    if (!this.requireAuthorization) return true;
     const values = headerValues(request, "proxy-authorization");
     if (values.length !== 1) return false;
     const raw = values[0] ?? "";
@@ -341,7 +353,7 @@ export class EgressProxy {
     if (length !== null && length > this.maxRequestBytes) throw new EgressProxyError("Request body is too large", "request_too_large", 413);
   }
 
-  private async targetFor(target: URL): Promise<{ address: string; hostname: string; port: number; authority: string; tls: boolean }> {
+  private async targetFor(target: URL): Promise<{ addresses: string[]; hostname: string; port: number; authority: string; tls: boolean }> {
     const hostname = normalizeHostname(target.hostname);
     const protocol = target.protocol === "https:" ? "https:" : "http:";
     const port = target.port ? Number(target.port) : protocol === "https:" ? 443 : 80;
@@ -357,7 +369,7 @@ export class EgressProxy {
       addresses = await this.resolveAddresses(hostname);
     }
     const authority = authorityFor(protocol, hostname, target.port);
-    return { address: addresses[0] ?? "", hostname, port, authority, tls: protocol === "https:" };
+    return { addresses, hostname, port, authority, tls: protocol === "https:" };
   }
 
   private async resolveAddresses(hostname: string): Promise<string[]> {
@@ -401,43 +413,55 @@ export class EgressProxy {
       this.validateRequestFraming(request);
       const target = this.parseAbsoluteTarget(request);
       const resolved = await this.targetFor(target);
+      // The client may have gone, or the proxy closed, while DNS was pending.
+      if (request.destroyed || this.closing !== null) {
+        response.destroy();
+        return;
+      }
       const headers = stripHopByHopHeaders(request.headers);
       headers.host = resolved.authority;
       headers.connection = "close";
-      const options: RequestOptions = {
+      // autoSelectFamily reaches net.connect through the agent; RequestOptions does not declare it.
+      const options: RequestOptions & { autoSelectFamily: boolean } = {
         protocol: target.protocol,
-        hostname: resolved.address,
+        hostname: resolved.hostname,
         port: resolved.port,
         method: request.method,
         path: `${target.pathname || "/"}${target.search}`,
         headers,
         timeout: this.connectTimeoutMs,
-        ...(resolved.tls && isIP(resolved.hostname) === 0 ? { servername: resolved.hostname } : {}),
+        lookup: pinnedLookup(resolved.addresses),
+        autoSelectFamily: true,
       };
       const requestFn = resolved.tls ? this.httpsRequest : this.httpRequest;
       let bodyTooLarge = false;
-      const upstream = requestFn(options, (upstreamResponse) => this.pipeResponse(upstreamResponse, response, request));
+      const upstream = requestFn(options, (upstreamResponse) => this.pipeResponse(upstreamResponse, response));
+      // The connect timeout stops applying once connected: a streaming
+      // response may then stay quiet up to the tunnel idle limit.
+      upstream.once("socket", (socket) => {
+        const lift = (): void => { upstream.setTimeout(this.tunnelIdleTimeoutMs); };
+        if (socket.connecting) socket.once("connect", lift);
+        else lift();
+      });
       upstream.once("timeout", () => upstream.destroy(new EgressProxyError("Upstream connection timed out", "upstream_timeout", 504)));
       upstream.once("error", (error) => {
         if (bodyTooLarge) return;
         if (!response.headersSent) writeProxyError(response, error instanceof EgressProxyError && error.code === "upstream_timeout" ? 504 : 502, "Upstream connection failed");
         else response.destroy();
       });
-      request.once("aborted", () => upstream.destroy());
-      const body = new ByteLimitTransform(this.maxRequestBytes, "request_too_large");
-      body.once("error", () => {
-        bodyTooLarge = true;
-        upstream.destroy();
-        writeProxyError(response, 413, "Request body is too large");
+      pipeline(request, new ByteLimitTransform(this.maxRequestBytes, "request_too_large"), upstream, (error) => {
+        if (error instanceof EgressProxyError && error.code === "request_too_large") {
+          bodyTooLarge = true;
+          writeProxyError(response, 413, "Request body is too large");
+        }
       });
-      request.pipe(body).pipe(upstream);
     } catch (error) {
       this.sendHttpFailure(response, error);
       request.destroy();
     }
   }
 
-  private pipeResponse(upstream: OutboundResponse, response: ServerResponse, request: IncomingMessage): void {
+  private pipeResponse(upstream: OutboundResponse, response: ServerResponse): void {
     const length = contentLength(upstream.headers);
     if (length !== null && length > this.maxResponseBytes) {
       writeProxyError(response, 502, "Upstream response is too large");
@@ -445,13 +469,16 @@ export class EgressProxy {
       return;
     }
     response.writeHead(upstream.statusCode ?? 502, responseHeaders(upstream.headers));
-    const body = new ByteLimitTransform(this.maxResponseBytes, "response_too_large");
-    body.once("error", () => {
-      upstream.destroy();
-      response.destroy();
+    // Streaming to the browser may be quiet longer than the request idle limit.
+    response.socket?.setTimeout(this.tunnelIdleTimeoutMs);
+    // pipeline tears both ends down together: a truncated upstream resets the
+    // browser's connection at once, and a client that leaves stops the upstream.
+    pipeline(upstream, new ByteLimitTransform(this.maxResponseBytes, "response_too_large"), response, (error) => {
+      if (error) {
+        upstream.destroy();
+        response.destroy();
+      }
     });
-    request.once("aborted", () => upstream.destroy());
-    upstream.pipe(body).pipe(response);
   }
 
   private parseConnectTarget(request: IncomingMessage): { hostname: string; port: number } {
@@ -499,9 +526,15 @@ export class EgressProxy {
         if (isBlockedHostname(target.hostname)) throw new EgressProxyError("Target hostname is not allowed", "egress_policy_denied", 403);
         addresses = await this.resolveAddresses(target.hostname);
       }
-      const address = addresses[0];
-      if (!address) throw new EgressProxyError("Target has no DNS answers", "egress_policy_denied", 403);
-      const options: NetConnectOpts = { host: address, port: target.port, timeout: this.connectTimeoutMs };
+      if (addresses.length === 0) throw new EgressProxyError("Target has no DNS answers", "egress_policy_denied", 403);
+      if (client.destroyed || this.closing !== null) return;
+      const options: NetConnectOpts = {
+        host: target.hostname,
+        port: target.port,
+        timeout: this.connectTimeoutMs,
+        lookup: pinnedLookup(addresses),
+        autoSelectFamily: true,
+      };
       upstream = this.connect(options);
       upstream.setTimeout(this.connectTimeoutMs, () => upstream?.destroy(new EgressProxyError("Upstream connection timed out", "upstream_timeout", 504)));
       upstream.once("error", () => {
@@ -514,6 +547,9 @@ export class EgressProxy {
           return;
         }
         connected = true;
+        // Connected tunnels may idle (WebSocket, SSE, HTTP/2) up to the tunnel limit.
+        upstream?.setTimeout(this.tunnelIdleTimeoutMs);
+        client.setTimeout(this.tunnelIdleTimeoutMs);
         client.write("HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n");
         if (head.length > 0) upstream?.write(head);
         client.pipe(upstream!);

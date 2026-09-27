@@ -9,7 +9,7 @@ import type {
   RuntimeLease,
 } from "../src/execution/runtime/contracts.js";
 import { RuntimeManagerError } from "../src/execution/runtime/manager.js";
-import { WslProcessBackend, type RuntimeProcessRunner } from "../src/execution/runtime/wsl/process-backend.js";
+import { RuntimeProcessBackend, type RuntimeProcessRunner } from "../src/execution/runtime/process-backend.js";
 import { LocalFileExecutor } from "../src/execution/files.js";
 import { WorkspaceQuota, WorkspaceQuotaError } from "../src/execution/quota.js";
 import { WorkspaceSandbox } from "../src/execution/workspace.js";
@@ -68,13 +68,13 @@ const managerFor = (value: RuntimeLease | Error): AgentRuntimeManager => ({
   close: vi.fn(),
 });
 
-describe("WslProcessBackend", () => {
+describe("RuntimeProcessBackend", () => {
   it("recusa process.run antes do lease quando o workspace já excedeu a quota", async () => {
     const held = lease();
     const manager = managerFor(held);
     const runner: RuntimeProcessRunner = { run: vi.fn(async () => success()) };
     const quota = { assertWithinQuota: vi.fn(async () => { throw new WorkspaceQuotaError(); }) };
-    const backend = new WslProcessBackend({ agentId: "agent-a", manager, runner, quota });
+    const backend = new RuntimeProcessBackend({ agentId: "agent-a", manager, runner, quota });
 
     await expect(backend.execute(request())).resolves.toMatchObject({ ok: false, code: "quota_exceeded" });
     expect(manager.acquire).not.toHaveBeenCalled();
@@ -105,7 +105,7 @@ describe("WslProcessBackend", () => {
       return held;
     });
     const runner = { run: vi.fn(async () => success()) };
-    const backend = new WslProcessBackend({ agentId: "agent-a", manager, runner, quota });
+    const backend = new RuntimeProcessBackend({ agentId: "agent-a", manager, runner, quota });
     const execution = backend.execute(request());
     await acquired;
     failQuota(new WorkspaceQuotaError());
@@ -125,7 +125,7 @@ describe("WslProcessBackend", () => {
       scopes: { downloads: { maxBytes: 4, maxFiles: 10 } },
     });
     const manager = managerFor(lease());
-    const backend = new WslProcessBackend({ agentId: "agent-a", manager, runner: { run: vi.fn() }, quota });
+    const backend = new RuntimeProcessBackend({ agentId: "agent-a", manager, runner: { run: vi.fn() }, quota });
     await expect(backend.execute(request())).resolves.toMatchObject({ ok: false, code: "quota_exceeded" });
     expect(manager.acquire).not.toHaveBeenCalled();
     expect(quota.metrics()).toMatchObject({ scans: 1, activeObservers: 0, activeProcesses: 0 });
@@ -145,7 +145,7 @@ describe("WslProcessBackend", () => {
         signal.addEventListener("abort", () => resolve({ ok: false, operation: "process.run", code: "process_aborted", message: "aborted" }), { once: true });
       })),
     };
-    const backend = new WslProcessBackend({
+    const backend = new RuntimeProcessBackend({
       agentId: "agent-a",
       manager: managerFor(held),
       runner,
@@ -182,7 +182,7 @@ describe("WslProcessBackend", () => {
         });
       }),
     };
-    const backend = new WslProcessBackend({
+    const backend = new RuntimeProcessBackend({
       agentId: "agent-a",
       manager: managerFor(lease()),
       runner,
@@ -205,7 +205,7 @@ describe("WslProcessBackend", () => {
     const workspace = await WorkspaceSandbox.create(root);
     const scan = vi.fn(async () => ({ bytes: 0, files: 0, directories: 0, entries: 0 }));
     const quota = new WorkspaceQuota(workspace, { maxBytes: 100, maxFiles: 10, maxEntries: 10 }, scan);
-    const backend = new WslProcessBackend({
+    const backend = new RuntimeProcessBackend({
       agentId: "agent-a",
       manager: managerFor(lease()),
       runner: { run: vi.fn(async () => {
@@ -213,7 +213,6 @@ describe("WslProcessBackend", () => {
         return success();
       }) },
       quota,
-      quotaPollIntervalMs: 1,
       quotaObserverFactory: () => ({
         start: async () => undefined,
         drain: async () => undefined,
@@ -238,7 +237,7 @@ describe("WslProcessBackend", () => {
       });
       return success();
     } };
-    const backends = [0, 1].map(() => new WslProcessBackend({ agentId: "agent-a", manager: managerFor(lease()), runner, quota }));
+    const backends = [0, 1].map(() => new RuntimeProcessBackend({ agentId: "agent-a", manager: managerFor(lease()), runner, quota }));
     const executions = backends.map((backend) => backend.execute(request()));
     await started;
     try {
@@ -268,7 +267,7 @@ describe("WslProcessBackend", () => {
         if (count === 2) bothStarted();
       });
     } };
-    const backend = new WslProcessBackend({ agentId: "agent-a", manager: managerFor(lease()), runner, quota });
+    const backend = new RuntimeProcessBackend({ agentId: "agent-a", manager: managerFor(lease()), runner, quota });
     const executions = [backend.execute(request()), backend.execute(request())];
     await started;
     await writeFile(join(root, "external.txt"), "12345");
@@ -292,7 +291,7 @@ describe("WslProcessBackend", () => {
         signal.addEventListener("abort", () => resolve({ ok: false, operation: "process.run", code: "process_aborted", message: "aborted" }), { once: true });
       })),
     };
-    const backend = new WslProcessBackend({
+    const backend = new RuntimeProcessBackend({
       agentId: "agent-a",
       manager: managerFor(lease()),
       runner,
@@ -314,7 +313,7 @@ describe("WslProcessBackend", () => {
       expect(activeLease.agentId).toBe("agent-a");
       return success();
     }) };
-    const backend = new WslProcessBackend({ agentId: "agent-a", manager: managerFor(held), runner });
+    const backend = new RuntimeProcessBackend({ agentId: "agent-a", manager: managerFor(held), runner });
 
     await expect(backend.execute(request())).resolves.toMatchObject({ ok: true, exitCode: 0 });
     expect(runner.run).toHaveBeenCalledTimes(1);
@@ -322,7 +321,7 @@ describe("WslProcessBackend", () => {
   });
 
   it("recusa operações não-processo e perfis de rede desconhecidos", async () => {
-    const backend = new WslProcessBackend({ agentId: "agent-a", manager: managerFor(lease()), runner: { run: vi.fn() } });
+    const backend = new RuntimeProcessBackend({ agentId: "agent-a", manager: managerFor(lease()), runner: { run: vi.fn() } });
     await expect(backend.execute({ operation: "file.list", path: "." })).resolves.toMatchObject({ ok: false, code: "unsupported" });
     await expect(backend.execute(request({ networkProfile: "web" as never }))).resolves.toMatchObject({ ok: false, code: "process_not_allowed" });
   });
@@ -331,7 +330,7 @@ describe("WslProcessBackend", () => {
     const runner = vi.fn()
       .mockResolvedValueOnce(success({ stdout: "x".repeat(MAX_PROCESS_OUTPUT_BYTES + 1) }))
       .mockResolvedValueOnce(success({ stderr: "e".repeat(MAX_PROCESS_OUTPUT_BYTES + 1) }));
-    const backend = new WslProcessBackend({
+    const backend = new RuntimeProcessBackend({
       agentId: "agent-a",
       manager: managerFor(lease()),
       runner: { run: runner },
@@ -347,7 +346,7 @@ describe("WslProcessBackend", () => {
         signal.addEventListener("abort", () => resolve({ ok: false, operation: "process.run", code: "process_aborted", message: "aborted" }), { once: true });
       })),
     };
-    const backend = new WslProcessBackend({ agentId: "agent-a", manager: managerFor(lease()), runner });
+    const backend = new RuntimeProcessBackend({ agentId: "agent-a", manager: managerFor(lease()), runner });
 
     await expect(backend.execute(request({ timeoutMs: 5 }))).resolves.toMatchObject({ ok: false, code: "process_timeout" });
     const controller = new AbortController();
@@ -357,7 +356,7 @@ describe("WslProcessBackend", () => {
   });
 
   it("sanitiza indisponibilidade do runtime", async () => {
-    const backend = new WslProcessBackend({
+    const backend = new RuntimeProcessBackend({
       agentId: "agent-a",
       manager: managerFor(new RuntimeManagerError("runtime_unavailable", "private host detail")),
       runner: { run: vi.fn() },

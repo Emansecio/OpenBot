@@ -1,16 +1,13 @@
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { runInNewContext } from "node:vm";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+import { BROWSER_HOST_SOURCE as hostSource, loadBrowserHost } from "./helpers/browser-host.js";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const hostPath = resolve(root, "scripts/openbot-browser-host.cjs");
 const electronCli = resolve(root, "node_modules/electron/cli.js");
-const hostSource = readFileSync(hostPath, "utf8");
-const requireForTest = createRequire(import.meta.url);
 
 interface SchedulerRequest {
   id: string;
@@ -24,6 +21,9 @@ interface SchedulerRequest {
 interface SchedulerHarness {
   enqueueRequest(request: SchedulerRequest): void;
   handleCancel(request: SchedulerRequest): void;
+  handleLine(line: string): Promise<void>;
+  hostExecute(request: SchedulerRequest, signal: AbortSignal): Promise<unknown>;
+  seedTab(tabId: string, tab: Record<string, unknown>): void;
   setExecute(execute: (request: SchedulerRequest, signal: AbortSignal) => Promise<unknown>): void;
   setTransport(
     sendValue: (value: unknown) => Promise<void>,
@@ -47,41 +47,16 @@ function schedulerRequest(id: string, agentId: string, command: SchedulerRequest
 }
 
 function createSchedulerHarness(): SchedulerHarness {
-  const fakeApp = {
-    quitCalls: 0,
-    on: () => fakeApp,
-    commandLine: { appendSwitch: () => undefined },
-    isReady: () => true,
-    quit() { this.quitCalls += 1; },
-  };
-  const fakeProcess = {
-    env: {},
-    exitCode: 0,
-    on: () => fakeProcess,
-    exit: () => undefined,
-    stderr: { write: () => true },
-    platform: process.platform,
-  };
-  const context: Record<string, unknown> = {
-    AbortController,
-    Buffer,
-    URL,
-    clearImmediate,
-    clearTimeout,
-    console,
-    process: fakeProcess,
-    require: (id: string) => id === "electron"
-      ? { app: fakeApp, BrowserWindow: class {}, nativeImage: {}, session: {} }
-      : requireForTest(id),
-    setImmediate: () => undefined,
-    setTimeout,
-  };
+  // Runs inside the host module scope, so it can swap the scheduler seams.
   const exposeHarness = `
   let fatalTabDestroyCalls = 0;
   let keepAliveDestroyCalls = 0;
-  globalThis.__schedulerHarness = {
+  harness.scheduler = {
   enqueueRequest,
   handleCancel,
+  handleLine,
+  hostExecute: execute,
+  seedTab(tabId, tab) { TABS.set(tabId, tab); },
   setExecute(value) { execute = value; },
   setTransport(sendValue, sendFailure) { send = sendValue; sendError = sendFailure; },
   failFastHost,
@@ -103,8 +78,7 @@ function createSchedulerHarness(): SchedulerHarness {
     };
   },
 };`;
-  runInNewContext(`${hostSource}\n${exposeHarness}`, context, { filename: hostPath });
-  return context.__schedulerHarness as SchedulerHarness;
+  return loadBrowserHost({ append: exposeHarness }).scope.scheduler as SchedulerHarness;
 }
 
 async function flushScheduler(): Promise<void> {
@@ -163,6 +137,78 @@ describe("browser host fatal lifecycle", () => {
     await flushScheduler();
     expect(started).toEqual(["a-1", "b-1", "c-1", "d-1", "e-1"]);
     expect(harness.state().activeRequestCount).toBe(4);
+  });
+
+  it("lets close preempt the tab's queued and running work, even with a full queue", async () => {
+    const harness = createSchedulerHarness();
+    const started: string[] = [];
+    const signals = new Map<string, AbortSignal>();
+    const releases = new Map<string, () => void>();
+    const failures: Array<{ id: string; code: string }> = [];
+    harness.setExecute((request, signal) => {
+      started.push(request.id);
+      signals.set(request.id, signal);
+      return new Promise<void>((resolve) => releases.set(request.id, resolve));
+    });
+    harness.setTransport(async () => undefined, async (id, code) => { failures.push({ id, code }); });
+    harness.enqueueRequest(schedulerRequest("a-running", "a"));
+    for (let index = 0; index < 16; index += 1) harness.enqueueRequest(schedulerRequest(`a-queued-${index}`, "a"));
+    harness.enqueueRequest(schedulerRequest("b-running", "b"));
+
+    harness.enqueueRequest(schedulerRequest("a-close", "a", { command: "close" }));
+
+    expect(signals.get("a-running")?.aborted).toBe(true);
+    expect(failures).toContainEqual({ id: "a-running", code: "BROWSER_COMMAND_ABORTED" });
+    expect(failures).toContainEqual({ id: "a-queued-15", code: "BROWSER_COMMAND_ABORTED" });
+    expect(failures).not.toContainEqual({ id: "a-close", code: "BROWSER_QUEUE_FULL" });
+    expect(signals.get("b-running")?.aborted).toBe(false);
+    releases.get("a-running")!();
+    await flushScheduler();
+    expect(started).toEqual(["a-running", "b-running", "a-close"]);
+  });
+
+  it("refuses agent commands on a handed-off or crashed tab but still lets lifecycle through", async () => {
+    const harness = createSchedulerHarness();
+    const window = {
+      isDestroyed: () => false,
+      isFocused: () => true,
+      show: () => undefined,
+      focus: () => undefined,
+      webContents: { isDestroyed: () => false, getURL: () => "https://example.com/", getTitle: () => "Example" },
+    };
+    const owner = { agentId: "a", sessionId: "session-a", partition: "persist:a" };
+    harness.seedTab("tab-a", { ...owner, window, handoff: { engaged: true, timer: undefined } });
+    const signal = new AbortController().signal;
+    await expect(harness.hostExecute(schedulerRequest("snapshot", "a"), signal))
+      .rejects.toMatchObject({ code: "BROWSER_HANDOFF_ACTIVE" });
+    await expect(harness.hostExecute(schedulerRequest("handoff", "a", { command: "handoff" }), signal))
+      .resolves.toMatchObject({ command: "handoff", visible: true });
+
+    harness.seedTab("tab-a", { ...owner, window, handoff: null, crashed: true });
+    await expect(harness.hostExecute(schedulerRequest("snapshot", "a"), signal))
+      .rejects.toMatchObject({ code: "BROWSER_TAB_CRASHED" });
+  });
+
+  it("reports a malformed command from an authenticated caller as invalid, not unauthorized", async () => {
+    const harness = createSchedulerHarness();
+    const failures: Array<{ id: string; code: string }> = [];
+    harness.setTransport(async () => undefined, async (id, code) => { failures.push({ id, code }); });
+    const envelope = {
+      protocolVersion: 1,
+      kind: "request",
+      agentId: "a",
+      sessionId: "session-a",
+      tabId: "tab-a",
+      partition: "persist:openbot-agent-" + "a".repeat(32),
+      downloadRoot: "C:\\Downloads",
+    };
+    // The harness host runs without a launch token, so the valid token is "".
+    await harness.handleLine(JSON.stringify({ ...envelope, id: "bad-shape", token: "", command: { command: "upload", selector: "input", path: "a.txt:stream" } }));
+    await harness.handleLine(JSON.stringify({ ...envelope, id: "bad-token", token: "wrong", command: { command: "snapshot" } }));
+    expect(failures).toEqual([
+      { id: "bad-shape", code: "BROWSER_COMMAND_INVALID" },
+      { id: "bad-token", code: "BROWSER_UNAUTHORIZED" },
+    ]);
   });
 
   it("checks queue limits before retaining a new agent queue", () => {
@@ -264,4 +310,36 @@ describe("browser host fatal lifecycle", () => {
     expect(result.code).not.toBe(0);
     expect(stderr).toMatch(/uncaughtException: injected browser host exception/iu);
   }, 15_000);
+});
+
+describe("browser host home lifecycle", () => {
+  it.each([true, false])("awaits owned download cleanup and flushes storage even if the tab is present=%s", async (present) => {
+    let finishDownload!: () => void;
+    const done = new Promise<void>((resolve) => { finishDownload = resolve; });
+    const cancel = vi.fn();
+    const otherCancel = vi.fn();
+    const destroy = vi.fn();
+    const close = vi.fn(() => { throw new Error("beforeunload may veto close"); });
+    const storage = { flushStorageData: vi.fn(), cookies: { flushStore: vi.fn(async () => undefined) }, clearStorageData: vi.fn() };
+    const { host } = loadBrowserHost({ electron: { session: { fromPartition: () => storage } } });
+    const owner = { agentId: "agent-a", sessionId: "session-a", partition: "persist:agent-a" };
+    if (present) host.TABS.set("a", { ...owner, window: { isDestroyed: () => false, destroy, close } });
+    host.ACTIVE_DOWNLOADS.set("a", new Set([{ item: { cancel }, finished: false, done }]));
+    host.ACTIVE_DOWNLOADS.set("b", new Set([{ item: { cancel: otherCancel }, finished: false, done: Promise.resolve() }]));
+    let drained = false;
+    const closing = host.closeTab({ ...owner, tabId: "a" }).then(() => { drained = true; });
+    await Promise.resolve();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(otherCancel).not.toHaveBeenCalled();
+    expect(destroy).toHaveBeenCalledTimes(present ? 1 : 0);
+    expect(close).not.toHaveBeenCalled();
+    expect(drained).toBe(false);
+    expect(storage.flushStorageData).not.toHaveBeenCalled();
+    finishDownload();
+    await closing;
+    expect(storage.flushStorageData).toHaveBeenCalledOnce();
+    expect(storage.cookies.flushStore).toHaveBeenCalledOnce();
+    expect(storage.clearStorageData).not.toHaveBeenCalled();
+    expect(host.TABS.has("a")).toBe(false);
+  });
 });

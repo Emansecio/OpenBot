@@ -10,6 +10,7 @@ import { verifyBackendArtifacts } from "../scripts/verify-backend-artifacts.mjs"
 
 const sourceFiles = [
   "main.ts",
+  "entry.ts",
   "server/local-exec-bridge.ts",
   "server/webauthn-bridge.ts",
   "execution/runtime/local/driver.ts",
@@ -80,7 +81,7 @@ describe("backend artifact verifier", () => {
       for (const relativePath of sourceFiles) await rm(join(fixture.sourceRoot, "src", relativePath), { force: true });
       const result = verifyBackendArtifacts({ sourceRoot: fixture.sourceRoot, distRoot: fixture.distRoot });
       expect(result.ok).toBe(false);
-      expect(result.errors.filter((error: string) => error.includes("required output is missing"))).toHaveLength(4);
+      expect(result.errors.filter((error: string) => error.includes("required output is missing"))).toHaveLength(5);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }

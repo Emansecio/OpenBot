@@ -8,6 +8,9 @@ export const MAX_BROWSER_SNAPSHOT_TEXT_BYTES = 128 * 1024;
 export const MAX_BROWSER_UPLOAD_PATH_BYTES = 4096;
 export const MAX_BROWSER_UPLOAD_SELECTOR_BYTES = 4096;
 export const MAX_BROWSER_UPLOAD_BYTES = 4 * 1024 * 1024;
+/** Same component rules as the Electron host applies before reading the file. */
+const INVALID_UPLOAD_COMPONENT = /[<>:"|?*\u0000-\u001f]/u;
+const RESERVED_UPLOAD_DEVICE = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])$/iu;
 
 export type BrowserCommandName =
   | "open"
@@ -135,7 +138,7 @@ export interface BrowserHostReady {
   hostVersion: string;
 }
 
-export interface BrowserHostEvent {
+export interface BrowserHostDownloadEvent {
   protocolVersion: typeof BROWSER_PROTOCOL_VERSION;
   kind: "event";
   event: "download";
@@ -145,6 +148,17 @@ export interface BrowserHostEvent {
   state?: "completed" | "cancelled" | "interrupted" | "limit";
   bytes?: number;
 }
+
+/** The user took (active) or returned (inactive) control of a tab's window. */
+export interface BrowserHostHandoffEvent {
+  protocolVersion: typeof BROWSER_PROTOCOL_VERSION;
+  kind: "event";
+  event: "handoff";
+  tabId: string;
+  active: boolean;
+}
+
+export type BrowserHostEvent = BrowserHostDownloadEvent | BrowserHostHandoffEvent;
 
 export type BrowserHostMessage = BrowserHostResponse | BrowserHostReady | BrowserHostEvent;
 
@@ -185,6 +199,11 @@ export function parseBrowserHostMessage(line: string): BrowserHostMessage {
     assertMessageKeys(value, ["protocolVersion", "kind", "hostVersion"]);
     if (typeof value.hostVersion !== "string") throw new Error("browser host ready message is invalid");
     return { protocolVersion: BROWSER_PROTOCOL_VERSION, kind: "ready", hostVersion: value.hostVersion };
+  }
+  if (value.kind === "event" && value.event === "handoff") {
+    assertMessageKeys(value, ["protocolVersion", "kind", "event", "tabId", "active"]);
+    if (typeof value.tabId !== "string" || typeof value.active !== "boolean") throw new Error("browser host event is invalid");
+    return { protocolVersion: BROWSER_PROTOCOL_VERSION, kind: "event", event: "handoff", tabId: value.tabId, active: value.active };
   }
   if (value.kind === "event") {
     assertMessageKeys(value, ["protocolVersion", "kind", "event", "tabId", "path", "state", "bytes"]);
@@ -274,6 +293,14 @@ export function assertSafeBrowserUploadPath(value: string): string {
     if (components.some((component) => component === "..")) throw new Error("browser upload path is outside the home");
     throw new Error("browser upload path is invalid");
   }
+  // Windows would reinterpret these names (streams, devices, trimmed dots),
+  // and the host rejects them; refuse them here with a clear message.
+  if (components.some((component) =>
+    INVALID_UPLOAD_COMPONENT.test(component) ||
+    /[ .]$/u.test(component) ||
+    RESERVED_UPLOAD_DEVICE.test(component.split(".", 1)[0] ?? ""))) {
+    throw new Error("browser upload path contains a name Windows cannot use");
+  }
   return value;
 }
 
@@ -294,12 +321,11 @@ export function validateBrowserCommand(command: BrowserCommand): BrowserCommand 
   switch (command.command) {
     case "open":
       assertExactKeys(command, ["command", "url"]);
-      if (command.url !== undefined) assertSafeBrowserUrl(command.url, true);
-      return command;
+      // Forward the normalized URL that was validated, not the raw input.
+      return command.url === undefined ? command : { command: "open", url: assertSafeBrowserUrl(command.url, true) };
     case "navigate":
       assertExactKeys(command, ["command", "url"]);
-      assertSafeBrowserUrl(command.url);
-      return command;
+      return { command: "navigate", url: assertSafeBrowserUrl(command.url) };
     case "snapshot":
       assertExactKeys(command, ["command", "includeText"]);
       if (command.includeText !== undefined && typeof command.includeText !== "boolean") throw new Error("snapshot includeText is invalid");

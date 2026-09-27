@@ -2,14 +2,13 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isMainModule } from "./common.mjs";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const defaultRoot = resolve(scriptDirectory, "..");
 const defaultManifest = join(defaultRoot, "client", "client-artifacts.manifest.json");
-const argv = process.argv.slice(2);
-const jsonOutput = argv.includes("--json");
 
-function optionValue(name) {
+function optionValue(argv, name) {
   const index = argv.indexOf(name);
   return index >= 0 ? argv[index + 1] : undefined;
 }
@@ -279,20 +278,28 @@ function verifyManifest({ root, manifestFile }) {
   };
 }
 
-const root = resolve(process.env.OPENBOT_ROOT || defaultRoot);
-const manifestOption = optionValue("--manifest") || process.env.OPENBOT_CLIENT_ARTIFACT_MANIFEST;
-const manifestFile = resolve(root, manifestOption || defaultManifest);
-const result = verifyManifest({ root, manifestFile });
-
-if (jsonOutput) {
-  console.log(JSON.stringify(result, null, 2));
-} else {
-  console.log(`CLIENT_ARTIFACTS ${result.ok ? "GREEN" : "RED"}`);
-  console.log(`manifest=${result.manifest}`);
-  if (result.clientVersion) console.log(`clientVersion=${result.clientVersion}`);
-  for (const warning of result.warnings) console.warn(`WARN ${warning}`);
-  for (const error of result.errors) console.error(`ERROR ${error}`);
-  if (result.ok) console.log(`checks=${result.checks.length}`);
+/** Verify the Electron client baseline against its manifest (used in-process by the launcher). */
+export function verifyClientArtifacts(options = {}) {
+  const root = resolve(options.root ?? defaultRoot);
+  const manifestFile = resolve(root, options.manifest ?? defaultManifest);
+  return verifyManifest({ root, manifestFile });
 }
 
-process.exitCode = result.ok ? 0 : 1;
+if (isMainModule(import.meta.url)) {
+  const argv = process.argv.slice(2);
+  const result = verifyClientArtifacts({
+    root: process.env.OPENBOT_ROOT || defaultRoot,
+    manifest: optionValue(argv, "--manifest") || process.env.OPENBOT_CLIENT_ARTIFACT_MANIFEST || undefined,
+  });
+  if (argv.includes("--json")) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(`CLIENT_ARTIFACTS ${result.ok ? "GREEN" : "RED"}`);
+    console.log(`manifest=${result.manifest}`);
+    if (result.clientVersion) console.log(`clientVersion=${result.clientVersion}`);
+    for (const warning of result.warnings) console.warn(`WARN ${warning}`);
+    for (const error of result.errors) console.error(`ERROR ${error}`);
+    if (result.ok) console.log(`checks=${result.checks.length}`);
+  }
+  process.exitCode = result.ok ? 0 : 1;
+}

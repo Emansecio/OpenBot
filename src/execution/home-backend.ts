@@ -6,7 +6,8 @@ import type { ExecutionBackend, ExecutionRequest, ExecutionResult } from "./cont
 import { LocalCommandExecutor } from "./commands.js";
 import { LocalFileExecutor } from "./files.js";
 import { effectiveGrant, readSharedGrants } from "./home-grants.js";
-import { extractRequestPaths } from "./policy.js";
+import { extractRequestPaths } from "./request-paths.js";
+import { ProtectedPathError, type ProtectedPaths } from "./protected-paths.js";
 import {
   resolveWorkspaceQuota,
   WorkspaceQuota,
@@ -75,6 +76,7 @@ const failure = (
 ): ExecutionResult => ({ ok: false, operation, code, message });
 
 const fromWorkspaceError = (operation: ExecutionRequest["operation"], error: WorkspaceError): ExecutionResult => {
+  if (error instanceof ProtectedPathError) return failure(operation, error.code, error.message);
   const message =
     error.code === "invalid_path"
       ? "File path is invalid."
@@ -124,6 +126,8 @@ export interface HomeWorkspaceBackendOptions {
   allowHostTrash?: boolean;
   /** Preserve the runtime contract that host transfers require two absolute paths on one volume. */
   requireAbsoluteHostTransferPeers?: boolean;
+  /** OpenBot data and sibling homes that host paths must never reach, scoped to this home. */
+  protectedPaths?: ProtectedPaths;
 }
 
 const readOnlyFailure = (operation: ExecutionRequest["operation"]): ExecutionResult =>
@@ -140,6 +144,7 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     private readonly agentId?: string,
     private readonly allowHostTrash = true,
     private readonly requireAbsoluteHostTransferPeers = false,
+    private readonly protectedPaths?: ProtectedPaths,
   ) {}
 
   static async create(root: string, options: HomeWorkspaceBackendOptions = {}): Promise<HomeWorkspaceBackend> {
@@ -175,6 +180,7 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
       options.agentId,
       options.allowHostTrash ?? true,
       options.requireAbsoluteHostTransferPeers ?? false,
+      options.protectedPaths?.forHome(workspace.root),
     );
   }
 
@@ -218,10 +224,13 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     const existing = this.hostMounts.get(key);
     if (existing) return existing;
     const workspace = await WorkspaceSandbox.create(driveRoot, { allowAncestorLinks: true });
+    const protectedPaths = this.protectedPaths;
     const mount: MountExecutors = {
       workspace,
       files: LocalFileExecutor.fromWorkspace(workspace),
-      commands: LocalCommandExecutor.fromWorkspace(workspace),
+      commands: LocalCommandExecutor.fromWorkspace(workspace, protectedPaths === undefined ? {} : {
+        excludePath: (absolute) => protectedPaths.blocksDescent(absolute),
+      }),
       readOnly: false,
     };
     this.hostMounts.set(key, mount);
@@ -242,7 +251,7 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
         return failure(request.operation, "access_denied", "Shared folder grants could not be verified.");
       }
       const current = new HomeWorkspaceBackend(this.workspace, this.quota, this.files, this.commands,
-        mounts, this.userProfile, this.agentId, this.allowHostTrash, this.requireAbsoluteHostTransferPeers);
+        mounts, this.userProfile, this.agentId, this.allowHostTrash, this.requireAbsoluteHostTransferPeers, this.protectedPaths);
       return current.executeResolved(request, signal);
     }
     return this.executeResolved(request, signal);
@@ -292,6 +301,7 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     if (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
       return { kind: "home", relative };
     }
+    if (classified.kind === "host" && this.protectedPaths?.blocksResolved(candidate)) throw new ProtectedPathError();
     return classified;
   }
 
@@ -302,7 +312,17 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     const started = Date.now();
     const lines: string[] = [];
     let matched = false;
-    for (const scope of request.params.paths.map((item) => joinVirtual(request.cwd, item))) {
+    // With several scopes (e.g. the default Documents + Projects), a missing one is
+    // skipped; the search is not_found only when none of them exists.
+    const scopes = request.params.paths.map((item) => joinVirtual(request.cwd, item));
+    let missing: ExecutionResult | undefined;
+    let searched = false;
+    const skipMissing = (result: ExecutionResult): boolean => {
+      if (result.ok || result.code !== "not_found" || scopes.length < 2) return false;
+      missing ??= result;
+      return true;
+    };
+    for (const scope of scopes) {
       let classified: ClassifiedAgentPath;
       try {
         classified = this.classifyPath(scope);
@@ -314,12 +334,17 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
         return failure(request.operation, "access_denied", "Workspace path cannot be accessed.");
       }
       if (classified.kind === "home") {
+        if (isReservedHomeRelative(classified.relative)) {
+          return failure(request.operation, "access_denied", "Workspace path cannot be accessed.");
+        }
         const result = await this.commands.execute({
           ...request,
           cwd: ".",
           params: { ...request.params, paths: [classified.relative] },
         }, signal);
+        if (skipMissing(result)) continue;
         if (!result.ok) return result;
+        searched = true;
         if (result.operation !== "command.run") return result;
         if (result.stdout.length > 0) lines.push(result.stdout);
         if (result.exitCode === 0) matched = true;
@@ -338,7 +363,9 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
           cwd: ".",
           params: { ...request.params, paths: [classified.relative] },
         }, signal);
+        if (skipMissing(result)) continue;
         if (!result.ok) return result;
+        searched = true;
         if (result.operation !== "command.run") return result;
         const prefix = `${classified.root.replaceAll("\\", "/")}`;
         for (const line of result.stdout.split("\n")) {
@@ -355,7 +382,9 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
         cwd: ".",
         params: { ...request.params, paths: [classified.relative] },
       }, signal);
+      if (skipMissing(result)) continue;
       if (!result.ok) return result;
+      searched = true;
       if (result.operation !== "command.run") return result;
       const prefix = `shared://${classified.mount}/`;
       for (const line of result.stdout.split("\n")) {
@@ -364,6 +393,7 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
       }
       if (result.exitCode === 0) matched = true;
     }
+    if (!searched && missing !== undefined) return missing;
     return {
       ok: true,
       operation: "command.run",
@@ -547,7 +577,8 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
     if (!mount) return failure(request.operation, "access_denied", "Shared folder is not granted or unavailable.");
     if (mount.readOnly) return readOnlyFailure(request.operation);
     const source = await mount.workspace.resolveExisting(classified.relative);
-    const summary = await inspectSafeTree(source, signal);
+    // Validates the tree (no links, within limits) before it leaves its folder.
+    await inspectSafeTree(source, signal);
     const trashRoot = path.join(this.workspace.root, ".openbot", "trash");
     const trashId = randomUUID();
     const entry = path.join(trashRoot, trashId);
@@ -557,11 +588,8 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
       ? `${classified.root.replaceAll("\\", "/")}${classified.relative.replaceAll("\\", "/")}`
       : `shared://${classified.mount}/${classified.relative.replaceAll("\\", "/")}`;
     const markerContents = JSON.stringify({ version: 1, path: storedPath });
-    const reservation = await this.quota.reserveDelta({
-      bytes: summary.bytes + Buffer.byteLength(markerContents),
-      files: summary.files + 1,
-      entries: summary.entries + 2,
-    }, entry);
+    // The bot trash is not measured: host files moved into it cost no quota.
+    const reservation = await this.quota.reserveDelta({ bytes: 0, files: 0, entries: 0 }, entry);
     try {
       await mkdir(entry, { recursive: true });
       abortIfRequested(signal);
@@ -574,6 +602,8 @@ export class HomeWorkspaceBackend implements ExecutionBackend {
       reservation.cancel();
       const payloadMissing = await lstat(payload).then(() => false).catch(() => true);
       if (payloadMissing) await rm(entry, { recursive: true, force: true }).catch(() => undefined);
+      // A cross-volume copy may have landed before the source removal failed.
+      else this.quota.markUsageDirty();
       throw error;
     }
   }

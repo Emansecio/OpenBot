@@ -23,6 +23,20 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 async function fixture(): Promise<string> { const root = await tempRoots.makeAsync("openbot-native-ownership-"); return root; }
+
+/** Resolves once no process has this pid: a dead descendant cannot write anymore. */
+async function waitForProcessExit(pid: number, timeoutMs = 8_000): Promise<void> {
+  expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+  await vi.waitFor(() => {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw error;
+    }
+    throw new Error(`process ${pid} is still running`);
+  }, { timeout: timeoutMs, interval: 50 });
+}
 const record = (): RuntimeLeaseRecord => { const leaseId = randomUUID(); return { recoveryKind: "native-job-v1", leaseId, agentId: "fixture", runtimeBootId: randomUUID(), temporaryId: `tmp-${leaseId}`, sandboxId: nativeSandboxId(leaseId) }; };
 
 it("measures only admission waits with bounded aggregate counters", async () => {
@@ -41,7 +55,7 @@ it("measures only admission waits with bounded aggregate counters", async () => 
 });
 
 describe.runIf(process.platform === "win32")("native owned foreground processes", () => {
-  it("compiles a managed source-keyed helper once, reuses it, and rejects a corrupted binary", async () => {
+  it("compiles a managed source-keyed helper once, reuses it, and quarantines then rebuilds a corrupted binary", async () => {
     const parent = await fixture();
     const state = join(parent, "usuário-缓存-🚀"); await mkdir(state);
     const cache = new NativeJobHelperCache(state);
@@ -52,8 +66,12 @@ describe.runIf(process.platform === "win32")("native owned foreground processes"
     const ready = performance.now(); await job.start(); console.info(JSON.stringify({ nativeHelperFixture: { cachedReadyMs: Math.round(performance.now() - ready) } }));
     await job.stop();
     await writeFile(executable, "tampered fixture");
-    await expect(new NativeJobHelperCache(state).executable()).rejects.toThrow("could not be verified");
-  }, 15_000);
+    const rebuilt = await new NativeJobHelperCache(state).executable();
+    expect(rebuilt).toBe(executable);
+    expect(await readFile(rebuilt, "utf8").catch(() => "")).not.toBe("tampered fixture");
+    const cacheEntries = await readdir(join(state, "native-helper-cache"));
+    expect(cacheEntries.filter((name) => name.startsWith(".quarantine-"))).toHaveLength(1);
+  }, 40_000);
 
   it("resolves relative and bare executables in request cwd instead of the gateway directory", async () => {
     const home = await fixture(), host = await fixture(), state = await fixture();
@@ -79,7 +97,7 @@ describe.runIf(process.platform === "win32")("native owned foreground processes"
       const supervisor=spawn(helper,[],{stdio:['pipe','pipe','ignore'],windowsHide:true});
       const frames=createInterface({input:supervisor.stdout});
       frames.on('line',line=>{ const frame=JSON.parse(line);
-        if(frame.kind==='ready') supervisor.stdin.write(JSON.stringify({command:JSON.stringify(process.execPath)+' -e '+JSON.stringify("process.stdout.write('started');setTimeout(()=>require('fs').writeFileSync('late','orphan'),2500);setInterval(()=>{},1000)"),cwd,stdin:'',env:process.env})+'\\n');
+        if(frame.kind==='ready') supervisor.stdin.write(JSON.stringify({command:JSON.stringify(process.execPath)+' -e '+JSON.stringify("require('fs').writeFileSync('child.pid',String(process.pid));process.stdout.write('started');setTimeout(()=>require('fs').writeFileSync('late','orphan'),2500);setInterval(()=>{},1000)"),cwd,stdin:'',env:process.env})+'\\n');
         if(frame.kind==='stdout' && Buffer.from(frame.data,'base64').toString().includes('started')) process.exit(17);
       });
       supervisor.stdin.write(JSON.stringify({mode:'create',name})+'\\n');`;
@@ -95,7 +113,8 @@ describe.runIf(process.platform === "win32")("native owned foreground processes"
       });
       // Read-only inspection must see absence BEFORE any reconciler can kill it.
       await vi.waitFor(async () => expect(await inspect()).toBe("absent"), { timeout: 2000 });
-      await new Promise((resolve) => setTimeout(resolve, 2700));
+      // Once the child is gone its delayed write can never happen.
+      await waitForProcessExit(Number(await readFile(join(home, "child.pid"), "utf8")));
       await expect(readFile(join(home, "late"))).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       owner.kill();
@@ -189,6 +208,26 @@ describe.runIf(process.platform === "win32")("native owned foreground processes"
     expect(await journal.list()).toHaveLength(2);
   }, 15_000);
 
+  it("keeps gateway credentials out of a managed command's environment", async () => {
+    const home = await fixture(), state = await fixture();
+    const secretName = "OPENBOT_TEST_GATEWAY_TOKEN";
+    vi.stubEnv(secretName, "gateway-token-must-not-leak");
+    vi.stubEnv("FIXTURE_SERVICE_API_KEY", "api-key-must-not-leak");
+    try {
+      const driver = new LocalRuntimeDriver({ runtimeRoot: state });
+      const manager = new RuntimeManager({ driver, reconciler: new LocalRuntimeReconciler({ runtimeRoot: state }) }); managers.push(manager);
+      const lease = await manager.acquire("fixture", { kind: "process.run", networkProfile: "host" });
+      const result = await driver.processRunner("fixture", home).run(lease, {
+        operation: "process.run", executable: process.execPath, cwd: ".", timeoutMs: 15_000, networkProfile: "host",
+        argv: ["-e", `process.stdout.write(JSON.stringify([process.env.${secretName} ?? null, process.env.FIXTURE_SERVICE_API_KEY ?? null, typeof process.env.PATH]))`],
+      }, new AbortController().signal);
+      await lease.release();
+      expect(result).toMatchObject({ ok: true, stdout: JSON.stringify([null, null, "string"]) });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 20_000);
+
   it("reopens the durable journal and terminates only its named supervisor and descendants", async () => {
     const home = await fixture(), other = await fixture(), state = await fixture();
     const journal = new FileRuntimeLeaseJournal(state);
@@ -199,9 +238,10 @@ describe.runIf(process.platform === "win32")("native owned foreground processes"
     const request = { operation: "process.run" as const, executable: process.execPath, argv: ["-e", "console.log('ready');setInterval(()=>{},1000)"], cwd: ".", timeoutMs: 15_000, networkProfile: "host" as const };
     const readyPath = join(home, "ready");
     const latePath = join(home, "late");
+    const pidPath = join(home, "descendant.pid");
     const descendant = "setTimeout(()=>require('fs').writeFileSync(process.argv[1],'leaked'),5000)";
-    const script = "require('child_process').spawn(process.execPath,['-e',process.argv[1],process.argv[2]],{detached:true,stdio:'ignore'});require('fs').writeFileSync(process.argv[3],'ready');setInterval(()=>{},1000)";
-    const running = driver.processRunner("a", home).run(a, { ...request, argv: ["-e", script, descendant, latePath, readyPath] }, new AbortController().signal);
+    const script = "const c=require('child_process').spawn(process.execPath,['-e',process.argv[1],process.argv[2]],{detached:true,stdio:'ignore'});require('fs').writeFileSync(process.argv[4],String(c.pid));require('fs').writeFileSync(process.argv[3],'ready');setInterval(()=>{},1000)";
+    const running = driver.processRunner("a", home).run(a, { ...request, argv: ["-e", script, descendant, latePath, readyPath, pidPath] }, new AbortController().signal);
     await vi.waitFor(async () => expect(await readFile(readyPath, "utf8")).toBe("ready"), { timeout: 3000 });
     // A second journal instance simulates recovery after losing the host's in-memory tables.
     const restarted = new FileRuntimeLeaseJournal(state);
@@ -212,7 +252,7 @@ describe.runIf(process.platform === "win32")("native owned foreground processes"
     await expect(driver.processRunner("b", other).run(b, { ...request, argv: ["-e", "process.stdout.write('other-alive')"] }, new AbortController().signal)).resolves.toMatchObject({ ok: true, stdout: "other-alive" });
     await a.release(); await b.release();
     expect(await restarted.list()).toEqual([]);
-    await new Promise((resolve) => setTimeout(resolve, 5100));
+    await waitForProcessExit(Number(await readFile(pidPath, "utf8")));
     await expect(readFile(latePath)).rejects.toMatchObject({ code: "ENOENT" });
   }, 20_000);
 
@@ -234,10 +274,11 @@ describe.runIf(process.platform === "win32")("native owned foreground processes"
     const lease = { agentId: "fixture", capability: { networkProfile: "host" } } as RuntimeLease;
     const child = "setTimeout(()=>require('fs').writeFileSync('late','escaped'),1500)";
     const result = await runner.run(lease, { operation: "process.run", executable: process.execPath,
-      argv: ["-e", "require('child_process').spawn(process.execPath,['-e',process.argv[1]],{detached:true,stdio:'ignore'}).unref();process.stdout.write('root-exit')", child],
+      argv: ["-e", "const c=require('child_process').spawn(process.execPath,['-e',process.argv[1]],{detached:true,stdio:'ignore'});c.unref();process.stdout.write('root-exit:'+c.pid)", child],
       cwd: ".", timeoutMs: 3000, networkProfile: "host" }, new AbortController().signal);
-    expect(result).toMatchObject({ ok: true, stdout: "root-exit", exitCode: 0 });
-    await new Promise((resolve) => setTimeout(resolve, 1700));
+    expect(result).toMatchObject({ ok: true, stdout: expect.stringMatching(/^root-exit:\d+$/u), exitCode: 0 });
+    if (!result.ok || result.operation !== "process.run") throw new Error("root process failed");
+    await waitForProcessExit(Number(result.stdout.split(":")[1]));
     await expect(readFile(join(home, "late"))).rejects.toMatchObject({ code: "ENOENT" });
   }, 10_000);
 });

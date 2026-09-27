@@ -139,4 +139,21 @@ describe("P2.1 A2A RPC ownership and lifecycle", () => {
       expect.objectContaining({ messageId: first.json.value.message.messageId, nonce: "conflict" }),
     ]);
   });
+
+  it("refuses a sender outside the roster and acks of leases held by the delivery runtime", async () => {
+    const handle = await boot();
+    expect((await post(handle, "createAgent", { id: "agent-a", name: "A" })).status).toBe(200);
+    expect((await post(handle, "createAgent", { id: "agent-b", name: "B" })).status).toBe(200);
+    expectFailure(await post(handle, "sendAgentMessage", sendBody({ senderAgentId: "ghost", nonce: "ghost-1" })), 404);
+
+    await handle.a2aRuntime.stop();
+    const sent = await post(handle, "sendAgentMessage", sendBody({ nonce: "runtime-lease" }));
+    expect(sent.status).toBe(200);
+    const messageId = sent.json.value.message.messageId as string;
+    const lease = handle.a2aStore.claimNext("agent-b", { ownerId: "a2a-runtime:1234", leaseDurationMs: 60_000 })!;
+    expectFailure(await post(handle, "ackAgentMessage", {
+      agentId: "agent-b", messageId, ownerId: lease.lease.ownerId, expectedVersion: lease.lease.version, status: "dead",
+    }), 409);
+    expect(handle.a2aStore.getMessage(messageId)).toMatchObject({ status: "delivering" });
+  });
 });

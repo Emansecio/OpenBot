@@ -20,7 +20,7 @@ import type {
   ExecutionRequest,
   ExecutionResult,
 } from "../execution/contracts.js";
-import { effectiveGrant, readSharedGrants } from "../execution/home-grants.js";
+import { GrantsError, effectiveGrant, readSharedGrants } from "../execution/home-grants.js";
 import { loadAgentVisibleUserMounts, resolveBrowserUploadTarget } from "../execution/user-files.js";
 import { WorkspaceError } from "../execution/workspace.js";
 
@@ -225,7 +225,9 @@ export class BrowserExecutionBackend implements ExecutionBackend {
       if (isLeaseFailure(error)) this.clearLeaseReference();
       if (request.operation === "browser.close") {
         this.clearLeaseReference();
-        await this.manager.release(lease);
+        // Report the original close failure; the manager keeps the lease
+        // and its sweep retries the cleanup.
+        await this.manager.release(lease).catch(() => undefined);
       }
       return browserFailure(request.operation, error);
     }
@@ -388,7 +390,16 @@ function browserErrorCode(error: unknown): ExecutionErrorCode {
   if (code === "BROWSER_LEASE_EXPIRED") return "lease_expired";
   if (code === "BROWSER_COMMAND_TIMEOUT" || code === "BROWSER_NAVIGATION_TIMEOUT") return "timed_out";
   if (code === "BROWSER_COMMAND_ABORTED") return "aborted";
-  if (code === "BROWSER_MANAGER_CLOSED" || code === "BROWSER_HOST_NOT_READY" || code === "BROWSER_HOST_EXITED") return "runtime_unavailable";
+  if (
+    code === "BROWSER_MANAGER_CLOSED" ||
+    code === "BROWSER_HOST_NOT_READY" ||
+    code === "BROWSER_HOST_EXITED" ||
+    code === "BROWSER_PENDING_LIMIT" ||
+    code === "BROWSER_QUEUE_FULL"
+  ) return "runtime_unavailable";
+  if (code === "BROWSER_PAGE_UNRESPONSIVE") return "timed_out";
+  if (code === "BROWSER_HANDOFF_ACTIVE") return "permission_denied";
+  if (code === "BROWSER_TAB_NOT_FOUND" || code === "BROWSER_TAB_CRASHED") return "invalid_request";
   if (code === "BROWSER_PROTOCOL_ERROR") return "runtime_protocol_error";
   if (code === "BROWSER_TAB_FORBIDDEN" || code === "BROWSER_UNAUTHORIZED") return "permission_denied";
   if (code === "BROWSER_UPLOAD_FILE_NOT_FOUND") return "not_found";
@@ -436,6 +447,9 @@ async function validateUploadFile(
     }
     if (error instanceof WorkspaceError && error.code === "access_denied") {
       throw new BrowserHostError("BROWSER_UPLOAD_ACCESS_DENIED", "browser upload folder is not granted or unavailable");
+    }
+    if (error instanceof GrantsError) {
+      throw new BrowserHostError("BROWSER_UPLOAD_ACCESS_DENIED", "this bot's shared-folder grants could not be read; ask the user to review its folder access");
     }
     const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
     if (code === "ENOENT" || code === "ENOTDIR") {

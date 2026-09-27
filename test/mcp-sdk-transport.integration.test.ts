@@ -163,6 +163,41 @@ describe("MCP SDK transport integration", () => {
     }
   });
 
+  it("replaces a stdio server that exits on its own before the next call, and releases its snapshot", async () => {
+    const serverPath = join(fixtureRoot, "test", `mcp-crash-${Date.now()}-${Math.random().toString(16).slice(2)}.mjs`);
+    await writeFile(serverPath, `
+import { McpServer } from "@modelcontextprotocol/server";
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+
+const server = new McpServer({ name: "crash-fixture", version: "1.0.0" });
+server.registerTool("pid", { description: "report the server process" }, async () => ({ content: [{ type: "text", text: String(process.pid) }] }));
+server.registerTool("crash", { description: "exit right after replying" }, async () => {
+  setTimeout(() => process.exit(3), 20);
+  return { content: [{ type: "text", text: "bye" }] };
+});
+await server.connect(new StdioServerTransport());
+`, "utf8");
+    const manager = new McpManager({
+      servers: [{ id: "crashy", transport: "stdio", command: nodeCommand, args: [serverPath], cwd: fixtureRoot }],
+      policies: { bot: { enabled: true, serverAllowlist: ["crashy"] } },
+      stdioApprovedCwdRoots: [fixtureRoot],
+      timeoutMs: 10_000,
+    });
+    const before = (await stagedDirectories()).length;
+    try {
+      const pid = (result: unknown) => (result as { content: Array<{ text: string }> }).content[0]!.text;
+      const first = pid(await manager.callProviderTool("bot", "mcp__crashy__pid", {}));
+      await manager.callProviderTool("bot", "mcp__crashy__crash", {});
+      // The exited child's snapshot is released without any further request.
+      await vi.waitFor(async () => expect((await stagedDirectories()).length).toBe(before), { timeout: 5_000 });
+      const second = pid(await manager.callProviderTool("bot", "mcp__crashy__pid", {}));
+      expect(second).not.toBe(first);
+    } finally {
+      await manager.close();
+      await rm(serverPath, { force: true });
+    }
+  });
+
   it("connects with a spaced original cwd and keeps legitimate server writes visible", async () => {
     const root = await mkdtemp(join(tmpdir(), "openbot mcp cwd spaces "));
     const cwd = join(root, "cwd with spaces");

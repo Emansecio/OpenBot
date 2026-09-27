@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { OpenCodeGoAdapter } from "../src/providers/opencode-go.js";
+import { isContextOverflowError } from "../src/memory/context.js";
 import type { ProviderStreamEvent } from "../src/providers/router.js";
 
 const request = (model: string) => ({
@@ -30,6 +31,31 @@ describe("OpenCode Go", () => {
     await adapter.streamChat({ ...request(`opencode-go/${model}`), sessionId: "conversation-fixture" }, () => undefined);
     expect(sessions).toEqual(["conversation-fixture", "conversation-fixture"]);
   });
+  it("keeps the provider's error message and Retry-After when a messages request fails", async () => {
+    const overflow = new OpenCodeGoAdapter({ apiKey: "oc-test", fetchImpl: (async () => Response.json(
+      { type: "error", error: { type: "invalid_request_error", message: "prompt too long: 210000 tokens > 200000 maximum" } },
+      { status: 400 },
+    )) as typeof fetch });
+    const error = await overflow.streamChat(request("opencode-go/minimax-m3"), () => undefined).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ status: 400, message: expect.stringContaining("prompt too long") });
+    // The tool loop and memory reflection shrink the request on this signal.
+    expect(isContextOverflowError(error)).toBe(true);
+
+    const limited = new OpenCodeGoAdapter({ apiKey: "oc-test", fetchImpl: (async () => new Response("{}", {
+      status: 429, headers: { "retry-after": "7" },
+    })) as typeof fetch });
+    await expect(limited.streamChat(request("opencode-go/minimax-m3"), () => undefined)).rejects.toMatchObject({ status: 429, retryAfterMs: 7_000 });
+  });
+
+  it("lets the caller cancel a model discovery that hangs", async () => {
+    const adapter = new OpenCodeGoAdapter({ apiKey: "oc-test", fetchImpl: ((_input, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+    })) as typeof fetch });
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error("cancelled")), 20);
+    await expect(adapter.discoverModels(controller.signal)).rejects.toThrow("cancelled");
+  });
+
   it("discovers all valid public model identifiers without sending credentials", async () => {
     const fetchImpl = vi.fn(async (_input, init) => {
       expect(new Headers(init?.headers).get("authorization")).toBeNull();

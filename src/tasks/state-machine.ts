@@ -22,6 +22,7 @@ import {
   type SubagentBudgetRemaining,
   type SubagentBudgetUsage,
 } from "./contracts.js";
+import { utf8Prefix } from "../shared/utf8.js";
 
 const TRANSITIONS: Readonly<Record<AsyncTaskStatus, ReadonlySet<AsyncTaskStatus>>> = {
   queued: new Set(["admitted", "cancelled"]),
@@ -562,18 +563,6 @@ export function assertTaskWithinWallBudget(
 export const TASK_RESULT_TRUNCATION_MARKER = "\n[task result truncated]";
 /** Explicit ASCII fallback that fits every valid positive result-byte cap. */
 export const TASK_RESULT_MIN_TRUNCATION_MARKER = "~";
-
-function utf8Prefix(value: string, maxBytes: number): string {
-  let output = "";
-  let bytes = 0;
-  for (const codePoint of value) {
-    const nextBytes = Buffer.byteLength(codePoint, "utf8");
-    if (bytes + nextBytes > maxBytes) break;
-    output += codePoint;
-    bytes += nextBytes;
-  }
-  return output;
-}
 
 export function limitTaskResultUtf8(value: string, maxResultBytes: number): LimitedTaskResult {
   if (typeof value !== "string") invalidBudgetContract("Task result must be a string.");

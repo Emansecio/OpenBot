@@ -7,64 +7,10 @@ import { describe, expect, it, vi } from "vitest";
 import { createProviderRegistry, type ProviderChatRequest } from "../src/providers/router.js";
 import type { ConfigStore } from "../src/config/store.js";
 import { createFakeAdapter } from "./mocks/fake-provider-adapter.js";
-import { MAX_SEND_QUEUE_PER_AGENT, createMemoryTranscriptStore, createTurnRunner, type TurnRunnerOptions, type TranscriptStore } from "../src/rpc/send.js";
+import { MAX_SEND_QUEUE_PER_AGENT, createMemoryTranscriptStore, createTurnRunner, type TranscriptStore } from "../src/rpc/send.js";
 import type { TranscriptEntry } from "../src/shared/contracts.js";
-
-/** Coleta os eventos publicados pelo runner (pub fake — sem HTTP). */
-function collectPublish() {
-  const events: { channel: string; payload: unknown }[] = [];
-  return {
-    events,
-    publish: (channel: string, payload: unknown) => {
-      events.push({ channel, payload });
-    },
-  };
-}
-
-/** Relógio determinístico (entries com timestampMs estável e crescente). */
-function fixedClock() {
-  let t = 1_000;
-  return {
-    now: () => (t += 1),
-  };
-}
-
-function ids() {
-  let n = 0;
-  return { newId: () => `id:${++n}` };
-}
-
-function deferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((done) => { resolve = done; });
-  return { promise, resolve };
-}
-
-type RunnerOpts = Omit<TurnRunnerOptions, "now" | "newId"> & {
-  now?: () => number;
-  newId?: (role: "user" | "assistant") => string;
-};
-
-function makeRunner(opts: RunnerOpts = {}): {
-  runner: ReturnType<typeof createTurnRunner>;
-  events: ReturnType<typeof collectPublish>["events"];
-} {
-  const now = opts.now ?? fixedClock().now;
-  const newId = opts.newId ?? ids().newId;
-  const pub = collectPublish();
-  const runner = createTurnRunner({
-    registry: opts.registry,
-    store: opts.store,
-    config: opts.config,
-    systemPrompt: opts.systemPrompt,
-    resolveProvider: opts.resolveProvider,
-    publish: pub.publish,
-    now,
-    newId,
-    ledgerCap: opts.ledgerCap,
-  });
-  return { runner, events: pub.events };
-}
+import { fakeConfig } from "./helpers/fake-config.js";
+import { collectPublish, deferred, makeRunner, fakeXai } from "./helpers/turn-runner.js";
 
 /** Todas as entries dos eventos appended do canal transcript. */
 function allAppended(events: ReturnType<typeof collectPublish>["events"]): TranscriptEntry[] {
@@ -72,18 +18,6 @@ function allAppended(events: ReturnType<typeof collectPublish>["events"]): Trans
     .filter((e) => e.channel === "transcript" && (e.payload as { type: string }).type === "appended")
     .map((e) => (e.payload as { entry: TranscriptEntry }).entry);
 }
-
-/** Registra um adapter fake como "xai" (provider do modelo default do catálogo). */
-function fakeXai(deltas: string[] = ["resposta"]): {
-  registry: ReturnType<typeof createProviderRegistry>;
-  adapter: ReturnType<typeof createFakeAdapter>;
-} {
-  const registry = createProviderRegistry();
-  const adapter = createFakeAdapter("xai", { deltas });
-  registry.register(adapter);
-  return { registry, adapter };
-}
-
 
 describe("fake provider abort lifecycle", () => {
   it("não deixa rejeição órfã quando o sinal aborta após stream sem delay", async () => {
@@ -102,7 +36,6 @@ describe("fake provider abort lifecycle", () => {
     }
   });
 });
-
 
 describe("T10 sendPrompt — aceitação e dedupe por clientNonce", () => {
   it("sendPrompt válido confirma após persistir o echo", async () => {
@@ -164,9 +97,7 @@ describe("T10 sendPrompt — aceitação e dedupe por clientNonce", () => {
       claimCalls += 1;
       return claim(...args);
     };
-    const config = {
-      snapshot: () => ({ agents: [{ id: "known" }] }),
-    } as ConfigStore;
+    const config = fakeConfig({ agents: [{ id: "known" }] }) as unknown as ConfigStore;
     const { runner } = makeRunner({ registry, store, config });
 
     expect(() => runner.sendPrompt({ agentId: "ghost", prompt: "p", clientNonce: "nonce:ghost" }))
@@ -394,5 +325,53 @@ describe("T10 sendPrompt — aceitação e dedupe por clientNonce", () => {
     expect(() => runner.sendPrompt({ agentId: "a", prompt: "x", clientNonce: "   " })).toThrow(/clientNonce/);
     expect(() => runner.sendPrompt({ agentId: "a", prompt: "x", clientNonce: null as unknown as string })).toThrow(/clientNonce/);
     expect(() => runner.sendPrompt({ agentId: "a", prompt: "x", clientNonce: 42 as unknown as string })).toThrow(/clientNonce/);
+  });
+});
+
+describe("turn runner — acceptance and snapshot deferral", () => {
+  it("settles sendPrompt as accepted when a step after the durable user echo fails", async () => {
+    const { registry } = fakeXai(["ok"]);
+    const store = createMemoryTranscriptStore();
+    store.rememberAcceptedNonce = () => { throw new Error("SQLITE_BUSY: nonce ledger"); };
+    const { runner } = makeRunner({ registry, store });
+
+    const outcome = await Promise.race([
+      runner.sendPrompt({ agentId: "a", prompt: "p", clientNonce: "nonce:echo-then-fail" }),
+      new Promise((resolve) => setTimeout(() => resolve("still pending"), 2_000)),
+    ]);
+    // The echo is durable, so the send was accepted; the RPC must not hang.
+    expect(outcome).toEqual({ accepted: true });
+    await runner.flush("a");
+    expect(store.getEntries("a").some((entry) => entry.kind === "message" && entry.role === "user")).toBe(true);
+  });
+
+  it("does not hold one agent's tool-card snapshot while another agent's turn is streaming", async () => {
+    const gate = deferred();
+    let streaming = false;
+    const registry = createProviderRegistry();
+    registry.register({
+      name: "xai",
+      async streamChat(_request, emit) {
+        streaming = true;
+        await gate.promise;
+        emit({ type: "delta", delta: "a" });
+      },
+    });
+    const store = createMemoryTranscriptStore();
+    store.append("b", [{ kind: "tool-call", id: "tool-b", name: "file", summary: "read", status: "running" }]);
+    const { runner, events } = makeRunner({ registry, store });
+
+    runner.sendPrompt({ agentId: "a", prompt: "long turn", clientNonce: "nonce:a" });
+    // Agent A is inside its provider attempt, where it defers its own snapshots.
+    await vi.waitFor(() => expect(streaming).toBe(true));
+    const before = events.length;
+    runner.closeOpenToolCalls("b", { ok: false, code: "aborted", message: "stopped" });
+    const snapshotsForB = events.slice(before).filter((event) => event.channel === "transcript"
+      && (event.payload as { type: string; agentId: string }).type === "snapshot"
+      && (event.payload as { agentId: string }).agentId === "b");
+    expect(snapshotsForB).toHaveLength(1);
+
+    gate.resolve();
+    await runner.flush("a");
   });
 });

@@ -49,11 +49,6 @@ describe("execution contracts", () => {
     [{ operation: "browser.screenshot", fullPage: false }, "browser.screenshot"],
     [{ operation: "browser.handoff" }, "browser.handoff"],
     [{ operation: "browser.close" }, "browser.close"],
-    [{ operation: "whatsapp", op: "doctor" }, "whatsapp"],
-    [{ operation: "whatsapp", op: "sweep" }, "whatsapp"],
-    [{ operation: "whatsapp", op: "messages_list", chat: "5511999999999@s.whatsapp.net", limit: 20 }, "whatsapp"],
-    [{ operation: "whatsapp", op: "send", chat: "5511999999999", text: "oi", etapa: "adesao" }, "whatsapp"],
-    [{ operation: "whatsapp", op: "download", chat: "5511999999999", mediaId: "ABC" }, "whatsapp"],
   ] as const)("aceita %j", (input, operation) => {
     expect(parseExecutionRequest(input).operation).toBe(operation);
   });
@@ -81,10 +76,8 @@ describe("execution contracts", () => {
     { operation: "browser.upload", selector: "input[type=file]", path: "../secret.txt" },
     { operation: "browser.upload", selector: "input[type=file]", path: "C:\\secret.txt" },
     { operation: "browser.snapshot", includeText: "yes" },
-    { operation: "whatsapp", op: "shell" },
-    { operation: "whatsapp", op: "send", chat: "C:\\secret.txt", text: "x" },
-    { operation: "whatsapp", op: "doctor", extra: true },
-    { operation: "whatsapp", op: "sweep", chat: "5511" },
+    // The WhatsApp host operation was removed; old requests are rejected.
+    { operation: "whatsapp", op: "doctor" },
   ])("rejeita entrada não permitida %#", (input) => {
     expect(() => parseExecutionRequest(input)).toThrow(ExecutionRequestError);
   });

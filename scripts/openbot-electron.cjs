@@ -5,15 +5,13 @@ const { pathToFileURL } = require("node:url");
 // Windows taskbar identity is independent of BrowserWindow's icon.
 if (process.platform === "win32") {
   const appId = "OpenBot.Desktop";
-  const iconPath = join(process.env.OPENBOT_RELEASE_ROOT || join(__dirname, ".."), "assets", "openbot.ico");
-  const launcher = process.env.OPENBOT_INSTALL_ROOT
-    ? join(process.env.OPENBOT_INSTALL_ROOT, "OpenBot.vbs")
-    : join(__dirname, "openbot-desktop.vbs");
-  const windowIconPath = join(process.env.OPENBOT_RELEASE_ROOT || join(__dirname, ".."), "assets", "openbot.png");
+  const iconPath = join(__dirname, "..", "assets", "openbot.ico");
+  const launcher = join(__dirname, "openbot-desktop.vbs");
+  const windowIconPath = join(__dirname, "..", "assets", "openbot.png");
   const image = nativeImage.createFromPath(windowIconPath);
   const shellIcon = nativeImage.createFromPath(iconPath);
   if (image.isEmpty() || shellIcon.isEmpty()) {
-    throw new Error("OpenBot desktop icons are missing or invalid. Repair the installation before launching.");
+    throw new Error("OpenBot desktop icons are missing or invalid (assets/openbot.png, assets/openbot.ico).");
   }
   process.env.SAND_DEV_APP_ICON = windowIconPath;
   app.setName("OpenBot");
@@ -67,6 +65,8 @@ if (process.platform === "win32") {
             { type: "separator" },
             { label: "Encerrar OpenBot", click: () => app.quit() },
           ]));
+          // A single click reopens; reopen is idempotent, so a double click is harmless.
+          candidate.on("click", reopen);
           candidate.on("double-click", reopen);
           tray = candidate;
         } catch (error) {

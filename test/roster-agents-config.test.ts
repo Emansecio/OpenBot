@@ -23,7 +23,6 @@ async function boot(onTestFinished: RegisterCleanup, seedDefault = true) {
   if (seedDefault) {
     const config = new ConfigStore({ configPath });
     config.update({ agents: [{ id: "openbot-default", name: "Local User", avatarId: "openbot-default" }] });
-    config.close();
   }
   handle = await startServer(0, {
     stateRoot: join(dir, "state"),

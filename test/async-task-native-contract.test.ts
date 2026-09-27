@@ -465,7 +465,7 @@ describe("P2.2 ownership and bridge prerequisites", () => {
     const task = taskInput("agent-a");
     handle.asyncTaskStore.dispatch(task);
     const before = handle.asyncTaskStore.getTask(task.taskId)!;
-    await expect(Promise.resolve().then(() => handler(handle, "abortAsyncTask")({ agentId: "agent-a", taskId: task.taskId, intentId: randomUUID(), expectedAbortVersion: before.abortVersion + 1, reason: "user" }, context(handle)))).rejects.toMatchObject({ code: "invalid_transition" });
+    await expect(Promise.resolve().then(() => handler(handle, "abortAsyncTask")({ agentId: "agent-a", taskId: task.taskId, intentId: randomUUID(), expectedAbortVersion: before.abortVersion + 1, reason: "user" }, context(handle)))).rejects.toMatchObject({ code: "invalid_transition", status: 409 });
     await expect(Promise.resolve().then(() => handler(handle, "steerAsyncTask")({ agentId: "agent-a", taskId: task.taskId, intentId: randomUUID(), expectedSteerVersion: before.steerVersion, message: { malformed: true } }, context(handle)))).rejects.toMatchObject({ status: 400 });
     expect(handle.asyncTaskStore.getTask(task.taskId)).toMatchObject({ version: before.version, status: before.status });
   });

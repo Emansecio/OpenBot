@@ -53,15 +53,6 @@ describe("AgentHomeStore lifecycle", () => {
     const imported = await targetStore.importArchive("portable", archivePath);
     // A foreign archive must not carry pre-approved access to real folders.
     expect(Object.keys((await readSharedGrants(imported.root)).grants)).toHaveLength(0);
-
-    const snapshotSource = await temp();
-    const snapshotStore = await AgentHomeStore.create(snapshotSource);
-    const snapshotHome = await snapshotStore.ensure("restored");
-    await writeSharedGrants(snapshotHome.root, { version: 1, grants: { Downloads: { access: "write" } } });
-    const snapshot = await snapshotStore.snapshot("restored");
-    // restoreSnapshot quarantines the active home and rolls back on failure.
-    const restored = await snapshotStore.restoreSnapshot("restored", snapshot.seq);
-    expect((await readSharedGrants(restored.root)).grants["Downloads"]?.access).toBe("write");
   });
 
   it("rejects a tampered archive before creating an active home", async () => {

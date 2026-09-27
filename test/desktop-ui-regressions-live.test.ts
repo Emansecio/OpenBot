@@ -195,7 +195,6 @@ describe.skipIf(process.platform !== "win32" || process.env.OPENBOT_RUN_LIVE_DES
       }
       gateway.close(); http.closeAllConnections();
       if (http.listening) await new Promise<void>(resolve => http.close(() => resolve()));
-      config.close();
       if (child?.pid && child.exitCode === null && child.signalCode === null) throw new Error(`Fixture did not exit; state retained at ${root}`);
       await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }

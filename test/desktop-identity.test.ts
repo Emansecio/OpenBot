@@ -8,8 +8,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
-// @ts-expect-error Release helpers are native ESM scripts.
-import { createShortcut, writeVersionLauncher } from "../scripts/release-common.mjs";
+// @ts-expect-error Checkout helpers are native ESM scripts.
+import { createShortcut } from "../scripts/common.mjs";
 // @ts-expect-error Desktop setup is a native ESM script.
 import { setupDesktopShortcut } from "../scripts/setup-desktop-shortcut.mjs";
 
@@ -179,11 +179,14 @@ describe.skipIf(process.platform !== "win32")("real Windows desktop identity", (
       const ico = join(root, "assets", "openbot.ico");
       copyFileSync(join(repo, "assets", "openbot.png"), png);
       copyFileSync(join(repo, "assets", "openbot.ico"), ico);
-      await writeVersionLauncher(root);
-      // Replace only the disposable fixture CMD, never a real launcher. /u
-      // makes cmd's cwd output Unicode without depending on the system locale.
-      writeFileSync(join(root, "OpenBot.cmd"), '@echo off\r\n"%ComSpec%" /d /u /c cd > "%~dp0sentinel.tmp"\r\nmove /y "%~dp0sentinel.tmp" "%~dp0sentinel.txt" >nul\r\nexit /b 0\r\n');
-      const launcher = join(root, "OpenBot.vbs");
+      // A disposable checkout: the production VBS and Electron wrapper, with a
+      // sentinel in place of the real cmd. /u makes cmd's cwd output Unicode
+      // without depending on the system locale.
+      mkdirSync(join(root, "scripts"));
+      copyFileSync(join(repo, "scripts", "openbot-desktop.vbs"), join(root, "scripts", "openbot-desktop.vbs"));
+      copyFileSync(join(repo, "scripts", "openbot-electron.cjs"), join(root, "scripts", "openbot-electron.cjs"));
+      writeFileSync(join(root, "scripts", "openbot-desktop.cmd"), '@echo off\r\n"%ComSpec%" /d /u /c cd > "%~dp0..\\sentinel.tmp"\r\nmove /y "%~dp0..\\sentinel.tmp" "%~dp0..\\sentinel.txt" >nul\r\nexit /b 0\r\n');
+      const launcher = join(root, "scripts", "openbot-desktop.vbs");
       const shortcut = join(root, "OpenBot fixture.lnk");
       const system32 = join(process.env.SystemRoot ?? "C:\\Windows", "System32");
       const created = await createShortcut(launcher, shortcut, {
@@ -192,16 +195,14 @@ describe.skipIf(process.platform !== "win32")("real Windows desktop identity", (
       });
       expect(created.skipped).toBe(false);
       expect(created.fallback).toBe(false);
-      mkdirSync(join(root, "scripts"));
-      copyFileSync(join(repo, "scripts", "openbot-desktop.vbs"), join(root, "scripts", "openbot-desktop.vbs"));
       const checkoutShortcut = join(root, "checkout-fixture.lnk");
       await setupDesktopShortcut({ root, shortcutPath: checkoutShortcut });
       writeFileSync(join(root, "native.ps1"), nativeProbe, "utf8");
       writeFileSync(join(root, "main.cjs"), electronFixture, "utf8");
       writeFileSync(join(root, "config.json"), JSON.stringify({
-        png, ico, launcher, shortcut, checkoutShortcut, wrapper: join(repo, "scripts", "openbot-electron.cjs"),
+        png, ico, launcher, shortcut, checkoutShortcut, wrapper: join(root, "scripts", "openbot-electron.cjs"),
       }));
-      const env: NodeJS.ProcessEnv = { ...process.env, OPENBOT_IDENTITY_FIXTURE: root, OPENBOT_RELEASE_ROOT: root, OPENBOT_INSTALL_ROOT: root,
+      const env: NodeJS.ProcessEnv = { ...process.env, OPENBOT_IDENTITY_FIXTURE: root,
         APPDATA: join(root, "profile", "roaming"), LOCALAPPDATA: join(root, "profile", "local"),
         USERPROFILE: join(root, "profile"), HOME: join(root, "profile"), OPENBOT_HOME: join(root, "profile"),
         TEMP: join(root, "profile", "temp"), TMP: join(root, "profile", "temp"),

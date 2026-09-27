@@ -70,10 +70,57 @@ describe("LocalCommandExecutor", () => {
     expect(ambiguous).toMatchObject({ ok: false, code: "invalid_path" });
   });
 
+  it("aceita alternâncias escapadas e classes de dígito, mas recusa retrorreferências", async () => {
+    expect(isSafeSearchRegex("(\\.js|\\.ts)+")).toBe(true);
+    expect(isSafeSearchRegex("v[1-9]")).toBe(true);
+    expect(isSafeSearchRegex("(a)\\1")).toBe(false);
+    const root = await temp(); await writeFile(path.join(root, "a.txt"), "main.js.ts\nv2 release\n");
+    const executor = await LocalCommandExecutor.create(root);
+    expect(await executor.execute(text("(\\.js|\\.ts)+$", "regex"))).toMatchObject({ ok: true, stdout: "a.txt:1:main.js.ts" });
+    expect(await executor.execute(text("^v[1-9]", "regex"))).toMatchObject({ ok: true, stdout: "a.txt:2:v2 release" });
+    expect(await executor.execute(text("x".repeat(201), "regex"))).toMatchObject({ ok: false, code: "invalid_path", message: expect.stringMatching(/200 characters/u) });
+  });
+
+  it("interrompe uma regex catastrófica que passa pelo filtro sem congelar o gateway", async () => {
+    const root = await temp(); await writeFile(path.join(root, "slow.txt"), `${"a".repeat(40)}\nok\n`);
+    const executor = await LocalCommandExecutor.create(root);
+    expect(isSafeSearchRegex("(.|a)*b")).toBe(true);
+    let ticks = 0;
+    const ticker = setInterval(() => { ticks += 1; }, 50);
+    const started = Date.now();
+    try {
+      const result = await executor.execute(text("(.|a)*b", "regex"));
+      expect(result).toMatchObject({ ok: false, code: "invalid_path", message: expect.stringMatching(/took longer/u) });
+    } finally {
+      clearInterval(ticker);
+    }
+    expect(Date.now() - started).toBeLessThan(6_000);
+    // The event loop kept running while the worker was stuck.
+    expect(ticks).toBeGreaterThan(10);
+  }, 15_000);
+
+  it("aborta uma regex em andamento encerrando o worker", async () => {
+    const root = await temp(); await writeFile(path.join(root, "slow.txt"), `${"a".repeat(40)}\n`);
+    const executor = await LocalCommandExecutor.create(root);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 200);
+    const started = Date.now();
+    expect(await executor.execute(text("(.|a)*b", "regex"), controller.signal)).toMatchObject({ ok: false, code: "aborted" });
+    expect(Date.now() - started).toBeLessThan(1_500);
+  }, 15_000);
+
   it("normaliza regex inválida e abort", async () => {
     const root = await temp(); const executor = await LocalCommandExecutor.create(root);
     expect(await executor.execute(text("[", "regex"))).toMatchObject({ ok: false, code: "invalid_path" });
     const controller = new AbortController(); controller.abort();
     expect(await executor.execute(files({ paths: ["."] }), controller.signal)).toMatchObject({ ok: false, code: "aborted" });
+  });
+});
+
+describe("unsafe search regexes", () => {
+  it("rejects nested and repeated unbounded groups", () => {
+    expect(isSafeSearchRegex("foo")).toBe(true);
+    expect(isSafeSearchRegex("(.*){1000}")).toBe(false);
+    expect(isSafeSearchRegex("(.*)(.*)")).toBe(false);
   });
 });

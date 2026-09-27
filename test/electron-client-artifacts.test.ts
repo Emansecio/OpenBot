@@ -95,9 +95,9 @@ describe("Electron client artifact baseline", () => {
   });
 
   it("protects the launcher preflight and visual gate", () => {
-    const launcher = readFileSync(resolve(root, "scripts/openbot-desktop.cmd"), "utf8");
-    expect(launcher).toContain('scripts\\verify-client-artifacts.mjs"');
-    expect(launcher).toMatch(/verify-client-artifacts\.mjs[\s\S]{0,160}if errorlevel 1/);
+    const launcher = readFileSync(resolve(root, "scripts/launch.mjs"), "utf8");
+    expect(launcher).toContain('(await import("./verify-client-artifacts.mjs")).verifyClientArtifacts({ root })');
+    expect(launcher).toMatch(/const client = await verifyClient\(\);\r?\n\s+if \(!client\.ok\) throw new LaunchError\([^\n]*EXIT\.BUILD\)/u);
     const visualGate = readFileSync(resolve(root, "scripts/verify-visual-ui-gate.mjs"), "utf8");
     const boundary = visualGate.indexOf('run("renderer-boundary"');
     const artifacts = visualGate.indexOf('run("client-artifacts"');

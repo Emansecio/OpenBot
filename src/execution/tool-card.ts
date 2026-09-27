@@ -95,16 +95,19 @@ export function toolCallSummary(name: string, rawArgs: string): string {
     if (name === "search_text") return "search text";
     if (name === "search_files") return "search files";
     if (name === "search_skills") return "search skills";
+    if (name === "search_mcp_tools") return "search MCP tools";
+    if (name === "call_mcp_tool") {
+      const target = typeof parsed.name === "string" && parsed.name.startsWith("mcp__")
+        ? safeToolName(parsed.name.slice(5).split("__")[0] ?? "")
+        : "";
+      return sanitizeToolSummary(target.length === 0 ? "call MCP tool" : `MCP ${target}`);
+    }
     if (name === "use_skill") {
       const skillId = safeLabel(parsed.id, "");
       return sanitizeToolSummary(skillId.length === 0 ? "use skill" : `use skill ${skillId}`);
     }
     if (name === "save_skill") return sanitizeToolSummary(`save skill ${safeLabel(parsed.id, "")}`.trim());
     if (name === "process_run") return "run process";
-    if (name === "whatsapp") {
-      const op = safeLabel(parsed.op, "whatsapp");
-      return sanitizeToolSummary(op === "whatsapp" ? "whatsapp" : `whatsapp ${op}`);
-    }
     if (name === "browser_navigate") {
       if (typeof parsed.url === "string") {
         try {
@@ -157,9 +160,6 @@ export function toolCallResult(result: ExecutionResult, request?: ExecutionReque
   if (result.operation === "file.list") return { ok: true, operation: result.operation, count: result.entries.length, ...(path ? { path } : {}) };
   if (result.operation === "command.run") {
     return { ok: true, operation: result.operation, command: result.command, exitCode: result.exitCode };
-  }
-  if (result.operation === "whatsapp") {
-    return { ok: true, operation: result.operation, command: result.op, exitCode: result.exitCode };
   }
   return { ok: true };
 }

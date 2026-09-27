@@ -8,18 +8,17 @@
  */
 import { execFile, spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createServer } from "node:net";
 import { promisify } from "node:util";
-import { connectCdp, startE2eWatchdog } from "./e2e-runtime.mjs";
+import { cleanE2eEnvironment, connectCdp, sleep, startE2eWatchdog } from "./e2e-runtime.mjs";
+import { resolveElectronExecutable } from "./electron-executable.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(process.env.OPENBOT_ROOT || dirname(dirname(fileURLToPath(import.meta.url))));
-const requireFromProject = createRequire(join(repoRoot, "package.json"));
-const electronExecutable = process.env.ELECTRON_EXE || requireFromProject("electron");
+const electronExecutable = resolveElectronExecutable(repoRoot);
 const electronMain = process.env.OPENBOT_ELECTRON_MAIN || join(repoRoot, "scripts", "openbot-electron.cjs");
 const backendEntry = join(repoRoot, "dist", "main.js");
 
@@ -351,14 +350,6 @@ const INSTRUMENTATION_SOURCE = String.raw`(() => {
   };
 })();`;
 
-function sleep(ms) { return new Promise((resolvePromise) => setTimeout(resolvePromise, ms)); }
-
-function cleanEnvironment(extra = {}) {
-  const env = { ...process.env };
-  for (const key of ["VITEST", "VITEST_WORKER_ID", "VITEST_POOL_ID", "NODE_OPTIONS", "ELECTRON_RUN_AS_NODE", "OPENBOT_DATA_ROOT", "OPENBOT_LOCAL_GATEWAY", "SAND_HOST_GATEWAY_URL", "SAND_HOST_GATEWAY_TOKEN", "SAND_DEV_BOX_CONTROL_PLANE", "GATEWAY_TOKEN"]) delete env[key];
-  return { ...env, ...extra };
-}
-
 function spawnExit(child) {
   return new Promise((resolvePromise) => child.once("close", (code, signal) => resolvePromise({ code, signal }))); 
 }
@@ -643,7 +634,7 @@ process.on("SIGINT", () => void stop("SIGINT"));`;
     },
   );
   try {
-    backend = spawn(process.execPath, ["--input-type=module", "-e", backendCode], { cwd: repoRoot, detached: true, windowsHide: true, env: cleanEnvironment({ NODE_ENV: "test", OPENBOT_DATA_ROOT: dataRoot, P27_RUN_ROOT: runRoot, P27_READY_PATH: readyPath, P27_STREAM_DELTAS: "200", P27_STREAM_DELAY_MS: "10" }), stdio: ["ignore", "pipe", "pipe"] });
+    backend = spawn(process.execPath, ["--input-type=module", "-e", backendCode], { cwd: repoRoot, detached: true, windowsHide: true, env: cleanE2eEnvironment({ NODE_ENV: "test", OPENBOT_DATA_ROOT: dataRoot, P27_RUN_ROOT: runRoot, P27_READY_PATH: readyPath, P27_STREAM_DELTAS: "200", P27_STREAM_DELAY_MS: "10" }), stdio: ["ignore", "pipe", "pipe"] });
     backend.stdout?.on("data", (chunk) => appendFileSync(join(evidenceDir, "backend.stdout.log"), chunk));
     backend.stderr?.on("data", (chunk) => appendFileSync(join(evidenceDir, "backend.stderr.log"), chunk));
     const backendExited = spawnExit(backend);
@@ -657,7 +648,7 @@ process.on("SIGINT", () => void stop("SIGINT"));`;
     await rpc(gatewayUrl, backendReady.token, "createAgent", { id: "openbot-default", name: "P27 Profiler" });
     await rpc(gatewayUrl, backendReady.token, "openAgent", { agentId: "openbot-default" });
     const devToolsPath = join(userData, "DevToolsActivePort");
-    electron = spawn(electronExecutable, [`--user-data-dir=${userData}`, "--no-sandbox", "--disable-gpu", "--remote-debugging-port=0", electronMain], { cwd: repoRoot, windowsHide: true, env: cleanEnvironment({ APPDATA: appData, LOCALAPPDATA: localAppData, OPENBOT_USER_DATA: userData, OPENBOT_DATA_ROOT: dataRoot, OPENBOT_LOCAL_GATEWAY: "1", OPENBOT_VISUAL_TEST: "1", SAND_HOST_GATEWAY_URL: gatewayUrl, SAND_HOST_GATEWAY_TOKEN: backendReady.token, SAND_DEV_BOX_CONTROL_PLANE: "0", GATEWAY_TOKEN: backendReady.token }), stdio: ["ignore", "pipe", "pipe"] });
+    electron = spawn(electronExecutable, [`--user-data-dir=${userData}`, "--no-sandbox", "--disable-gpu", "--remote-debugging-port=0", electronMain], { cwd: repoRoot, windowsHide: true, env: cleanE2eEnvironment({ APPDATA: appData, LOCALAPPDATA: localAppData, OPENBOT_USER_DATA: userData, OPENBOT_DATA_ROOT: dataRoot, OPENBOT_LOCAL_GATEWAY: "1", OPENBOT_VISUAL_TEST: "1", SAND_HOST_GATEWAY_URL: gatewayUrl, SAND_HOST_GATEWAY_TOKEN: backendReady.token, SAND_DEV_BOX_CONTROL_PLANE: "0", GATEWAY_TOKEN: backendReady.token }), stdio: ["ignore", "pipe", "pipe"] });
     electron.stdout?.on("data", (chunk) => appendFileSync(join(evidenceDir, "electron.stdout.log"), chunk));
     electron.stderr?.on("data", (chunk) => appendFileSync(join(evidenceDir, "electron.stderr.log"), chunk));
     const electronExited = spawnExit(electron);

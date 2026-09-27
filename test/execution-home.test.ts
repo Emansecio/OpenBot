@@ -63,6 +63,16 @@ describe("AgentHomeStore", () => {
     await expect(store.inventory()).rejects.toMatchObject({ code: "unsafe_path" });
   });
 
+  it("does not recreate a welcome file the user deleted", async () => {
+    const store = await AgentHomeStore.create(await temp());
+    const first = await store.ensure("openbot-default");
+    const welcome = join(first.root, "Desktop", "Bem-vindo.md");
+    await rm(welcome);
+    await store.ensure("openbot-default");
+    await store.repair("openbot-default");
+    await expect(readFile(welcome, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("seeds layout once and keeps user files on the second ensure", async () => {
     const store = await AgentHomeStore.create(await temp());
     const first = await store.ensure("openbot-default");
@@ -210,7 +220,7 @@ describe("AgentHomeStore", () => {
     const store = await AgentHomeStore.create(root, { acl });
 
     await expect(Promise.all([
-      store.backendFor("agent-a"),
+      store.ensure("agent-a"),
       store.ensure("agent-b"),
     ])).resolves.toHaveLength(2);
   });

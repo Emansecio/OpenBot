@@ -24,15 +24,15 @@ function isAddon(value: unknown): value is DpapiAddon {
   return typeof record.protect === "function" && typeof record.unprotect === "function";
 }
 
+/** `native/dpapi/<platform>-<arch>/openbot-dpapi.node`, next to the compiled `dist/keystore`. */
 export function dpapiAddonPath(modulePath?: string): string {
   if (modulePath) return modulePath;
-  const platformArch = `${process.platform}-${process.arch}`;
-  const candidates = [
-    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../native/dpapi", platformArch, "openbot-dpapi.node"),
-    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../native/dpapi", platformArch, "openbot-dpapi.node"),
-    path.resolve(process.cwd(), "native/dpapi", platformArch, "openbot-dpapi.node"),
-  ];
-  return candidates[0]!;
+  return path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../../native/dpapi",
+    `${process.platform}-${process.arch}`,
+    "openbot-dpapi.node",
+  );
 }
 
 export function loadDpapiAddon(options: DpapiBackendOptions = {}): DpapiAddon {
@@ -103,8 +103,4 @@ export function dpapiLegacyReadBackend(options: DpapiBackendOptions = {}): Crypt
       }
     },
   };
-}
-
-export function isDpapiPayload(payload: Buffer): boolean {
-  return payload.length > PAYLOAD_TAG.length && payload.subarray(0, PAYLOAD_TAG.length).equals(PAYLOAD_TAG);
 }

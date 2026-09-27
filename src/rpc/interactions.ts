@@ -1,4 +1,3 @@
-import type { LocalExecutionBroker } from "../execution/broker.js";
 import type { Keystore } from "../keystore/index.js";
 import { RpcError, type Gateway } from "../server/gateway.js";
 import { SqliteTranscriptStore } from "../store/index.js";
@@ -32,7 +31,6 @@ export function registerInteractionHandlers(
   gateway: Gateway,
   store: SqliteTranscriptStore,
   keystore: Keystore,
-  executionBroker?: LocalExecutionBroker,
 ): void {
   const decision = (body: unknown, kind: string, allowed: readonly string[]) => {
     const b = record(body);
@@ -56,25 +54,6 @@ export function registerInteractionHandlers(
     const b = record(body);
     const id = agentId(b);
     return { ok: true, agentId: id, widgetId: optionalText(b, ["widgetId", "entryId"]) };
-  });
-  gateway.registerHandler("resolveLocalToolPermission", (body) => {
-    const b = record(body);
-    const id = agentId(b);
-    const requestId = optionalText(b, ["requestId", "entryId", "widgetId"]);
-    const value = decisionValue(b);
-    const mapped = ["approve", "allow", "allow-once", "always"].includes(value) ? "allow"
-      : ["reject", "deny", "never"].includes(value) ? "deny"
-      : null;
-    if (mapped === null) throw new RpcError(400, "decision inválida");
-    const pendingApproval = executionBroker?.peekPendingApproval(requestId, id);
-    if (pendingApproval !== undefined && pendingApproval.conversationId === undefined) {
-      throw new RpcError(409, "aprovação local sem conversa de origem");
-    }
-    const status = executionBroker?.resolutionStatus(requestId, mapped, id) ?? "not-found";
-    if (status === "expired") throw new RpcError(409, "aprovação local expirada");
-    if (status === "not-found") throw new RpcError(404, "aprovação local não encontrada para este agente");
-    const saved = store.rememberInteractionDecision(id, requestId, "local-tool-permission", mapped, pendingApproval?.conversationId);
-    return { ok: true, agentId: id, requestId, decision: saved.decision };
   });
   gateway.registerHandler("resolveAutoReviewApproval", (body) => decision(body, "auto-review-approval", ["approve", "reject", "allow", "deny"]));
   gateway.registerHandler("submitSecret", async (body) => {

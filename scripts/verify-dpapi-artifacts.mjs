@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { validateDpapiNativeArtifact } from "./release-common.mjs";
+import { validateDpapiNativeArtifact } from "./common.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const arch = process.env.OPENBOT_TARGET_ARCH ?? process.arch;

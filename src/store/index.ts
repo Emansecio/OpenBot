@@ -17,40 +17,16 @@ import type {
   TurnAttemptRecord,
   TurnOutcome,
 } from "../rpc/send.js";
-import { ensureDefaultConversation, migrateOpenBotSchema } from "./schema.js";
+import { ensureDefaultConversation, ensureOpenBotSchema, validateAgentId, type ConversationRow } from "./schema.js";
+import { windowsPowerShellPath } from "../shared/windows-tools.js";
 import { SqliteConversationStore } from "../conversations/store.js";
 import { SqliteMemoryStore } from "../memory/sqlite-store.js";
 import type { MemoryAgentSnapshot } from "../memory/types.js";
-import {
-  MAX_RESUME_EFFECT_IDS,
-  boundedResumeResult,
-  checkpointMatchesScope,
-  validateOpaqueResumeCursor,
-  type ResumeCheckpoint,
-  type ResumeCheckpointScope,
-  type ResumeBudgetSnapshot,
-  type ResumeEffectCommit,
-  type ResumeEffectRecord,
-  type ResumeEffectStatus,
-} from "../providers/resume.js";
-
+import { utf8Prefix } from "../shared/utf8.js";
 export const DEFAULT_TRANSCRIPT_PAGE_LIMIT = 50;
 export const MAX_TRANSCRIPT_PAGE_LIMIT = 1000;
 const MAX_KICKSTART_RESULT_BYTES = 4 * 1024;
 const MAX_KICKSTART_ERROR_BYTES = 2 * 1024;
-
-function utf8Prefix(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-  let output = "";
-  let bytes = 0;
-  for (const codePoint of value) {
-    const nextBytes = Buffer.byteLength(codePoint, "utf8");
-    if (bytes + nextBytes > maxBytes) break;
-    output += codePoint;
-    bytes += nextBytes;
-  }
-  return output;
-}
 
 export function defaultStoreDir(): string {
   const explicitRoot = process.env.OPENBOT_DATA_ROOT?.trim();
@@ -170,8 +146,6 @@ export interface SqliteTranscriptAgentSnapshot extends TranscriptAgentSnapshot {
   interactionDecisionRows: SqliteInteractionDecisionRowSnapshot[];
   turnAttemptRows: SqliteTurnAttemptRowSnapshot[];
   turnCompletionRows: SqliteTurnCompletionRowSnapshot[];
-  resumeCheckpoints: Array<ResumeCheckpoint & { updatedAtMs: number }>;
-  resumeEffects: ResumeEffectRecord[];
   kickstartRuns: KickstartRunRecord[];
   memorySnapshot?: MemoryAgentSnapshot;
 }
@@ -183,6 +157,9 @@ type EntryRow = {
 type PageRow = EntryRow & {
   sequence_id: number;
 };
+
+/** 64 MiB: after a large transaction the WAL file shrinks back instead of keeping its peak size. */
+const WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024;
 
 type PresenceRow = { present?: number };
 type TurnCompletionOutcomeRow = { outcome: TurnOutcome };
@@ -197,7 +174,7 @@ type InteractionDecisionRow = {
 };
 
 interface StoreStatements {
-  getEntries: Database.Statement<unknown[], EntryRow>;
+  getEntries: Database.Statement<unknown[], PageRow>;
   getNonces: Database.Statement<unknown[], NonceRow>;
   getInteractionDecisions: Database.Statement<unknown[], InteractionDecisionRow>;
   insertEntry: Database.Statement;
@@ -215,10 +192,10 @@ interface StoreStatements {
   nextPage: Database.Statement<unknown[], PageRow>;
   replaceEntry: Database.Statement;
   replaceToolCallByLocalId: Database.Statement;
-  recentEntries: Database.Statement<unknown[], EntryRow>;
-  recentEntriesByKinds: Database.Statement<unknown[], EntryRow>;
+  recentEntries: Database.Statement<unknown[], PageRow>;
+  recentEntriesByKinds: Database.Statement<unknown[], PageRow>;
   latestAssistant: Database.Statement<unknown[], EntryRow>;
-  openToolCalls: Database.Statement<unknown[], EntryRow>;
+  openToolCalls: Database.Statement<unknown[], PageRow>;
   findToolCallByLocalId: Database.Statement<unknown[], EntryRow>;
   firstUserMessage: Database.Statement<unknown[], EntryRow>;
   latestNonEmptyMessage: Database.Statement<unknown[], EntryRow>;
@@ -246,34 +223,6 @@ type TurnAttemptRow = {
   model: string;
   phase: TurnAttemptPhase;
   started_at_ms: number;
-};
-
-type ResumeCheckpointRow = {
-  checkpoint_id: string;
-  agent_id: string;
-  conversation_id: string;
-  turn_id: string;
-  provider: string;
-  model: string;
-  cursor: string;
-  safe_sequence_id: number;
-  completed_effect_ids_json: string;
-  expires_at_ms: number;
-  version: number;
-  budget_json: string;
-};
-
-type ResumeEffectRow = {
-  agent_id: string;
-  conversation_id: string;
-  turn_id: string;
-  effect_id: string;
-  fingerprint_hash: string;
-  status: ResumeEffectStatus;
-  result_json: string | null;
-  created_at_ms: number;
-  started_at_ms: number | null;
-  completed_at_ms: number | null;
 };
 
 type KickstartRunRow = {
@@ -324,18 +273,6 @@ type TurnCompletionRow = {
   turn_id: string;
   outcome: TurnOutcome;
   completed_at_ms: number;
-};
-
-type ConversationRow = {
-  id: string;
-  agent_id: string;
-  title: string;
-  title_source: "auto" | "manual";
-  temporary: number;
-  archived_at_ms: number | null;
-  created_at_ms: number;
-  updated_at_ms: number;
-  last_message_at_ms: number | null;
 };
 
 function parseKickstartRun(row: KickstartRunRow): KickstartRunRecord {
@@ -476,75 +413,8 @@ function isTranscriptEntry(value: unknown): value is TranscriptEntry {
   }
 }
 
-function parseResumeBudget(value: unknown): ResumeBudgetSnapshot {
-  if (!isRecord(value)) throw new Error("resume checkpoint budget is invalid");
-  const fields = [
-    "maxProviderAttempts",
-    "providerAttemptsUsed",
-    "maxToolRounds",
-    "toolRoundsUsed",
-    "maxToolCalls",
-    "toolCallsUsed",
-  ] as const;
-  if (fields.some((field) => !Number.isSafeInteger(value[field]) || Number(value[field]) < 0)) {
-    throw new Error("resume checkpoint budget is invalid");
-  }
-  return {
-    maxProviderAttempts: Number(value.maxProviderAttempts),
-    providerAttemptsUsed: Number(value.providerAttemptsUsed),
-    maxToolRounds: Number(value.maxToolRounds),
-    toolRoundsUsed: Number(value.toolRoundsUsed),
-    maxToolCalls: Number(value.maxToolCalls),
-    toolCallsUsed: Number(value.toolCallsUsed),
-  };
-}
-
 function transcriptEntryId(entry: TranscriptEntry): string | undefined {
   return "id" in entry && typeof entry.id === "string" ? entry.id : undefined;
-}
-
-function validateResumeScope(scope: ResumeCheckpointScope): void {
-  validateAgentId(scope.agentId);
-  validateConversationId(scope.conversationId);
-  if (typeof scope.turnId !== "string" || scope.turnId.length === 0) throw new Error("turnId inválido");
-  if (typeof scope.provider !== "string" || scope.provider.length === 0) throw new Error("provider inválido");
-  if (typeof scope.model !== "string" || scope.model.length === 0) throw new Error("model inválido");
-}
-
-function parseResumeCheckpoint(row: ResumeCheckpointRow): ResumeCheckpoint {
-  const completedEffectIds = JSON.parse(row.completed_effect_ids_json) as unknown;
-  const budget = JSON.parse(row.budget_json) as unknown;
-  if (!Array.isArray(completedEffectIds)) throw new Error("resume checkpoint inválido");
-  validateOpaqueResumeCursor(row.cursor);
-  return {
-    checkpointId: row.checkpoint_id,
-    agentId: row.agent_id,
-    conversationId: row.conversation_id,
-    turnId: row.turn_id,
-    provider: row.provider,
-    model: row.model,
-    cursor: row.cursor,
-    safeSequenceId: row.safe_sequence_id,
-    completedEffectIds: completedEffectIds.filter((value): value is string => typeof value === "string"),
-    expiresAtMs: row.expires_at_ms,
-    version: row.version,
-    budget: parseResumeBudget(budget),
-  };
-}
-
-function parseResumeEffect(row: ResumeEffectRow): ResumeEffectRecord {
-  return {
-    agentId: row.agent_id,
-    conversationId: row.conversation_id,
-    turnId: row.turn_id,
-    effectId: row.effect_id,
-    fingerprintHash: row.fingerprint_hash,
-    status: row.status,
-    ...(row.result_json === null ? {} : { result: JSON.parse(row.result_json) }),
-    createdAtMs: row.created_at_ms,
-    ...(row.started_at_ms === null ? {} : { startedAtMs: row.started_at_ms }),
-    ...(row.completed_at_ms === null ? {} : { completedAtMs: row.completed_at_ms }),
-  };
 }
 
 function parseEntry(payload: string): TranscriptEntry {
@@ -555,7 +425,7 @@ function parseEntry(payload: string): TranscriptEntry {
   return normalizeTranscriptEntry(value);
 }
 
-/** Boot reconciliation must not refuse to open over one unreadable row; the row is left untouched. */
+/** Boot reconciliation and display reads must not fail over one unreadable row; the row is left untouched. */
 function tryParseEntry(payload: string): TranscriptEntry | undefined {
   try {
     return parseEntry(payload);
@@ -564,22 +434,49 @@ function tryParseEntry(payload: string): TranscriptEntry | undefined {
   }
 }
 
-function parseMessageEntry(payload: string): Extract<TranscriptEntry, { kind: "message" }> {
-  const entry = parseEntry(payload);
-  if (entry.kind !== "message") throw new Error("store: persisted entry is not a message");
-  return entry;
+/** Display lookup: an unreadable or mismatched row reads as absent. */
+function readMessageEntry(payload: string): Extract<TranscriptEntry, { kind: "message" }> | undefined {
+  const entry = tryParseEntry(payload);
+  return entry?.kind === "message" ? entry : undefined;
 }
 
-function parseToolCallEntry(payload: string): Extract<TranscriptEntry, { kind: "tool-call" }> {
-  const entry = parseEntry(payload);
-  if (entry.kind !== "tool-call") throw new Error("store: persisted entry is not a tool call");
-  return entry;
+function readToolCallEntry(payload: string): Extract<TranscriptEntry, { kind: "tool-call" }> | undefined {
+  const entry = tryParseEntry(payload);
+  return entry?.kind === "tool-call" ? entry : undefined;
 }
 
-function validateAgentId(agentId: string): void {
-  if (typeof agentId !== "string" || agentId.trim().length === 0) {
-    throw new Error("agentId deve ser uma string não vazia");
+/**
+ * Serializes an entry and proves it reads back. Data the reader would reject
+ * (e.g. a NaN that JSON turns into null) fails this write instead of making
+ * every later read of the conversation fail.
+ */
+function serializeEntry(entry: TranscriptEntry): string {
+  const json = JSON.stringify(entry);
+  if (!isTranscriptEntry(JSON.parse(json))) {
+    throw new Error(`store: transcript entry inválida (${String((entry as { kind?: unknown }).kind)})`);
   }
+  return json;
+}
+
+/** Stands in for an unreadable row so the rest of the conversation stays readable. */
+function unreadableEntry(sequenceId: number): TranscriptEntry {
+  return normalizeTranscriptEntry({
+    kind: "notice",
+    id: `notice:unreadable:${sequenceId}`,
+    type: "unreadable-entry",
+    level: "error",
+    text: "Uma entrada deste histórico não pôde ser lida e foi omitida.",
+  });
+}
+
+function entryCreatedAt(entry: TranscriptEntry): number {
+  const record = entry as Record<string, unknown>;
+  return typeof record.timestampMs === "number" && Number.isFinite(record.timestampMs) ? record.timestampMs : Date.now();
+}
+
+function entryIdOf(entry: TranscriptEntry): string | null {
+  const record = entry as Record<string, unknown>;
+  return typeof record.id === "string" ? record.id : null;
 }
 
 function validateConversationId(conversationId: string): void {
@@ -604,8 +501,6 @@ function isSqliteTranscriptAgentSnapshot(snapshot: TranscriptAgentSnapshot): sna
     Array.isArray(candidate.interactionDecisionRows) &&
     Array.isArray(candidate.turnAttemptRows) &&
     Array.isArray(candidate.turnCompletionRows) &&
-    Array.isArray(candidate.resumeCheckpoints) &&
-    Array.isArray(candidate.resumeEffects) &&
     (typeof candidate.activeConversationId === "string" || candidate.activeConversationId === null);
 }
 
@@ -682,7 +577,7 @@ function queryProcessIdentity(pid: number): ProcessIdentity | null {
   if (process.platform !== "win32") return null;
   const script = `$p=Get-Process -Id ${pid} -ErrorAction Stop; ` +
     `[pscustomobject]@{startedAtMs=[DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds();executablePath=$p.Path}|ConvertTo-Json -Compress`;
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+  const result = spawnSync(windowsPowerShellPath(), ["-NoProfile", "-NonInteractive", "-Command", script], {
     encoding: "utf8",
     windowsHide: true,
     timeout: 3_000,
@@ -721,7 +616,36 @@ export class SqliteTranscriptStore implements TranscriptStore {
   private readonly currentProcessIdentity: ProcessIdentity;
   private readonly processIdentity: (pid: number) => ProcessIdentity | null;
   private readonly liveEntries = new Map<string, Map<string, Map<string, TranscriptEntry>>>();
+  /** Statements prepared on first use and reused; better-sqlite3 compiles on every prepare. */
+  private readonly statementCache = new Map<string, Database.Statement>();
+  private readonly reportedUnreadable = new Set<number>();
   private closed = false;
+
+  private sql<P extends unknown[] = unknown[], R = unknown>(text: string): Database.Statement<P, R> {
+    let statement = this.statementCache.get(text);
+    if (statement === undefined) {
+      statement = this.db.prepare(text);
+      this.statementCache.set(text, statement);
+    }
+    return statement as unknown as Database.Statement<P, R>;
+  }
+
+  /** Bulk read: an unreadable row becomes a notice instead of failing the whole read. */
+  private readRow(row: PageRow): TranscriptEntry {
+    const entry = tryParseEntry(row.payload_json);
+    if (entry !== undefined) return entry;
+    if (!this.reportedUnreadable.has(row.sequence_id)) {
+      this.reportedUnreadable.add(row.sequence_id);
+      console.warn(`[openbot] store: transcript entry ${row.sequence_id} ilegível substituída por aviso`);
+    }
+    return unreadableEntry(row.sequence_id);
+  }
+
+  private insertEntryRow(agentId: string, conversationId: string, entry: TranscriptEntry): number {
+    const createdAt = entryCreatedAt(entry);
+    this.statements.insertEntry.run(agentId, conversationId, entryIdOf(entry), entry.kind, serializeEntry(entry), createdAt);
+    return createdAt;
+  }
 
   private liveFor(agentId: string, conversationId: string, create = false): Map<string, TranscriptEntry> | undefined {
     let conversations = this.liveEntries.get(agentId);
@@ -774,8 +698,9 @@ export class SqliteTranscriptStore implements TranscriptStore {
         this.db.pragma("journal_mode = WAL");
         this.db.pragma("synchronous = NORMAL");
         this.db.pragma("busy_timeout = 5000");
+        this.db.pragma(`journal_size_limit = ${WAL_SIZE_LIMIT_BYTES}`);
       }
-      migrateOpenBotSchema(this.db);
+      ensureOpenBotSchema(this.db);
       this.promptQueue = createPromptQueue(this.db);
       const memoryStore = opts.memoryStore ?? new SqliteMemoryStore({ path: opts.path, database: this.db, secretValues: opts.secretValues });
       if (!memoryStore.sharesDatabase(this.db)) {
@@ -864,14 +789,16 @@ export class SqliteTranscriptStore implements TranscriptStore {
   }
 
   private reconcileInterruptedEntries(): void {
-    const rows = this.db.prepare<unknown[], PageRow>(`
+    // Each branch repeats a partial index predicate verbatim, so the boot
+    // reads only the rows still in flight instead of every transcript row.
+    const rows = this.sql<unknown[], PageRow>(`
       SELECT sequence_id, payload_json
-      FROM transcript_entries
-      WHERE (kind = 'message' AND (
-               json_extract(payload_json, '$.streaming') = 1 OR
-               json_extract(payload_json, '$.isStreaming') = 1
-             ))
-         OR (kind = 'tool-call' AND json_extract(payload_json, '$.status') IN ('pending', 'running'))
+      FROM transcript_entries INDEXED BY idx_transcript_streaming_messages
+      WHERE kind = 'message' AND (json_extract(payload_json, '$.streaming') = 1 OR json_extract(payload_json, '$.isStreaming') = 1)
+      UNION ALL
+      SELECT sequence_id, payload_json
+      FROM transcript_entries INDEXED BY idx_transcript_open_tool_calls
+      WHERE kind = 'tool-call' AND json_extract(payload_json, '$.status') IN ('pending', 'running')
     `).all();
     if (rows.length === 0) return;
     const update = this.db.prepare("UPDATE transcript_entries SET payload_json = ? WHERE sequence_id = ?");
@@ -939,14 +866,14 @@ export class SqliteTranscriptStore implements TranscriptStore {
     const clearPending = this.db.prepare("DELETE FROM pending_nonces");
     this.db.transaction(() => {
       const interrupted = deleteOrphans.all() as Array<{ agent_id: string; conversation_id: string; nonce: string }>;
+      const insert = this.sql("INSERT INTO transcript_entries (agent_id, conversation_id, entry_id, kind, payload_json, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)");
       for (const pending of interrupted) {
         const notice = normalizeTranscriptEntry({
           kind: "notice", id: `notice:${randomUUID()}`, level: "error",
           text: "Um envio foi interrompido antes da confirmação. Confira a pendência local antes de reenviar: ela pode recuperar o texto e os anexos. O servidor não retomou ferramentas automaticamente.",
           clientNonce: pending.nonce,
         });
-        this.db.prepare("INSERT INTO transcript_entries (agent_id, conversation_id, entry_id, kind, payload_json, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)")
-          .run(pending.agent_id, pending.conversation_id, notice.id, notice.kind, JSON.stringify(notice), Date.now());
+        insert.run(pending.agent_id, pending.conversation_id, notice.id, notice.kind, JSON.stringify(notice), Date.now());
       }
       clearPending.run();
     })();
@@ -979,7 +906,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
   private prepareStatements(): StoreStatements {
     return {
       getEntries: this.db.prepare(
-        "SELECT payload_json FROM transcript_entries WHERE agent_id = ? AND conversation_id = ? ORDER BY sequence_id ASC",
+        "SELECT sequence_id, payload_json FROM transcript_entries WHERE agent_id = ? AND conversation_id = ? ORDER BY sequence_id ASC",
       ),
       getNonces: this.db.prepare(
         "SELECT nonce FROM accepted_nonces WHERE agent_id = ? ORDER BY accepted_at_ms ASC, rowid ASC",
@@ -1051,14 +978,14 @@ export class SqliteTranscriptStore implements TranscriptStore {
         )
       `),
       recentEntries: this.db.prepare(`
-        SELECT payload_json
+        SELECT sequence_id, payload_json
         FROM transcript_entries
         WHERE agent_id = ? AND conversation_id = ? AND sequence_id > ?
         ORDER BY sequence_id DESC
         LIMIT ?
       `),
       recentEntriesByKinds: this.db.prepare(`
-        SELECT payload_json
+        SELECT sequence_id, payload_json
         FROM transcript_entries
         WHERE agent_id = ? AND conversation_id = ?
           AND sequence_id > ?
@@ -1076,8 +1003,8 @@ export class SqliteTranscriptStore implements TranscriptStore {
         LIMIT 1
       `),
       openToolCalls: this.db.prepare(`
-        SELECT payload_json
-        FROM transcript_entries
+        SELECT sequence_id, payload_json
+        FROM transcript_entries INDEXED BY idx_transcript_open_tool_calls
         WHERE agent_id = ? AND conversation_id = ?
           AND kind = 'tool-call'
           AND json_extract(payload_json, '$.status') IN ('pending', 'running')
@@ -1164,7 +1091,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
     const rows = this.statements.getEntries.all(agentId, resolvedConversationId);
-    return this.mergeLive(agentId, resolvedConversationId, rows.map((row) => parseEntry(row.payload_json)));
+    return this.mergeLive(agentId, resolvedConversationId, rows.map((row) => this.readRow(row)));
   }
 
   /** Uses idx_transcript_agent_entry; only identity is read, never transcript bodies. */
@@ -1172,7 +1099,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     validateAgentId(agentId);
     this.ensureOpen();
     if (!entryId) return [];
-    const rows = this.db.prepare(conversationId === undefined
+    const rows = this.sql(conversationId === undefined
       ? "SELECT DISTINCT conversation_id FROM transcript_entries WHERE agent_id = ? AND entry_id = ? AND conversation_id IS NOT NULL LIMIT 2"
       : "SELECT DISTINCT conversation_id FROM transcript_entries WHERE agent_id = ? AND entry_id = ? AND conversation_id = ? LIMIT 1")
       .all(...(conversationId === undefined ? [agentId, entryId] : [agentId, entryId, conversationId])) as Array<{ conversation_id: string | null }>;
@@ -1199,19 +1126,14 @@ export class SqliteTranscriptStore implements TranscriptStore {
       let lastMessageAtMs: number | null = null;
       for (const entry of items) {
         if (consumeStagedAttachments && entry.kind === "user-attachment" && entry.file_path.startsWith("attachment:") && !entry.skipped) {
-          const consumed = this.db.prepare(`
+          const consumed = this.sql(`
             UPDATE attachment_staging SET state = 'committed', consumed_at_ms = ?
             WHERE id = ? AND agent_id = ? AND (conversation_id IS NULL OR conversation_id = ?)
               AND state != 'discarded' AND consumed_at_ms IS NULL AND expires_at_ms > ?
           `).run(Date.now(), entry.file_path.slice("attachment:".length), agentId, resolvedConversationId, Date.now());
           if (consumed.changes !== 1) throw new Error("Anexo indisponível para envio. Anexe novamente ou tente recuperar a pendência.");
         }
-        const record = entry as Record<string, unknown>;
-        const entryId = typeof record.id === "string" ? record.id : null;
-        const createdAt = typeof record.timestampMs === "number" && Number.isFinite(record.timestampMs)
-          ? record.timestampMs
-          : Date.now();
-        this.statements.insertEntry.run(agentId, resolvedConversationId, entryId, entry.kind, JSON.stringify(entry), createdAt);
+        const createdAt = this.insertEntryRow(agentId, resolvedConversationId, entry);
         if (createdAt > updatedAtMs) updatedAtMs = createdAt;
         if (entry.kind === "message" && (lastMessageAtMs === null || createdAt > lastMessageAtMs)) {
           lastMessageAtMs = createdAt;
@@ -1289,8 +1211,6 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
     const deleteConversationState = this.db.prepare("DELETE FROM agent_conversation_state WHERE agent_id = ?");
     const deletePendingNonces = this.db.prepare("DELETE FROM pending_nonces WHERE agent_id = ?");
-    const deleteCheckpoints = this.db.prepare("DELETE FROM turn_checkpoints WHERE agent_id = ?");
-    const deleteEffects = this.db.prepare("DELETE FROM turn_effects WHERE agent_id = ?");
     const deleteKickstarts = this.db.prepare("DELETE FROM kickstart_runs WHERE agent_id = ?");
     const deleteConversations = this.db.prepare("DELETE FROM agent_conversations WHERE agent_id = ?");
     const transaction = this.db.transaction(() => {
@@ -1302,8 +1222,6 @@ export class SqliteTranscriptStore implements TranscriptStore {
         this.statements.deleteInteractionDecisions.run(agentId);
         this.statements.deleteAgentTurnAttempts.run(agentId);
         this.statements.deleteAgentTurnCompletions.run(agentId);
-        deleteCheckpoints.run(agentId);
-        deleteEffects.run(agentId);
         deleteKickstarts.run(agentId);
         this.promptQueue.clear(agentId);
         this.memoryStore.clearAgentRows(agentId);
@@ -1311,8 +1229,8 @@ export class SqliteTranscriptStore implements TranscriptStore {
       }
     });
     transaction();
+    // The delete triggers already removed these rows from both FTS tables.
     for (const agentId of uniqueAgentIds) this.liveEntries.delete(agentId);
-    this.memoryStore.rebuildFts();
   }
 
   snapshotAgent(agentId: string): SqliteTranscriptAgentSnapshot {
@@ -1343,16 +1261,6 @@ export class SqliteTranscriptStore implements TranscriptStore {
         SELECT agent_id, conversation_id, client_nonce, turn_id, outcome, completed_at_ms
         FROM turn_completions WHERE agent_id = ? ORDER BY completed_at_ms ASC, turn_id ASC
       `).all(agentId);
-      const resumeCheckpointRows = this.db.prepare<unknown[], ResumeCheckpointRow & { updated_at_ms: number }>(`
-        SELECT checkpoint_id, agent_id, conversation_id, turn_id, provider, model, cursor,
-               safe_sequence_id, completed_effect_ids_json, expires_at_ms, version, budget_json, updated_at_ms
-        FROM turn_checkpoints WHERE agent_id = ? ORDER BY updated_at_ms ASC, checkpoint_id ASC
-      `).all(agentId).map((row) => ({ ...parseResumeCheckpoint(row), updatedAtMs: row.updated_at_ms }));
-      const resumeEffectRows = this.db.prepare<unknown[], ResumeEffectRow>(`
-        SELECT agent_id, conversation_id, turn_id, effect_id, fingerprint_hash, status,
-               result_json, created_at_ms, started_at_ms, completed_at_ms
-        FROM turn_effects WHERE agent_id = ? ORDER BY created_at_ms ASC, conversation_id ASC, turn_id ASC, effect_id ASC
-      `).all(agentId).map(parseResumeEffect);
       const kickstartRuns = this.db.prepare<unknown[], KickstartRunRow>(`
         SELECT agent_id, client_nonce, conversation_id, origin, version, attempt, turn_id, provider, model,
                status, observable_output, result_json, error, created_at_ms, updated_at_ms
@@ -1363,7 +1271,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
         FROM agent_conversations WHERE agent_id = ? ORDER BY updated_at_ms ASC, id ASC
       `).all(agentId);
       const active = this.db.prepare<unknown[], { active_conversation_id: string }>("SELECT active_conversation_id FROM agent_conversation_state WHERE agent_id = ?").get(agentId);
-      const entries = transcriptRows.map((row) => parseEntry(row.payload_json));
+      const entries = transcriptRows.map((row) => this.readRow(row));
       const interactionDecisions: TranscriptInteractionDecision[] = interactionDecisionRows.map((row) => ({
         requestId: row.request_id,
         kind: row.kind,
@@ -1444,8 +1352,6 @@ export class SqliteTranscriptStore implements TranscriptStore {
           outcome: row.outcome,
           completedAtMs: row.completed_at_ms,
         })),
-        resumeCheckpoints: resumeCheckpointRows,
-        resumeEffects: resumeEffectRows,
         kickstartRuns,
         promptQueueRows: this.db.prepare<unknown[], NonNullable<SqliteTranscriptAgentSnapshot["promptQueueRows"]>[number]>("SELECT * FROM prompt_queue WHERE agent_id=? ORDER BY sequence").all(agentId),
         memorySnapshot: this.memoryStore.snapshotAgent(agentId),
@@ -1522,63 +1428,6 @@ export class SqliteTranscriptStore implements TranscriptStore {
       completionTurnIds.add(row.turnId);
     }
 
-    const checkpointIds = new Set<string>();
-    for (const checkpoint of snapshot.resumeCheckpoints) {
-      if (checkpoint.agentId !== agentId) throw new Error("snapshot contém checkpoint de outro agente");
-      validateResumeScope(checkpoint);
-      validateBoundConversationId(conversationIds, checkpoint.conversationId, "checkpoint");
-      validateOpaqueResumeCursor(checkpoint.cursor);
-      if (typeof checkpoint.checkpointId !== "string" || checkpoint.checkpointId.length === 0) throw new Error("snapshot contém checkpoint inválido");
-      if (checkpointIds.has(checkpoint.checkpointId)) throw new Error("snapshot contém checkpoint duplicado");
-      checkpointIds.add(checkpoint.checkpointId);
-      if (!Number.isSafeInteger(checkpoint.safeSequenceId) || checkpoint.safeSequenceId < 0) throw new Error("snapshot contém checkpoint inválido");
-      if (!Array.isArray(checkpoint.completedEffectIds) || checkpoint.completedEffectIds.length > MAX_RESUME_EFFECT_IDS) throw new Error("snapshot contém ledger de checkpoint inválido");
-      const effectIds = new Set<string>();
-      for (const effectId of checkpoint.completedEffectIds) {
-        if (typeof effectId !== "string" || effectId.length === 0 || effectIds.has(effectId)) throw new Error("snapshot contém ledger de checkpoint inválido");
-        effectIds.add(effectId);
-      }
-      if (!Number.isSafeInteger(checkpoint.expiresAtMs) || checkpoint.expiresAtMs <= 0
-        || !Number.isSafeInteger(checkpoint.version) || checkpoint.version < 1
-        || !Number.isSafeInteger(checkpoint.updatedAtMs) || checkpoint.updatedAtMs < 0) {
-        throw new Error("snapshot contém checkpoint inválido");
-      }
-      parseResumeBudget(checkpoint.budget);
-    }
-
-    const effectKeys = new Set<string>();
-    for (const effect of snapshot.resumeEffects) {
-      if (effect.agentId !== agentId) throw new Error("snapshot contém efeito de outro agente");
-      validateAgentId(effect.agentId);
-      validateConversationId(effect.conversationId);
-      validateBoundConversationId(conversationIds, effect.conversationId, "efeito");
-      if (typeof effect.turnId !== "string" || effect.turnId.length === 0
-        || typeof effect.effectId !== "string" || effect.effectId.length === 0
-        || typeof effect.fingerprintHash !== "string" || effect.fingerprintHash.length === 0) {
-        throw new Error("snapshot contém efeito inválido");
-      }
-      const key = `${effect.conversationId}\u0000${effect.turnId}\u0000${effect.effectId}`;
-      if (effectKeys.has(key)) throw new Error("snapshot contém efeito duplicado");
-      effectKeys.add(key);
-      if (!["prepared", "started", "completed", "unsafe"].includes(effect.status)) {
-        throw new Error("snapshot contém efeito inválido");
-      }
-      if (!Number.isSafeInteger(effect.createdAtMs) || effect.createdAtMs < 0
-        || (effect.startedAtMs !== undefined && (!Number.isSafeInteger(effect.startedAtMs) || effect.startedAtMs < 0))
-        || (effect.completedAtMs !== undefined && (!Number.isSafeInteger(effect.completedAtMs) || effect.completedAtMs < 0))) {
-        throw new Error("snapshot contém efeito inválido");
-      }
-      if (effect.result !== undefined) {
-        let encoded: string | undefined;
-        try {
-          encoded = JSON.stringify(effect.result);
-        } catch {
-          throw new Error("snapshot contém resultado de efeito inválido");
-        }
-        if (encoded === undefined) throw new Error("snapshot contém resultado de efeito inválido");
-      }
-    }
-
     const kickstartNonces = new Set<string>();
     for (const run of snapshot.kickstartRuns ?? []) {
       if (run.agentId !== agentId) throw new Error("snapshot contém kickstart de outro agente");
@@ -1627,20 +1476,6 @@ export class SqliteTranscriptStore implements TranscriptStore {
       INSERT INTO turn_completions(agent_id, conversation_id, client_nonce, turn_id, outcome, completed_at_ms)
       VALUES (?, ?, ?, ?, ?, ?)
     `);
-    const insertResumeCheckpoint = this.db.prepare(`
-      INSERT INTO turn_checkpoints
-        (checkpoint_id, agent_id, conversation_id, turn_id, provider, model, cursor,
-         safe_sequence_id, completed_effect_ids_json, expires_at_ms, version, budget_json, updated_at_ms)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const insertResumeEffect = this.db.prepare(`
-      INSERT INTO turn_effects
-        (agent_id, conversation_id, turn_id, effect_id, fingerprint_hash, status,
-         result_json, created_at_ms, started_at_ms, completed_at_ms)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const deleteResumeCheckpoints = this.db.prepare("DELETE FROM turn_checkpoints WHERE agent_id = ?");
-    const deleteResumeEffects = this.db.prepare("DELETE FROM turn_effects WHERE agent_id = ?");
     const insertKickstartRow = this.db.prepare(`
       INSERT INTO kickstart_runs
         (agent_id, client_nonce, conversation_id, origin, version, attempt, turn_id, provider, model,
@@ -1660,10 +1495,6 @@ export class SqliteTranscriptStore implements TranscriptStore {
       this.statements.deleteInteractionDecisions.run(agentId);
       this.statements.deleteAgentTurnAttempts.run(agentId);
       this.statements.deleteAgentTurnCompletions.run(agentId);
-      if (complete) {
-        deleteResumeCheckpoints.run(agentId);
-        deleteResumeEffects.run(agentId);
-      }
       this.db.prepare("DELETE FROM kickstart_runs WHERE agent_id = ?").run(agentId);
       this.promptQueue.clear(agentId);
       this.memoryStore.clearAgentRows(agentId);
@@ -1703,37 +1534,6 @@ export class SqliteTranscriptStore implements TranscriptStore {
         for (const row of state.turnCompletionRows) {
           insertTurnCompletionRow.run(agentId, row.conversationId, row.clientNonce, row.turnId, row.outcome ?? "success", row.completedAtMs);
         }
-        for (const checkpoint of state.resumeCheckpoints) {
-          insertResumeCheckpoint.run(
-            checkpoint.checkpointId,
-            agentId,
-            checkpoint.conversationId,
-            checkpoint.turnId,
-            checkpoint.provider,
-            checkpoint.model,
-            checkpoint.cursor,
-            checkpoint.safeSequenceId,
-            JSON.stringify(checkpoint.completedEffectIds),
-            checkpoint.expiresAtMs,
-            checkpoint.version,
-            JSON.stringify(checkpoint.budget),
-            checkpoint.updatedAtMs,
-          );
-        }
-        for (const effect of state.resumeEffects) {
-          insertResumeEffect.run(
-            agentId,
-            effect.conversationId,
-            effect.turnId,
-            effect.effectId,
-            effect.fingerprintHash,
-            effect.status,
-            effect.result === undefined ? null : JSON.stringify(effect.result),
-            effect.createdAtMs,
-            effect.startedAtMs ?? null,
-            effect.completedAtMs ?? null,
-          );
-        }
         for (const run of state.kickstartRuns ?? []) {
           insertKickstartRow.run(
             agentId,
@@ -1752,10 +1552,10 @@ export class SqliteTranscriptStore implements TranscriptStore {
             run.updatedAtMs,
           );
         }
+        const insertPromptQueueRow = this.sql("INSERT INTO prompt_queue(sequence,agent_id,conversation_id,nonce,args_json,inference_json,state,payload_digest,payload_compacted,recovery_of) VALUES(?,?,?,?,?,?,?,?,?,?)");
         for (const row of state.promptQueueRows ?? []) {
           if (row.agent_id !== agentId) throw new Error("Invalid prompt queue snapshot owner");
-          this.db.prepare("INSERT INTO prompt_queue(sequence,agent_id,conversation_id,nonce,args_json,inference_json,state,payload_digest,payload_compacted,recovery_of) VALUES(?,?,?,?,?,?,?,?,?,?)")
-            .run(row.sequence, agentId, row.conversation_id, row.nonce, row.args_json, row.inference_json, row.state, row.payload_digest ?? "", row.payload_compacted ?? 0, row.recovery_of ?? null);
+          insertPromptQueueRow.run(row.sequence, agentId, row.conversation_id, row.nonce, row.args_json, row.inference_json, row.state, row.payload_digest ?? "", row.payload_compacted ?? 0, row.recovery_of ?? null);
         }
         const memorySnapshot = state.memorySnapshot ?? {
           settings: null,
@@ -1767,14 +1567,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
         this.memoryStore.restoreAgentRows(agentId, memorySnapshot, false);
         return;
       }
-      for (const entry of state.entries) {
-        const record = entry as Record<string, unknown>;
-        const entryId = typeof record.id === "string" ? record.id : null;
-        const createdAt = typeof record.timestampMs === "number" && Number.isFinite(record.timestampMs)
-          ? record.timestampMs
-          : Date.now();
-        this.statements.insertEntry.run(agentId, conversationId!, entryId, entry.kind, JSON.stringify(entry), createdAt);
-      }
+      for (const entry of state.entries) this.insertEntryRow(agentId, conversationId!, entry);
       const now = Date.now();
       for (const nonce of state.acceptedNonces) this.statements.insertNonce.run(agentId, conversationId, nonce, now);
       for (const completion of state.completedNonceBindings ?? []) {
@@ -1791,8 +1584,8 @@ export class SqliteTranscriptStore implements TranscriptStore {
         );
       }
     });
+    // Insert triggers index the restored rows; a full FTS rebuild is not needed.
     transaction(snapshot);
-    this.memoryStore.rebuildFts();
   }
 
   hasAcceptedNonce(agentId: string, nonce: string, conversationId?: string): boolean {
@@ -1810,7 +1603,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     return rows.map((row) => row.conversation_id);
   }
 
-  /** Direct indexed lookup for the user echo of a nonce (replaces full scans). */
+  /** Nonce-indexed lookup for the user echo; strict, because a missed echo could duplicate a send. */
   findUserEchoByNonce(agentId: string, nonce: string, conversationId?: string): TranscriptEntry | undefined {
     validateAgentId(agentId);
     if (nonce.length === 0) return undefined;
@@ -1833,7 +1626,10 @@ export class SqliteTranscriptStore implements TranscriptStore {
     return row === undefined ? undefined : parseEntry(row.payload_json);
   }
 
-  /** Direct indexed lookup for a retryable error notice of a turn. */
+  /**
+   * Retryable error notice of a turn: a range scan of one conversation's rows,
+   * strict like the echo lookup because retry decisions depend on it.
+   */
   findRetryableErrorNotice(agentId: string, turnId: string, conversationId?: string): TranscriptEntry | undefined {
     validateAgentId(agentId);
     if (turnId.length === 0) return undefined;
@@ -1851,6 +1647,54 @@ export class SqliteTranscriptStore implements TranscriptStore {
     `);
     const row = this.retryableNoticeStmt.get(agentId, resolvedConversationId, turnId);
     return row === undefined ? undefined : parseEntry(row.payload_json);
+  }
+
+  /**
+   * Transcript suffix that failure recovery needs: from the user message of the
+   * latest retryable failure notice to the end. Everything recovery inspects
+   * (that message, its attachments, the failed turn's tool calls, later
+   * messages) is appended at or after that message, and turn ids are unique
+   * (`turn:<uuid>`), so the suffix answers the
+   * same questions as the whole conversation without reading it. Returns [] when
+   * no such notice exists, and undefined when a suffix cannot be proven
+   * equivalent (live previews, an unreadable notice, no matching message); the
+   * caller then reads the whole conversation.
+   */
+  getRetryableFailureWindow(agentId: string, conversationId?: string): readonly TranscriptEntry[] | undefined {
+    validateAgentId(agentId);
+    this.ensureOpen();
+    const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
+    if ((this.liveFor(agentId, resolvedConversationId)?.size ?? 0) > 0) return undefined;
+    // Same predicate recovery applies to parsed entries; normalization only adds ids.
+    const notice = this.sql<unknown[], PageRow>(`
+      SELECT sequence_id, payload_json FROM transcript_entries
+      WHERE agent_id = ? AND conversation_id = ? AND kind = 'notice'
+        AND json_extract(payload_json, '$.level') = 'error'
+        AND json_type(payload_json, '$.retryable') = 'true'
+        AND json_type(payload_json, '$.turnId') = 'text'
+        AND json_type(payload_json, '$.provider') = 'text'
+        AND json_type(payload_json, '$.model') = 'text'
+      ORDER BY sequence_id DESC
+      LIMIT 1
+    `).get(agentId, resolvedConversationId);
+    if (notice === undefined) return [];
+    const failure = tryParseEntry(notice.payload_json);
+    if (failure?.kind !== "notice" || typeof failure.turnId !== "string") return undefined;
+    const originalNonce = typeof failure.retryOfClientNonce === "string"
+      ? failure.retryOfClientNonce
+      : typeof failure.clientNonce === "string" ? failure.clientNonce : null;
+    const user = this.sql<unknown[], { sequence_id: number }>(`
+      SELECT sequence_id FROM transcript_entries
+      WHERE agent_id = ? AND conversation_id = ? AND kind = 'message'
+        AND json_extract(payload_json, '$.role') = 'user'
+        AND (json_extract(payload_json, '$.turnId') = ? OR (? IS NOT NULL AND json_extract(payload_json, '$.clientNonce') = ?))
+      ORDER BY sequence_id DESC
+      LIMIT 1
+    `).get(agentId, resolvedConversationId, failure.turnId, originalNonce, originalNonce);
+    if (user === undefined) return undefined;
+    return this.sql<unknown[], PageRow>(
+      "SELECT sequence_id, payload_json FROM transcript_entries WHERE agent_id = ? AND conversation_id = ? AND sequence_id >= ? ORDER BY sequence_id ASC",
+    ).all(agentId, resolvedConversationId, Math.min(user.sequence_id, notice.sequence_id)).map((row) => this.readRow(row));
   }
 
   private registerOwnershipAndReconcile(): void {
@@ -1881,9 +1725,6 @@ export class SqliteTranscriptStore implements TranscriptStore {
         this.reconcileInterruptedTurnAttempts();
         this.reconcileInterruptedEntries();
         this.reconcileKickstartRuns();
-        for (const agent of this.db.prepare<unknown[], { agent_id: string }>("SELECT DISTINCT agent_id FROM turn_effects").all()) {
-          this.reconcileResumeEffects(agent.agent_id);
-        }
       }
     }).immediate();
   }
@@ -1955,7 +1796,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
   getKickstartRun(agentId: string, clientNonce: string): KickstartRunRecord | undefined {
     validateAgentId(agentId);
     this.ensureOpen();
-    const row = this.db.prepare<unknown[], KickstartRunRow>(`
+    const row = this.sql<unknown[], KickstartRunRow>(`
       SELECT agent_id, client_nonce, conversation_id, origin, version, attempt, turn_id, provider, model,
              status, observable_output, result_json, error, created_at_ms, updated_at_ms
       FROM kickstart_runs WHERE agent_id = ? AND client_nonce = ?
@@ -1968,7 +1809,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     this.ensureOpen();
     const claim = this.db.transaction(() => {
       const nowMs = Date.now();
-      const inserted = this.db.prepare(`
+      const inserted = this.sql(`
         INSERT OR IGNORE INTO kickstart_runs
           (agent_id, client_nonce, conversation_id, origin, version, attempt, turn_id, provider, model,
            status, observable_output, result_json, error, created_at_ms, updated_at_ms)
@@ -1986,7 +1827,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
       let run = this.getKickstartRun(input.agentId, input.clientNonce)!;
       if (inserted.changes === 1) return { run, claimed: true };
       if (run.status === "retryable" && !run.observableOutput) {
-        this.db.prepare(`
+        this.sql(`
           UPDATE kickstart_runs
           SET conversation_id = ?, version = ?, attempt = attempt + 1, turn_id = NULL,
               provider = ?, model = ?, status = 'queued', observable_output = 0,
@@ -2019,7 +1860,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     const next = { ...current, ...update, updatedAtMs: Date.now() };
     if (next.result !== undefined) next.result = { text: utf8Prefix(next.result.text, MAX_KICKSTART_RESULT_BYTES) };
     if (next.error !== undefined) next.error = utf8Prefix(next.error, MAX_KICKSTART_ERROR_BYTES);
-    this.db.prepare(`
+    this.sql(`
       UPDATE kickstart_runs
       SET turn_id = ?, provider = ?, model = ?, status = ?, observable_output = ?,
           result_json = ?, error = ?, updated_at_ms = ?
@@ -2050,7 +1891,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
   reconcileKickstartRuns(nowMs = Date.now()): number {
     this.ensureOpen();
-    const result = this.db.prepare(`
+    const result = this.sql(`
       UPDATE kickstart_runs
       SET status = CASE WHEN observable_output = 1 THEN 'interrupted' ELSE 'retryable' END,
           error = CASE WHEN observable_output = 1 THEN 'restart-after-output' ELSE 'restart-before-output' END,
@@ -2060,280 +1901,15 @@ export class SqliteTranscriptStore implements TranscriptStore {
     return result.changes;
   }
 
-  createResumeCheckpoint(checkpoint: ResumeCheckpoint): boolean {
-    validateResumeScope(checkpoint);
-    this.ensureOpen();
-    validateOpaqueResumeCursor(checkpoint.cursor);
-    if (!Number.isSafeInteger(checkpoint.version) || checkpoint.version < 1) throw new Error("resume checkpoint version inválida");
-    if (!Number.isSafeInteger(checkpoint.safeSequenceId) || checkpoint.safeSequenceId < 0) throw new Error("resume sequence inválida");
-    if (!Number.isSafeInteger(checkpoint.expiresAtMs) || checkpoint.expiresAtMs <= 0) throw new Error("resume expiry inválida");
-    const effectIds = [...new Set(checkpoint.completedEffectIds)];
-    if (effectIds.length > 128 || effectIds.some((id) => typeof id !== "string" || id.length === 0)) throw new Error("resume effect ledger excede o limite");
-    const result = this.db.prepare(`
-      INSERT OR IGNORE INTO turn_checkpoints
-        (checkpoint_id, agent_id, conversation_id, turn_id, provider, model, cursor,
-         safe_sequence_id, completed_effect_ids_json, expires_at_ms, version, budget_json, updated_at_ms)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      checkpoint.checkpointId,
-      checkpoint.agentId,
-      checkpoint.conversationId,
-      checkpoint.turnId,
-      checkpoint.provider,
-      checkpoint.model,
-      checkpoint.cursor,
-      checkpoint.safeSequenceId,
-      JSON.stringify(effectIds),
-      checkpoint.expiresAtMs,
-      checkpoint.version,
-      JSON.stringify(checkpoint.budget),
-      Date.now(),
-    );
-    return result.changes === 1;
-  }
-
-  getResumeCheckpoint(scope: ResumeCheckpointScope): ResumeCheckpoint | undefined {
-    validateResumeScope(scope);
-    this.ensureOpen();
-    const row = this.db.prepare<unknown[], ResumeCheckpointRow>(`
-      SELECT checkpoint_id, agent_id, conversation_id, turn_id, provider, model, cursor,
-             safe_sequence_id, completed_effect_ids_json, expires_at_ms, version, budget_json
-      FROM turn_checkpoints
-      WHERE agent_id = ? AND conversation_id = ? AND turn_id = ?
-    `).get(scope.agentId, scope.conversationId, scope.turnId);
-    if (row === undefined) return undefined;
-    const checkpoint = parseResumeCheckpoint(row);
-    if (!checkpointMatchesScope(checkpoint, scope)) throw new Error("resume checkpoint scope mismatch");
-    return checkpoint;
-  }
-
-  findResumeCheckpoint(agentId: string, conversationId: string, turnId: string): ResumeCheckpoint | undefined {
-    validateAgentId(agentId);
-    validateConversationId(conversationId);
-    if (typeof turnId !== "string" || turnId.length === 0) throw new Error("turnId inválido");
-    this.ensureOpen();
-    const row = this.db.prepare<unknown[], ResumeCheckpointRow>(`
-      SELECT checkpoint_id, agent_id, conversation_id, turn_id, provider, model, cursor,
-             safe_sequence_id, completed_effect_ids_json, expires_at_ms, version, budget_json
-      FROM turn_checkpoints
-      WHERE agent_id = ? AND conversation_id = ? AND turn_id = ?
-    `).get(agentId, conversationId, turnId);
-    return row === undefined ? undefined : parseResumeCheckpoint(row);
-  }
-
-  advanceResumeCheckpoint(
-    scope: ResumeCheckpointScope,
-    expectedVersion: number,
-    update: Pick<ResumeCheckpoint, "cursor" | "safeSequenceId" | "completedEffectIds" | "expiresAtMs" | "budget">,
-  ): ResumeCheckpoint {
-    validateResumeScope(scope);
-    this.ensureOpen();
-    validateOpaqueResumeCursor(update.cursor);
-    const effectIds = [...new Set(update.completedEffectIds)];
-    if (effectIds.length > 128 || !Number.isSafeInteger(update.safeSequenceId) || update.safeSequenceId < 0) throw new Error("resume checkpoint update inválido");
-    const changed = this.db.prepare(`
-      UPDATE turn_checkpoints
-      SET cursor = ?, safe_sequence_id = ?, completed_effect_ids_json = ?, expires_at_ms = ?,
-          version = version + 1, budget_json = ?, updated_at_ms = ?
-      WHERE agent_id = ? AND conversation_id = ? AND turn_id = ?
-        AND version = ? AND safe_sequence_id <= ?
-    `).run(
-      update.cursor,
-      update.safeSequenceId,
-      JSON.stringify(effectIds),
-      update.expiresAtMs,
-      JSON.stringify(update.budget),
-      Date.now(),
-      scope.agentId,
-      scope.conversationId,
-      scope.turnId,
-      expectedVersion,
-      update.safeSequenceId,
-    );
-    if (changed.changes !== 1) throw new Error("resume checkpoint CAS rejected");
-    return this.getResumeCheckpoint(scope)!;
-  }
-
-  prepareResumeEffect(scope: ResumeCheckpointScope, effectId: string, fingerprintHash: string): ResumeEffectRecord {
-    validateResumeScope(scope);
-    this.ensureOpen();
-    if (effectId.length === 0 || fingerprintHash.length === 0) throw new Error("resume effect identity inválida");
-    const transaction = this.db.transaction(() => {
-      const select = () => this.db.prepare<unknown[], ResumeEffectRow>(`
-        SELECT agent_id, conversation_id, turn_id, effect_id, fingerprint_hash, status,
-               result_json, created_at_ms, started_at_ms, completed_at_ms
-        FROM turn_effects
-        WHERE agent_id = ? AND conversation_id = ? AND turn_id = ? AND effect_id = ?
-      `).get(scope.agentId, scope.conversationId, scope.turnId, effectId);
-      const existing = select();
-      if (existing !== undefined) {
-        if (existing.fingerprint_hash !== fingerprintHash) throw new Error("resume effect key reused with different fingerprint");
-        return existing;
-      }
-      this.db.prepare(`
-        INSERT INTO turn_effects
-          (agent_id, conversation_id, turn_id, effect_id, fingerprint_hash, status, result_json, created_at_ms, started_at_ms, completed_at_ms)
-        VALUES (?, ?, ?, ?, ?, 'prepared', NULL, ?, NULL, NULL)
-      `).run(scope.agentId, scope.conversationId, scope.turnId, effectId, fingerprintHash, Date.now());
-      return select()!;
-    });
-    return parseResumeEffect(transaction());
-  }
-
-  markResumeEffectStarted(scope: ResumeCheckpointScope, effectId: string): ResumeEffectRecord | undefined {
-    validateResumeScope(scope);
-    this.ensureOpen();
-    this.db.prepare(`
-      UPDATE turn_effects SET status = 'started', started_at_ms = ?
-      WHERE agent_id = ? AND conversation_id = ? AND turn_id = ? AND effect_id = ? AND status = 'prepared'
-    `).run(Date.now(), scope.agentId, scope.conversationId, scope.turnId, effectId);
-    return this.getResumeEffect(scope, effectId);
-  }
-
-  markResumeEffectUnsafe(scope: ResumeCheckpointScope, effectId: string): ResumeEffectRecord | undefined {
-    validateResumeScope(scope);
-    this.ensureOpen();
-    this.db.prepare(`
-      UPDATE turn_effects SET status = 'unsafe'
-      WHERE agent_id = ? AND conversation_id = ? AND turn_id = ? AND effect_id = ? AND status IN ('prepared', 'started')
-    `).run(scope.agentId, scope.conversationId, scope.turnId, effectId);
-    return this.getResumeEffect(scope, effectId);
-  }
-
-  getResumeEffect(scope: ResumeCheckpointScope, effectId: string): ResumeEffectRecord | undefined {
-    validateResumeScope(scope);
-    this.ensureOpen();
-    const row = this.db.prepare<unknown[], ResumeEffectRow>(`
-      SELECT agent_id, conversation_id, turn_id, effect_id, fingerprint_hash, status,
-             result_json, created_at_ms, started_at_ms, completed_at_ms
-      FROM turn_effects
-      WHERE agent_id = ? AND conversation_id = ? AND turn_id = ? AND effect_id = ?
-    `).get(scope.agentId, scope.conversationId, scope.turnId, effectId);
-    return row === undefined ? undefined : parseResumeEffect(row);
-  }
-
-  hasUnsafeResumeEffect(scope: ResumeCheckpointScope): boolean {
-    validateResumeScope(scope);
-    this.ensureOpen();
-    return this.db.prepare(`
-      SELECT 1 AS found FROM turn_effects
-      WHERE agent_id = ? AND conversation_id = ? AND turn_id = ? AND status = 'unsafe'
-      LIMIT 1
-    `).get(scope.agentId, scope.conversationId, scope.turnId) !== undefined;
-  }
-
-  completeResumeEffect(scope: ResumeCheckpointScope, effectId: string, fingerprintHash: string, result: unknown): ResumeEffectRecord {
-    validateResumeScope(scope);
-    this.ensureOpen();
-    const resultJson = JSON.stringify(boundedResumeResult(result));
-    const changed = this.db.prepare(`
-      UPDATE turn_effects
-      SET status = 'completed', result_json = ?, completed_at_ms = ?
-      WHERE agent_id = ? AND conversation_id = ? AND turn_id = ? AND effect_id = ?
-        AND fingerprint_hash = ? AND status IN ('prepared', 'started')
-    `).run(resultJson, Date.now(), scope.agentId, scope.conversationId, scope.turnId, effectId, fingerprintHash);
-    const record = this.getResumeEffect(scope, effectId);
-    if (record === undefined) throw new Error("resume effect is not claimed");
-    if (record.fingerprintHash !== fingerprintHash) throw new Error("resume effect fingerprint conflict");
-    if (record.status === "unsafe") throw new Error("resume effect is unsafe");
-    if (changed.changes === 0 && record.status !== "completed") throw new Error("resume effect completion rejected");
-    return record;
-  }
-
-  commitResumeEffectAndCheckpoint(input: ResumeEffectCommit): ResumeCheckpoint {
-    validateResumeScope(input.scope);
-    this.ensureOpen();
-    validateOpaqueResumeCursor(input.checkpoint.cursor);
-    const effectIds = [...new Set(input.checkpoint.completedEffectIds)];
-    if (effectIds.length > 128 || !effectIds.includes(input.effectId)) throw new Error("resume checkpoint effect ledger inválido");
-    const resultJson = JSON.stringify(boundedResumeResult(input.result));
-    const transaction = this.db.transaction(() => {
-      const effect = this.getResumeEffect(input.scope, input.effectId);
-      if (effect === undefined) throw new Error("resume effect is not claimed");
-      if (effect.fingerprintHash !== input.fingerprintHash) throw new Error("resume effect fingerprint conflict");
-      const checkpointRow = this.db.prepare<unknown[], ResumeCheckpointRow>(`
-        SELECT checkpoint_id, agent_id, conversation_id, turn_id, provider, model, cursor,
-               safe_sequence_id, completed_effect_ids_json, expires_at_ms, version, budget_json
-        FROM turn_checkpoints
-        WHERE agent_id = ? AND conversation_id = ? AND turn_id = ?
-      `).get(input.scope.agentId, input.scope.conversationId, input.scope.turnId);
-      if (checkpointRow === undefined) throw new Error("resume checkpoint not found");
-      parseResumeCheckpoint(checkpointRow);
-      if (effect.status === "unsafe") throw new Error("resume effect is unsafe");
-      if (effect.status !== "completed") {
-        for (const entry of input.transcriptEntries ?? []) {
-          const record = entry as Record<string, unknown>;
-          const entryId = typeof record.id === "string" ? record.id : null;
-          const createdAt = typeof record.timestampMs === "number" && Number.isFinite(record.timestampMs)
-            ? record.timestampMs
-            : Date.now();
-          this.db.prepare(`
-            INSERT INTO transcript_entries (agent_id, conversation_id, entry_id, kind, payload_json, created_at_ms)
-            VALUES (?, ?, ?, ?, ?, ?)
-          `).run(input.scope.agentId, input.scope.conversationId, entryId, entry.kind, JSON.stringify(entry), createdAt);
-        }
-        this.db.prepare(`
-          UPDATE turn_effects SET status = 'completed', result_json = ?, completed_at_ms = ?
-          WHERE agent_id = ? AND conversation_id = ? AND turn_id = ? AND effect_id = ?
-            AND fingerprint_hash = ? AND status IN ('prepared', 'started')
-        `).run(resultJson, Date.now(), input.scope.agentId, input.scope.conversationId, input.scope.turnId, input.effectId, input.fingerprintHash);
-      }
-      const changed = this.db.prepare(`
-        UPDATE turn_checkpoints
-        SET cursor = ?, safe_sequence_id = ?, completed_effect_ids_json = ?, expires_at_ms = ?,
-            version = version + 1, budget_json = ?, updated_at_ms = ?
-        WHERE agent_id = ? AND conversation_id = ? AND turn_id = ?
-          AND version = ? AND safe_sequence_id <= ?
-      `).run(
-        input.checkpoint.cursor,
-        input.checkpoint.safeSequenceId,
-        JSON.stringify(effectIds),
-        input.checkpoint.expiresAtMs,
-        JSON.stringify(input.checkpoint.budget),
-        Date.now(),
-        input.scope.agentId,
-        input.scope.conversationId,
-        input.scope.turnId,
-        input.checkpoint.expectedVersion,
-        input.checkpoint.safeSequenceId,
-      );
-      if (changed.changes !== 1) throw new Error("resume checkpoint CAS rejected");
-      const checkpoint = this.db.prepare<unknown[], ResumeCheckpointRow>(`
-        SELECT checkpoint_id, agent_id, conversation_id, turn_id, provider, model, cursor,
-               safe_sequence_id, completed_effect_ids_json, expires_at_ms, version, budget_json
-        FROM turn_checkpoints
-        WHERE agent_id = ? AND conversation_id = ? AND turn_id = ?
-      `).get(input.scope.agentId, input.scope.conversationId, input.scope.turnId);
-      if (checkpoint === undefined) throw new Error("resume checkpoint not found after commit");
-      return checkpoint;
-    });
-    return parseResumeCheckpoint(transaction());
-  }
-
-  reconcileResumeEffects(agentId: string, nowMs = Date.now()): number {
-    validateAgentId(agentId);
-    this.ensureOpen();
-    const result = this.db.prepare(`
-      UPDATE turn_effects SET status = 'unsafe'
-      WHERE agent_id = ? AND status = 'started' AND result_json IS NULL
-    `).run(agentId);
-    this.db.prepare("DELETE FROM turn_checkpoints WHERE agent_id = ? AND expires_at_ms <= ?").run(agentId, nowMs);
-    return result.changes;
-  }
-
   hasCompletedTurnForNonce(agentId: string, nonce: string, conversationId?: string): boolean {
-    validateAgentId(agentId);
-    this.ensureOpen();
-    const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
-    const row = this.statements.hasTurnCompletion.get(agentId, resolvedConversationId, nonce);
-    return row !== undefined;
+    return this.getTurnOutcomeForNonce(agentId, nonce, conversationId) !== undefined;
   }
 
   getTurnOutcomeForNonce(agentId: string, nonce: string, conversationId?: string): TurnOutcome | undefined {
     validateAgentId(agentId);
     this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
-    return (this.statements.hasTurnCompletion.get(agentId, resolvedConversationId, nonce) as { outcome?: TurnOutcome } | undefined)?.outcome;
+    return this.statements.hasTurnCompletion.get(agentId, resolvedConversationId, nonce)?.outcome;
   }
 
   forgetAcceptedNonce(agentId: string, nonce: string, conversationId?: string): void {
@@ -2354,7 +1930,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     this.ensureOpen();
     const trim = this.db.transaction(() => {
       this.statements.trimNonces.run(agentId, agentId, cap);
-      this.db.prepare(`
+      this.sql(`
         DELETE FROM turn_completions
         WHERE agent_id = ? AND NOT EXISTS (
           SELECT 1 FROM accepted_nonces AS accepted
@@ -2387,16 +1963,47 @@ export class SqliteTranscriptStore implements TranscriptStore {
     const hasNext = rows.length > limit;
     const selected = hasNext ? rows.slice(0, limit) : rows;
     const pageRows = [...selected].reverse();
-    const page: TranscriptPage = { entries: pageRows.map((row) => parseEntry(row.payload_json)) };
+    const page: TranscriptPage = { entries: pageRows.map((row) => this.readRow(row)) };
     if (hasNext && pageRows[0]) page.nextBeforeSeq = pageRows[0].sequence_id;
     return page;
   }
 
   openAgentTail(agentId: string, limit = DEFAULT_TRANSCRIPT_PAGE_LIMIT, beforeSeq?: number, conversationId?: string): TranscriptPage {
-    const page = this.getAgentTranscriptTail(agentId, limit, beforeSeq, conversationId);
-    if (beforeSeq !== undefined) return page;
+    if (beforeSeq !== undefined) return this.getAgentTranscriptTail(agentId, limit, beforeSeq, conversationId);
+    validateAgentId(agentId);
+    validateLimit(limit);
+    this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
-    return { ...page, entries: this.mergeLive(agentId, resolvedConversationId, page.entries).slice(-limit) };
+    const rows = this.statements.firstPage.all(agentId, resolvedConversationId, limit + 1);
+    const hasNext = rows.length > limit;
+    const durable = (hasNext ? rows.slice(0, limit) : rows).reverse();
+    const live = this.liveFor(agentId, resolvedConversationId);
+    if (live === undefined || live.size === 0) {
+      const page: TranscriptPage = { entries: durable.map((row) => this.readRow(row)) };
+      if (hasNext && durable[0]) page.nextBeforeSeq = durable[0].sequence_id;
+      return page;
+    }
+    // Live previews replace their durable row in place or append after it.
+    // Trimming the merged page to `limit` drops the oldest durable rows, so
+    // the cursor must point at the oldest row still shown.
+    const consumed = new Set<string>();
+    const merged: Array<{ entry: TranscriptEntry; sequenceId?: number }> = durable.map((row) => {
+      const entry = this.readRow(row);
+      const id = transcriptEntryId(entry);
+      const preview = id === undefined ? undefined : live.get(id);
+      if (id !== undefined && preview !== undefined) consumed.add(id);
+      return { entry: preview ?? entry, sequenceId: row.sequence_id };
+    });
+    for (const [id, preview] of live) if (!consumed.has(id)) merged.push({ entry: preview });
+    const shown = merged.slice(-limit);
+    const page: TranscriptPage = { entries: shown.map((item) => item.entry) };
+    const oldestShown = shown.find((item) => item.sequenceId !== undefined)?.sequenceId;
+    const newestDurable = durable.at(-1)?.sequence_id;
+    if (merged.length > shown.length || hasNext) {
+      const cursor = oldestShown ?? (newestDurable === undefined ? undefined : newestDurable + 1);
+      if (cursor !== undefined) page.nextBeforeSeq = cursor;
+    }
+    return page;
   }
 
   /**
@@ -2430,7 +2037,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     this.ensureOpen();
     if (typeof entryId !== "string" || entryId.length === 0) return false;
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
-    const result = this.statements.replaceEntry.run(JSON.stringify(entry), agentId, resolvedConversationId, entryId);
+    const result = this.statements.replaceEntry.run(serializeEntry(entry), agentId, resolvedConversationId, entryId);
     return result.changes > 0;
   }
 
@@ -2447,7 +2054,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     const entryId = typeof entry.id === "string" ? entry.id : null;
     const result = this.statements.replaceToolCallByLocalId.run(
       entryId,
-      JSON.stringify(entry),
+      serializeEntry(entry),
       agentId,
       resolvedConversationId,
       localToolCallId,
@@ -2457,9 +2064,9 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
   getRecentEntries(agentId: string, options: RecentEntriesOptions, conversationId?: string): readonly TranscriptEntry[] {
     validateAgentId(agentId);
-    if (!Number.isInteger(options.limit) || options.limit < 1) throw new Error("limit invÃ¡lido");
+    if (!Number.isInteger(options.limit) || options.limit < 1) throw new Error("limit inválido");
     if (options.afterSequenceId !== undefined && (!Number.isSafeInteger(options.afterSequenceId) || options.afterSequenceId < 0)) {
-      throw new Error("afterSequenceId invÃ¡lido");
+      throw new Error("afterSequenceId inválido");
     }
     this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
@@ -2467,7 +2074,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     const rows = options.kinds === undefined
       ? this.statements.recentEntries.all(agentId, resolvedConversationId, afterSequenceId, options.limit)
       : this.statements.recentEntriesByKinds.all(agentId, resolvedConversationId, afterSequenceId, JSON.stringify([...new Set(options.kinds)]), options.limit);
-    return rows.reverse().map((row) => parseEntry(row.payload_json));
+    return rows.reverse().map((row) => this.readRow(row));
   }
 
   getLatestAssistant(agentId: string, conversationId?: string): Extract<TranscriptEntry, { kind: "message" }> | undefined {
@@ -2475,9 +2082,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
     const row = this.statements.latestAssistant.get(agentId, resolvedConversationId);
-    return row === undefined
-      ? undefined
-      : parseMessageEntry(row.payload_json);
+    return row === undefined ? undefined : readMessageEntry(row.payload_json);
   }
 
   getOpenToolCalls(agentId: string, conversationId?: string): readonly Extract<TranscriptEntry, { kind: "tool-call" }>[] {
@@ -2485,7 +2090,11 @@ export class SqliteTranscriptStore implements TranscriptStore {
     this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
     const rows = this.statements.openToolCalls.all(agentId, resolvedConversationId);
-    return rows.map((row) => parseToolCallEntry(row.payload_json));
+    // An unreadable open call cannot be reconciled; it is reported by bulk reads.
+    return rows.flatMap((row) => {
+      const entry = readToolCallEntry(row.payload_json);
+      return entry === undefined ? [] : [entry];
+    });
   }
 
   findToolCallByLocalId(
@@ -2498,9 +2107,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
     const row = this.statements.findToolCallByLocalId.get(agentId, resolvedConversationId, localToolCallId);
-    return row === undefined
-      ? undefined
-      : parseToolCallEntry(row.payload_json);
+    return row === undefined ? undefined : readToolCallEntry(row.payload_json);
   }
 
   getEarliestUser(agentId: string, conversationId?: string): Extract<TranscriptEntry, { kind: "message" }> | undefined {
@@ -2508,9 +2115,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
     const row = this.statements.firstUserMessage.get(agentId, resolvedConversationId);
-    return row === undefined
-      ? undefined
-      : parseMessageEntry(row.payload_json);
+    return row === undefined ? undefined : readMessageEntry(row.payload_json);
   }
 
   getConversationOutline(agentId: string, conversationId?: string): ConversationOutline {
@@ -2519,12 +2124,8 @@ export class SqliteTranscriptStore implements TranscriptStore {
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
     const firstRow = this.statements.firstUserMessage.get(agentId, resolvedConversationId);
     const lastRow = this.statements.latestNonEmptyMessage.get(agentId, resolvedConversationId);
-    const firstUser = firstRow === undefined
-      ? undefined
-      : parseMessageEntry(firstRow.payload_json);
-    const last = lastRow === undefined
-      ? undefined
-      : parseMessageEntry(lastRow.payload_json);
+    const firstUser = firstRow === undefined ? undefined : readMessageEntry(firstRow.payload_json);
+    const last = lastRow === undefined ? undefined : readMessageEntry(lastRow.payload_json);
     return { title: firstUser?.content ?? null, lastMessage: last?.content ?? null };
   }
 
@@ -2532,7 +2133,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     validateAgentId(agentId);
     this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
-    const row = this.db.prepare<unknown[], { sequence_id: number | null }>(`
+    const row = this.sql<unknown[], { sequence_id: number | null }>(`
       SELECT MAX(sequence_id) AS sequence_id
       FROM transcript_entries
       WHERE agent_id = ? AND conversation_id = ?
@@ -2561,13 +2162,13 @@ export class SqliteTranscriptStore implements TranscriptStore {
     if (!Number.isSafeInteger(throughSequenceId) || throughSequenceId < fromSequenceId) throw new Error("throughSequenceId inválido");
     this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
-    const rows = this.db.prepare<unknown[], EntryRow & { sequence_id: number }>(`
+    const rows = this.sql<unknown[], PageRow>(`
       SELECT sequence_id, payload_json
       FROM transcript_entries
       WHERE agent_id = ? AND conversation_id = ? AND sequence_id BETWEEN ? AND ?
       ORDER BY sequence_id ASC
     `).all(agentId, resolvedConversationId, fromSequenceId, throughSequenceId);
-    return rows.map((row) => ({ sequenceId: row.sequence_id, entry: parseEntry(row.payload_json) }));
+    return rows.map((row) => ({ sequenceId: row.sequence_id, entry: this.readRow(row) }));
   }
 
   getInteractionDecision(agentId: string, requestId: string, kind: string, conversationId?: string): InteractionDecision | null {
@@ -2577,20 +2178,35 @@ export class SqliteTranscriptStore implements TranscriptStore {
     return row ? { agentId: row.agent_id, requestId: row.request_id, kind: row.kind, decision: row.decision, createdAtMs: row.created_at_ms } : null;
   }
 
+  /**
+   * Records the first decision for a request. Decisions are unique per agent
+   * (UNIQUE(agent_id, request_id, kind)), so the stored one is returned even
+   * when it was recorded from another conversation.
+   */
   rememberInteractionDecision(agentId: string, requestId: string, kind: string, decision: string, conversationId?: string): InteractionDecision {
     validateAgentId(agentId); this.ensureOpen();
     const resolvedConversationId = this.resolveConversationId(agentId, conversationId);
     this.statements.insertInteractionDecision.run(agentId, resolvedConversationId, requestId, kind, decision, Date.now());
-    return this.getInteractionDecision(agentId, requestId, kind, resolvedConversationId)!;
+    const row = this.sql<unknown[], InteractionDecisionRow>(
+      "SELECT agent_id, request_id, kind, decision, created_at_ms FROM interaction_decisions WHERE agent_id = ? AND request_id = ? AND kind = ?",
+    ).get(agentId, requestId, kind);
+    if (row === undefined) throw new Error("store: decisão de interação não foi registrada");
+    return { agentId: row.agent_id, requestId: row.request_id, kind: row.kind, decision: row.decision, createdAtMs: row.created_at_ms };
   }
 
   close(): void {
     if (this.closed) return;
     this.liveEntries.clear();
+    this.statementCache.clear();
     this.unregisterOwnership();
     this.memoryStore.close();
     this.conversationStore.close();
-    if (this.ownsDatabase) this.db.close();
+    if (this.ownsDatabase) {
+      // Cheap, and recommended before closing: refreshes planner statistics
+      // only for tables whose shape changed.
+      try { this.db.pragma("optimize"); } catch { /* best effort */ }
+      this.db.close();
+    }
     this.closed = true;
   }
 }

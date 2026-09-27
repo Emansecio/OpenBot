@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
-import type { LocalExecutionBroker, LocalToolPermission } from "./broker.js";
-import type { ExecutionRequest, ExecutionResult } from "./contracts.js";
+import type { LocalExecutionBroker } from "./broker.js";
+import type { ExecutionResult } from "./contracts.js";
 import { makeToolCallEntry, occurrenceToolCallId, stableToolCallId, toolCallLocalId, toolCallResult, toolCallSummary, type ToolCallEntry } from "./tool-card.js";
 import { toolCallToExecutionRequest } from "./tool-request.js";
 import { BROWSER_CAPTURE_TEXT_PREFIX, buildToolTurnMessages, type ToolResultInput } from "../providers/tool-calls.js";
 import { ProviderError, type ProviderAssistantMessage, type ProviderChatMessage, type ProviderChatRequest, type ProviderStreamEvent, type ProviderToolCall, type StreamChatResult } from "../providers/router.js";
 import { MAX_LIVE_RESPONSE_BYTES, MAX_TRANSCRIPT_DELTA_BYTES } from "../rpc/stream-state.js";
 import type { ToolCallResult } from "../shared/contracts.js";
-import { resumeFingerprintHash, stableResumeEffectId, type ResumeEffectRecord } from "../providers/resume.js";
+import { utf8Prefix } from "../shared/utf8.js";
 
 /** Resultado do loop com a conclusão factual da solicitação, além do transporte. */
 export type ToolLoopResult = StreamChatResult & { taskOutcome?: "partial" };
@@ -100,10 +100,8 @@ export interface ToolProgress {
 }
 export interface ToolLoopOptions {
   agentId: string;
-  conversationId?: string;
   request: ProviderChatRequest;
   broker?: LocalExecutionBroker;
-  resolveHostPermission?: (agentId: string, request: ExecutionRequest) => LocalToolPermission | undefined;
   /** Executor de extensões compartilhadas (Skills/MCP). `handled:false` mantém o fallback local fechado. */
   executeTool?: ToolCallExecutor;
   stream: (
@@ -125,8 +123,6 @@ export interface ToolLoopOptions {
   /** Hold round text until calls are known; discard it when one of these tools runs. */
   deferTextUntilToolResultFor?: readonly string[];
   onProgress?: (progress: ToolProgress) => void;
-  /** Durable P2.6 effect ledger; omitted for non-resumable turns. */
-  resumableEffects?: ToolLoopResumableEffects;
   turnId?: string;
   contextOverflowRetry?: {
     isOverflow(error: unknown): boolean;
@@ -134,13 +130,6 @@ export interface ToolLoopOptions {
   };
   /** Optional explicit override for the provider/model-derived tool budget. */
   toolLoopBudget?: ToolLoopBudgetOverrides;
-}
-
-export interface ToolLoopResumableEffects {
-  prepare(effectId: string, fingerprintHash: string): ResumeEffectRecord;
-  markStarted(effectId: string): ResumeEffectRecord | undefined;
-  markUnsafe?(effectId: string): ResumeEffectRecord | undefined;
-  complete(effectId: string, fingerprintHash: string, result: unknown): ResumeEffectRecord;
 }
 
 export interface ToolExecutionContext {
@@ -165,15 +154,6 @@ interface ToolOutcome {
   error?: string;
   result: ToolCallResult;
   visual?: { mimeType: "image/png"; dataBase64: string; width: number; height: number };
-}
-
-function persistedOutcome(value: unknown): value is ToolOutcome {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const record = value as Record<string, unknown>;
-  return typeof record.ok === "boolean"
-    && typeof record.content === "string"
-    && typeof record.result === "object"
-    && record.result !== null;
 }
 
 type BrowserVisual = { mimeType: "image/png"; dataBase64: string; width: number; height: number };
@@ -208,18 +188,6 @@ function resultText(result: ExecutionResult, visualAvailable: boolean): string {
     visualAvailable,
     screenshot: { mimeType: image.mimeType, width: image.width, height: image.height },
   });
-}
-function utf8Prefix(value: string, maxBytes: number): string {
-  if (maxBytes <= 0) return "";
-  let usedBytes = 0;
-  let end = 0;
-  for (const character of value) {
-    const characterBytes = Buffer.byteLength(character, "utf8");
-    if (usedBytes + characterBytes > maxBytes) break;
-    usedBytes += characterBytes;
-    end += character.length;
-  }
-  return value.slice(0, end);
 }
 
 export function isReadOnlyToolCall(call: ProviderToolCall): boolean {
@@ -316,6 +284,22 @@ export function maskStaleToolResults(
     }
     return message;
   });
+}
+
+/** Tool-call arguments as a JSON object; undefined for invalid JSON or any other JSON value. */
+export function parseToolArguments(raw: string): Record<string, unknown> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+}
+
+/** A handled tool failure with no content: the message and code travel in `error` and `result`. */
+export function toolFailure(operation: string, code: string, message: string): ToolExecutionResult {
+  return { handled: true, ok: false, content: "", error: message, result: { ok: false, operation, code, message } };
 }
 
 export function truncateToolResult(value: string, maxBytes: number = MAX_TOOL_RESULT_BYTES_PER_ROUND): string {
@@ -477,7 +461,6 @@ function withFinalizationInstruction(system: string | undefined): string {
 
 function emitFinalizationResult(options: ToolLoopOptions, result: ToolLoopResult): ToolLoopResult {
   if (result.aborted || options.request.signal?.aborted || result.message === undefined) return result;
-  if (result.cursor !== undefined) options.onEvent({ type: "resume-cursor", cursor: result.cursor });
   options.onEvent({ type: "message", message: result.message });
   options.onEvent({ type: "done" });
   return result;
@@ -537,7 +520,6 @@ async function tryFinalizeToolLoop(
         aborted: false,
         message: result.message,
         taskOutcome: "partial",
-        ...(result.cursor === undefined ? {} : { cursor: result.cursor }),
       });
     }
   } catch {
@@ -558,8 +540,6 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopRes
   const executedMutationFingerprints = new Set<string>();
   /** Read-only fingerprints whose cached outcomes remain valid only while no mutation runs. */
   const observationFingerprints = new Set<string>();
-  /** Per-turn count of actual executions per fingerprint — distinguishes resumable occurrences. */
-  const executionCounts = new Map<string, number>();
   /** Occurrences let repeated provider IDs receive matching local identities. */
   const toolCallIdOccurrences = new Map<string, number>();
   /** Bounded-by-round tool outcomes retained for a deterministic final report. */
@@ -906,17 +886,6 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopRes
       id: string;
       summary: string;
       fingerprint: string;
-      resumableClaim?: { effectId: string; fingerprintHash: string };
-    };
-
-    const persistOutcome = (item: PendingCall, outcome: ToolOutcome): void => {
-      if (item.resumableClaim === undefined) return;
-      try {
-        options.resumableEffects?.complete(item.resumableClaim.effectId, item.resumableClaim.fingerprintHash, outcome);
-      } catch (error) {
-        options.resumableEffects?.markUnsafe?.(item.resumableClaim.effectId);
-        throw error;
-      }
     };
 
     const invalidateReadObservations = (): void => {
@@ -962,12 +931,6 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopRes
 
     const executePending = async (item: PendingCall): Promise<ToolOutcome> => {
       const { call, id, summary } = item;
-      // Reserve the durable effect only at the point where this admitted item
-      // is about to execute. Queued parallel siblings remain merely prepared,
-      // so a later boundary cannot strand `started` claims.
-      if (item.resumableClaim !== undefined) {
-        options.resumableEffects?.markStarted(item.resumableClaim.effectId);
-      }
       let extensionResult: ToolExecutionResult = { handled: false };
       const extensionExpected = options.executeTool?.canHandle?.(call.function.name) ?? false;
       if (extensionExpected) {
@@ -1042,25 +1005,7 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopRes
         };
       }
       const executionRequestId = localId(options.turnId, id) ?? id;
-      const hostPermission = options.resolveHostPermission?.(options.agentId, parsed.request);
-      let executed;
-      try {
-        executed = await options.broker.execute(
-          options.agentId,
-          executionRequestId,
-          parsed.request,
-          options.request.signal,
-          hostPermission === undefined && options.conversationId === undefined
-            ? undefined
-            : {
-              ...(hostPermission === undefined ? {} : { permission: hostPermission }),
-              ...(options.conversationId === undefined ? {} : { conversationId: options.conversationId }),
-            },
-        );
-      } catch (error) {
-        if (item.resumableClaim !== undefined) options.resumableEffects?.markUnsafe?.(item.resumableClaim.effectId);
-        throw error;
-      }
+      const executed = await options.broker.execute(options.agentId, executionRequestId, parsed.request, options.request.signal);
       // Any mutating or unknown-effect execution invalidates cached read
       // observations: a read issued before a write must not satisfy a read
       // issued after it. Conservative by design — the cost of a stale
@@ -1084,7 +1029,6 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopRes
     };
 
     const applyOutcome = (item: PendingCall, outcome: ToolOutcome): StreamChatResult | undefined => {
-      persistOutcome(item, outcome);
       if (!isReadOnlyToolCall(item.call)) executedMutationFingerprints.add(item.fingerprint);
       if (recordSuccessfulOutcome(item, outcome)) noProgressObservation = true;
       finish(item.call, item.id, item.summary, item.fingerprint, outcome);
@@ -1093,9 +1037,9 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopRes
     };
 
     const parallelReadOnlyRound = calls.length > 1 && calls.every((call) => isReadOnlyToolCall(call));
-    // Reserve a whole parallel batch before creating resumable claims. If the
-    // aggregate cap or wall clock cannot admit every sibling, close the batch
-    // together so no `started` claim is left without an execution.
+    // Reserve a whole parallel batch up front. If the aggregate cap or wall
+    // clock cannot admit every sibling, close the batch together so no
+    // sibling is left half-started.
     const parallelExecutionCount = new Set(calls.map(semanticFingerprint)).size;
     if (parallelReadOnlyRound && (actualToolExecutions + parallelExecutionCount > budget.maxTotalCalls || wallClockExpired())) {
       const reason = actualToolExecutions + parallelExecutionCount > budget.maxTotalCalls
@@ -1194,34 +1138,7 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopRes
         return tryFinalizeToolLoop(options, messages, turnToolResults);
       }
 
-      let resumableClaim: PendingCall["resumableClaim"];
-      if (options.resumableEffects !== undefined) {
-        // Distinct executions of the same fingerprint are distinct effects:
-        // read → write → read must not inherit the pre-mutation outcome.
-        const occurrence = executionCounts.get(fingerprint) ?? 0;
-        executionCounts.set(fingerprint, occurrence + 1);
-        const effectId = stableResumeEffectId(options.turnId ?? "", occurrence === 0 ? fingerprint : `${fingerprint}\0occurrence:${occurrence}`);
-        const fingerprintHash = resumeFingerprintHash(fingerprint);
-        const previous = options.resumableEffects.prepare(effectId, fingerprintHash);
-        if (previous.status === "completed") {
-          if (!persistedOutcome(previous.result)) throw new ProviderError("persisted resume effect outcome is invalid", { kind: "validation", code: "unsafe_effect" });
-          if (!readOnly) executedMutationFingerprints.add(fingerprint);
-          finish(call, id, summary, fingerprint, previous.result);
-          continue;
-        }
-        if (previous.status === "unsafe" || previous.status === "started") {
-          if (previous.status === "started") options.resumableEffects.markUnsafe?.(effectId);
-          finish(call, id, summary, fingerprint, {
-            ok: false,
-            content: "resume effect is unsafe after restart",
-            error: "resume effect is unsafe after restart",
-            result: { ok: false, code: "io_error", message: "Resume effect is unsafe after restart." },
-          });
-          return { aborted: false, error: new ProviderError("resume effect is unsafe after restart", { kind: "validation", code: "unsafe_effect" }) };
-        }
-        resumableClaim = { effectId, fingerprintHash };
-      }
-      const item: PendingCall = { call, id, summary, fingerprint, ...(resumableClaim === undefined ? {} : { resumableClaim }) };
+      const item: PendingCall = { call, id, summary, fingerprint };
       const admission = admitToolExecution();
       if (admission === "aborted") return abortedResult();
       if (admission === "limit") {
@@ -1284,8 +1201,7 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopRes
     if (parallelReadOnlyRound) {
       // Every started sibling reaches a terminal state: a failed or cancelled
       // read must not discard the recorded outcomes of its siblings — their
-      // transcript cards and resumable claims still need finish()/complete()
-      // or they would poison the next resume.
+      // transcript cards still need finish().
       const settled = await Promise.all(pending.map(async (item) => {
         try {
           return { item, outcome: await executePending(item), error: undefined as unknown };
@@ -1300,10 +1216,9 @@ export async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopRes
           const { item } = entry;
           let outcome = entry.outcome;
           if (outcome === undefined) {
-            // A rejected sibling is still terminal work: close its card and
-            // mark its claim unsafe instead of leaking `started` forever.
+            // A rejected sibling is still terminal work: close its card
+            // instead of leaving it running forever.
             firstError ??= entry.error;
-            if (item.resumableClaim !== undefined) options.resumableEffects?.markUnsafe?.(item.resumableClaim.effectId);
             const message = entry.error instanceof Error ? entry.error.message : String(entry.error);
             outcome = {
               ok: false,

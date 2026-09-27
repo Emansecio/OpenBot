@@ -1,14 +1,14 @@
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdir, readFile, rm, writeFile, stat } from "node:fs/promises";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 // @ts-ignore local runner is intentionally JavaScript.
 const runner: any = await import("../scripts/verify-clean-profile.mjs");
-const { assertCleanProfilePaths, buildCleanProfileEnvironment, cleanProfileDpapiAddonRelativePath, copyInstall, createCleanProfilePaths, ensureRoots, isElectronReadyEvidence, runCleanProfile, waitChildExit } = runner;
+const { assertCleanProfilePaths, buildCleanProfileEnvironment, cleanProfileDpapiAddonRelativePath, copyInstall, createCleanProfilePaths, ensureRoots, isElectronReadyEvidence, resolveCleanProfileTempRoot, runCleanProfile, waitChildExit } = runner;
 const testProductPort = 20_000 + (process.pid % 20_000);
 
 function runIsolatedCleanProfile(options: Record<string, unknown> = {}) {
@@ -17,6 +17,15 @@ function runIsolatedCleanProfile(options: Record<string, unknown> = {}) {
 
 function isolatedRoot(label: string): string {
   return mkdtempSync(join(tmpdir(), `openbot-clean-profile-${label}-`));
+}
+
+/** The 8.3 spelling of an existing path, or null when the volume has no short names for it. */
+function shortPathAlias(path: string): string | null {
+  if (process.platform !== "win32") return null;
+  // cmd parses its own command line, so pass it verbatim (Node would escape the inner quotes).
+  const result = spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `"for %I in ("${path}") do @echo %~sI"`], { encoding: "utf8", windowsHide: true, windowsVerbatimArguments: true });
+  const alias = result.status === 0 ? result.stdout.trim() : "";
+  return alias !== "" && alias.toLowerCase() !== path.toLowerCase() ? alias : null;
 }
 
 function realTcpLifecycle() {
@@ -94,6 +103,38 @@ describe("clean profile gate", () => {
       await expect(assertCleanProfilePaths(paths)).rejects.toThrow(/reparse|escapes/i);
     } finally {
       rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("runs from an 8.3-aliased TempRoot (Windows default %TEMP% for profiles with spaces)", async (context) => {
+    // A long name with spaces makes NTFS generate a short alias when 8.3 names are enabled.
+    const root = mkdtempSync(join(tmpdir(), "openbot clean profile short alias "));
+    try {
+      const alias = shortPathAlias(root);
+      if (alias === null) context.skip();
+      const canonical = realpathSync.native(root);
+      // The isolation check itself stays strict: an alias spelling is not TempRoot.
+      await expect(ensureRoots(createCleanProfilePaths(alias))).rejects.toThrow(/escapes TempRoot/u);
+      await expect(resolveCleanProfileTempRoot(alias)).resolves.toBe(canonical);
+      const lifecycle = realTcpLifecycle();
+      await expect(runIsolatedCleanProfile({ tempRoot: alias, lifecycle })).resolves.toMatchObject({ status: "GREEN", tempRoot: canonical, boots: 2 });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a TempRoot that reaches its target through a junction instead of canonicalizing it", async () => {
+    const outside = isolatedRoot("junction-target");
+    const holder = isolatedRoot("junction-holder");
+    const link = join(holder, "root");
+    try {
+      symlinkSync(outside, link, "junction");
+      await expect(resolveCleanProfileTempRoot(link)).rejects.toThrow("must not traverse a reparse/symbolic path");
+      await expect(resolveCleanProfileTempRoot(join(link, "nested"))).rejects.toThrow("must not traverse a reparse/symbolic path");
+      await expect(resolveCleanProfileTempRoot(join(holder, "missing"))).resolves.toBe(join(realpathSync.native(holder), "missing"));
+    } finally {
+      rmSync(holder, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });
     }
   });

@@ -672,6 +672,6 @@ describe("Electron/Windows local integration patches", () => {
   });
 
   it("accepts absolute Windows paths when resolving a staged attachment preview", () => {
-    expect(main).toContain('if (import_node_path39.default.isAbsolute(source)) return source;');
+    expect(main).toMatch(/if \(\w+\.default\.isAbsolute\(source\)\) return source;/u);
   });
 });

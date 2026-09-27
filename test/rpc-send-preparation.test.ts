@@ -105,7 +105,6 @@ describe("send preparation cancellation", () => {
     } finally {
       release.resolve();
       await runner.flush("a");
-      config.close();
       catalog.close();
       fs.rmSync(directory, { recursive: true, force: true });
     }

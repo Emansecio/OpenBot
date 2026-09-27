@@ -4,6 +4,7 @@ import type { Gateway } from "../server/gateway.js";
 import { RpcError } from "../server/gateway.js";
 import { parseA2ASendInput, type A2ASendInput } from "../a2a/contracts.js";
 import { A2AStore } from "../a2a/store.js";
+import { A2A_RUNTIME_OWNER_PREFIX } from "../a2a/runtime.js";
 
 export interface A2ARpcOptions {
   store: A2AStore;
@@ -42,7 +43,14 @@ export function registerA2AHandlers(gateway: Gateway, options: A2ARpcOptions): v
   gateway.registerHandler("sendAgentMessage", (body) => {
     const value = strictBody(body, "sendAgentMessage", ["senderAgentId", "recipientAgentId", "nonce", "parentTaskId", "parentTurnId", "priority", "hopCount", "payload"]);
     try {
-      if (options.activeAgents !== undefined) options.store.syncActiveAgents(options.activeAgents());
+      if (options.activeAgents !== undefined) {
+        const active = options.activeAgents();
+        // A message speaks for its sender: it must be a bot of the roster.
+        if (typeof value.senderAgentId !== "string" || !active.includes(value.senderAgentId)) {
+          throw new RpcError(404, "sendAgentMessage: remetente não é um bot ativo");
+        }
+        options.store.syncActiveAgents(active);
+      }
       const createdAtMs = now();
       const input: A2ASendInput = parseA2ASendInput({
         version: 1,
@@ -79,6 +87,11 @@ export function registerA2AHandlers(gateway: Gateway, options: A2ARpcOptions): v
     const messageId = requiredString(value.messageId, "messageId", "ackAgentMessage");
     const message = options.store.getMessageForRecipient(agentId, messageId);
     if (message === undefined) throw new RpcError(404, "ackAgentMessage: mensagem não encontrada para o recipient");
+    // The in-process runtime owns its leases and acknowledges them itself; a
+    // client that merely read the lease owner must not ack or kill them.
+    if (message.leaseOwner?.startsWith(A2A_RUNTIME_OWNER_PREFIX) === true) {
+      throw new RpcError(409, "ackAgentMessage: mensagem em entrega pelo runtime");
+    }
     try {
       const ownerId = requiredString(value.ownerId, "ownerId", "ackAgentMessage");
       if (!Number.isSafeInteger(value.expectedVersion)) throw new RpcError(400, "ackAgentMessage: expectedVersion inválido");

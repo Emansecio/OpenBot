@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { migrateOpenBotSchema } from "../store/schema.js";
+import { ensureOpenBotSchema } from "../store/schema.js";
 import type {
   AsyncTaskAbortIntent,
   AsyncTaskAttemptRecord,
@@ -44,6 +44,7 @@ import {
   TASK_RESULT_MIN_TRUNCATION_MARKER,
   TASK_RESULT_TRUNCATION_MARKER,
 } from "./state-machine.js";
+import { utf8Prefix } from "../shared/utf8.js";
 
 export interface AsyncTaskStoreOptions {
   readonly path: string;
@@ -378,18 +379,6 @@ function nullableString(value: unknown, name: string, maxBytes = MAX_PERSISTED_T
   if (value === null) return null;
   if (typeof value !== "string" || /\p{Cc}/u.test(value) || Buffer.byteLength(value, "utf8") > maxBytes) invalid(`${name} is invalid.`);
   return value.normalize("NFC");
-}
-
-function utf8Prefix(value: string, maxBytes: number): string {
-  let result = "";
-  let bytes = 0;
-  for (const character of value) {
-    const characterBytes = Buffer.byteLength(character, "utf8");
-    if (bytes + characterBytes > maxBytes) break;
-    result += character;
-    bytes += characterBytes;
-  }
-  return result;
 }
 
 const REDACTED_TEXT = "[redacted]";
@@ -845,7 +834,7 @@ export class AsyncTaskStore {
         this.db.pragma("synchronous = NORMAL");
         this.db.pragma("busy_timeout = 5000");
       }
-      migrateOpenBotSchema(this.db);
+      ensureOpenBotSchema(this.db);
     } catch (error) {
       if (this.ownsDatabase) database?.close();
       throw error;
@@ -1242,6 +1231,34 @@ export class AsyncTaskStore {
   }
 
   /** Removes every durable task row for a committed agent deletion so a recreated id starts empty. */
+/** Whether any task is still queued, admitted, running, waiting to retry, cancelling or abandoned. */
+  hasActiveWork(): boolean {
+    this.ensureOpen();
+    return this.db.prepare("SELECT 1 FROM async_tasks WHERE status IN ('queued', 'admitted', 'running', 'retry_wait', 'cancelling', 'abandoned') LIMIT 1").get() !== undefined;
+  }
+
+  /**
+   * Drop history older than `beforeMs`: finished tasks (their attempts,
+   * grants, usage and outbox rows cascade), outbox and projection rows that
+   * were delivered or went unclaimed for that long, and parent budget rows
+   * with no task left. Unfinished tasks are never touched. Returns the number
+   * of tasks removed.
+   */
+  pruneHistory(beforeMs: number): number {
+    this.ensureOpen();
+    const cutoff = nonNegativeInteger(beforeMs, "beforeMs");
+    const operation = this.db.transaction(() => {
+      const removed = this.db.prepare("DELETE FROM async_tasks WHERE status IN ('completed', 'failed', 'cancelled') AND COALESCE(finished_at_ms, created_at_ms) < ?").run(cutoff).changes;
+      this.db.prepare("DELETE FROM async_task_outbox WHERE COALESCE(delivered_at_ms, created_at_ms) < ?").run(cutoff);
+      this.db.prepare("DELETE FROM async_task_projection_outbox WHERE COALESCE(delivered_at_ms, created_at_ms) < ?").run(cutoff);
+      this.db.prepare("DELETE FROM async_task_parent_budget_usage WHERE updated_at_ms < ? AND NOT EXISTS ("
+        + " SELECT 1 FROM async_tasks AS task WHERE task.agent_id = async_task_parent_budget_usage.agent_id"
+        + " AND task.parent_turn_id = async_task_parent_budget_usage.parent_turn_id)").run(cutoff);
+      return removed;
+    });
+    return operation.immediate();
+  }
+
   purgeAgentTasks(agentIdValue: string): void {
     this.ensureOpen();
     const agentId = identifier(agentIdValue, "agentId");
@@ -2439,13 +2456,17 @@ export class AsyncTaskStore {
 
   recoverExpiredLeases(
     nowMsValue = this.now(),
-    agentIdValue?: string,
+    agentIdValue?: string | readonly string[],
     excludedTaskIdsValue?: readonly string[],
     includeAbandonedValue = false,
   ): AsyncTaskRecord[] {
     this.ensureOpen();
     const nowMs = nonNegativeInteger(nowMsValue, "nowMs");
-    const agentId = agentIdValue === undefined ? undefined : identifier(agentIdValue, "agentId");
+    const agentIds = agentIdValue === undefined
+      ? undefined
+      : (typeof agentIdValue === "string" ? [agentIdValue] : Array.from(new Set(agentIdValue)))
+        .map((value, index) => identifier(value, `agentIds[${index}]`));
+    if (agentIds !== undefined && agentIds.length > 256) invalid("agentIds cannot contain more than 256 agent IDs.");
     if (excludedTaskIdsValue !== undefined && !Array.isArray(excludedTaskIdsValue)) invalid("excludedTaskIds must be an array.");
     if (typeof includeAbandonedValue !== "boolean") invalid("includeAbandoned must be a boolean.");
     const excludedTaskIds = excludedTaskIdsValue === undefined
@@ -2464,10 +2485,10 @@ export class AsyncTaskStore {
               AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms <= ?)
             ${includeAbandonedValue ? "OR status = 'abandoned'" : ""}
           )
-          ${agentId === undefined ? "" : "AND agent_id = ?"}
+          ${agentIds === undefined ? "" : agentIds.length === 0 ? "AND 0" : `AND agent_id IN (${agentIds.map(() => "?").join(", ")})`}
           ${exclusionClause}
         ORDER BY lease_expires_at_ms, task_id
-      `).all(operationNow, ...(agentId === undefined ? [] : [agentId]), ...excludedTaskIds);
+      `).all(operationNow, ...(agentIds ?? []), ...excludedTaskIds);
       const recovered: AsyncTaskRecord[] = [];
       for (const row of candidates) {
         let current: AsyncTaskRecord;

@@ -1,6 +1,7 @@
 import { lstat, open, opendir } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { win32 as path } from "node:path";
+import { Worker } from "node:worker_threads";
 
 import type { ExecutionRequest, ExecutionResult } from "./contracts.js";
 import { WorkspaceError, WorkspaceSandbox } from "./workspace.js";
@@ -12,12 +13,17 @@ const MAX_SEARCH_DIRS = 2_000;
 const MAX_SEARCH_FILE_BYTES = 1024 * 1024;
 const MAX_SEARCH_TOTAL_BYTES = 16 * 1024 * 1024;
 const MAX_SEARCH_RESULTS = 1_000;
+const MAX_SEARCH_REGEX_CHARS = 200;
+/** Wall-clock budget for one file's regex scan, worker startup included. */
+const REGEX_FILE_DEADLINE_MS = 2_000;
 
 type PathMetadata = Awaited<ReturnType<typeof lstat>>;
 
 export interface CommandExecutorOptions {
   /** Internal deterministic seam used by race-regression tests. */
   beforePathUse?: (absolute: string) => Promise<void>;
+  /** Entries a search must not descend into or read (e.g. protected OpenBot data under a host root). */
+  excludePath?: (absolute: string) => boolean;
 }
 
 const hasStableIdentity = (metadata: PathMetadata): boolean =>
@@ -79,7 +85,7 @@ const openVerifiedDirectory = async (
   }
 };
 
-const unsafeRegex = /(\.\*){2,}|\(\.\*\).*\(\.\*\)|\+\+|\*\*|\{\d{4,}\}|\[1-9]|\(\?[=!<]/;
+const unsafeRegex = /(\.\*){2,}|\(\.\*\).*\(\.\*\)|\+\+|\*\*|\{\d{4,}\}|\\[1-9]|\(\?[=!<]/;
 const quantifiedGroup = /\(([^()]*)\)[+*{]/g;
 const plainAlternative = /^(?:\.|[^.^$*+?()[\]{}|])*$/u;
 
@@ -89,7 +95,7 @@ function splitAlternatives(body: string): string[] | null {
   let escaped = false;
   for (const character of body.replace(/^\?:/u, "")) {
     if (escaped) {
-      current += `\${character}`;
+      current += `\\${character}`;
       escaped = false;
     } else if (character === "\\") {
       escaped = true;
@@ -141,7 +147,7 @@ function hasAmbiguousQuantifiedAlternation(pattern: string): boolean {
 }
 
 export function isSafeSearchRegex(pattern: string): boolean {
-  return pattern.length > 0 && pattern.length <= 200 && !unsafeRegex.test(pattern) && !hasAmbiguousQuantifiedAlternation(pattern) && ![...pattern.matchAll(quantifiedGroup)].some((match) => /[+*{]/.test(match[1] ?? ""));
+  return pattern.length > 0 && pattern.length <= MAX_SEARCH_REGEX_CHARS && !unsafeRegex.test(pattern) && !hasAmbiguousQuantifiedAlternation(pattern) && ![...pattern.matchAll(quantifiedGroup)].some((match) => /[+*{]/.test(match[1] ?? ""));
 }
 
 const fail = (code: "aborted" | "output_limit" | "io_error" | "not_found" | "outside_workspace" | "access_denied" | "invalid_path", message: string): ExecutionResult => ({
@@ -185,6 +191,7 @@ async function collectFiles(
       for await (const entry of directory) {
         abort(signal);
         if (entry.isSymbolicLink()) continue;
+        if (options.excludePath?.(path.join(absolute, entry.name))) continue;
         const child = normalizedRelative(workspace.root, path.join(absolute, entry.name));
         if (entry.isDirectory()) pending.push(child);
         else if (entry.isFile()) {
@@ -223,6 +230,80 @@ async function readBounded(
   }
 }
 
+class RegexTimeoutError extends Error {}
+
+// Self-contained so it runs the same from src (tests) and dist (production).
+const REGEX_WORKER_SOURCE = `
+const { parentPort, workerData } = require("node:worker_threads");
+const matcher = new RegExp(workerData.pattern, "u");
+parentPort.on("message", ({ id, text, limit }) => {
+  const matches = [];
+  const lines = text.split(/\\r?\\n/u);
+  for (let index = 0; index < lines.length && matches.length < limit; index += 1) {
+    if (matcher.test(lines[index])) matches.push(index);
+  }
+  parentPort.postMessage({ id, matches });
+});
+`;
+
+/**
+ * Regex matching off the gateway thread. The static filter above rejects the
+ * obvious catastrophic shapes, but it cannot prove a pattern linear; a scan
+ * that outlives its deadline (or an abort) terminates the worker instead of
+ * freezing every bot and the UI.
+ */
+class RegexLineMatcher {
+  private readonly worker: Worker;
+  private nextId = 0;
+
+  constructor(pattern: string) {
+    this.worker = new Worker(REGEX_WORKER_SOURCE, {
+      eval: true,
+      workerData: { pattern },
+      resourceLimits: { maxOldGenerationSizeMb: 128 },
+    });
+    this.worker.unref();
+  }
+
+  /** Indexes of the matching lines of `text`, split exactly like the fixed-mode scan. */
+  match(text: string, limit: number, signal: AbortSignal | undefined): Promise<number[]> {
+    abort(signal);
+    const id = this.nextId++;
+    return new Promise<number[]>((resolve, reject) => {
+      const settle = (outcome: () => void): void => {
+        clearTimeout(timer);
+        this.worker.off("message", onMessage);
+        this.worker.off("error", onError);
+        this.worker.off("exit", onExit);
+        signal?.removeEventListener("abort", onAbort);
+        outcome();
+      };
+      const onMessage = (message: { id: number; matches: number[] }): void => {
+        if (message.id === id) settle(() => resolve(message.matches));
+      };
+      const onError = (error: Error): void => settle(() => reject(error));
+      const onExit = (): void => settle(() => reject(new Error("Regex worker exited.")));
+      const onAbort = (): void => settle(() => {
+        void this.worker.terminate();
+        reject(new DOMException("Aborted", "AbortError"));
+      });
+      const timer = setTimeout(() => settle(() => {
+        void this.worker.terminate();
+        reject(new RegexTimeoutError());
+      }), REGEX_FILE_DEADLINE_MS);
+      this.worker.on("message", onMessage);
+      this.worker.once("error", onError);
+      this.worker.once("exit", onExit);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.worker.postMessage({ id, text, limit });
+    });
+  }
+
+  async close(): Promise<void> {
+    await this.worker.terminate();
+  }
+}
+
 export class LocalCommandExecutor {
   private constructor(
     private readonly workspace: WorkspaceSandbox,
@@ -250,27 +331,43 @@ export class LocalCommandExecutor {
       }
 
       const params = request.params as { pattern: string; mode: "fixed" | "regex"; paths: string[] };
-      if (params.mode === "regex" && !isSafeSearchRegex(params.pattern)) {
-        return fail("invalid_path", "Search pattern is unsafe.");
-      }
-      const matcher = params.mode === "fixed" ? null : new RegExp(params.pattern, "u");
-      const output: string[] = [];
-      let totalBytes = 0;
-      for (const file of files) {
-        const text = await readBounded(this.workspace, file, signal, this.options);
-        if (text === null) continue;
-        totalBytes += Buffer.byteLength(text);
-        if (totalBytes > MAX_SEARCH_TOTAL_BYTES) throw new RangeError("byte limit");
-        for (const [index, line] of text.split(/\r?\n/u).entries()) {
-          const matches = matcher ? matcher.test(line) : line.includes(params.pattern);
-          if (!matches) continue;
-          output.push(`${file}:${index + 1}:${line}`);
-          if (output.length >= MAX_SEARCH_RESULTS) throw new RangeError("result limit");
+      if (params.mode === "regex") {
+        if (params.pattern.length > MAX_SEARCH_REGEX_CHARS) {
+          return fail("invalid_path", `Regex search patterns are limited to ${MAX_SEARCH_REGEX_CHARS} characters; use a shorter pattern or fixed mode.`);
         }
+        if (!isSafeSearchRegex(params.pattern)) {
+          return fail("invalid_path", "Regex search pattern was refused: nested or overlapping repetition, lookaround and backreferences can take exponential time. Simplify it or use fixed mode.");
+        }
+        // Syntax errors surface here, on the gateway thread, before any worker starts.
+        new RegExp(params.pattern, "u");
       }
-      return { ok: true, operation: "command.run", command: request.command, stdout: output.join("\n"), stderr: "", exitCode: output.length > 0 ? 0 : 1, durationMs: Date.now() - started };
+      const matcher = params.mode === "fixed" ? null : new RegexLineMatcher(params.pattern);
+      try {
+        const output: string[] = [];
+        let totalBytes = 0;
+        for (const file of files) {
+          const text = await readBounded(this.workspace, file, signal, this.options);
+          if (text === null) continue;
+          totalBytes += Buffer.byteLength(text);
+          if (totalBytes > MAX_SEARCH_TOTAL_BYTES) throw new RangeError("byte limit");
+          const lines = text.split(/\r?\n/u);
+          const hits = matcher
+            ? await matcher.match(text, MAX_SEARCH_RESULTS - output.length, signal)
+            : lines.flatMap((line, index) => line.includes(params.pattern) ? [index] : []);
+          for (const index of hits) {
+            output.push(`${file}:${index + 1}:${lines[index]}`);
+            if (output.length >= MAX_SEARCH_RESULTS) throw new RangeError("result limit");
+          }
+        }
+        return { ok: true, operation: "command.run", command: request.command, stdout: output.join("\n"), stderr: "", exitCode: output.length > 0 ? 0 : 1, durationMs: Date.now() - started };
+      } finally {
+        await matcher?.close();
+      }
     } catch (error) {
       if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) return fail("aborted", "Execution was aborted.");
+      if (error instanceof RegexTimeoutError) {
+        return fail("invalid_path", `Regex search pattern took longer than ${REGEX_FILE_DEADLINE_MS / 1000}s on one file and was stopped; simplify it or use fixed mode.`);
+      }
       if (error instanceof RangeError) return fail("output_limit", "Search limit was exceeded.");
       if (error instanceof SyntaxError) return fail("invalid_path", "Search pattern is invalid.");
       if (error instanceof WorkspaceError) return fail(error.code, error.message);

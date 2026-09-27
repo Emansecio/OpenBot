@@ -1,4 +1,5 @@
-import { appendFile, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { appendFile, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
@@ -9,6 +10,7 @@ import {
   type HomeAclCommandResult,
   type HomeAclCommandRunner,
 } from "../src/execution/home-acl.js";
+import { systemToolPath } from "../src/shared/windows-tools.js";
 
 interface RecordedCall {
   file: string;
@@ -60,7 +62,7 @@ describe("WindowsHomeAclAdapter", () => {
 
     expect(result).toMatchObject({ status: "verified", platform: "win32" });
     expect(calls).toHaveLength(5);
-    expect(calls.every((call) => call.file === "icacls.exe")).toBe(true);
+    expect(calls.every((call) => call.file === systemToolPath("icacls.exe"))).toBe(true);
     expect(calls.every((call) => ! call.options.shell &&  call.options.windowsHide)).toBe(true);
     expect(calls[0]?.args).toEqual(["C:\\OpenBot\\workspaces\\agent-a", "/reset", "/T", "/Q"]);
     expect(calls[1]?.args).toEqual([
@@ -81,6 +83,56 @@ describe("WindowsHomeAclAdapter", () => {
     expect(calls[4]?.args.slice(1, 2)).toEqual(["/save"]);
     const joined = calls[1]?.args.join(" ") ?? "";
     expect(joined).not.toMatch(/(?:everyone|users)/iu);
+  });
+
+  it("configures a tree containing a junction at its root only, so icacls never crosses the link", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-acl-link-"));
+    const outside = await mkdtemp(join(tmpdir(), "openbot-acl-outside-"));
+    try {
+      await mkdir(join(root, "Projects", "app"), { recursive: true });
+      await symlink(outside, join(root, "Projects", "app", "node_modules"), "junction");
+      const { runner, calls } = fakeRunner([
+        { exitCode: 0 }, { exitCode: 0 }, { exitCode: 0 }, { exitCode: 0 }, { exitCode: 0, stdout: POLICY_SDDL },
+        { exitCode: 0 }, { exitCode: 0, stdout: POLICY_SDDL },
+      ]);
+      const adapter = new WindowsHomeAclAdapter({ platform: "win32", runner, currentUser: "CONTOSO\\alice" });
+      await expect(adapter.apply(root, { agentId: "agent-a", operation: "repair" })).resolves.toMatchObject({ status: "verified" });
+      expect(calls).toHaveLength(5);
+      expect(calls.some((call) => call.args.includes("/T"))).toBe(false);
+      await expect(adapter.verify(root)).resolves.toMatchObject({ status: "verified" });
+      expect(calls.slice(5).some((call) => call.args.includes("/T"))).toBe(false);
+    } finally {
+      await rm(join(root, "Projects", "app", "node_modules"), { force: true, recursive: false }).catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("fails verification when any saved descriptor is a null or unparsable DACL", async () => {
+    const { runner } = fakeRunner([
+      { exitCode: 0 }, { exitCode: 0 }, { exitCode: 0 }, { exitCode: 0 },
+      { exitCode: 0, stdout: `${POLICY_SDDL}\r\nD:NO_ACCESS_CONTROL` },
+    ]);
+    const adapter = new WindowsHomeAclAdapter({ platform: "win32", runner, currentUser: "CONTOSO\\alice" });
+    await expect(adapter.apply("C:\\OpenBot\\workspaces\\agent-a", { agentId: "agent-a", operation: "create" }))
+      .resolves.toMatchObject({ status: "failed", message: "icacls ACL descriptor is invalid." });
+  });
+
+  it("verifies the DACL of an entry whose saved line also carries an integrity-label SACL", async () => {
+    const { runner } = fakeRunner([
+      { exitCode: 0 }, { exitCode: 0 }, { exitCode: 0 }, { exitCode: 0 },
+      { exitCode: 0, stdout: `${POLICY_SDDL}\r\n${POLICY_SDDL}S:AI(ML;OICI;NW;;;LW)` },
+    ]);
+    const adapter = new WindowsHomeAclAdapter({ platform: "win32", runner, currentUser: "CONTOSO\\alice" });
+    await expect(adapter.apply("C:\\OpenBot\\workspaces\\agent-a", { agentId: "agent-a", operation: "create" }))
+      .resolves.toMatchObject({ status: "verified" });
+    const { runner: broad } = fakeRunner([
+      { exitCode: 0 }, { exitCode: 0 }, { exitCode: 0 }, { exitCode: 0 },
+      { exitCode: 0, stdout: `${POLICY_SDDL}\r\n${POLICY_SDDL}(A;;FA;;;WD)S:AI(ML;OICI;NW;;;LW)` },
+    ]);
+    await expect(new WindowsHomeAclAdapter({ platform: "win32", runner: broad, currentUser: "CONTOSO\\alice" })
+      .apply("C:\\OpenBot\\workspaces\\agent-a", { agentId: "agent-a", operation: "create" }))
+      .resolves.toMatchObject({ status: "failed" });
   });
 
   it("limits an icacls runner that never returns", async () => {
@@ -209,7 +261,7 @@ describe("WindowsHomeAclAdapter", () => {
       status: "verified",
       platform: "win32",
     });
-    expect(calls[2]?.file).toBe("whoami.exe");
+    expect(calls[2]?.file).toBe(systemToolPath("whoami.exe"));
     expect(calls[2]?.options.shell).toBe(false);
   });
 
@@ -271,6 +323,32 @@ describe("WindowsHomeAclAdapter", () => {
         });
       } finally {
         await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "win32" || process.env.OPENBOT_RUN_LIVE_ACL_TEST !== "1")(
+    "live Windows gate leaves the target of a junction inside the home untouched",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "openbot-acl-live-link-"));
+      const outside = await mkdtemp(join(tmpdir(), "openbot-acl-live-outside-"));
+      const link = join(root, "Projects", "node_modules");
+      const icacls = systemToolPath("icacls.exe");
+      try {
+        await mkdir(join(root, "Projects"), { recursive: true });
+        await mkdir(join(outside, "deep"));
+        await writeFile(join(outside, "deep", "f.txt"), "outside\n");
+        await symlink(outside, link, "junction");
+        const before = execFileSync(icacls, [join(outside, "deep")], { encoding: "utf8" });
+        const result = await new WindowsHomeAclAdapter().apply(root, { agentId: "live-acl-link", operation: "repair" });
+        expect(result.status).toBe("verified");
+        expect(execFileSync(icacls, [join(outside, "deep")], { encoding: "utf8" })).toBe(before);
+        await writeFile(join(root, "Projects", "late.txt"), "inside\n");
+        await rm(join(root, "Projects", "late.txt"));
+      } finally {
+        await rm(link, { force: true }).catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+        await rm(outside, { recursive: true, force: true });
       }
     },
   );

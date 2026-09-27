@@ -33,7 +33,6 @@ export interface ReflectionCandidate {
   expiresAtMs?: number | null;
 }
 
-export type MemoryReflectionCandidate = ReflectionCandidate;
 
 export interface PolicyRejection {
   index: number;
@@ -241,15 +240,26 @@ export function validateReflectionCandidates(
 }
 
 /** Singular convenience used by the SQLite store and callers that want a hard gate. */
+/** The comparison form of a canonical key: NFKC, trimmed, lower-case, single spaces. */
+export function canonicalKeyForm(value: string): string {
+  return value.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/gu, " ");
+}
+
+/**
+ * Policy failures carry `code: "policy"`: a caller applying several
+ * candidates (reflection) rejects just that one instead of aborting the batch.
+ */
+function policyError(message: string): Error & { code: "policy" } {
+  return Object.assign(new Error(message), { code: "policy" as const });
+}
+
 export function validateMemoryCandidate(candidate: unknown, options?: MemoryPolicyOptions): MemoryUpsertInput {
   const result = validateReflectionCandidates([candidate], options);
   const rejection = result.rejected[0];
-  if (rejection !== undefined) throw new Error(`${rejection.code}: ${rejection.message}`);
+  if (rejection !== undefined) throw policyError(`${rejection.code}: ${rejection.message}`);
   return result.accepted[0]!;
 }
 
-export const validateReflectionCandidate = validateMemoryCandidate;
-
 export function assertNoSensitiveMemoryContent(value: unknown, options?: MemoryPolicyOptions): void {
-  if (containsSensitiveSecret(value, options)) throw new Error("memória contém segredo ou credencial");
+  if (containsSensitiveSecret(value, options)) throw policyError("memória contém segredo ou credencial");
 }

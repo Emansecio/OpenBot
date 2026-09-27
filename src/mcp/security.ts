@@ -5,8 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { lstatSync, realpathSync } from "node:fs";
-import { chmod, lstat, mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
+import { systemToolPath } from "../shared/windows-tools.js";
 import type { McpHttpServerConfig, McpSecretRef, McpServerConfig, McpStdioServerConfig } from "./contracts.js";
 
 export const DEFAULT_MCP_TIMEOUT_MS = 30_000;
@@ -31,7 +32,7 @@ export const MAX_MCP_TOOL_SCHEMA_DEPTH = 16;
 export const MAX_MCP_TOOL_SCHEMA_NODES = 2048;
 
 const execFileAsync = promisify(execFile);
-const WINDOWS_ACL_TOOL = "icacls.exe";
+const WINDOWS_ACL_TOOL = systemToolPath("icacls.exe");
 const EVERYONE_PRINCIPAL = "*S-1-1-0";
 const SYSTEM_PRINCIPAL = "*S-1-5-18";
 
@@ -39,6 +40,18 @@ export class McpSecurityError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "McpSecurityError";
+  }
+}
+
+/**
+ * A security precondition could not be established for an operational reason
+ * (DNS, keystore, filesystem, snapshot). It still fails closed like any
+ * McpSecurityError, but it is an availability failure, not a policy denial.
+ */
+export class McpOperationalError extends McpSecurityError {
+  constructor(message: string) {
+    super(message);
+    this.name = "McpOperationalError";
   }
 }
 
@@ -101,15 +114,42 @@ const firstIpv6Hextet = (address: string): number | undefined => {
   return Number.isFinite(value) ? value : undefined;
 };
 
-export function isLoopbackAddress(address: string): boolean {
+function isLoopbackAddress(address: string): boolean {
   const ipv4 = mappedIpv4(address) ?? address;
   const parts = ipv4Parts(ipv4);
   if (parts !== undefined) return parts[0] === 127;
   return net.isIPv6(address) && address.toLowerCase() === "::1";
 }
 
+/** The eight 16-bit groups of an IPv6 address (with "::" and a dotted IPv4 tail expanded). */
+const ipv6Hextets = (address: string): number[] | undefined => {
+  if (!net.isIPv6(address)) return undefined;
+  let text = address;
+  const dotted = /(\d+\.\d+\.\d+\.\d+)$/u.exec(text)?.[1];
+  if (dotted !== undefined) {
+    const octets = dotted.split(".").map(Number);
+    text = `${text.slice(0, -dotted.length)}${((octets[0]! << 8) | octets[1]!).toString(16)}:${((octets[2]! << 8) | octets[3]!).toString(16)}`;
+  }
+  const [head = "", tail] = text.split("::");
+  const groups = (part: string): number[] => part === "" ? [] : part.split(":").map((group) => Number.parseInt(group, 16));
+  const left = groups(head);
+  const right = tail === undefined ? [] : groups(tail);
+  const hextets = [...left, ...Array<number>(Math.max(0, 8 - left.length - right.length)).fill(0), ...right];
+  return hextets.length === 8 && hextets.every((value) => Number.isInteger(value) && value >= 0 && value <= 0xffff) ? hextets : undefined;
+};
+
 export function isDisallowedHttpAddress(address: string): boolean {
   const normalized = address.trim().toLowerCase();
+  const hextets = ipv6Hextets(normalized);
+  // Transition prefixes that carry an IPv4 destination: 6to4 (2002::/16)
+  // routes to its embedded address, which must pass the IPv4 rules; Teredo
+  // (2001::/32) tunnels to an obfuscated one and is never a service endpoint.
+  // (NAT64 64:ff9b::/96 sits in ::/8, rejected below.)
+  if (hextets !== undefined && hextets[0] === 0x2002) {
+    const embedded = `${hextets[1]! >> 8}.${hextets[1]! & 0xff}.${hextets[2]! >> 8}.${hextets[2]! & 0xff}`;
+    if (isDisallowedHttpAddress(embedded)) return true;
+  }
+  if (hextets !== undefined && hextets[0] === 0x2001 && hextets[1] === 0) return true;
   const ipv4Address = mappedIpv4(normalized) ?? normalized;
   const parts = ipv4Parts(ipv4Address);
   if (parts !== undefined) {
@@ -210,9 +250,9 @@ export async function resolveAndValidateHttpEndpoint(
   let addresses: string[];
   try { addresses = normalizeLookupAddresses(await lookup(hostname)); } catch (error) {
     if (error instanceof McpSecurityError) throw error;
-    throw new McpSecurityError("MCP endpoint DNS resolution failed");
+    throw new McpOperationalError("MCP endpoint DNS resolution failed");
   }
-  if (addresses.length === 0) throw new McpSecurityError("MCP endpoint has no resolved addresses");
+  if (addresses.length === 0) throw new McpOperationalError("MCP endpoint has no resolved addresses");
   const loopbackHost = isLoopbackHost(hostname);
   if (url.protocol === "http:" && !addresses.every(isLoopbackAddress)) {
     throw new McpSecurityError("insecure MCP HTTP resolved outside loopback");
@@ -232,7 +272,7 @@ const isSecretRef = (value: unknown): value is McpSecretRef => {
   return Object.keys(record).length === 1 && typeof record.secretRef === "string" && record.secretRef.length > 0 && !record.secretRef.includes("\0");
 };
 
-export function validateSecretRefs(values: unknown, label: string): Record<string, McpSecretRef> | undefined {
+function validateSecretRefs(values: unknown, label: string): Record<string, McpSecretRef> | undefined {
   if (values === undefined) return undefined;
   if (typeof values !== "object" || values === null || Array.isArray(values)) throw new McpSecurityError(`${label} must use secret references`);
   const output: Record<string, McpSecretRef> = {};
@@ -245,7 +285,7 @@ export function validateSecretRefs(values: unknown, label: string): Record<strin
   return output;
 }
 
-export function validateHttpServerConfig(config: McpHttpServerConfig): void {
+function validateHttpServerConfig(config: McpHttpServerConfig): void {
   const allowed = new Set(["id", "transport", "url", "headers", "timeoutMs", "maxResultBytes", "sessionScope"]);
   if (Object.keys(config as unknown as Record<string, unknown>).some((key) => !allowed.has(key))) throw new McpSecurityError("MCP HTTP configuration contains unsupported fields");
   if (config.sessionScope !== undefined && config.sessionScope !== "shared" && config.sessionScope !== "agent") throw new McpSecurityError("MCP session scope is invalid");
@@ -316,7 +356,7 @@ const applyWindowsSnapshotDacl = async (root: string): Promise<void> => {
     try {
       await execFileAsync(WINDOWS_ACL_TOOL, [root, ...args], windowsAclOptions);
     } catch {
-      throw new McpSecurityError("MCP stdio executable snapshot DACL could not be applied");
+      throw new McpOperationalError("MCP stdio executable snapshot DACL could not be applied");
     }
   };
 
@@ -347,6 +387,15 @@ interface ResolvedExecutable {
 }
 
 const digestExecutable = (contents: Uint8Array): string => createHash("sha256").update(contents).digest("hex");
+
+/**
+ * Reference digests by canonical path, reused while the file keeps the same
+ * identity (device, inode, size and times). This only avoids re-reading an
+ * unchanged executable on every validation: staging still hashes the bytes it
+ * actually launches and fails closed when they differ from this reference.
+ */
+const executableDigests = new Map<string, StdioExecutableIdentity>();
+const MAX_EXECUTABLE_DIGESTS = 32;
 
 const readExecutableContents = async (target: string): Promise<Buffer> => {
   const handle = await open(target, "r");
@@ -426,31 +475,58 @@ const resolveExecutable = async (value: string, includeContentHash = false): Pro
   try {
     target = await realpath(requested);
   } catch {
-    throw new McpSecurityError("MCP stdio command target could not be resolved");
+    throw new McpOperationalError("MCP stdio command target could not be resolved");
   }
   let targetStat: Awaited<ReturnType<typeof lstat>>;
   try {
     targetStat = await lstat(target);
   } catch {
-    throw new McpSecurityError("MCP stdio command target could not be inspected");
+    throw new McpOperationalError("MCP stdio command target could not be inspected");
   }
   if (!targetStat.isFile()) throw new McpSecurityError("MCP stdio command target must be a regular file");
   if (BLOCKED_COMMANDS.has(basename(target))) throw new McpSecurityError("MCP stdio command is blocked");
-  let contents: Buffer | undefined;
-  if (includeContentHash) {
-    try {
-      contents = await readExecutableContents(target);
-    } catch {
-      throw new McpSecurityError("MCP stdio command target could not be read");
-    }
+  if (!includeContentHash) return { requested, target, identity: executableIdentity(targetStat) };
+  const identity = executableIdentity(targetStat);
+  const cached = executableDigests.get(pathKey(target));
+  if (cached !== undefined && sameExecutableIdentity(cached, identity)) return { requested, target, identity: cached };
+  let contents: Buffer;
+  try {
+    contents = await readExecutableContents(target);
+  } catch {
+    throw new McpOperationalError("MCP stdio command target could not be read");
   }
-  return { requested, target, identity: executableIdentity(targetStat, contents) };
+  const hashed = executableIdentity(targetStat, contents);
+  executableDigests.delete(pathKey(target));
+  executableDigests.set(pathKey(target), hashed);
+  if (executableDigests.size > MAX_EXECUTABLE_DIGESTS) executableDigests.delete(executableDigests.keys().next().value!);
+  return { requested, target, identity: hashed };
 };
 
 const containedBy = (candidate: string, root: string): boolean => {
   const relative = path.relative(root, candidate);
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !absolutePath(relative));
 };
+
+/**
+ * Registration-time command check, without touching the filesystem: accepts
+ * what validateStdioConfig would launch when paths are not links — a bare
+ * Node name, a bare name with exactly one approved absolute executable of that
+ * name, or an absolute path equal to an approved executable. The launch-time
+ * check stays authoritative.
+ */
+export function stdioCommandRegistrable(command: unknown, allowedCommands: readonly string[]): boolean {
+  if (typeof command !== "string" || command.length === 0 || command.includes("\0")) return false;
+  const commandName = basename(command);
+  if (BLOCKED_COMMANDS.has(commandName)) return false;
+  const absoluteAllowed = allowedCommands.filter(absolutePath);
+  if (absolutePath(command)) return absoluteAllowed.some((item) => pathKey(item) === pathKey(command));
+  if (command.includes("/") || command.includes("\\") || command === "." || command === "..") return false;
+  const allowed = new Set(allowedCommands.map((item) => item.toLowerCase()));
+  const named = allowed.has(command.toLowerCase()) || allowed.has(commandName);
+  const nodeCommand = commandName === "node" || commandName === "node.exe" || commandName === basename(process.execPath);
+  if (nodeCommand) return named || absoluteAllowed.some((item) => pathKey(item) === pathKey(process.execPath));
+  return named && absoluteAllowed.filter((item) => basename(item) === commandName).length === 1;
+}
 
 export async function validateStdioConfig(
   config: McpStdioServerConfig,
@@ -492,7 +568,7 @@ export async function validateStdioConfig(
     if (command.includes("/") || command.includes("\\") || command === "." || command === "..") {
       throw new McpSecurityError("MCP stdio command is not allowlisted");
     }
-    const processExecutable = await resolveExecutable(process.execPath, true);
+    const processExecutable = await resolveExecutable(process.execPath);
     let processExecutableAllowed = false;
     for (const item of configuredAllowedCommands) {
       if (!absolutePath(item)) continue;
@@ -511,7 +587,7 @@ export async function validateStdioConfig(
       // Never resolve `node` through PATH: it is the exact runtime already
       // trusted by this process.
       launchCommand = process.execPath;
-      commandIdentity = processExecutable.identity;
+      commandIdentity = (await resolveExecutable(process.execPath, true)).identity;
     } else {
       if (!allowed.has(command.toLowerCase()) && !allowed.has(commandName)) {
         throw new McpSecurityError("MCP stdio command is not allowlisted");
@@ -569,8 +645,50 @@ export interface StagedStdioExecutable {
  * This closes replacement of the configured alias; Windows also receives an
  * explicit read-only DACL because chmod does not override inherited ACLs.
  */
+const STDIO_SNAPSHOT_PREFIX = "openbot-mcp-stdio-";
+/** Snapshots named without an owning process are removed only once clearly abandoned. */
+const LEGACY_SNAPSHOT_MIN_AGE_MS = 24 * 60 * 60_000;
+
+const processAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+/**
+ * Remove executable snapshots left behind by a process that no longer runs
+ * (crash or hard kill skips their cleanup). Each snapshot directory carries
+ * its owner's PID, so snapshots of a live process are never touched.
+ * Best effort: a snapshot still locked by an orphaned child stays for the
+ * next sweep. Returns how many directories were removed.
+ */
+export async function sweepStaleStdioSnapshots(tmpRoot = os.tmpdir(), now = Date.now()): Promise<number> {
+  const entries = await readdir(tmpRoot, { withFileTypes: true }).catch(() => []);
+  let removed = 0;
+  for (const entry of entries) {
+    // Dirent.isDirectory() is false for links and junctions: they are never followed.
+    if (!entry.isDirectory() || !entry.name.startsWith(STDIO_SNAPSHOT_PREFIX)) continue;
+    const root = path.join(tmpRoot, entry.name);
+    const owner = /^openbot-mcp-stdio-(\d+)-/u.exec(entry.name)?.[1];
+    if (owner !== undefined) {
+      if (processAlive(Number(owner))) continue;
+    } else {
+      const stat = await lstat(root).catch(() => undefined);
+      if (stat === undefined || now - stat.mtimeMs < LEGACY_SNAPSHOT_MIN_AGE_MS) continue;
+    }
+    await resetWindowsSnapshotDacl(root);
+    await chmod(root, 0o700).catch(() => {});
+    await rm(root, { recursive: true, force: true }).catch(() => {});
+    if (await lstat(root).then(() => false, () => true)) removed += 1;
+  }
+  return removed;
+}
+
 export async function stageValidatedStdioExecutable(config: ValidatedStdioConfig): Promise<StagedStdioExecutable> {
-  const root = await mkdtemp(path.join(os.tmpdir(), "openbot-mcp-stdio-"));
+  const root = await mkdtemp(path.join(os.tmpdir(), `${STDIO_SNAPSHOT_PREFIX}${process.pid}-`));
   const stagedCommand = path.join(root, process.platform === "win32" ? "mcp-executable.exe" : "mcp-executable");
   let cleaned = false;
   const cleanup = async (): Promise<void> => {
@@ -600,7 +718,7 @@ export async function stageValidatedStdioExecutable(config: ValidatedStdioConfig
     await chmod(stagedCommand, 0o500);
     const stagedStat = await lstat(stagedCommand);
     if (!stagedStat.isFile() || digestExecutable(await readExecutableContents(stagedCommand)) !== config.commandIdentity.sha256) {
-      throw new McpSecurityError("MCP stdio executable snapshot could not be verified");
+      throw new McpOperationalError("MCP stdio executable snapshot could not be verified");
     }
     await applyWindowsSnapshotDacl(root);
     // chmod remains useful on non-Windows; Windows uses the explicit DACL
@@ -610,7 +728,7 @@ export async function stageValidatedStdioExecutable(config: ValidatedStdioConfig
   } catch (error) {
     await cleanup();
     if (error instanceof McpSecurityError) throw error;
-    throw new McpSecurityError("MCP stdio executable snapshot could not be created");
+    throw new McpOperationalError("MCP stdio executable snapshot could not be created");
   }
 }
 
@@ -639,7 +757,7 @@ export async function resolveSecretRefs(
   const output: Record<string, string> = {};
   for (const [key, ref] of Object.entries(values)) {
     let value: string;
-    try { value = await resolver(ref.secretRef); } catch { throw new McpSecurityError(`MCP secret ${key} could not be resolved`); }
+    try { value = await resolver(ref.secretRef); } catch { throw new McpOperationalError(`MCP secret ${key} could not be resolved`); }
     if (typeof value !== "string" || value.includes("\0")) throw new McpSecurityError(`MCP secret ${key} is invalid`);
     output[key] = value;
   }

@@ -54,11 +54,10 @@ artifact boundary. The two OpenBot overlays and the declared welcome media are
 listed separately so their local classification is not confused with the
 surrounding extracted bundle.
 
-The current release pipeline is not a clean-room package: `scripts/release.mjs`
-copies `client/extracted/dist` into the release staging tree, so the resulting
-package still contains extracted artifacts. It must not be treated as
-redistributable without the necessary authorization or replacement of those
-artifacts with a clean-room implementation.
+There is currently no release pipeline; OpenBot runs from this checkout. Any
+future package built from it would contain `client/extracted/dist` and must not
+be treated as redistributable without the necessary authorization or
+replacement of those artifacts with a clean-room implementation.
 
 **A hash proves the integrity of the observed file; it does not prove
 authorship, license, or authenticity.** A dependency manifest likewise records

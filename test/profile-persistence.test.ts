@@ -21,13 +21,10 @@ async function fixture() {
   registerRosterHandlers(gateway, config);
   const invoke = (method: string, body: unknown = {}) => gateway.invokeRegisteredHandler(method, body);
   const reopen = async () => {
-    config.close();
     const reopened = new ConfigStore({ configPath });
     const reloadedGateway = createGateway();
     registerRosterHandlers(reloadedGateway, reopened);
-    try {
-      return await reloadedGateway.invokeRegisteredHandler("getLocalProfile", {});
-    } finally { reopened.close(); }
+    return await reloadedGateway.invokeRegisteredHandler("getLocalProfile", {});
   };
   return { root, config, invoke, reopen };
 }

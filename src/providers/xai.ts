@@ -10,7 +10,7 @@
  * (src/providers/openai-helpers.ts):
  *   - `buildChatBody` — corpo JSON do chat.completions (system inline + tools
  *     + temperature + max_tokens);
- *   - parser SSE linha-a-linha + `OpenAiToolCallAccumulator` — normalização
+ *   - leitor SSE por frame + `OpenAiToolCallAccumulator` — normalização
  *     de tool calls fragmentadas;
  *   - `normalizeOpenAiError` + `extractOpenAiErrorMessage` — erros de
  *     transporte/HTTP normalizados para o `classifyProviderError` do roteador
@@ -29,18 +29,12 @@
  */
 
 import { OpenAiAdapter, type OpenAiAdapterOptions } from "./openai.js";
-import { defaultRegistry } from "./router.js";
 
 /** Nome canônico do provider no registry e no namespace da keystore. */
 export const XAI_PROVIDER_NAME = "xai" as const;
 
 /** Endpoint default da xAI — API OpenAI-compatible (plano §3 T7). */
 export const XAI_API_BASE_URL = "https://api.x.ai/v1" as const;
-
-/** Chave da keystore: `scoped:v1:provider:xai:apiKey` (T4). */
-export function xaiApiKeyKey(): string {
-  return `scoped:v1:provider:${XAI_PROVIDER_NAME}:apiKey`;
-}
 
 export interface XaiAdapterOptions extends OpenAiAdapterOptions {
   /** Força o nome do provider como "xai" (baseUrl/apiKey/keystore seguem o OpenAiAdapter). */
@@ -66,16 +60,4 @@ export class XaiAdapter extends OpenAiAdapter {
       reasoningEffortPolicy: opts.reasoningEffortPolicy ?? "declared",
     });
   }
-}
-
-/**
- * Registra o adapter xAI no registry default do roteador como "xai"
- * (contrato `ProviderRegistry.register` de T5). Retorna a instância criada.
- * Chamado no boot (T7 — main.ts, mesmo padrão do registerOpenAiAdapter) e
- * pelos testes.
- */
-export function registerXaiAdapter(opts: XaiAdapterOptions = {}): XaiAdapter {
-  const adapter = new XaiAdapter(opts);
-  defaultRegistry.register(adapter);
-  return adapter;
 }

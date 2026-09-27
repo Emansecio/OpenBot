@@ -100,6 +100,10 @@ export class AsyncTaskRuntime {
   private roundRobinCursor = 0;
   private projectionFailureCount = 0;
   private projectionRetryAtMs = 0;
+  /** Backoff per projection channel: a channel nobody listens to must not delay the others. */
+  private readonly channelBackoff = new Map<string, { failures: number; retryAtMs: number }>();
+  /** A wake that arrived while the loop was not waiting; the next wait returns at once. */
+  private wakeRequested = false;
   private claimScheduleFailureCount = 0;
   private claimScheduleRetryAtMs = 0;
 
@@ -186,77 +190,76 @@ export class AsyncTaskRuntime {
   private recoverExpiredWork(excludedTaskIds = this.activeClaimTaskIds()): boolean {
     const now = this.nowFn();
     let healthy = true;
-    for (const agentId of this.agentIds()) {
-      let recoveredTasks: readonly AsyncTaskRecord[];
+    const agentIds = Array.from(new Set(this.agentIds()));
+    let recoveredTasks: readonly AsyncTaskRecord[];
+    try {
+      // One transaction for every roster agent (the store skips unreadable rows).
+      recoveredTasks = this.store.recoverExpiredLeases(now, agentIds, excludedTaskIds, true);
+    } catch (error) {
+      this.reportRecoveryFailure("scan", error);
+      return false;
+    }
+    for (const recovered of recoveredTasks) {
+      if (recovered.status !== "abandoned") continue;
       try {
-        recoveredTasks = this.store.recoverExpiredLeases(now, agentId, excludedTaskIds, true);
+        const attempt = this.store.listAttempts(recovered.taskId).find((entry) => entry.attempt === recovered.attempt);
+        const recoveredAtMs = attempt?.finishedAtMs;
+        if (recoveredAtMs === null || recoveredAtMs === undefined) {
+          throw new Error("Recovered task attempt has no authoritative finish timestamp.");
+        }
+        // Keep policy metadata anchored to the persisted recovery timestamp;
+        // the store owns the authoritative operation time for the retry.
+        const transitionAtMs = recoveredAtMs;
+        this.store.liquidateAbandonedBudget(recovered.taskId, recoveredAtMs);
+        if (attempt?.unsafeEffectStarted) {
+          this.store.transition({
+            taskId: recovered.taskId, expectedVersion: recovered.version,
+            to: "failed", atMs: transitionAtMs,
+            error: {
+              code: "internal_error",
+              message: "Task effect outcome is uncertain after lease recovery; automatic retry is blocked.",
+              retryable: false,
+            },
+          });
+          continue;
+        }
+        if (recovered.attempt >= this.maxAttempts) {
+          const grant = this.store.getGrant(recovered.taskId);
+          const revoked = grant?.revokedAt !== undefined && grant.revokedAt <= recoveredAtMs;
+          this.store.transition({
+            taskId: recovered.taskId, expectedVersion: recovered.version,
+            to: revoked ? "cancelled" : "failed", atMs: transitionAtMs,
+            error: revoked
+              ? { code: "capability_denied", message: "Recovered task capability grant was revoked after retry exhaustion.", retryable: false }
+              : { code: "internal_error", message: "Task lease recovery exhausted the retry limit.", retryable: false },
+          });
+          continue;
+        }
+        try {
+          this.store.transition({
+            taskId: recovered.taskId, expectedVersion: recovered.version, to: "retry_wait", atMs: transitionAtMs,
+            retryAtOperationNow: true, error: { code: "internal_error", message: "Worker lease recovered after process restart.", retryable: true },
+          });
+        } catch (error) {
+          if (error instanceof AsyncTaskContractError && error.code === "capability_denied") {
+            // Only a proved capability denial may take the cancellation
+            // fallback; CAS/DB and budget failures remain recoverable.
+            this.store.transition({
+              taskId: recovered.taskId, expectedVersion: recovered.version, to: "cancelled", atMs: transitionAtMs,
+              error: { code: "capability_denied", message: "Recovered task capability grant was revoked before retry.", retryable: false },
+            });
+          } else if (error instanceof AsyncTaskContractError && error.code === "budget_exhausted") {
+            this.store.transition({
+              taskId: recovered.taskId, expectedVersion: recovered.version, to: "failed", atMs: transitionAtMs,
+              error: { code: "budget_exhausted", message: error.message, retryable: false },
+            });
+          } else {
+            throw error;
+          }
+        }
       } catch (error) {
         healthy = false;
-        this.reportRecoveryFailure(`agent ${agentId}`, error);
-        continue;
-      }
-      for (const recovered of recoveredTasks) {
-        if (recovered.agentId !== agentId || recovered.status !== "abandoned") continue;
-        try {
-          const attempt = this.store.listAttempts(recovered.taskId).find((entry) => entry.attempt === recovered.attempt);
-          const recoveredAtMs = attempt?.finishedAtMs;
-          if (recoveredAtMs === null || recoveredAtMs === undefined) {
-            throw new Error("Recovered task attempt has no authoritative finish timestamp.");
-          }
-          // Keep policy metadata anchored to the persisted recovery timestamp;
-          // the store owns the authoritative operation time for the retry.
-          const transitionAtMs = recoveredAtMs;
-          this.store.liquidateAbandonedBudget(recovered.taskId, recoveredAtMs);
-          if (attempt?.unsafeEffectStarted) {
-            this.store.transition({
-              taskId: recovered.taskId, expectedVersion: recovered.version,
-              to: "failed", atMs: transitionAtMs,
-              error: {
-                code: "internal_error",
-                message: "Task effect outcome is uncertain after lease recovery; automatic retry is blocked.",
-                retryable: false,
-              },
-            });
-            continue;
-          }
-          if (recovered.attempt >= this.maxAttempts) {
-            const grant = this.store.getGrant(recovered.taskId);
-            const revoked = grant?.revokedAt !== undefined && grant.revokedAt <= recoveredAtMs;
-            this.store.transition({
-              taskId: recovered.taskId, expectedVersion: recovered.version,
-              to: revoked ? "cancelled" : "failed", atMs: transitionAtMs,
-              error: revoked
-                ? { code: "capability_denied", message: "Recovered task capability grant was revoked after retry exhaustion.", retryable: false }
-                : { code: "internal_error", message: "Task lease recovery exhausted the retry limit.", retryable: false },
-            });
-            continue;
-          }
-          try {
-            this.store.transition({
-              taskId: recovered.taskId, expectedVersion: recovered.version, to: "retry_wait", atMs: transitionAtMs,
-              retryAtOperationNow: true, error: { code: "internal_error", message: "Worker lease recovered after process restart.", retryable: true },
-            });
-          } catch (error) {
-            if (error instanceof AsyncTaskContractError && error.code === "capability_denied") {
-              // Only a proved capability denial may take the cancellation
-              // fallback; CAS/DB and budget failures remain recoverable.
-              this.store.transition({
-                taskId: recovered.taskId, expectedVersion: recovered.version, to: "cancelled", atMs: transitionAtMs,
-                error: { code: "capability_denied", message: "Recovered task capability grant was revoked before retry.", retryable: false },
-              });
-            } else if (error instanceof AsyncTaskContractError && error.code === "budget_exhausted") {
-              this.store.transition({
-                taskId: recovered.taskId, expectedVersion: recovered.version, to: "failed", atMs: transitionAtMs,
-                error: { code: "budget_exhausted", message: error.message, retryable: false },
-              });
-            } else {
-              throw error;
-            }
-          }
-        } catch (error) {
-          healthy = false;
-          this.reportRecoveryFailure(`task ${recovered.taskId}`, error);
-        }
+        this.reportRecoveryFailure(`task ${recovered.taskId}`, error);
       }
     }
     return healthy;
@@ -283,11 +286,8 @@ export class AsyncTaskRuntime {
 
   wake(): void {
     if (this.stopped) return;
+    if (this.waiters.size === 0) this.wakeRequested = true;
     this.notifyWaiters();
-  }
-
-  async drain(): Promise<void> {
-    await this.whenIdle();
   }
 
   /** Suspend only this agent's admissions. Nested maintenance owns its own fence. */
@@ -353,9 +353,17 @@ export class AsyncTaskRuntime {
 
   private async loop(): Promise<void> {
     while (!this.stopped) {
-      this.maybeRecoverExpiredWork();
-      this.maybeExpireQueuedWork();
-      const progressed = this.scheduleClaims();
+      // A wake requested before this pass is served by it; only a later one repeats it at once.
+      this.wakeRequested = false;
+      // On demand: recovery, expiry and admission only run while a task is
+      // unfinished. An idle tick costs one indexed read, and still notices
+      // work whose wake was lost.
+      const active = this.activeClaims.size > 0 || this.hasActiveWork();
+      if (active) {
+        this.maybeRecoverExpiredWork();
+        this.maybeExpireQueuedWork();
+      }
+      const progressed = active && this.scheduleClaims();
       await this.flushProjections();
       if (!progressed) await this.waitForWork();
     }
@@ -440,8 +448,21 @@ export class AsyncTaskRuntime {
     return progressed;
   }
 
+  private hasActiveWork(): boolean {
+    try {
+      return this.store.hasActiveWork();
+    } catch {
+      // Unknown state: keep the bounded polling fallback.
+      return true;
+    }
+  }
+
   /** Waits for a claim/completion wake, with polling as a bounded fallback. */
   private waitForWork(): Promise<void> {
+    if (this.wakeRequested || this.stopped) {
+      this.wakeRequested = false;
+      return Promise.resolve();
+    }
     return new Promise<void>((resolve) => {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -467,8 +488,11 @@ export class AsyncTaskRuntime {
     if (Date.now() < this.projectionRetryAtMs) return;
     try {
       const pending = this.store.projectUndelivered(100);
-      let failed = false;
+      const wallNow = Date.now();
+      const failedChannels = new Set<string>();
+      const deliveredChannels = new Set<string>();
       for (const envelope of pending) {
+        if (wallNow < (this.channelBackoff.get(envelope.channel)?.retryAtMs ?? 0)) continue;
         // The pending projection comes from the durable outbox; the native item
         // is read from the current SQLite record (never an artificial fixture).
         // SSE receipt never mutates task state — acknowledgements only clear the
@@ -485,23 +509,24 @@ export class AsyncTaskRuntime {
         try {
           const accepted = await this.publishProjection(event);
           if (!accepted) {
-            failed = true;
+            failedChannels.add(envelope.channel);
             continue;
           }
           this.store.acknowledgeProjection(envelope.projectionId, true, this.nowFn());
+          deliveredChannels.add(envelope.channel);
         } catch {
           // One unavailable channel must not head-of-line block projections
           // for another subscribed channel. The durable row stays pending.
-          failed = true;
+          failedChannels.add(envelope.channel);
         }
       }
-      if (failed) {
-        this.projectionFailureCount = Math.min(this.projectionFailureCount + 1, 7);
-        this.projectionRetryAtMs = Date.now() + Math.min(5_000, 100 * (2 ** (this.projectionFailureCount - 1)));
-      } else {
-        this.projectionFailureCount = 0;
-        this.projectionRetryAtMs = 0;
+      for (const channel of failedChannels) {
+        const failures = Math.min((this.channelBackoff.get(channel)?.failures ?? 0) + 1, 7);
+        this.channelBackoff.set(channel, { failures, retryAtMs: Date.now() + Math.min(5_000, 100 * (2 ** (failures - 1))) });
       }
+      for (const channel of deliveredChannels) if (!failedChannels.has(channel)) this.channelBackoff.delete(channel);
+      this.projectionFailureCount = 0;
+      this.projectionRetryAtMs = 0;
     } catch {
       this.projectionFailureCount = Math.min(this.projectionFailureCount + 1, 7);
       this.projectionRetryAtMs = Date.now() + Math.min(5_000, 100 * (2 ** (this.projectionFailureCount - 1)));

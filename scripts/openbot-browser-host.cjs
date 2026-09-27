@@ -12,12 +12,31 @@ const fsp = require("node:fs/promises");
 const net = require("node:net");
 const path = require("node:path");
 const readline = require("node:readline");
-const { app, BrowserWindow, nativeImage, session } = require("electron");
+const { app, BrowserWindow, ipcMain, nativeImage, session } = require("electron");
 
 const PROTOCOL_VERSION = 1;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_TEXT_BYTES = 64 * 1024;
 const MAX_SNAPSHOT_TEXT_BYTES = 128 * 1024;
+const MAX_SNAPSHOT_ELEMENTS = 200;
+// Page scripts, text insertion and captures are raced against this bound so a
+// hung renderer cannot hold an agent's scheduler slot. It stays below the
+// manager's default 30 s command timeout so the host reports the real cause.
+const PAGE_CALL_TIMEOUT_MS = 20_000;
+const NAVIGATION_TIMEOUT_MS = 25_000;
+// Snapshot scripts run in their own JavaScript world: the page cannot patch
+// the DOM APIs they use or observe the element registry.
+const SNAPSHOT_WORLD_ID = 1717;
+// After a handoff, the tab stays under user control while its window is the
+// active window. If the user never activates it, control returns after this.
+const HANDOFF_ENGAGE_MS = 60_000;
+const HANDOFF_COMMANDS = new Set(["close", "reset", "handoff"]);
+const RELOADING_COMMANDS = new Set(["open", "navigate", "close", "reset"]);
+const CLIPBOARD_POLICY_CHANNEL = "openbot:clipboard-write-allowed";
+const MAX_TAB_DOWNLOADS = 20;
+const MAX_SESSION_DOWNLOAD_BYTES = 200 * 1024 * 1024;
+const MAX_FILENAME_LENGTH = 180;
+const SHUTDOWN_DRAIN_MS = 5_000;
 // A screenshot is returned inside the authenticated JSON frame. Keep the
 // encoded image comfortably below MAX_FRAME_BYTES so metadata and JSON
 // escaping cannot turn an otherwise valid image into an oversized frame.
@@ -38,11 +57,17 @@ const PROXY_URL = process.env.OPENBOT_BROWSER_PROXY_URL || "";
 const PROXY_TOKEN = process.env.OPENBOT_BROWSER_PROXY_TOKEN || "";
 const MAX_DOWNLOAD_BYTES = parseDownloadLimit(process.env.OPENBOT_BROWSER_MAX_DOWNLOAD_BYTES);
 const PROXY = parseProxy(PROXY_URL, PROXY_TOKEN);
+// Chromium child processes (renderers included) inherit this environment.
+// Keep the pipe and proxy secrets only in the parsed values above.
+delete process.env.OPENBOT_BROWSER_AUTH_TOKEN;
+delete process.env.OPENBOT_BROWSER_PROXY_TOKEN;
 const TABS = new Map();
-const DOWNLOAD_SESSIONS = new WeakSet();
 const DOWNLOAD_CONFIG = new WeakMap();
 // Downloads outlive WebContents. Keep ownership until final file cleanup ends.
 const ACTIVE_DOWNLOADS = new Map();
+// Save paths of in-flight downloads, lowercased: Chromium does not uniquify
+// a path set through setSavePath, so two same-named downloads would collide.
+const RESERVED_DOWNLOAD_PATHS = new Set();
 const SECURED_SESSIONS = new WeakSet();
 const MAX_ACTIVE_REQUESTS = 4;
 const MAX_AGENT_QUEUE = 16;
@@ -113,8 +138,19 @@ app.on("before-quit", (event) => {
 // These switches are process-wide and must be applied before Chromium starts.
 // They prevent network paths that do not honor the authenticated HTTP proxy.
 app.commandLine.appendSwitch("disable-quic");
-app.commandLine.appendSwitch("disable-features", "DnsOverHttps,UseDnsHttpsSvcbAlpn,AsyncDns,EncryptedClientHello");
+// Agent windows open behind the user's windows; without occlusion tracking
+// Chromium keeps rendering them, so captures and input still work there.
+app.commandLine.appendSwitch("disable-features", "DnsOverHttps,UseDnsHttpsSvcbAlpn,AsyncDns,EncryptedClientHello,CalculateNativeWinOcclusion");
 app.commandLine.appendSwitch("force-webrtc-ip-handling-policy", "disable_non_proxied_udp");
+// Agent scrolls must land at once, not over an animation a snapshot can catch.
+app.commandLine.appendSwitch("disable-smooth-scrolling");
+
+// Electron's default picks the first certificate in the Windows store. A site
+// asking for mTLS must never receive the user's personal certificate.
+app.on("select-client-certificate", (event, _webContents, _url, _list, callback) => {
+  event.preventDefault();
+  callback();
+});
 
 app.on("login", (event, _webContents, _request, authInfo, callback) => {
   event.preventDefault();
@@ -139,9 +175,10 @@ if (!AUTH_TOKEN || !USER_DATA_ROOT || !path.isAbsolute(USER_DATA_ROOT) || !DOWNL
   process.exitCode = 78;
   setImmediate(() => process.exit(78));
 } else {
+  // A startup failure must end the process: the keep-alive window would
+  // otherwise leave an Electron instance nobody owns.
   void main().catch((error) => {
-    process.stderr.write(`${sanitizeError(error)}\n`);
-    process.exitCode = 1;
+    failFastHost("startup", error);
   });
 }
 
@@ -151,6 +188,11 @@ async function main() {
   await ensureManagedUserDataRoot();
   app.setPath("userData", path.resolve(USER_DATA_ROOT));
   await app.whenReady();
+  // The tab preload asks, from its isolated world, whether the page may write
+  // the system clipboard. Only the user may do that, during a handoff.
+  ipcMain.on(CLIPBOARD_POLICY_CHANNEL, (event) => {
+    event.returnValue = tabForContents(event.sender)?.handoff != null;
+  });
   // Electron on Windows exits immediately when no BrowserWindow exists, even
   // if the stdio manager is still attached. Keep one hidden local window alive
   // so the authenticated owner controls host lifetime explicitly.
@@ -197,10 +239,13 @@ async function handleLine(line) {
   } catch {
     throw new Error("browser host received invalid JSON");
   }
-  if (!isValidRequest(request) || !safeEqual(request.token, AUTH_TOKEN)) {
-    if (isRecord(request) && typeof request.id === "string") {
-      sendError(request.id, "BROWSER_UNAUTHORIZED", "browser request was not authorized");
-    }
+  if (!isRecord(request) || typeof request.id !== "string" || request.id.length === 0 || request.id.length > 4096) return;
+  if (!safeEqual(request.token, AUTH_TOKEN)) {
+    sendError(request.id, "BROWSER_UNAUTHORIZED", "browser request was not authorized");
+    return;
+  }
+  if (!isValidRequest(request)) {
+    sendError(request.id, "BROWSER_COMMAND_INVALID", "browser request is invalid");
     return;
   }
   if (request.command.command === "cancel") {
@@ -212,9 +257,12 @@ async function handleLine(line) {
 
 function enqueueRequest(request) {
   pruneEmptyAgentQueues();
+  const lifecycle = request.command.command === "close" || request.command.command === "reset";
+  // Lifecycle commands must not wait behind the work they are ending.
+  if (lifecycle) preemptAgentWork(request);
   const existingQueue = AGENT_QUEUES.get(request.agentId);
   const queuedCount = AGENT_ORDER.reduce((total, agentId) => total + (AGENT_QUEUES.get(agentId)?.items.length ?? 0), 0);
-  if ((existingQueue?.items.length ?? 0) >= MAX_AGENT_QUEUE || queuedCount >= MAX_TOTAL_QUEUE) {
+  if (!lifecycle && ((existingQueue?.items.length ?? 0) >= MAX_AGENT_QUEUE || queuedCount >= MAX_TOTAL_QUEUE)) {
     void sendError(request.id, "BROWSER_QUEUE_FULL", "browser host queue is full");
     maybeResumeInput();
     return;
@@ -230,7 +278,8 @@ function enqueueRequest(request) {
     cancelled: false,
     responded: false,
   };
-  agentQueue.items.push(item);
+  if (lifecycle) agentQueue.items.unshift(item);
+  else agentQueue.items.push(item);
   REQUESTS.set(request.id, item);
   pumpScheduler();
   if (queuedCount + 1 >= MAX_TOTAL_QUEUE && commandInput !== null && !inputPaused) {
@@ -239,22 +288,35 @@ function enqueueRequest(request) {
   }
 }
 
+/** Abort the agent's queued and running work on the tab (close) or partition (reset). */
+function preemptAgentWork(request) {
+  const queue = AGENT_QUEUES.get(request.agentId);
+  if (queue === undefined) return;
+  const affected = (item) => item.request.partition === request.partition &&
+    (request.command.command === "reset" || item.request.tabId === request.tabId);
+  for (const item of [...queue.items, ...(queue.active === null ? [] : [queue.active])]) {
+    if (affected(item)) abortRequestItem(item);
+  }
+}
+
+function abortRequestItem(item) {
+  item.cancelled = true;
+  item.controller.abort();
+  if (!item.responded) {
+    item.responded = true;
+    void sendError(item.request.id, "BROWSER_COMMAND_ABORTED", "browser command was aborted");
+  }
+  const queue = AGENT_QUEUES.get(item.request.agentId);
+  if (queue?.active !== item) {
+    if (queue !== undefined) queue.items = queue.items.filter((candidate) => candidate !== item);
+    REQUESTS.delete(item.request.id);
+  }
+}
+
 function handleCancel(request) {
-  const targetId = request.command.targetId;
-  const item = REQUESTS.get(targetId);
+  const item = REQUESTS.get(request.command.targetId);
   if (item !== undefined && ownsRequest(item.request, request)) {
-    item.cancelled = true;
-    item.controller.abort();
-    if (item.request.id !== targetId) return;
-    if (!item.responded) {
-      item.responded = true;
-      void sendError(item.request.id, "BROWSER_COMMAND_ABORTED", "browser command was aborted");
-    }
-    const queue = AGENT_QUEUES.get(item.request.agentId);
-    if (queue?.active !== item) {
-      if (queue !== undefined) queue.items = queue.items.filter((candidate) => candidate !== item);
-      REQUESTS.delete(item.request.id);
-    }
+    abortRequestItem(item);
     // A cancelled active item still owns its scheduler slot until the
     // underlying browser operation returns through runScheduledRequest.
     pumpScheduler();
@@ -352,6 +414,15 @@ function maybeResumeInput() {
 
 async function execute(request, signal) {
   throwIfAborted(signal);
+  if (!HANDOFF_COMMANDS.has(request.command.command) && TABS.get(request.tabId)?.handoff) {
+    throw browserError(
+      "BROWSER_HANDOFF_ACTIVE",
+      "the user is controlling this browser window; wait until the user returns to the chat before using the browser again",
+    );
+  }
+  if (!RELOADING_COMMANDS.has(request.command.command) && TABS.get(request.tabId)?.crashed) {
+    throw browserError("BROWSER_TAB_CRASHED", "the page crashed; open or navigate to a URL to load it again");
+  }
   switch (request.command.command) {
     case "open":
       return openTab(request, signal);
@@ -387,24 +458,30 @@ async function execute(request, signal) {
 async function openTab(request, signal) {
   throwIfAborted(signal);
   let tab = TABS.get(request.tabId);
+  const created = !tab;
   if (!tab) tab = await createTab(request, signal);
   assertTabOwnership(tab, request);
-  const url = request.command.url || "about:blank";
-  assertSafeUrl(url, true);
   assertWindowAlive(tab.window);
-  if (tab.window.webContents.getURL() !== url) await loadUrl(tab.window, url, signal);
+  // Re-opening an existing tab without a URL keeps its page and form state,
+  // unless its renderer crashed and the page must be loaded again.
+  if (request.command.url !== undefined || created || tab.crashed) {
+    const current = tab.window.webContents.getURL();
+    const url = assertSafeUrl(request.command.url ?? (created || !isNetworkUrl(current) ? "about:blank" : current), true);
+    if (current !== url || tab.crashed) await loadUrl(tab.window, url, signal);
+    tab.crashed = false;
+  }
   throwIfAborted(signal);
   assertWindowAlive(tab.window);
-  tab.window.show();
+  // Visible but behind the user's active window: agent work never takes focus.
+  if (!tab.window.isVisible()) tab.window.showInactive();
   return resultBase("open", request.tabId, tab.window, { visible: true });
 }
 
 async function navigateTab(request, signal) {
   throwIfAborted(signal);
   const tab = getTab(request);
-  const url = request.command.url;
-  assertSafeUrl(url, false);
-  await loadUrl(tab.window, url, signal);
+  await loadUrl(tab.window, assertSafeUrl(request.command.url, false), signal);
+  tab.crashed = false;
   throwIfAborted(signal);
   assertWindowAlive(tab.window);
   return resultBase("navigate", request.tabId, tab.window);
@@ -431,10 +508,12 @@ async function snapshotTab(request, signal) {
       ...(text === undefined ? {} : { text }),
       elements,
       screenshot,
+      // Viewport captures are normalized to window coordinates (DIP), the
+      // same space as click coordinates, so one screenshot pixel is one unit.
       viewport: {
         width: screenshot.width,
         height: screenshot.height,
-        deviceScaleFactor: tab.window.webContents.getZoomFactor(),
+        deviceScaleFactor: 1,
       },
     },
   };
@@ -447,8 +526,7 @@ async function clickTab(request, signal) {
   const bounds = tab.window.getContentBounds();
   const { x, y, button = "left", clickCount = 1 } = request.command;
   if (x > bounds.width || y > bounds.height) throw browserError("BROWSER_COORDINATES_INVALID", "click is outside the browser viewport");
-  tab.window.show();
-  tab.window.focus();
+  // Input events reach the page without OS focus; only a handoff focuses.
   tab.window.webContents.sendInputEvent({ type: "mouseDown", x, y, button, clickCount });
   tab.window.webContents.sendInputEvent({ type: "mouseUp", x, y, button, clickCount });
   throwIfAborted(signal);
@@ -463,15 +541,15 @@ async function clickElementTab(request, signal) {
     throw browserError("BROWSER_ELEMENT_STALE", "browser element id is stale; take a new snapshot");
   }
   assertWindowAlive(tab.window);
-  const point = await tab.window.webContents.executeJavaScript(`(() => {
-    const id = ${JSON.stringify(id)};
-    const element = document.querySelector('[data-openbot-element-id="' + id + '"]');
-    if (!element) return null;
+  const point = await runSnapshotScript(tab.window, signal, `(() => {
+    const registry = globalThis.__openbotElements;
+    const element = registry instanceof Map ? registry.get(${JSON.stringify(id)}) : undefined;
+    if (!element || !element.isConnected) return null;
     const rect = element.getBoundingClientRect();
     const style = getComputedStyle(element);
     if (style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) return null;
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-  })()`, true);
+  })()`);
   throwIfAborted(signal);
   if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
     throw browserError("BROWSER_ELEMENT_STALE", "browser element is no longer actionable; take a new snapshot");
@@ -480,8 +558,6 @@ async function clickElementTab(request, signal) {
   if (point.x < 0 || point.y < 0 || point.x > bounds.width || point.y > bounds.height) {
     throw browserError("BROWSER_ELEMENT_OUTSIDE_VIEWPORT", "browser element is outside the viewport; scroll and take a new snapshot");
   }
-  tab.window.show();
-  tab.window.focus();
   tab.window.webContents.sendInputEvent({ type: "mouseDown", x: point.x, y: point.y, button: "left", clickCount: 1 });
   tab.window.webContents.sendInputEvent({ type: "mouseUp", x: point.x, y: point.y, button: "left", clickCount: 1 });
   return resultBase("click_element", request.tabId, tab.window);
@@ -492,12 +568,22 @@ async function scrollTab(request, signal) {
   const tab = getTab(request);
   assertWindowAlive(tab.window);
   const { deltaX, deltaY } = request.command;
-  await tab.window.webContents.executeJavaScript(`(() => {
-    window.scrollBy({ left: ${Number(deltaX)}, top: ${Number(deltaY)}, behavior: 'auto' });
-    return { x: window.scrollX, y: window.scrollY };
-  })()`, true);
+  const bounds = tab.window.getContentBounds();
+  // A wheel event at the viewport centre scrolls the element under it, which
+  // also reaches inner panels that window.scrollBy leaves untouched. Chromium
+  // wheel deltas are positive towards the top/left, hence the sign flip.
+  tab.window.webContents.sendInputEvent({
+    type: "mouseWheel",
+    x: Math.floor(bounds.width / 2),
+    y: Math.floor(bounds.height / 2),
+    deltaX: -Number(deltaX),
+    deltaY: -Number(deltaY),
+    canScroll: true,
+  });
+  // The wheel is applied asynchronously; answer only after two frames so the
+  // agent's next snapshot sees the scrolled page.
+  await runSnapshotScript(tab.window, signal, "new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))");
   throwIfAborted(signal);
-  tab.actionElementIds = new Set();
   return resultBase("scroll", request.tabId, tab.window);
 }
 
@@ -516,11 +602,14 @@ async function pressKeyTab(request, signal) {
     ARROWRIGHT: "ArrowRight",
     BACKSPACE: "Backspace",
   };
+  // Form submission and button activation are driven by the character event,
+  // not by keyDown alone.
+  const characters = { ENTER: "\r", SPACE: " " };
   const keyCode = keyCodes[request.command.key];
   if (!keyCode) throw browserError("BROWSER_KEY_INVALID", "browser key is invalid");
-  tab.window.show();
-  tab.window.focus();
   tab.window.webContents.sendInputEvent({ type: "keyDown", keyCode });
+  const character = characters[request.command.key];
+  if (character !== undefined) tab.window.webContents.sendInputEvent({ type: "char", keyCode: character });
   tab.window.webContents.sendInputEvent({ type: "keyUp", keyCode });
   throwIfAborted(signal);
   return resultBase("press_key", request.tabId, tab.window);
@@ -530,9 +619,7 @@ async function typeTab(request, signal) {
   throwIfAborted(signal);
   const tab = getTab(request);
   assertWindowAlive(tab.window);
-  tab.window.show();
-  tab.window.focus();
-  await tab.window.webContents.insertText(request.command.text);
+  await pageCall(tab.window, signal, () => tab.window.webContents.insertText(request.command.text));
   throwIfAborted(signal);
   assertWindowAlive(tab.window);
   return resultBase("type", request.tabId, tab.window);
@@ -547,7 +634,7 @@ async function uploadTab(request, signal) {
   let assigned;
   try {
     assertWindowAlive(tab.window);
-    assigned = await tab.window.webContents.executeJavaScript(`(() => {
+    assigned = await pageCall(tab.window, signal, () => tab.window.webContents.executeJavaScript(`(() => {
       const selector = ${JSON.stringify(request.command.selector)};
       let input;
       try {
@@ -572,8 +659,9 @@ async function uploadTab(request, signal) {
       } catch {
         return { ok: false, code: "BROWSER_UPLOAD_ASSIGN_FAILED" };
       }
-    })()`, true);
-  } catch {
+    })()`, true));
+  } catch (error) {
+    if (error && (error.code === "BROWSER_COMMAND_ABORTED" || error.code === "BROWSER_PAGE_UNRESPONSIVE")) throw error;
     throw browserError("BROWSER_UPLOAD_EXECUTION_FAILED", "browser file upload could not be applied");
   }
   throwIfAborted(signal);
@@ -611,6 +699,7 @@ async function closeTab(request, signal) {
   if (tab) {
     assertTabOwnership(tab, request);
     TABS.delete(request.tabId);
+    if (tab.handoff) clearTimeout(tab.handoff.timer);
     // Lifecycle close must not be vetoed by beforeunload handlers.
     if (!tab.window.isDestroyed()) tab.window.destroy();
   }
@@ -634,9 +723,76 @@ async function handoffTab(request, signal) {
   throwIfAborted(signal);
   const tab = getTab(request);
   assertWindowAlive(tab.window);
+  // The only command that brings a bot window forward and focuses it.
   tab.window.show();
   tab.window.focus();
+  beginHandoff(request.tabId, tab);
   return resultBase("handoff", request.tabId, tab.window, { visible: true });
+}
+
+function beginHandoff(tabId, tab) {
+  if (!tab.handoff) {
+    tab.handoff = { engaged: false, timer: undefined };
+    updateWindowTitle(tab);
+    void sendHandoffEvent(tabId, true);
+  }
+  const handoff = tab.handoff;
+  clearTimeout(handoff.timer);
+  // Windows may refuse to bring the window forward; the user then activates
+  // it from the taskbar, which the focus listener records.
+  if (tab.window.isFocused()) {
+    handoff.engaged = true;
+    return;
+  }
+  handoff.timer = setTimeout(() => {
+    if (tab.handoff === handoff && !handoff.engaged) endHandoff(tabId, tab);
+  }, HANDOFF_ENGAGE_MS);
+}
+
+/** Control returns to the agent once the user leaves the handed-off window. */
+function endHandoff(tabId, tab) {
+  if (!tab.handoff) return;
+  clearTimeout(tab.handoff.timer);
+  tab.handoff = null;
+  updateWindowTitle(tab);
+  void sendHandoffEvent(tabId, false);
+}
+
+function sendHandoffEvent(tabId, active) {
+  return send({ protocolVersion: PROTOCOL_VERSION, kind: "event", event: "handoff", tabId, active }).catch(() => undefined);
+}
+
+function tabForContents(contents) {
+  for (const tab of TABS.values()) {
+    try {
+      if (!tab.window.isDestroyed() && tab.window.webContents === contents) return tab;
+    } catch {
+      // A window torn down concurrently owns no clipboard policy.
+    }
+  }
+  return undefined;
+}
+
+function updateWindowTitle(tab) {
+  try {
+    if (tab.window.isDestroyed()) return;
+    // The page title is never shown: the user must see which origin a
+    // handed-off window belongs to before typing anything into it.
+    const origin = displayOrigin(tab.window.webContents.getURL());
+    tab.window.setTitle(`${tab.handoff ? "Você está no controle · " : ""}OpenBot · ${origin}`);
+  } catch {
+    // Title updates race with window teardown and are cosmetic.
+  }
+}
+
+function displayOrigin(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") return parsed.origin;
+  } catch {
+    // Fall through to the neutral label.
+  }
+  return "página em branco";
 }
 
 async function resetPartition(request, signal) {
@@ -649,8 +805,8 @@ async function resetPartition(request, signal) {
   await browserSession.clearStorageData();
   throwIfAborted(signal);
   if (typeof browserSession.clearCache === "function") await browserSession.clearCache();
-  throwIfAborted(signal);
-  await fsp.rm(partitionRootFor(request.partition), { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
+  // The partition folder stays open while this shared host runs; the manager
+  // deletes it before the next host start.
   return { command: "reset", tabId: request.tabId, visible: false };
 }
 
@@ -659,7 +815,8 @@ async function createTab(request, signal) {
   const downloadRoot = await ensureDownloadRoot(request.downloadRoot);
   throwIfAborted(signal);
   const window = new BrowserWindow({
-    show: true,
+    show: false,
+    title: "OpenBot",
     width: 1280,
     height: 800,
     webPreferences: {
@@ -667,12 +824,19 @@ async function createTab(request, signal) {
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
+      // Runs the sandboxed clipboard guard in every frame; it never enables Node.
+      nodeIntegrationInSubFrames: true,
+      preload: path.join(__dirname, "openbot-browser-preload.cjs"),
       devTools: false,
       webviewTag: false,
       webSecurity: true,
       allowRunningInsecureContent: false,
       plugins: false,
       enableWebSQL: false,
+      // alert/confirm/prompt would block the renderer behind a native modal.
+      disableDialogs: true,
+      // The window usually sits behind the user's windows while the agent works.
+      backgroundThrottling: false,
     },
   });
   try {
@@ -690,69 +854,18 @@ async function createTab(request, signal) {
     agentId: request.agentId,
     sessionId: request.sessionId,
     partition: request.partition,
-    downloadRoot,
+    downloadRoot: downloadRoot.root,
     actionElementIds: new Set(),
+    handoff: null,
   };
   TABS.set(request.tabId, tab);
   const browserSession = window.webContents.session;
   let downloadConfigs = DOWNLOAD_CONFIG.get(browserSession);
-  if (!DOWNLOAD_SESSIONS.has(browserSession)) {
-    DOWNLOAD_SESSIONS.add(browserSession);
+  if (downloadConfigs === undefined) {
     downloadConfigs = new Map();
     DOWNLOAD_CONFIG.set(browserSession, downloadConfigs);
     browserSession.on("will-download", (_event, item, webContents) => {
-      const config = downloadConfigs.get(webContents?.id);
-      if (!config) {
-        item.cancel();
-        return;
-      }
-      const filename = safeFilename(item.getFilename());
-      let savePath;
-      try {
-        savePath = uniqueDownloadPath(config.root, filename);
-      } catch {
-        item.cancel();
-        return;
-      }
-      const expectedBytes = item.getTotalBytes();
-      let limitExceeded = Number.isFinite(expectedBytes) && expectedBytes > MAX_DOWNLOAD_BYTES;
-      let receivedBytes = 0;
-      item.setSavePath(savePath);
-      let finishDownload;
-      const download = { item, finished: false, done: new Promise((resolve) => { finishDownload = resolve; }) };
-      const downloads = ACTIVE_DOWNLOADS.get(config.tabId) || new Set();
-      ACTIVE_DOWNLOADS.set(config.tabId, downloads);
-      downloads.add(download);
-      item.on("updated", (_updatedEvent, state) => {
-        receivedBytes = Math.max(receivedBytes, item.getReceivedBytes());
-        if (state === "progressing" && receivedBytes > MAX_DOWNLOAD_BYTES && !limitExceeded) {
-          limitExceeded = true;
-          item.cancel();
-        }
-      });
-      item.once("done", (_doneEvent, state) => {
-        download.finished = true;
-        receivedBytes = Math.max(receivedBytes, item.getReceivedBytes());
-        const lifecycle = limitExceeded ? "limit" : state === "completed" ? "completed" : state === "cancelled" ? "cancelled" : "interrupted";
-        void (async () => {
-          if (lifecycle !== "completed") await fsp.rm(savePath, { force: true }).catch(() => undefined);
-          await send({
-            protocolVersion: PROTOCOL_VERSION,
-            kind: "event",
-            event: "download",
-            tabId: config.tabId,
-            path: savePath,
-            state: lifecycle,
-            bytes: receivedBytes,
-          });
-        })().catch(() => undefined).finally(() => {
-          downloads.delete(download);
-          if (downloads.size === 0) ACTIVE_DOWNLOADS.delete(config.tabId);
-          finishDownload();
-        });
-      });
-      // Register done ownership first: cancel may complete synchronously.
-      if (limitExceeded) item.cancel();
+      handleWillDownload(downloadConfigs.get(webContents?.id), item);
     });
   }
   // Electron can destroy webContents before emitting the BrowserWindow
@@ -760,17 +873,141 @@ async function createTab(request, signal) {
   // cleanup never dereferences a destroyed WebContents object.
   const webContentsId = window.webContents.id;
   downloadConfigs.set(webContentsId, {
-    root: downloadRoot,
+    root: downloadRoot.root,
+    realBase: downloadRoot.realBase,
+    relation: downloadRoot.relation,
     tabId: request.tabId,
-    agentId: request.agentId,
-    sessionId: request.sessionId,
+    downloads: 0,
+    bytes: 0,
   });
   attachWindowSecurity(window);
+  attachTabLifecycle(request.tabId, tab);
   window.on("closed", () => {
-    if (TABS.get(request.tabId)?.window === window) TABS.delete(request.tabId);
+    if (TABS.get(request.tabId)?.window === window) {
+      TABS.delete(request.tabId);
+      // A user closing a handed-off window returns control; the lease then
+      // sees the missing tab on its next command.
+      if (tab.handoff) {
+        clearTimeout(tab.handoff.timer);
+        tab.handoff = null;
+        void sendHandoffEvent(request.tabId, false);
+      }
+    }
     downloadConfigs.delete(webContentsId);
   });
   return tab;
+}
+
+/** Save one download of a tab, or cancel it (unknown tab, limits, unsafe root). */
+function handleWillDownload(config, item) {
+  // The Downloads folder lives in the agent home and can be swapped for a
+  // junction after the tab opened; re-check it before every save path.
+  if (!config || config.downloads >= MAX_TAB_DOWNLOADS || !downloadRootIntact(config)) {
+    item.cancel();
+    return;
+  }
+  config.downloads += 1;
+  const filename = safeFilename(item.getFilename());
+  let savePath;
+  try {
+    savePath = uniqueDownloadPath(config.root, filename);
+  } catch {
+    item.cancel();
+    return;
+  }
+  const reservation = savePath.toLowerCase();
+  RESERVED_DOWNLOAD_PATHS.add(reservation);
+  const expectedBytes = item.getTotalBytes();
+  let limitExceeded = Number.isFinite(expectedBytes) && (
+    expectedBytes > MAX_DOWNLOAD_BYTES ||
+    config.bytes + expectedBytes > MAX_SESSION_DOWNLOAD_BYTES
+  );
+  let receivedBytes = 0;
+  // Bytes of this download currently included in the session total.
+  let countedBytes = 0;
+  const account = () => {
+    receivedBytes = Math.max(receivedBytes, item.getReceivedBytes());
+    config.bytes += receivedBytes - countedBytes;
+    countedBytes = receivedBytes;
+  };
+  item.setSavePath(savePath);
+  let finishDownload;
+  const download = { item, finished: false, done: new Promise((resolve) => { finishDownload = resolve; }) };
+  const downloads = ACTIVE_DOWNLOADS.get(config.tabId) || new Set();
+  ACTIVE_DOWNLOADS.set(config.tabId, downloads);
+  downloads.add(download);
+  item.on("updated", (_updatedEvent, state) => {
+    account();
+    if (state === "progressing" && !limitExceeded && (receivedBytes > MAX_DOWNLOAD_BYTES || config.bytes > MAX_SESSION_DOWNLOAD_BYTES)) {
+      limitExceeded = true;
+      item.cancel();
+    }
+  });
+  item.once("done", (_doneEvent, state) => {
+    download.finished = true;
+    account();
+    const lifecycle = limitExceeded ? "limit" : state === "completed" ? "completed" : state === "cancelled" ? "cancelled" : "interrupted";
+    // Removed files do not consume the session budget.
+    if (lifecycle !== "completed") config.bytes -= countedBytes;
+    void (async () => {
+      if (lifecycle !== "completed") await fsp.rm(savePath, { force: true }).catch(() => undefined);
+      await send({
+        protocolVersion: PROTOCOL_VERSION,
+        kind: "event",
+        event: "download",
+        tabId: config.tabId,
+        path: savePath,
+        state: lifecycle,
+        bytes: receivedBytes,
+      });
+    })().catch(() => undefined).finally(() => {
+      RESERVED_DOWNLOAD_PATHS.delete(reservation);
+      downloads.delete(download);
+      if (downloads.size === 0) ACTIVE_DOWNLOADS.delete(config.tabId);
+      finishDownload();
+    });
+  });
+  // Register done ownership first: cancel may complete synchronously.
+  if (limitExceeded) item.cancel();
+}
+
+function attachTabLifecycle(tabId, tab) {
+  const window = tab.window;
+  const contents = window.webContents;
+  const current = () => TABS.get(tabId) === tab;
+  window.on("focus", () => {
+    if (!current() || !tab.handoff) return;
+    tab.handoff.engaged = true;
+    clearTimeout(tab.handoff.timer);
+  });
+  const leave = () => {
+    if (current() && tab.handoff?.engaged) endHandoff(tabId, tab);
+  };
+  window.on("blur", leave);
+  window.on("minimize", () => {
+    if (current()) endHandoff(tabId, tab);
+  });
+  window.on("hide", () => {
+    if (current()) endHandoff(tabId, tab);
+  });
+  contents.on("page-title-updated", (event) => {
+    event.preventDefault();
+    updateWindowTitle(tab);
+  });
+  contents.on("did-navigate", () => updateWindowTitle(tab));
+  contents.on("did-navigate-in-page", () => updateWindowTitle(tab));
+  contents.on("render-process-gone", (_event, details) => {
+    tab.actionElementIds = new Set();
+    // A renderer this host restarted is already reloading; any other loss
+    // leaves a crash page that only open/navigate can replace.
+    if (tab.restartingRenderer) tab.restartingRenderer = false;
+    else tab.crashed = true;
+    try {
+      process.stderr.write(`OpenBot browser tab renderer ended: ${String(details?.reason ?? "unknown").slice(0, 64)}\n`);
+    } catch {
+      // Diagnostics are best-effort.
+    }
+  });
 }
 
 async function secureBrowserSession(browserSession) {
@@ -789,6 +1026,15 @@ async function secureBrowserSession(browserSession) {
   if (typeof browserSession.setDevicePermissionHandler === "function") {
     browserSession.setDevicePermissionHandler(() => false);
   }
+  if (typeof browserSession.on === "function") {
+    // Without a handler Electron may pick the first device for these choosers.
+    for (const chooser of ["select-hid-device", "select-serial-port", "select-usb-device"]) {
+      browserSession.on(chooser, (event, _details, callback) => {
+        event.preventDefault();
+        callback();
+      });
+    }
+  }
   // The scoped app login handler supplies proxy credentials. Injecting the
   // restricted Proxy-Authorization header breaks Chromium download requests.
   browserSession.webRequest.onBeforeRequest({ urls: ["<all_urls>"] }, (details, callback) => {
@@ -800,7 +1046,8 @@ async function secureBrowserSession(browserSession) {
       return;
     }
     const mainFrameBlank = details.resourceType === "mainFrame" && details.url === "about:blank";
-    const allowed = protocol === "http:" || protocol === "https:" || protocol === "blob:" || mainFrameBlank;
+    // WebSockets travel through the same authenticated proxy tunnel.
+    const allowed = protocol === "http:" || protocol === "https:" || protocol === "ws:" || protocol === "wss:" || protocol === "blob:" || mainFrameBlank;
     callback({ cancel: !allowed });
   });
   SECURED_SESSIONS.add(browserSession);
@@ -808,8 +1055,31 @@ async function secureBrowserSession(browserSession) {
 
 function attachWindowSecurity(window) {
   const contents = window.webContents;
-  contents.setWindowOpenHandler(() => ({ action: "deny" }));
+  // Popups and target=_blank links load in this same tab, so sign-in flows
+  // keep working without a second, ungoverned window.
+  contents.setWindowOpenHandler((details) => {
+    const url = details && typeof details.url === "string" ? details.url : "";
+    if (isNetworkUrl(url)) {
+      setImmediate(() => {
+        try {
+          if (!contents.isDestroyed()) contents.loadURL(url).catch(() => undefined);
+        } catch {
+          // The tab may already be closing.
+        }
+      });
+    }
+    return { action: "deny" };
+  });
   contents.on("will-attach-webview", (event) => {
+    event.preventDefault();
+  });
+  // Without a handler Electron pairs with the first Bluetooth device found.
+  contents.on("select-bluetooth-device", (event, _devices, callback) => {
+    event.preventDefault();
+    callback("");
+  });
+  // A beforeunload veto would silently cancel agent navigation and close.
+  contents.on("will-prevent-unload", (event) => {
     event.preventDefault();
   });
   const validateNavigation = (event, url) => {
@@ -830,7 +1100,7 @@ function isNetworkUrl(url) {
 
 function getTab(request) {
   const tab = TABS.get(request.tabId);
-  if (!tab) throw browserError("BROWSER_TAB_NOT_FOUND", "browser tab is not open");
+  if (!tab) throw browserError("BROWSER_TAB_NOT_FOUND", "browser tab is not open; call browser.open first");
   assertTabOwnership(tab, request);
   return tab;
 }
@@ -844,18 +1114,27 @@ function assertTabOwnership(tab, request) {
 async function loadUrl(window, url, signal) {
   throwIfAborted(signal);
   assertWindowAlive(window);
+  const contents = window.webContents;
   let timeoutId;
   let abortHandler;
+  let domReadyHandler;
   let navigation;
   try {
     navigation = Promise.resolve().then(() => window.loadURL(url));
     await Promise.race([
       navigation,
+      // The page is usable once its document is parsed; waiting for every
+      // subresource made heavy pages report a timeout. Main-frame failures
+      // reject loadURL before the error page is parsed.
+      new Promise((resolve) => {
+        domReadyHandler = () => resolve();
+        contents.once("dom-ready", domReadyHandler);
+      }),
       new Promise((_, reject) => {
         timeoutId = setTimeout(() => {
           safeStopLoading(window);
           reject(browserError("BROWSER_NAVIGATION_TIMEOUT", "browser navigation timed out"));
-        }, 45_000);
+        }, NAVIGATION_TIMEOUT_MS);
       }),
       new Promise((_, reject) => {
         if (signal === undefined) return;
@@ -869,8 +1148,59 @@ async function loadUrl(window, url, signal) {
     ]);
   } finally {
     clearTimeout(timeoutId);
+    if (domReadyHandler !== undefined) contents.removeListener("dom-ready", domReadyHandler);
     if (signal !== undefined && abortHandler !== undefined) signal.removeEventListener("abort", abortHandler);
   }
+}
+
+/**
+ * Race one renderer round trip against cancellation and a bound. A renderer
+ * that stays unresponsive is restarted so the tab (and the agent's scheduler
+ * slot) recovers instead of waiting forever.
+ */
+async function pageCall(window, signal, operation) {
+  throwIfAborted(signal);
+  assertWindowAlive(window);
+  let timeoutId;
+  let abortHandler;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          restartUnresponsiveRenderer(window);
+          reject(browserError("BROWSER_PAGE_UNRESPONSIVE", "the page stopped responding and was reloaded; take a new snapshot"));
+        }, PAGE_CALL_TIMEOUT_MS);
+      }),
+      new Promise((_, reject) => {
+        if (signal === undefined) return;
+        abortHandler = () => reject(browserAbortError());
+        signal.addEventListener("abort", abortHandler, { once: true });
+        if (signal.aborted) abortHandler();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+    if (signal !== undefined && abortHandler !== undefined) signal.removeEventListener("abort", abortHandler);
+  }
+}
+
+function restartUnresponsiveRenderer(window) {
+  try {
+    if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return;
+    const tab = tabForContents(window.webContents);
+    if (tab !== undefined) tab.restartingRenderer = true;
+    // Electron documents reload() right after a forced crash as the way to
+    // bring the page back in a fresh renderer process.
+    window.webContents.forcefullyCrashRenderer();
+    window.webContents.reload();
+  } catch {
+    // The window may be closing; the command already reports the timeout.
+  }
+}
+
+function runSnapshotScript(window, signal, code) {
+  return pageCall(window, signal, () => window.webContents.executeJavaScriptInIsolatedWorld(SNAPSHOT_WORLD_ID, [{ code }], false));
 }
 
 function delayWithAbort(milliseconds, signal) {
@@ -936,7 +1266,7 @@ async function captureViewport(window, signal) {
     assertWindowAlive(window);
     let image;
     try {
-      image = await window.webContents.capturePage();
+      image = await pageCall(window, signal, () => window.webContents.capturePage());
     } catch (error) {
       // A newly opened window can have no compositor frame yet.
       if (!String(error?.message ?? error).includes("UnknownVizError") || attempt === 4) throw error;
@@ -945,9 +1275,12 @@ async function captureViewport(window, signal) {
     }
     throwIfAborted(signal);
     const size = image.getSize();
-    const png = image.toPNG();
-    if (size.width > 0 && size.height > 0 && png.length > 0) {
-      return formatScreenshot(png, size, "viewport");
+    if (size.width > 0 && size.height > 0) {
+      // Captures arrive at the display scale. Normalize them to window
+      // coordinates (DIP) so image pixels match click positions on high-DPI
+      // screens and the frame stays smaller.
+      const png = image.resize({ width: size.width, height: size.height, quality: "better" }).toPNG();
+      if (png.length > 0) return formatScreenshot(png, size, "viewport");
     }
     await delayWithAbort(50, signal);
   }
@@ -975,12 +1308,14 @@ async function captureFullPage(window, signal) {
       attachedByUs = true;
     }
     throwIfAborted(signal);
-    const result = await debuggerApi.sendCommand("Page.captureScreenshot", {
+    // Scale by 1/DPR so the page is captured in CSS pixels, the same units
+    // as the viewport capture.
+    const result = await pageCall(window, signal, () => debuggerApi.sendCommand("Page.captureScreenshot", {
       format: "png",
       fromSurface: true,
       captureBeyondViewport: true,
-      clip: { x: 0, y: 0, width: metrics.width, height: metrics.height, scale: 1 },
-    });
+      clip: { x: 0, y: 0, width: metrics.width, height: metrics.height, scale: 1 / metrics.deviceScaleFactor },
+    }));
     throwIfAborted(signal);
     const encoded = result && typeof result.data === "string" ? result.data : "";
     const png = Buffer.from(encoded, "base64");
@@ -1007,15 +1342,15 @@ async function readPageMetrics(window, signal) {
   try {
     throwIfAborted(signal);
     assertWindowAlive(window);
-    metrics = await window.webContents.executeJavaScript(`(() => {
+    metrics = await runSnapshotScript(window, signal, `(() => {
       const root = document.documentElement;
       const body = document.body;
       const width = Math.max(root?.scrollWidth || 0, root?.clientWidth || 0, body?.scrollWidth || 0, window.innerWidth || 0);
       const height = Math.max(root?.scrollHeight || 0, root?.clientHeight || 0, body?.scrollHeight || 0, window.innerHeight || 0);
       return { width, height, deviceScaleFactor: window.devicePixelRatio || 1 };
-    })()`, true);
+    })()`);
   } catch (error) {
-    if (error && typeof error.code === "string" && error.code === "BROWSER_COMMAND_ABORTED") throw error;
+    if (error && typeof error.code === "string" && error.code.startsWith("BROWSER_")) throw error;
     throw browserError("BROWSER_FULL_PAGE_UNAVAILABLE", "could not measure the page for full-page capture");
   }
   if (!metrics || typeof metrics !== "object") throw browserError("BROWSER_FULL_PAGE_UNAVAILABLE", "could not measure the page for full-page capture");
@@ -1067,9 +1402,10 @@ function formatScreenshot(png, size, context) {
 async function readVisibleText(window, signal) {
   throwIfAborted(signal);
   assertWindowAlive(window);
-  const value = await window.webContents.executeJavaScript(
+  const value = await runSnapshotScript(
+    window,
+    signal,
     "(() => { const body = document.body; if (!body) return ''; let result = ''; let count = 0; for (const character of body.innerText || '') { if (count >= 131072) break; result += character; count += 1; } return result; })()",
-    true,
   );
   throwIfAborted(signal);
   const text = typeof value === "string" ? value : "";
@@ -1077,23 +1413,22 @@ async function readVisibleText(window, signal) {
 }
 
 function truncateUtf8(value, maxBytes) {
-  const characters = [];
-  let bytes = 0;
-  for (const character of value) {
-    const characterBytes = Buffer.byteLength(character, "utf8");
-    if (bytes + characterBytes > maxBytes) break;
-    characters.push(character);
-    bytes += characterBytes;
-  }
-  return characters.join("");
+  const encoded = Buffer.from(value, "utf8");
+  if (encoded.length <= maxBytes) return value;
+  // Step back from a continuation byte so no character is split.
+  let end = maxBytes;
+  while (end > 0 && (encoded[end] & 0xc0) === 0x80) end -= 1;
+  return encoded.subarray(0, end).toString("utf8");
 }
 
 async function readInteractiveElements(window, signal) {
   throwIfAborted(signal);
   assertWindowAlive(window);
-  const value = await window.webContents.executeJavaScript(`(() => {
-    const attribute = 'data-openbot-element-id';
-    document.querySelectorAll('[' + attribute + ']').forEach((element) => element.removeAttribute(attribute));
+  // Element handles stay in this isolated world's registry, so the page
+  // neither sees marker attributes nor can redirect click_element lookups.
+  const value = await runSnapshotScript(window, signal, `(() => {
+    const registry = new Map();
+    globalThis.__openbotElements = registry;
     const selector = 'a[href],button,input:not([type="hidden"]),select,textarea,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="tab"],[role="menuitem"],[tabindex]';
     const result = [];
     const roleFor = (element) => {
@@ -1113,15 +1448,25 @@ async function readInteractiveElements(window, signal) {
       }
       return 'interactive';
     };
+    // Typed secrets must never reach the model through an element name.
+    const secretInput = (element) => {
+      if (!(element instanceof HTMLInputElement)) return false;
+      const type = (element.type || '').toLowerCase();
+      if (type === 'password' || type === 'hidden') return true;
+      const autocomplete = (element.getAttribute('autocomplete') || '').toLowerCase();
+      return autocomplete.includes('cc-') || autocomplete.includes('one-time-code') || autocomplete.includes('password');
+    };
     for (const element of document.querySelectorAll(selector)) {
-      if (result.length >= 200) break;
+      if (result.length >= ${MAX_SNAPSHOT_ELEMENTS}) break;
       const rect = element.getBoundingClientRect();
-      const style = getComputedStyle(element);
-      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || rect.width <= 0 || rect.height <= 0) continue;
+      if (rect.width <= 0 || rect.height <= 0) continue;
       if (rect.bottom < 0 || rect.right < 0 || rect.top > window.innerHeight || rect.left > window.innerWidth) continue;
+      const style = getComputedStyle(element);
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
       const id = 'ob-el-' + (result.length + 1);
-      element.setAttribute(attribute, id);
-      const name = (element.getAttribute('aria-label') || element.getAttribute('alt') || element.getAttribute('title') || element.innerText || element.value || '').replace(/\\s+/g, ' ').trim().slice(0, 256);
+      registry.set(id, element);
+      const value = secretInput(element) ? '' : element.value;
+      const name = (element.getAttribute('aria-label') || element.getAttribute('alt') || element.getAttribute('title') || element.innerText || value || element.getAttribute('placeholder') || '').replace(/\\s+/g, ' ').trim().slice(0, 256);
       result.push({
         id,
         role: roleFor(element),
@@ -1134,10 +1479,32 @@ async function readInteractiveElements(window, signal) {
       });
     }
     return result;
-  })()`, true);
+  })()`);
   throwIfAborted(signal);
+  return sanitizeElements(value);
+}
+
+/** The snapshot result crosses from the renderer; re-bound every field. */
+function sanitizeElements(value) {
   if (!Array.isArray(value)) return [];
-  return value.slice(0, 200);
+  const elements = [];
+  for (const candidate of value.slice(0, MAX_SNAPSHOT_ELEMENTS)) {
+    if (!isRecord(candidate) || typeof candidate.id !== "string" || !/^ob-el-[1-9][0-9]{0,5}$/u.test(candidate.id)) continue;
+    const box = [candidate.x, candidate.y, candidate.width, candidate.height].map(Number);
+    if (!box.every(Number.isFinite)) continue;
+    const [x, y, width, height] = box.map((number) => Math.max(-100_000, Math.min(100_000, Math.round(number))));
+    elements.push({
+      id: candidate.id,
+      role: typeof candidate.role === "string" && candidate.role.length > 0 ? candidate.role.slice(0, 64) : "interactive",
+      name: typeof candidate.name === "string" ? candidate.name.slice(0, 256) : "",
+      x,
+      y,
+      width,
+      height,
+      ...(candidate.disabled === true ? { disabled: true } : {}),
+    });
+  }
+  return elements;
 }
 
 function resultBase(command, tabId, window, extra = {}) {
@@ -1160,10 +1527,10 @@ async function ensureDownloadRoot(root) {
     throw browserError("BROWSER_DOWNLOAD_ROOT_INVALID", "managed browser root is unsafe");
   }
   const realBase = await fsp.realpath(base);
-  const relation = path.relative(realBase, normalized);
-  if (relation.startsWith("..") || path.isAbsolute(relation)) {
-    throw browserError("BROWSER_DOWNLOAD_ROOT_INVALID", "download root is outside the managed browser root");
-  }
+  // The relation is lexical: root and base use the same configured spelling
+  // even when an ancestor of the managed root is an 8.3 name or a junction.
+  // Every component below the root is then checked from the real base.
+  const relation = path.relative(base, normalized);
   let current = realBase;
   for (const component of relation ? relation.split(path.sep) : []) {
     current = path.join(current, component);
@@ -1180,7 +1547,31 @@ async function ensureDownloadRoot(root) {
       }
     }
   }
-  return current;
+  return { root: normalized, realBase, relation };
+}
+
+/** Synchronous re-check for will-download, which must set the path before returning. */
+function downloadRootIntact(config) {
+  try {
+    let current = config.realBase;
+    const baseMetadata = fs.lstatSync(current);
+    if (baseMetadata.isSymbolicLink() || !baseMetadata.isDirectory()) return false;
+    for (const component of config.relation ? config.relation.split(path.sep) : []) {
+      current = path.join(current, component);
+      let metadata;
+      try {
+        metadata = fs.lstatSync(current);
+      } catch (error) {
+        if (!error || error.code !== "ENOENT") return false;
+        fs.mkdirSync(current);
+        metadata = fs.lstatSync(current);
+      }
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) return false;
+    }
+    return samePath(fs.realpathSync.native(current), current);
+  } catch {
+    return false;
+  }
 }
 
 async function ensureManagedUserDataRoot() {
@@ -1410,6 +1801,7 @@ function downloadPathAvailable(candidate) {
   if (!isPathWithin(path.resolve(DOWNLOADS_ROOT), path.resolve(candidate))) {
     throw browserError("BROWSER_DOWNLOAD_ROOT_INVALID", "download path is outside the managed browser root");
   }
+  if (RESERVED_DOWNLOAD_PATHS.has(candidate.toLowerCase())) return false;
   if (!fs.existsSync(candidate)) return true;
   const metadata = fs.lstatSync(candidate);
   if (metadata.isSymbolicLink() || !metadata.isFile()) {
@@ -1419,9 +1811,23 @@ function downloadPathAvailable(candidate) {
 }
 
 function safeFilename(filename) {
-  const normalized = path.basename(typeof filename === "string" ? filename : "download").replace(/[\u0000-\u001f<>:"/\\|?*]/gu, "_").trim();
-  if (!normalized || normalized === "." || normalized === "..") return "download";
-  return normalized.slice(0, 180) || "download";
+  // Windows drops trailing dots/spaces and maps CON, NUL, COM1... to devices.
+  let normalized = path.basename(typeof filename === "string" ? filename : "download")
+    .replace(/[\u0000-\u001f<>:"/\\|?*]/gu, "_")
+    .trim()
+    .replace(/[. ]+$/u, "");
+  if (!normalized) return "download";
+  if (RESERVED_UPLOAD_DEVICE.test(normalized.split(".", 1)[0] || "")) normalized = `_${normalized}`;
+  if (normalized.length <= MAX_FILENAME_LENGTH) return normalized;
+  // Keep a short extension so the file still opens with the right program.
+  const extension = path.extname(normalized);
+  const kept = extension.length > 1 && extension.length <= 16 ? extension : "";
+  let stem = "";
+  for (const character of normalized.slice(0, normalized.length - kept.length)) {
+    if (stem.length + character.length > MAX_FILENAME_LENGTH - kept.length) break;
+    stem += character;
+  }
+  return `${stem.trimEnd()}${kept}`;
 }
 
 function assertSafeUrl(url, allowBlank) {
@@ -1580,20 +1986,11 @@ function parseProxy(url, token) {
     parsed.hash
   ) return null;
   return {
-    url: `http://127.0.0.1:${Number(parsed.port)}`,
     rules: `http=127.0.0.1:${Number(parsed.port)};https=127.0.0.1:${Number(parsed.port)}`,
     host: "127.0.0.1",
     port: Number(parsed.port),
     token,
   };
-}
-
-function partitionRootFor(partition) {
-  const name = partition.startsWith("persist:") ? partition.slice("persist:".length) : partition;
-  const root = path.resolve(USER_DATA_ROOT, "Partitions", name);
-  const base = path.resolve(USER_DATA_ROOT, "Partitions");
-  if (!isPathWithin(base, root)) throw browserError("BROWSER_PARTITION_INVALID", "browser partition path is invalid");
-  return root;
 }
 
 async function shutdown() {
@@ -1617,7 +2014,13 @@ async function shutdown() {
     }
   }
   TABS.clear();
-  await Promise.all([...ACTIVE_DOWNLOADS.keys()].map((tabId) => drainTabDownloads(tabId)));
+  // A download that never reports `done` must not keep the process alive.
+  let drainTimer;
+  await Promise.race([
+    Promise.all([...ACTIVE_DOWNLOADS.keys()].map((tabId) => drainTabDownloads(tabId))),
+    new Promise((resolve) => { drainTimer = setTimeout(resolve, SHUTDOWN_DRAIN_MS); }),
+  ]);
+  clearTimeout(drainTimer);
   if (keepAliveWindow && !keepAliveWindow.isDestroyed()) {
     try {
       keepAliveWindow.destroy();
@@ -1627,4 +2030,36 @@ async function shutdown() {
   }
   keepAliveWindow = null;
   if (app.isReady()) app.quit();
+}
+
+// Test seam. Electron runs this file as its main script, where nothing is
+// exported; a test harness that loads it as a module gets the internals it
+// exercises directly instead of slicing this file's text.
+if (require.main !== module) {
+  module.exports = {
+    TABS,
+    ACTIVE_DOWNLOADS,
+    RESERVED_DOWNLOAD_PATHS,
+    enqueueRequest,
+    handleCancel,
+    handleLine,
+    execute,
+    failFastHost,
+    openTab,
+    uploadTab,
+    closeTab,
+    createTab,
+    handleWillDownload,
+    secureBrowserSession,
+    attachWindowSecurity,
+    loadUrl,
+    captureViewport,
+    captureFullPage,
+    readVisibleText,
+    readInteractiveElements,
+    sanitizeElements,
+    readUploadFile,
+    uniqueDownloadPath,
+    safeFilename,
+  };
 }

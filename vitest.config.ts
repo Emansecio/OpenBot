@@ -19,8 +19,8 @@ export default defineConfig({
     include: ["test/**/*.test.ts"],
     maxConcurrency: 2,
     maxWorkers: 10,
-    // Cobertura do escopo T1/T2: contratos e smoke. Testes de integração
-    // HTTP (T3+) entram no mesmo diretório test/.
+    // Live/Windows gates are excluded by the npm scripts (see
+    // docs/verification-gates.md), not here.
     testTimeout: 15000,
     hookTimeout: 15000,
   },

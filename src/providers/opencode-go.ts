@@ -4,13 +4,14 @@ import { providerToolResultContent } from "./tool-calls.js";
 import type { ProviderAdapter, ProviderChatMessage, ProviderChatRequest, ProviderStreamEvent } from "./router.js";
 import {
   ApiError,
-  findSseFrameBoundary,
   normalizeOpenAiError,
   normalizeToolCallArguments,
   openAiStreamErrorStatus,
-  providerTimeoutError,
+  providerHttpError,
   raceWithAbort,
-  splitSseLines,
+  readSseFrames,
+  sseFrameData,
+  startProviderDeadline,
 } from "./openai-helpers.js";
 import { OpenAiAdapter } from "./openai.js";
 import {
@@ -26,6 +27,8 @@ export type { OpenCodeGoProtocol } from "./opencode-go-models.js";
 export const OPENCODE_GO_PROVIDER_NAME = "opencode-go" as const;
 export const OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1" as const;
 export const OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen/v1" as const;
+/** Model listing is a settings action; a hung endpoint must not block it. */
+const DISCOVERY_TIMEOUT_MS = 15_000;
 
 export interface OpenCodeGoAdapterOptions {
   apiKey?: string;
@@ -155,7 +158,9 @@ export class OpenCodeGoAdapter implements ProviderAdapter {
     throw new ApiError("chave de API do OpenCode Go não configurada", 401);
   }
 
-  async discoverModels(signal?: AbortSignal): Promise<string[]> {
+  async discoverModels(callerSignal?: AbortSignal): Promise<string[]> {
+    const timeout = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
+    const signal = callerSignal === undefined ? timeout : AbortSignal.any([callerSignal, timeout]);
     const list = async (baseUrl: string): Promise<string[]> => {
       const response = await this.fetchImpl(`${baseUrl}/models`, {
         method: "GET",
@@ -220,33 +225,16 @@ export class OpenCodeGoAdapter implements ProviderAdapter {
   }
 
   private async streamAnthropic(req: ProviderChatRequest, emit: (event: ProviderStreamEvent) => void, baseUrl = this.baseUrl): Promise<void> {
-    const controller = new AbortController();
-    const onAbort = () => controller.abort(req.signal?.reason);
-    req.signal?.addEventListener("abort", onAbort, { once: true });
-    if (req.signal?.aborted) onAbort();
-    let timeoutError: ReturnType<typeof providerTimeoutError> | undefined;
-    let idleTimer: ReturnType<typeof setTimeout> | undefined;
-    const resetIdleTimer = (): void => {
-      if (idleTimer !== undefined) clearTimeout(idleTimer);
-      if (controller.signal.aborted) return;
-      idleTimer = setTimeout(() => {
-        if (controller.signal.aborted) return;
-        timeoutError = providerTimeoutError(this.timeoutMs);
-        controller.abort(timeoutError);
-      }, this.timeoutMs);
-    };
-    resetIdleTimer();
-    const maxDurationTimer = setTimeout(() => {
-      if (controller.signal.aborted) return;
-      timeoutError = providerTimeoutError(this.maxDurationMs);
-      controller.abort(timeoutError);
-    }, this.maxDurationMs);
+    const deadline = startProviderDeadline(req.signal, this.timeoutMs, this.maxDurationMs);
+    const signal = deadline.signal;
+    let response: Response | undefined;
+    let succeeded = false;
     try {
-      const key = await raceWithAbort(this.resolveCredential(), controller.signal);
+      const key = await raceWithAbort(this.resolveCredential(), signal);
       const body = this.serializeRequest(req);
-      controller.signal.throwIfAborted();
+      signal.throwIfAborted();
       req.onTransportStart?.("messages");
-      const response = await raceWithAbort(this.fetchImpl(`${baseUrl}/messages`, {
+      response = await raceWithAbort(this.fetchImpl(`${baseUrl}/messages`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -259,19 +247,24 @@ export class OpenCodeGoAdapter implements ProviderAdapter {
           ...(req.sessionId ? { "x-opencode-session": req.sessionId } : {}),
         },
         body,
-        signal: controller.signal,
-      }), controller.signal);
-      resetIdleTimer();
-      if (!response.ok) throw new ApiError(`opencode-go: HTTP ${response.status}`, response.status);
+        signal,
+      }), signal);
+      deadline.resetIdle();
+      // The provider's message (e.g. a context-window error) must reach the
+      // retry logic and the user, and a 429 keeps its Retry-After.
+      if (!response.ok) throw await providerHttpError("opencode-go", response, signal, deadline.resetIdle);
       if (!response.body) throw new ApiError("opencode-go: resposta sem corpo", 502);
-      await this.readAnthropicStream(response.body, emit, controller.signal, resetIdleTimer);
+      await this.readAnthropicStream(response.body, emit, signal, deadline.resetIdle);
+      succeeded = true;
     } catch (error) {
-      if (timeoutError) throw timeoutError;
+      if (deadline.timeoutError) throw deadline.timeoutError;
       throw error instanceof ApiError ? error : normalizeOpenAiError(error);
     } finally {
-      if (idleTimer !== undefined) clearTimeout(idleTimer);
-      clearTimeout(maxDurationTimer);
-      req.signal?.removeEventListener("abort", onAbort);
+      deadline.dispose();
+      const responseBody = response?.body;
+      if (!succeeded && responseBody !== undefined && responseBody !== null && !responseBody.locked) {
+        await responseBody.cancel().catch(() => undefined);
+      }
     }
   }
 
@@ -281,10 +274,7 @@ export class OpenCodeGoAdapter implements ProviderAdapter {
     signal: AbortSignal,
     onActivity: () => void,
   ): Promise<void> {
-    const reader = body.getReader();
-    const decoder = new TextDecoder();
     const tools = new Map<number, { id: string; name: string; arguments: string; streaming: boolean; stopped: boolean }>();
-    let buffer = "";
     let completed = false;
     let stopReason: string | undefined;
     let stopPayload: unknown;
@@ -297,8 +287,7 @@ export class OpenCodeGoAdapter implements ProviderAdapter {
     };
 
     const dispatch = (frame: string): void => {
-      const data = splitSseLines(frame).filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).replace(/^ /, "")).join("\n");
+      const data = sseFrameData(frame);
       if (!data) return;
       let parsed: unknown;
       try { parsed = JSON.parse(data); } catch { throw new ApiError("opencode-go: frame Anthropic inválido", 502); }
@@ -344,27 +333,11 @@ export class OpenCodeGoAdapter implements ProviderAdapter {
         completed = true;
       }
     };
-    try {
-      while (!completed) {
-        const { done, value } = await raceWithAbort(reader.read(), signal);
-        if (done) break;
-        onActivity();
-        buffer += decoder.decode(value, { stream: true });
-        let boundary = findSseFrameBoundary(buffer);
-        while (boundary && !completed) {
-          const frame = buffer.slice(0, boundary.index);
-          buffer = buffer.slice(boundary.index + boundary.length);
-          if (Buffer.byteLength(frame, "utf8") > 1_048_576) throw new ApiError("opencode-go: frame SSE excedeu 1 MiB", 502);
-          dispatch(frame);
-          boundary = findSseFrameBoundary(buffer);
-        }
-        if (!completed && Buffer.byteLength(buffer, "utf8") > 1_048_576) throw new ApiError("opencode-go: buffer SSE residual excedeu 1 MiB", 502);
-      }
-      if (!completed) throw new ApiError("opencode-go: stream terminou antes de message_stop", 502);
-    } finally {
-      await reader.cancel().catch(() => undefined);
-      reader.releaseLock();
-    }
+    const terminated = await readSseFrames(body, signal, onActivity, "opencode-go", (frame) => {
+      dispatch(frame);
+      return completed;
+    });
+    if (!terminated) throw new ApiError("opencode-go: stream terminou antes de message_stop", 502);
     const disposition = stopDisposition(stopReason);
     if (disposition === "incomplete" || disposition === "unknown") {
       throw new ApiError(`opencode-go: geração interrompida (${stopReason})`, disposition === "incomplete" ? 400 : 502, stopPayload, { code: stopReason });

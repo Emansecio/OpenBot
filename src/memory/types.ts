@@ -286,20 +286,15 @@ export interface MemoryStore {
   getSettings(agentId: string): MemorySettings;
   setSettings(agentId: string, mode: MemoryMode): MemorySettings;
   getMemory(agentId: string, memoryId: string): Memory | null;
-  get(agentId: string, memoryId: string): Memory | null;
   /** Direct lookup by the active unique key (expects an already-normalized key). Optional so external stores keep working. */
   getMemoryByCanonicalKey?(agentId: string, canonicalKey: string): Memory | null;
   upsertMemory(input: MemoryUpsertInput & { agentId: string; authority: MemoryMutationAuthority }): Memory;
   upsertMemory(agentId: string, input: MemoryUpsertInput, authority: MemoryMutationAuthority): Memory;
-  upsert(input: MemoryUpsertInput & { agentId: string; authority: MemoryMutationAuthority }): Memory;
-  upsert(agentId: string, input: MemoryUpsertInput, authority: MemoryMutationAuthority): Memory;
   supersedeMemory(agentId: string, memoryId: string, authority: MemoryMutationAuthority, replacement?: MemoryUpsertInput, reason?: string): Memory;
   forgetMemory(agentId: string, memoryId: string, authority: MemoryMutationAuthority, reason?: string): Memory;
   listMemories(agentId: string, options?: MemoryListOptions): readonly Memory[];
   listMemoriesPage(agentId: string, options?: MemoryPageOptions): MemoryPage;
-  list(agentId: string, options?: MemoryListOptions): readonly Memory[];
   searchMemories(agentId: string, query: string, options?: MemorySearchOptions): readonly MemorySearchResult[];
-  search(agentId: string, query: string, options?: MemorySearchOptions): readonly MemorySearchResult[];
   getSummary(agentId: string, conversationId: string, automatic?: boolean): ConversationSummary | null;
   getForgottenSourceIds(agentId: string, conversationId: string): ReadonlySet<string>;
   hasForgottenContextSources(agentId: string, sources: readonly MemoryContextSource[]): boolean;
@@ -326,6 +321,8 @@ export interface MemoryStore {
    */
   deferJob(agentId: string, jobId: string, fromSequenceId: number, nowMs?: number): MemoryJob | null;
   retryJob(agentId: string, jobId: string, error?: MemoryJobError, nowMs?: number, policy?: MemoryJobRetryPolicy): MemoryJob | null;
+  /** Hands a claimed job back without spending the attempt (worker shutdown). */
+  releaseJob(agentId: string, jobId: string, nowMs?: number): MemoryJob | null;
   deadJob(agentId: string, jobId: string, error?: MemoryJobError, nowMs?: number): MemoryJob | null;
   cancelConversationJobs(agentId: string, conversationId: string, error?: MemoryJobError, nowMs?: number): number;
   listJobs(agentId: string, options?: { status?: MemoryJobStatus | readonly MemoryJobStatus[]; limit?: number }): readonly MemoryJob[];

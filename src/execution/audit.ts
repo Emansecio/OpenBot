@@ -1,6 +1,5 @@
 /**
- * Audit-before-act por bot (melhoria 2 do spec
- * 2026-08-21-workspace-quality-improvements-design.md).
+ * Audit-before-act por bot.
  *
  * JSONL append-only em `<home>/.openbot/audit/audit-<UTC-date>.jsonl`. A
  * entrada de decisão é gravada ANTES da execução; a de resultado depois.
@@ -39,6 +38,8 @@ export class HomeAuditLogger {
   private readonly directory: string;
   /** Number of entries dropped due to write failures (observability). */
   failedWrites = 0;
+  /** The directory is created once; a failed write retries the creation. */
+  private directoryReady = false;
 
   constructor(
     homeRoot: string,
@@ -51,9 +52,13 @@ export class HomeAuditLogger {
     const line = `${JSON.stringify({ ts: now.toISOString(), agentId: this.agentId, ...entry })}\n`;
     const file = join(this.directory, `audit-${auditDate(now)}.jsonl`);
     try {
-      await mkdir(this.directory, { recursive: true });
+      if (!this.directoryReady) {
+        await mkdir(this.directory, { recursive: true });
+        this.directoryReady = true;
+      }
       await appendFile(file, line, { encoding: "utf8", mode: 0o600 });
     } catch {
+      this.directoryReady = false;
       this.failedWrites += 1;
     }
   }

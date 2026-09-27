@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, opendir, open, rename, rm } from "node:fs/promises";
+import { link, lstat, mkdir, opendir, open, rename, rm, unlink } from "node:fs/promises";
 import { win32 as path } from "node:path";
 
 const MAX_TREE_ENTRIES = 100_000;
@@ -110,10 +110,11 @@ export async function copySafeTreeAtomic(
     await copySafeTree(source, temporary, signal);
     const copied = await inspectSafeTree(temporary, signal);
     if (copied.bytes > summary.bytes || copied.files > summary.files || copied.entries > summary.entries) {
-      throw new SafeTreeError("output_limit", "Directory exceeds the entry limit.");
+      throw new SafeTreeError("output_limit", "The source grew while it was being copied; try again.");
     }
     abortIfRequested(signal);
-    await rename(temporary, destination);
+    if (copied.kind === "file") await moveFileNoReplace(temporary, destination);
+    else await rename(temporary, destination);
     return copied;
   } catch (error) {
     await rm(temporary, { recursive: true, force: true }).catch(() => undefined);
@@ -142,6 +143,31 @@ export async function copySafeTree(source: string, destination: string, signal?:
   }
 }
 
+/**
+ * Moves a file without replacing one created at the destination since its
+ * absence was checked: on Windows, rename silently overwrites a file. A hard
+ * link fails with EEXIST instead. Volumes without hard links fall back to a
+ * last absence check and rename.
+ */
+async function moveFileNoReplace(source: string, destination: string): Promise<void> {
+  try {
+    await link(source, destination);
+  } catch (error) {
+    const code = fsCode(error);
+    if (code === "EEXIST") throw new SafeTreeError("invalid_path", "File path is invalid.");
+    if (code !== "EPERM" && code !== "ENOTSUP" && code !== "ENOSYS") throw error;
+    await assertPathAbsent(destination);
+    await rename(source, destination);
+    return;
+  }
+  try {
+    await unlink(source);
+  } catch (error) {
+    await unlink(destination).catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function assertPathAbsent(destination: string): Promise<void> {
   const existing = await lstat(destination).catch((error: unknown) => {
     if (fsCode(error) === "ENOENT") return null;
@@ -157,7 +183,8 @@ export async function renameOrCopy(
 ): Promise<void> {
   abortIfRequested(signal);
   try {
-    await rename(source, destination);
+    if ((await lstat(source)).isFile()) await moveFileNoReplace(source, destination);
+    else await rename(source, destination);
   } catch (error) {
     if (fsCode(error) !== "EXDEV") throw error;
     await copySafeTreeAtomic(source, destination, signal);

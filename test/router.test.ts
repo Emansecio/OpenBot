@@ -132,6 +132,18 @@ describe("T5 router — acumulador de deltas → mensagem completa", () => {
     expect(acc.text).toBe("ab");
     expect(acc.toolCallCount).toBe(1);
   });
+
+  it("DeltaAccumulator descarta só o reenvio idêntico de uma tool call na mesma resposta", () => {
+    const acc = new DeltaAccumulator();
+    const call = { id: "c1", type: "function" as const, function: { name: "sh", arguments: "{\"a\":1}" } };
+    expect(acc.addToolCall(call)).toBe(true);
+    expect(acc.addToolCall({ ...call, function: { ...call.function } })).toBe(false);
+    expect(acc.addToolCall({ ...call, function: { name: "sh", arguments: "{\"a\":2}" } })).toBe(true);
+    const anonymous = { id: "", type: "function" as const, function: { name: "sh", arguments: "{}" } };
+    expect(acc.addToolCall(anonymous)).toBe(true);
+    expect(acc.addToolCall(anonymous)).toBe(true);
+    expect(acc.toolCallCount).toBe(4);
+  });
 });
 
 describe("T5 router — done/error emitidos corretamente", () => {
@@ -464,5 +476,14 @@ describe("T5 router — contrato do pedido repassado ao adapter", () => {
     expect(events.map((event) => event.type)).toEqual(["delta", "error"]);
     expect(fake.invocations[0]?.aborted).toBe(true);
     expect(fake.invocations[0]?.req.signal?.aborted).toBe(true);
+  });
+});
+
+describe("provider timeout classification", () => {
+  it("classifies a provider timeout as a retryable network error", () => {
+    const err = Object.assign(new Error("provider request timed out"), { name: "AbortError", code: "ETIMEDOUT" });
+    const classified = classifyProviderError(err);
+    expect(classified.kind).toBe("network");
+    expect(classified.retryable).toBe(true);
   });
 });

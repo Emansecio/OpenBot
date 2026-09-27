@@ -116,6 +116,35 @@ describe("LocalFileExecutor", () => {
     expect(raced).toBe(true);
   });
 
+  it("lê por inteiro um arquivo que cresceu entre o stat e a leitura, dimensionando o buffer pelo tamanho", async () => {
+    const root = await temp();
+    const target = path.join(root, "growing.txt");
+    await writeFile(target, "abc");
+    const executor = await LocalFileExecutor.create(root);
+    const probe = await open(target, "r");
+    const fileHandlePrototype = Object.getPrototypeOf(probe) as typeof probe;
+    await probe.close();
+    const originalStat = fileHandlePrototype.stat;
+    let stats = 0;
+    const stat = vi.spyOn(fileHandlePrototype, "stat").mockImplementation(async function (this: typeof probe, ...args: unknown[]) {
+      const result = await (originalStat as (...values: unknown[]) => ReturnType<typeof probe.stat>).apply(this, args);
+      // The second stat is the size the read buffer is planned from.
+      if (++stats === 2) await writeFile(target, "abc" + "x".repeat(200));
+      return result;
+    } as typeof fileHandlePrototype.stat);
+    const allocate = vi.spyOn(Buffer, "allocUnsafe");
+    try {
+      const result = await executor.execute({ operation: "file.read", path: "growing.txt", encoding: "utf8" });
+      expect(result).toMatchObject({ ok: true, content: "abc" + "x".repeat(200), bytes: 203 });
+      const sizes = allocate.mock.calls.map(([size]) => Number(size));
+      expect(sizes[0]).toBe(4);
+      expect(Math.max(...sizes)).toBeLessThan(MAX_FILE_BYTES);
+    } finally {
+      stat.mockRestore();
+      allocate.mockRestore();
+    }
+  });
+
   it("aplica limite de leitura sem alocar o arquivo completo", async () => {
     const root = await temp();
     const largeFile = path.join(root, "large.bin");
@@ -274,16 +303,33 @@ describe("LocalFileExecutor", () => {
     await expect(readFile(path.join(root, "restored.txt"), "utf8")).resolves.toBe("original");
   });
 
-  it("reserva também a estrutura interna antes de mover para a lixeira", async () => {
+  it("move para a lixeira mesmo quando criar a estrutura interna passaria do limite de entradas", async () => {
     const root = await temp();
     const workspace = await WorkspaceSandbox.create(root);
-    const quota = new WorkspaceQuota(workspace, { maxBytes: 1024, maxFiles: 10, maxEntries: 4 });
+    const quota = new WorkspaceQuota(workspace, { maxBytes: 1024, maxFiles: 10, maxEntries: 1 });
     const executor = LocalFileExecutor.fromWorkspace(workspace, quota);
     await expect(executor.execute({ operation: "file.write", path: "item.txt", content: "x", encoding: "utf8" }))
       .resolves.toMatchObject({ ok: true });
     await expect(executor.execute({ operation: "file.trash", path: "item.txt" }))
+      .resolves.toMatchObject({ ok: true });
+    await expect(readdir(root)).resolves.toEqual([".openbot"]);
+  });
+
+  it("deixa um bot acima da quota liberar espaço: lixeira e sobrescrita menor passam, crescimento não", async () => {
+    const root = await temp();
+    const workspace = await WorkspaceSandbox.create(root);
+    const quota = new WorkspaceQuota(workspace, { maxBytes: 64, maxFiles: 10, maxEntries: 10 });
+    const executor = LocalFileExecutor.fromWorkspace(workspace, quota);
+    await writeFile(path.join(root, "big.txt"), "x".repeat(60));
+    await writeFile(path.join(root, "other.txt"), "y".repeat(40));
+    await quota.refreshUsage();
+    await expect(executor.execute({ operation: "file.write", path: "new.txt", content: "z", encoding: "utf8" }))
       .resolves.toMatchObject({ ok: false, code: "quota_exceeded" });
-    await expect(readFile(path.join(root, "item.txt"), "utf8")).resolves.toBe("x");
-    await expect(readdir(root)).resolves.toEqual(["item.txt"]);
+    await expect(executor.execute({ operation: "file.write", path: "other.txt", content: "small", encoding: "utf8" }))
+      .resolves.toMatchObject({ ok: true });
+    await expect(executor.execute({ operation: "file.trash", path: "big.txt" }))
+      .resolves.toMatchObject({ ok: true });
+    await expect(executor.execute({ operation: "file.write", path: "new.txt", content: "z", encoding: "utf8" }))
+      .resolves.toMatchObject({ ok: true });
   });
 });

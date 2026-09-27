@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 
-import { migrateOpenBotSchema } from "../store/schema.js";
+import { ensureOpenBotSchema } from "../store/schema.js";
 import {
   A2A_MAX_BYTES_PER_PARENT_TURN,
   A2A_MAX_DELIVERY_ATTEMPTS,
@@ -136,6 +136,45 @@ function messageComparable(message: A2AMessageRecord): string {
   });
 }
 
+/** Delivery state kept next to the validated envelope of a message. */
+interface MessageState {
+  version: number;
+  status: A2AMessageRecord["status"];
+  attempt: number;
+  ackNonce: string | null;
+  terminalReason: string | null;
+  leaseOwner: string | null;
+  leaseExpiresAtMs: number | null;
+}
+
+/** One record shape for rows and persisted projections (key order is part of the stored JSON). */
+function messageRecord(parsed: ReturnType<typeof parseA2AEnvelope>, state: MessageState): A2AMessageRecord {
+  return {
+    messageId: parsed.messageId,
+    senderAgentId: parsed.senderAgentId,
+    senderIncarnation: parsed.senderIncarnation,
+    recipientAgentId: parsed.recipientAgentId,
+    recipientIncarnation: parsed.recipientIncarnation,
+    nonce: parsed.nonce,
+    parentTaskId: parsed.parentTaskId,
+    parentTurnId: parsed.parentTurnId,
+    priority: parsed.priority,
+    hopCount: parsed.hopCount,
+    payload: parsed.payload,
+    createdAtMs: parsed.createdAtMs,
+    availableAtMs: parsed.availableAtMs,
+    expiresAtMs: parsed.expiresAtMs,
+    version: state.version,
+    status: state.status,
+    attempt: state.attempt,
+    ackNonce: state.ackNonce,
+    ...(state.ackNonce === null ? {} : { ack: { ackNonce: state.ackNonce } }),
+    terminalReason: state.terminalReason,
+    leaseOwner: state.leaseOwner,
+    leaseExpiresAtMs: state.leaseExpiresAtMs,
+  };
+}
+
 function parseProjectionRecord(value: unknown): A2AMessageRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("a2a: invalid persisted projection payload");
   const source = value as Record<string, unknown>;
@@ -167,30 +206,15 @@ function parseProjectionRecord(value: unknown): A2AMessageRecord {
   const leaseExpiresAtMs = source.leaseExpiresAtMs === null || (Number.isSafeInteger(source.leaseExpiresAtMs) && (source.leaseExpiresAtMs as number) >= 0)
     ? source.leaseExpiresAtMs as number | null
     : null;
-  return {
-    messageId: parsed.messageId,
-    senderAgentId: parsed.senderAgentId,
-    senderIncarnation: parsed.senderIncarnation,
-    recipientAgentId: parsed.recipientAgentId,
-    recipientIncarnation: parsed.recipientIncarnation,
-    nonce: parsed.nonce,
-    parentTaskId: parsed.parentTaskId,
-    parentTurnId: parsed.parentTurnId,
-    priority: parsed.priority,
-    hopCount: parsed.hopCount,
-    payload: parsed.payload,
-    createdAtMs: parsed.createdAtMs,
-    availableAtMs: parsed.availableAtMs,
-    expiresAtMs: parsed.expiresAtMs,
+  return messageRecord(parsed, {
     version: parsed.versionNumber,
     status: parsed.status,
     attempt: parsed.attempt,
     ackNonce: parsed.ackNonce ?? null,
-    ...(parsed.ackNonce === undefined || parsed.ackNonce === null ? {} : { ack: { ackNonce: parsed.ackNonce } }),
     terminalReason,
     leaseOwner,
     leaseExpiresAtMs,
-  };
+  });
 }
 
 export class A2AStore {
@@ -211,7 +235,7 @@ export class A2AStore {
       this.db.pragma("synchronous = NORMAL");
       this.db.pragma("busy_timeout = 5000");
     }
-    migrateOpenBotSchema(this.db);
+    ensureOpenBotSchema(this.db);
     this.now = options.now ?? (() => Date.now());
     this.sensitiveValues = options.sensitiveValues ?? (() => []);
     this.limits = {
@@ -248,30 +272,15 @@ export class A2AStore {
       availableAtMs: row.available_at_ms,
       expiresAtMs: row.expires_at_ms,
     });
-    return {
-      messageId: parsed.messageId,
-      senderAgentId: parsed.senderAgentId,
-      senderIncarnation: parsed.senderIncarnation,
-      recipientAgentId: parsed.recipientAgentId,
-      recipientIncarnation: parsed.recipientIncarnation,
-      nonce: parsed.nonce,
-      parentTaskId: parsed.parentTaskId,
-      parentTurnId: parsed.parentTurnId,
-      priority: parsed.priority,
-      hopCount: parsed.hopCount,
-      payload: parsed.payload,
-      createdAtMs: parsed.createdAtMs,
-      availableAtMs: parsed.availableAtMs,
-      expiresAtMs: parsed.expiresAtMs,
+    return messageRecord(parsed, {
       version: row.version,
       status: row.status,
       attempt: row.attempt,
       ackNonce: row.ack_nonce,
-      ...(row.ack_nonce === null ? {} : { ack: { ackNonce: row.ack_nonce } }),
       terminalReason: row.terminal_reason,
       leaseOwner: row.lease_owner,
       leaseExpiresAtMs: row.lease_expires_at_ms,
-    };
+    });
   }
 
   private appendTransition(messageId: string, eventKind: string, createdAtMs = nowValue(this.now)): void {
@@ -307,11 +316,24 @@ export class A2AStore {
       )`).run(deliveredAtMs, agentId, incarnation);
   }
 
+  private activeIncarnation(agentId: string): string | undefined {
+    return (this.db.prepare("SELECT incarnation FROM a2a_agent_incarnations WHERE agent_id = ? AND status = 'active'").get(agentId) as { incarnation: string } | undefined)?.incarnation;
+  }
+
+  /** Retire one incarnation and cancel its pending traffic; runs inside the caller's transaction. */
+  private retireIncarnation(agentId: string, incarnation: string, now: number): void {
+    this.db.prepare("UPDATE a2a_agent_incarnations SET status = 'retired', retired_at_ms = ? WHERE agent_id = ? AND incarnation = ?").run(now, agentId, incarnation);
+    const affected = this.db.prepare("SELECT message_id FROM a2a_messages WHERE (recipient_agent_id = ? AND recipient_incarnation = ? OR sender_agent_id = ? AND sender_incarnation = ?) AND status IN ('queued', 'delivering')").all(agentId, incarnation, agentId, incarnation) as Array<{ message_id: string }>;
+    this.db.prepare("UPDATE a2a_messages SET status = 'cancelled', version = version + 1, terminal_reason = 'agent-retired', lease_owner = NULL, lease_expires_at_ms = NULL WHERE (recipient_agent_id = ? AND recipient_incarnation = ? OR sender_agent_id = ? AND sender_incarnation = ?) AND status IN ('queued', 'delivering')").run(agentId, incarnation, agentId, incarnation);
+    for (const message of affected) this.appendTransition(message.message_id, "cancelled", now);
+    this.settleRetiredRecipientProjections(agentId, incarnation, now);
+  }
+
   ensureAgentIncarnation(agentId: string): string {
     this.assertOpen();
     const ensure = this.db.transaction(() => {
-      const current = this.db.prepare("SELECT incarnation FROM a2a_agent_incarnations WHERE agent_id = ? AND status = 'active'").get(agentId) as { incarnation: string } | undefined;
-      if (current !== undefined) return current.incarnation;
+      const current = this.activeIncarnation(agentId);
+      if (current !== undefined) return current;
       const recreating = this.db.prepare("SELECT 1 FROM a2a_agent_incarnations WHERE agent_id = ? AND status = 'retired' LIMIT 1").get(agentId) !== undefined;
       const incarnation = randomUUID();
       const now = nowValue(this.now);
@@ -331,13 +353,8 @@ export class A2AStore {
       const rows = this.db.prepare("SELECT agent_id FROM a2a_agent_incarnations WHERE status = 'active'").all() as Array<{ agent_id: string }>;
       const now = nowValue(this.now);
       for (const row of rows) if (!active.has(row.agent_id)) {
-        const incarnation = this.db.prepare("SELECT incarnation FROM a2a_agent_incarnations WHERE agent_id = ? AND status = 'active'").get(row.agent_id) as { incarnation: string } | undefined;
-        if (incarnation === undefined) continue;
-        this.db.prepare("UPDATE a2a_agent_incarnations SET status = 'retired', retired_at_ms = ? WHERE agent_id = ? AND incarnation = ?").run(now, row.agent_id, incarnation.incarnation);
-        const affected = this.db.prepare("SELECT message_id FROM a2a_messages WHERE (recipient_agent_id = ? AND recipient_incarnation = ? OR sender_agent_id = ? AND sender_incarnation = ?) AND status IN ('queued', 'delivering')").all(row.agent_id, incarnation.incarnation, row.agent_id, incarnation.incarnation) as Array<{ message_id: string }>;
-        this.db.prepare("UPDATE a2a_messages SET status = 'cancelled', version = version + 1, terminal_reason = 'agent-retired', lease_owner = NULL, lease_expires_at_ms = NULL WHERE (recipient_agent_id = ? AND recipient_incarnation = ? OR sender_agent_id = ? AND sender_incarnation = ?) AND status IN ('queued', 'delivering')").run(row.agent_id, incarnation.incarnation, row.agent_id, incarnation.incarnation);
-        for (const message of affected) this.appendTransition(message.message_id, "cancelled", now);
-        this.settleRetiredRecipientProjections(row.agent_id, incarnation.incarnation, now);
+        const incarnation = this.activeIncarnation(row.agent_id);
+        if (incarnation !== undefined) this.retireIncarnation(row.agent_id, incarnation, now);
       }
       for (const agentId of active) this.ensureAgentIncarnation(agentId);
     }).immediate();
@@ -353,28 +370,84 @@ export class A2AStore {
     this.db.prepare("DELETE FROM a2a_agent_fences WHERE agent_id = ?").run(agentId);
   }
 
+  isAgentFenced(agentId: string): boolean {
+    this.assertOpen();
+    return this.db.prepare("SELECT 1 FROM a2a_agent_fences WHERE agent_id = ?").get(agentId) !== undefined;
+  }
+
   retireAgent(agentId: string): void {
     this.assertOpen();
     const retire = this.db.transaction(() => {
-      const now = nowValue(this.now);
-      const active = this.db.prepare("SELECT incarnation FROM a2a_agent_incarnations WHERE agent_id = ? AND status = 'active'").get(agentId) as { incarnation: string } | undefined;
-      if (active === undefined) return;
-      this.db.prepare("UPDATE a2a_agent_incarnations SET status = 'retired', retired_at_ms = ? WHERE agent_id = ? AND incarnation = ?").run(now, agentId, active.incarnation);
-      const affected = this.db.prepare("SELECT message_id FROM a2a_messages WHERE (recipient_agent_id = ? AND recipient_incarnation = ? OR sender_agent_id = ? AND sender_incarnation = ?) AND status IN ('queued', 'delivering')").all(agentId, active.incarnation, agentId, active.incarnation) as Array<{ message_id: string }>;
-      this.db.prepare("UPDATE a2a_messages SET status = 'cancelled', version = version + 1, terminal_reason = 'agent-retired', lease_owner = NULL, lease_expires_at_ms = NULL WHERE (recipient_agent_id = ? AND recipient_incarnation = ? OR sender_agent_id = ? AND sender_incarnation = ?) AND status IN ('queued', 'delivering')").run(agentId, active.incarnation, agentId, active.incarnation);
-      for (const message of affected) this.appendTransition(message.message_id, "cancelled", now);
-      this.settleRetiredRecipientProjections(agentId, active.incarnation, now);
+      const active = this.activeIncarnation(agentId);
+      if (active !== undefined) this.retireIncarnation(agentId, active, nowValue(this.now));
     });
     retire.immediate();
+  }
+
+  /**
+   * Delete every A2A row of a deleted agent - as sender or recipient - with
+   * their outbox and projection rows, usage counters, incarnations, fence and
+   * projection state. Pending traffic is cancelled first.
+   */
+  purgeAgent(agentId: string): void {
+    this.assertOpen();
+    const purge = this.db.transaction(() => {
+      const active = this.activeIncarnation(agentId);
+      if (active !== undefined) this.retireIncarnation(agentId, active, nowValue(this.now));
+      const involving = "SELECT message_id FROM a2a_messages WHERE sender_agent_id = ? OR recipient_agent_id = ?";
+      this.db.prepare("DELETE FROM a2a_projection_outbox WHERE agent_id = ? OR message_id IN (" + involving + ")").run(agentId, agentId, agentId);
+      this.db.prepare("DELETE FROM a2a_outbox WHERE message_id IN (" + involving + ")").run(agentId, agentId);
+      this.db.prepare("DELETE FROM a2a_messages WHERE sender_agent_id = ? OR recipient_agent_id = ?").run(agentId, agentId);
+      this.db.prepare("DELETE FROM a2a_parent_usage WHERE sender_agent_id = ?").run(agentId);
+      this.db.prepare("DELETE FROM a2a_projection_state WHERE agent_id = ?").run(agentId);
+      this.db.prepare("DELETE FROM a2a_agent_incarnations WHERE agent_id = ?").run(agentId);
+      this.db.prepare("DELETE FROM a2a_agent_fences WHERE agent_id = ?").run(agentId);
+    });
+    purge.immediate();
+  }
+
+  /**
+   * Drop history older than `beforeMs`: finished messages with their outbox
+   * and projection rows, delivered outbox rows, usage counters without any
+   * remaining message, and retired incarnations of agents that are active
+   * again. Queued and in-flight traffic is never touched. Returns the number
+   * of messages removed.
+   */
+  pruneHistory(beforeMs: number): number {
+    this.assertOpen();
+    const prune = this.db.transaction(() => {
+      const finished = "SELECT message_id FROM a2a_messages WHERE status IN ('acked', 'rejected', 'dead', 'cancelled') AND COALESCE(ack_at_ms, created_at_ms) < ?";
+      this.db.prepare("DELETE FROM a2a_projection_outbox WHERE message_id IN (" + finished + ") OR (delivered_at_ms IS NOT NULL AND delivered_at_ms < ?)").run(beforeMs, beforeMs);
+      this.db.prepare("DELETE FROM a2a_outbox WHERE message_id IN (" + finished + ") OR (delivered_at_ms IS NOT NULL AND delivered_at_ms < ?)").run(beforeMs, beforeMs);
+      const removed = this.db.prepare("DELETE FROM a2a_messages WHERE status IN ('acked', 'rejected', 'dead', 'cancelled') AND COALESCE(ack_at_ms, created_at_ms) < ?").run(beforeMs).changes;
+      this.db.prepare("DELETE FROM a2a_parent_usage WHERE NOT EXISTS ("
+        + " SELECT 1 FROM a2a_messages AS message"
+        + " WHERE message.sender_agent_id = a2a_parent_usage.sender_agent_id"
+        + " AND message.sender_incarnation = a2a_parent_usage.sender_incarnation"
+        + " AND message.parent_turn_id = a2a_parent_usage.parent_turn_id)").run();
+      this.db.prepare("DELETE FROM a2a_agent_incarnations"
+        + " WHERE status = 'retired' AND retired_at_ms < ?"
+        + " AND EXISTS (SELECT 1 FROM a2a_agent_incarnations AS active WHERE active.agent_id = a2a_agent_incarnations.agent_id AND active.status = 'active')").run(beforeMs);
+      return removed;
+    });
+    return prune.immediate();
+  }
+
+  /** Whether any message still waits for delivery or is being delivered. */
+  hasActiveMessages(): boolean {
+    this.assertOpen();
+    return this.db.prepare("SELECT 1 FROM a2a_messages WHERE status IN ('queued', 'delivering') LIMIT 1").get() !== undefined;
   }
 
   send(input: A2ASendInput, options: { expectedRecipientIncarnation?: string } = {}): A2ASendResult {
     this.assertOpen();
     const parsed = parseA2ASendInput(input);
     const send = this.db.transaction(() => {
-      const sender = this.db.prepare("SELECT incarnation FROM a2a_agent_incarnations WHERE agent_id = ? AND status = 'active'").get(parsed.senderAgentId) as { incarnation: string } | undefined;
-      const recipient = this.db.prepare("SELECT incarnation FROM a2a_agent_incarnations WHERE agent_id = ? AND status = 'active'").get(parsed.recipientAgentId) as { incarnation: string } | undefined;
-      if (sender === undefined || recipient === undefined) throw new Error("a2a: sender or recipient is not active");
+      const senderIncarnation = this.activeIncarnation(parsed.senderAgentId);
+      const recipientIncarnation = this.activeIncarnation(parsed.recipientAgentId);
+      if (senderIncarnation === undefined || recipientIncarnation === undefined) throw new Error("a2a: sender or recipient is not active");
+      const sender = { incarnation: senderIncarnation };
+      const recipient = { incarnation: recipientIncarnation };
       if (options.expectedRecipientIncarnation !== undefined && options.expectedRecipientIncarnation !== recipient.incarnation) throw new Error("a2a: recipient incarnation mismatch");
       if (this.db.prepare("SELECT 1 FROM a2a_agent_fences WHERE agent_id IN (?, ?) LIMIT 1").get(parsed.senderAgentId, parsed.recipientAgentId) !== undefined) throw new Error("a2a: sender or recipient is fenced");
       if (parsed.parentTaskId !== null) {
@@ -428,8 +501,12 @@ export class A2AStore {
 
   listForRecipient(agentId: string, limit = 128): A2AMessageRecord[] {
     this.assertOpen();
-    const bounded = Math.max(1, Math.min(128, Math.trunc(limit)));
-    return (this.db.prepare(`SELECT recent.* FROM (
+    return this.recentForRecipient(agentId, Math.max(1, Math.min(128, Math.trunc(limit)))).map((row) => this.toRecord(row));
+  }
+
+  /** The recipient's latest messages of its active incarnation, oldest first. */
+  private recentForRecipient(agentId: string, limit: number): Row[] {
+    return this.db.prepare(`SELECT recent.* FROM (
       SELECT message.* FROM a2a_messages AS message
         JOIN a2a_agent_incarnations AS incarnation
           ON incarnation.agent_id = message.recipient_agent_id
@@ -437,21 +514,22 @@ export class A2AStore {
          AND incarnation.status = 'active'
         WHERE message.recipient_agent_id = ?
         ORDER BY message.created_at_ms DESC, message.message_id DESC LIMIT ?
-    ) AS recent ORDER BY recent.created_at_ms ASC, recent.message_id ASC`).all(agentId, bounded) as Row[]).map((row) => this.toRecord(row));
+    ) AS recent ORDER BY recent.created_at_ms ASC, recent.message_id ASC`).all(agentId, limit) as Row[];
   }
 
   listUndeliveredOutbox(): unknown[] { this.assertOpen(); return this.db.prepare("SELECT * FROM a2a_outbox WHERE delivered_at_ms IS NULL ORDER BY created_at_ms ASC, outbox_id ASC").all(); }
 
   getParentTurnUsage(senderAgentId: string, parentTurnId: string): { messageCount: number; byteCount: number; recipients: string[] } {
-    const incarnation = this.db.prepare("SELECT incarnation FROM a2a_agent_incarnations WHERE agent_id = ? AND status = 'active'").get(senderAgentId) as { incarnation: string } | undefined;
-    const row = incarnation === undefined ? undefined : this.db.prepare("SELECT message_count, byte_count, recipients_json FROM a2a_parent_usage WHERE sender_agent_id = ? AND sender_incarnation = ? AND parent_turn_id = ?").get(senderAgentId, incarnation.incarnation, parentTurnId) as { message_count: number; byte_count: number; recipients_json: string } | undefined;
+    this.assertOpen();
+    const incarnation = this.activeIncarnation(senderAgentId);
+    const row = incarnation === undefined ? undefined : this.db.prepare("SELECT message_count, byte_count, recipients_json FROM a2a_parent_usage WHERE sender_agent_id = ? AND sender_incarnation = ? AND parent_turn_id = ?").get(senderAgentId, incarnation, parentTurnId) as { message_count: number; byte_count: number; recipients_json: string } | undefined;
     return { messageCount: row?.message_count ?? 0, byteCount: row?.byte_count ?? 0, recipients: row === undefined ? [] : JSON.parse(row.recipients_json) as string[] };
   }
 
-  claimNext(recipientAgentId: string, options: { ownerId: string; nowMs?: number; leaseDurationMs: number }): A2AClaimResult | undefined {
+  claimNext(recipientAgentId: string, options: { ownerId: string; nowMs?: number; leaseDurationMs: number; recover?: boolean }): A2AClaimResult | undefined {
     this.assertOpen();
     const now = options.nowMs ?? nowValue(this.now);
-    this.recoverExpired(now);
+    if (options.recover !== false) this.recoverExpired(now);
     const claim = this.db.transaction(() => {
       const row = this.db.prepare(`SELECT message.* FROM a2a_messages AS message
         JOIN a2a_agent_incarnations AS recipient
@@ -567,15 +645,7 @@ export class A2AStore {
       const epoch = projection?.epoch ?? randomUUID();
       const nextSequence = projection?.next_sequence ?? 1;
       if (projection === undefined) this.db.prepare("INSERT INTO a2a_projection_state(agent_id, epoch, next_sequence) VALUES (?, ?, 1)").run(agentId, epoch);
-      const rows = this.db.prepare(`SELECT recent.* FROM (
-        SELECT message.* FROM a2a_messages AS message
-          JOIN a2a_agent_incarnations AS incarnation
-            ON incarnation.agent_id = message.recipient_agent_id
-           AND incarnation.incarnation = message.recipient_incarnation
-           AND incarnation.status = 'active'
-          WHERE message.recipient_agent_id = ?
-          ORDER BY message.created_at_ms DESC, message.message_id DESC LIMIT 128
-      ) AS recent ORDER BY recent.created_at_ms ASC, recent.message_id ASC`).all(agentId) as Row[];
+      const rows = this.recentForRecipient(agentId, 128);
       return { agentId, epoch, sequence: Math.max(0, nextSequence - 1), items: rows.map((row) => this.toRecord(row)) };
     });
     return operation.immediate();

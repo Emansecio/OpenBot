@@ -38,13 +38,11 @@
  *     fixtures de teste injetam um `fetchImpl` próprio para o cert self-signed);
  *   - loopback = `localhost`, `::1` e `127.0.0.0/8` (`isLoopbackHost`).
  *
- * REGISTRO: `registerOpenAiCompatAdapter` registra como "openai-compat" no
- * registry default do roteador. SÓ registra quando uma `baseUrl` é fornecida
- * (sem baseURL custom configurada o adapter não existe — boot sem quebrar).
+ * REGISTRO: o boot e `setBoxSettings` (rpc/roster.ts) registram o adapter
+ * como "openai-compat" só quando há uma baseURL configurada.
  */
 
 import type { Keystore } from "../keystore/index.js";
-import { parseProviderUsage } from "./usage.js";
 import {
   defaultRegistry,
   type ProviderAdapter,
@@ -53,72 +51,17 @@ import {
 } from "./router.js";
 import {
   ApiError,
-  OpenAiToolCallAccumulator,
   buildChatBody,
-  classifyOpenAiFinishReason,
-  extractOpenAiErrorMessage,
-  findSseFrameBoundary,
+  createChatCompletionsStreamHandler,
   normalizeOpenAiError,
-  openAiStreamErrorStatus,
-  parseRetryAfterMs,
-  providerTimeoutError,
+  providerHttpError,
   raceWithAbort,
-  splitSseLines,
+  readSseFrames,
+  startProviderDeadline,
 } from "./openai-helpers.js";
 
 /** Nome canônico do provider no registry e no namespace da keystore. */
 export const OPENAI_COMPAT_PROVIDER_NAME = "openai-compat" as const;
-
-const MAX_ERROR_BODY_BYTES = 64 * 1024;
-const ERROR_BODY_TRUNCATION_MESSAGE = "corpo de erro truncado";
-const ERROR_BODY_TRUNCATION_MARKER = `\n[${ERROR_BODY_TRUNCATION_MESSAGE} após ${MAX_ERROR_BODY_BYTES} bytes]`;
-
-async function readErrorBody(
-  response: Response,
-  signal: AbortSignal,
-): Promise<{ text: string; truncated: boolean }> {
-  if (response.body === null) return { text: "", truncated: false };
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const parts: string[] = [];
-  let remaining = MAX_ERROR_BODY_BYTES;
-  let truncated = false;
-
-  try {
-    while (remaining > 0) {
-      const { done, value } = await raceWithAbort(reader.read(), signal);
-      if (done) {
-        parts.push(decoder.decode());
-        return { text: parts.join(""), truncated: false };
-      }
-
-      const retained = value.subarray(0, remaining);
-      parts.push(decoder.decode(retained, { stream: true }));
-      remaining -= retained.byteLength;
-      if (retained.byteLength < value.byteLength) {
-        truncated = true;
-        break;
-      }
-    }
-
-    if (!truncated) {
-      const next = await raceWithAbort(reader.read(), signal);
-      truncated = !next.done;
-    }
-    if (!truncated) parts.push(decoder.decode());
-    if (truncated) parts.push(ERROR_BODY_TRUNCATION_MARKER);
-    return { text: parts.join(""), truncated };
-  } finally {
-    if (truncated) await reader.cancel().catch(() => undefined);
-    reader.releaseLock();
-  }
-}
-
-/** Chave da keystore: `scoped:v1:provider:openai-compat:apiKey` (T4). */
-export function openaiCompatApiKeyKey(): string {
-  return `scoped:v1:provider:${OPENAI_COMPAT_PROVIDER_NAME}:apiKey`;
-}
 
 /**
  * True para hosts de loopback: `localhost`, `::1` e qualquer `127.x.x.x`
@@ -278,129 +221,32 @@ export class OpenAiCompatAdapter implements ProviderAdapter {
     return undefined;
   }
 
-  /** Lê o corpo SSE e emite `delta`/`tool-call` (reuso do acumulador T6). */
+  /** Chat Completions SSE through the shared handler (same wire as OpenAI). */
   private async readStream(
     body: ReadableStream<Uint8Array>,
     emit: (event: ProviderStreamEvent) => void,
     signal: AbortSignal,
     onActivity: () => void,
   ): Promise<void> {
-    const reader = body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    const toolAccumulator = new OpenAiToolCallAccumulator();
-    let buffer = "";
-    let terminated = false;
-    let finishReason: string | undefined;
-    let finishPayload: unknown;
-
-    const dispatchFrame = (frame: string): boolean => {
-      const data = splitSseLines(frame).filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).replace(/^ /, "")).join("\n");
-      if (data.length === 0) return false;
-      if (data === "[DONE]") return true;
-      let parsed: unknown;
-      try { parsed = JSON.parse(data); } catch {
-        throw new ApiError("openai-compat: frame SSE inválido", 502, data);
-      }
-      if (typeof parsed !== "object" || parsed === null) return false;
-      const payload = parsed as Record<string, unknown>;
-      const usage = parseProviderUsage(payload.usage, "chat");
-      if (usage) emit({ type: "usage", usage });
-      if (typeof payload.error === "object" && payload.error !== null) {
-        const error = payload.error as Record<string, unknown>;
-        throw new ApiError(
-          typeof error.message === "string" ? error.message : "openai-compat: erro no stream",
-          openAiStreamErrorStatus(error),
-          parsed,
-        );
-      }
-      const choices = payload.choices;
-      if (!Array.isArray(choices)) {
-        throw new ApiError("openai-compat: frame SSE sem choices", 502, parsed);
-      }
-      if (choices.length === 0) return false;
-      const choice = choices[0] as Record<string, unknown> | undefined;
-      const currentFinishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : undefined;
-      const delta = choice?.delta;
-      // Preserve a final chunk's delta before recording its finish reason;
-      // later frames are consumed only for protocol/usage completion.
-      if (finishReason === undefined && typeof delta === "object" && delta !== null) {
-        const record = delta as Record<string, unknown>;
-        if (typeof record.content === "string" && record.content.length > 0) emit({ type: "delta", delta: record.content });
-        if (Array.isArray(record.tool_calls)) for (const chunk of record.tool_calls) {
-          if (typeof chunk === "object" && chunk !== null) toolAccumulator.add(chunk as Parameters<OpenAiToolCallAccumulator["add"]>[0]);
-        }
-      }
-      if (finishReason === undefined && currentFinishReason !== undefined) {
-        finishReason = currentFinishReason;
-        finishPayload = parsed;
-      }
-      return false;
-    };
-
-    try {
-      while (!terminated) {
-        const { done, value } = await raceWithAbort(reader.read(), signal);
-        if (done) break;
-        onActivity();
-        buffer += decoder.decode(value, { stream: true });
-        let boundary = findSseFrameBoundary(buffer);
-        while (boundary !== undefined) {
-          const frame = buffer.slice(0, boundary.index);
-          buffer = buffer.slice(boundary.index + boundary.length);
-          if (Buffer.byteLength(frame, "utf8") > 1_048_576) throw new ApiError("openai-compat: frame SSE excedeu 1 MiB", 502);
-          if (dispatchFrame(frame)) { terminated = true; break; }
-          boundary = findSseFrameBoundary(buffer);
-        }
-        if (!terminated && Buffer.byteLength(buffer, "utf8") > 1_048_576) throw new ApiError("openai-compat: buffer SSE residual excedeu 1 MiB", 502);
-      }
-      if (!terminated) throw new ApiError("openai-compat: stream terminou antes de [DONE]", 502);
-    } finally {
-      await reader.cancel().catch(() => undefined);
-      reader.releaseLock();
+    const handler = createChatCompletionsStreamHandler("openai-compat", emit);
+    if (!await readSseFrames(body, signal, onActivity, "openai-compat", (frame) => handler.dispatchFrame(frame))) {
+      throw new ApiError("openai-compat: stream terminou antes de [DONE]", 502);
     }
-    const finishDisposition = classifyOpenAiFinishReason(finishReason);
-    if (finishDisposition === "incomplete" || finishDisposition === "unknown") {
-      throw new ApiError(`openai-compat: geração interrompida (${finishReason})`, finishDisposition === "incomplete" ? 400 : 502, finishPayload, { code: finishReason });
-    }
-    if (toolAccumulator.hasAny) {
-      for (const call of toolAccumulator.finalizedCalls("openai-compat")) emit({ type: "tool-call", call });
-    }
+    handler.finish();
   }
 
   async streamChat(
     req: ProviderChatRequest,
     emit: (event: ProviderStreamEvent) => void,
   ): Promise<void> {
-    const controller = new AbortController();
-    let timeoutError: ReturnType<typeof providerTimeoutError> | undefined;
-    const onAbort = (): void => {
-      if (!controller.signal.aborted) controller.abort(req.signal?.reason);
-    };
-    req.signal?.addEventListener("abort", onAbort, { once: true });
-    if (req.signal?.aborted) onAbort();
-    let idleTimer: ReturnType<typeof setTimeout> | undefined;
-    const resetIdleTimer = () => {
-      if (idleTimer !== undefined) clearTimeout(idleTimer);
-      if (controller.signal.aborted) return;
-      idleTimer = setTimeout(() => {
-        if (controller.signal.aborted) return;
-        timeoutError = providerTimeoutError(this.timeoutMs);
-        controller.abort(timeoutError);
-      }, this.timeoutMs);
-    };
-    resetIdleTimer();
-    const maxDurationTimer = setTimeout(() => {
-      if (controller.signal.aborted) return;
-      timeoutError = providerTimeoutError(this.maxDurationMs);
-      controller.abort(timeoutError);
-    }, this.maxDurationMs);
+    const deadline = startProviderDeadline(req.signal, this.timeoutMs, this.maxDurationMs);
+    const signal = deadline.signal;
     let response: Response | undefined;
     let succeeded = false;
 
     try {
       // Chave OPCIONAL, mas sua resolução também respeita abort/timeout.
-      const apiKey = await raceWithAbort(this.resolveApiKey(), controller.signal);
+      const apiKey = await raceWithAbort(this.resolveApiKey(), signal);
       const endpoint = new URL(this.baseUrl);
       endpoint.pathname = `${endpoint.pathname.replace(/\/+$/, "")}/chat/completions`;
       const url = endpoint.toString();
@@ -414,81 +260,39 @@ export class OpenAiCompatAdapter implements ProviderAdapter {
 
       try {
         const body = this.serializeRequest(req);
-        controller.signal.throwIfAborted();
+        signal.throwIfAborted();
         req.onTransportStart?.("chat");
         response = await raceWithAbort(this.fetchImpl(url, {
           method: "POST",
           headers,
           body,
-          signal: controller.signal,
-        }), controller.signal);
-        resetIdleTimer();
+          signal,
+        }), signal);
+        deadline.resetIdle();
       } catch (err) {
-        if (timeoutError !== undefined) throw timeoutError;
+        if (deadline.timeoutError !== undefined) throw deadline.timeoutError;
         throw normalizeOpenAiError(err);
       }
 
-      if (!response.ok) {
-        let message = `openai-compat: HTTP ${response.status}`;
-        let responseBody: unknown = undefined;
-        try {
-          const errorBody = await readErrorBody(response, controller.signal);
-          const text = errorBody.text;
-          let parsed: unknown = text;
-          try {
-            parsed = JSON.parse(text);
-          } catch {
-            // corpo não-JSON — mantém o texto bruto
-          }
-          const extracted = extractOpenAiErrorMessage(parsed);
-          if (extracted !== undefined) message = `openai-compat: HTTP ${response.status} — ${extracted}`;
-          if (errorBody.truncated) message = `${message} — ${ERROR_BODY_TRUNCATION_MESSAGE}`;
-          responseBody = parsed;
-        } catch {
-          // corpo ilegível — mensagem padrão já montada
-        }
-        throw new ApiError(message, response.status, responseBody, {
-          retryAfterMs: parseRetryAfterMs(response.headers.get("retry-after")),
-        });
-      }
+      if (!response.ok) throw await providerHttpError("openai-compat", response, signal, deadline.resetIdle);
 
       if (response.body === null) {
         throw new ApiError("openai-compat: resposta sem corpo (stream vazio)", 502);
       }
 
-      await this.readStream(response.body, emit, controller.signal, resetIdleTimer);
+      await this.readStream(response.body, emit, signal, deadline.resetIdle);
       succeeded = true;
     } catch (err) {
-      if (timeoutError !== undefined) throw timeoutError;
+      if (deadline.timeoutError !== undefined) throw deadline.timeoutError;
       throw err;
     } finally {
-      if (idleTimer !== undefined) clearTimeout(idleTimer);
-      clearTimeout(maxDurationTimer);
-      req.signal?.removeEventListener("abort", onAbort);
+      deadline.dispose();
       const responseBody = response?.body;
       if (!succeeded && responseBody !== undefined && responseBody !== null && !responseBody.locked) {
         await responseBody.cancel().catch(() => undefined);
       }
     }
   }
-}
-
-/**
- * Registra o adapter OpenAI-compatible no registry default do roteador como
- * "openai-compat" (contrato `ProviderRegistry.register` de T5). Chamado no
- * boot (T8) e pelos testes.
- *
- * SEM `baseUrl` (nenhuma baseURL custom configurada) o adapter NÃO registra e
- * retorna `undefined` — o provider não existe até ter baseURL (MVP: env
- * `OPENBOT_COMPAT_BASE_URL` no boot; T14 pluga a config local).
- */
-export function registerOpenAiCompatAdapter(
-  opts: OpenAiCompatAdapterOptions = {},
-): OpenAiCompatAdapter | undefined {
-  if (opts.baseUrl === undefined || opts.baseUrl.length === 0) return undefined;
-  const adapter = new OpenAiCompatAdapter(opts);
-  defaultRegistry.register(adapter);
-  return adapter;
 }
 
 export function unregisterOpenAiCompatAdapter(name = OPENAI_COMPAT_PROVIDER_NAME): boolean {

@@ -470,6 +470,26 @@ describe("memory context integration", () => {
       expect(deleted).not.toHaveProperty("revision");
       expect(store.memoryStore.getMemory("agent-a", memory.id)?.status).toBe("forgotten");
 
+      const rpcStatus = async (method: string, body: unknown): Promise<number | undefined> => {
+        try {
+          await callRpc(gateway, method, body);
+          return undefined;
+        } catch (error) {
+          return (error as { status?: number }).status;
+        }
+      };
+      expect(await rpcStatus("deleteMemory", { agentId: "agent-a", memoryId: "missing-memory" })).toBe(404);
+      expect(await rpcStatus("listMemoriesPage", { agentId: "agent-a", cursor: "not-a-cursor" })).toBe(400);
+      expect(await rpcStatus("searchMemoryHistory", { agentId: "agent-a", query: "x".repeat(513) })).toBe(400);
+      const editable = store.memoryStore.upsertMemory("agent-a", {
+        kind: "fact",
+        canonicalKey: "rpc-policy-edit",
+        text: "valor editável",
+        trust: "user",
+        sourceConversationId: conversationId,
+      }, { kind: "admin" });
+      expect(await rpcStatus("updateMemory", { agentId: "agent-a", memoryId: editable.id, text: "token=sk-prod-abcdef1234567890" })).toBe(400);
+
       const profileMemory = store.memoryStore.upsertMemory(USER_PROFILE_AGENT_ID, {
         kind: "identity",
         canonicalKey: "rpc-profile-name",
@@ -493,7 +513,6 @@ describe("memory context integration", () => {
       expect(userScopePage.items.some((item) => item.text === "só do bot")).toBe(false);
       await expect(() => callRpc(gateway, "listMemoriesPage", { agentId: "agent-a", scope: "bogus" })).toThrow(/scope inválido/i);
     } finally {
-      config.close();
       store.close();
       rmSync(configRoot, { recursive: true, force: true });
     }
@@ -521,7 +540,6 @@ describe("memory context integration", () => {
       await expect(() => callRpc(gateway, "setMemorySettings", { agentId: "agent-a", mode: "off" })).toThrow(/agente não encontrado/i);
       expect(store.memoryStore.getSummary("agent-a", conversationId)).toBeNull();
     } finally {
-      config.close();
       store.close();
       rmSync(configRoot, { recursive: true, force: true });
     }
@@ -595,7 +613,6 @@ describe("memory context integration", () => {
       expect(JSON.stringify(status.jobs.dead)).not.toContain("yyyy");
       expect(Buffer.byteLength(JSON.stringify(status), "utf8")).toBeLessThan(8_000);
     } finally {
-      config.close();
       store.close();
       rmSync(configRoot, { recursive: true, force: true });
     }

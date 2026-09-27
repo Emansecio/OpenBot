@@ -27,7 +27,6 @@ export {
   NetworkPolicyError,
   classifyIpAddress,
   isBlockedHostname,
-  isBlockedNetworkAddress,
   normalizeHostname,
   resolvePublicAddresses,
   type BlockedAddressReason,

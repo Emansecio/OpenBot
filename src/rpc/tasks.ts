@@ -3,41 +3,41 @@ import { randomUUID } from "node:crypto";
 import type { ConfigStore } from "../config/store.js";
 import { resolveAgentInference } from "./identity.js";
 import { RpcError, type Gateway } from "../server/gateway.js";
-import { parseDelegatedCapabilityGrant, parseTaskInputV1, type AsyncTaskRecord, type DelegatedCapabilityGrant, type DispatchAsyncTaskInput, type ProviderCapabilityGrant, type SubagentBudget } from "../tasks/contracts.js";
+import { AsyncTaskContractError, parseDelegatedCapabilityGrant, parseTaskInputV1, type AsyncTaskContractErrorCode, type AsyncTaskRecord, type DelegatedCapabilityGrant, type DispatchAsyncTaskInput, type ProviderCapabilityGrant, type SubagentBudget } from "../tasks/contracts.js";
 import { deriveEffectiveBudget, deriveEffectiveGrant } from "../tasks/state-machine.js";
 import { AsyncTaskStore } from "../tasks/store.js";
 import { projectAsyncTaskForRenderer } from "../tasks/projection.js";
+import { rpcRecord as record, rpcRequiredString as requiredString, rpcScopedAgent as scopedAgent, rpcScopedAgentOrIdAlias } from "./body.js";
 
-function record(body: unknown, method: string): Record<string, unknown> {
-  if (typeof body !== "object" || body === null || Array.isArray(body)) throw new RpcError(400, `${method}: corpo deve ser um objeto`);
-  return body as Record<string, unknown>;
+// P2.2 read-only scope: read-only list methods also accept the legacy native
+// `{id}` alias; every mutating task RPC keeps requiring an explicit `agentId`.
+const scopedReadAgent = rpcScopedAgentOrIdAlias;
+
+const CONTRACT_ERROR_STATUS: Readonly<Record<AsyncTaskContractErrorCode, number>> = {
+  invalid_contract: 400,
+  invalid_nonce: 409,
+  invalid_transition: 409,
+  capability_denied: 403,
+  budget_exhausted: 409,
+};
+
+/** An RPC rejection that keeps the task contract's error code next to its HTTP status. */
+class AsyncTaskRpcError extends RpcError {
+  constructor(status: number, message: string, readonly code: AsyncTaskContractErrorCode) {
+    super(status, message);
+  }
 }
 
-function requiredString(body: Record<string, unknown>, name: string, method: string): string {
-  const value = body[name];
-  if (typeof value !== "string" || value.trim().length === 0) throw new RpcError(400, `${method}: ${name} é obrigatório`);
-  return value.trim();
-}
-
-function scopedAgent(config: ConfigStore, body: Record<string, unknown>, method: string): string {
-  const agentId = requiredString(body, "agentId", method);
-  if (!config.snapshot().agents.some((agent) => agent.id === agentId)) throw new RpcError(404, `${method}: agente não encontrado`);
-  return agentId;
-}
-
-/**
- * P2.2 read-only scope: accepts the legacy native `{id}` alias and the
- * canonical `{agentId}` and normalizes both to a validated agentId. This is
- * intentionally restricted to read-only list methods; every mutating task
- * RPC keeps requiring an explicit `agentId`.
- */
-function scopedReadAgent(config: ConfigStore, body: Record<string, unknown>, method: string): string {
-  const explicit = typeof body.agentId === "string" ? body.agentId.trim() : "";
-  const alias = typeof body.id === "string" ? body.id.trim() : "";
-  const raw = explicit.length > 0 ? explicit : alias.length > 0 ? alias : "";
-  if (raw.length === 0) throw new RpcError(400, `${method}: agentId é obrigatório`);
-  if (!config.snapshot().agents.some((agent) => agent.id === raw)) throw new RpcError(404, `${method}: agente não encontrado`);
-  return raw;
+/** A task-contract rejection (stale version, finished task, revoked grant) is a client error, not a 500. */
+function taskMutation<T>(method: string, run: () => T): T {
+  try {
+    return run();
+  } catch (error) {
+    if (error instanceof AsyncTaskContractError) {
+      throw new AsyncTaskRpcError(CONTRACT_ERROR_STATUS[error.code], `${method}: ${error.message}`, error.code);
+    }
+    throw error;
+  }
 }
 
 function scopedTask(store: AsyncTaskStore, agentId: string, taskId: string, method: string): AsyncTaskRecord {
@@ -66,7 +66,7 @@ async function deriveConfiguredGrant(config: ConfigStore, requestedValue: unknow
     }
   }
   if (requested.kind !== "provider") throw new RpcError(403, "dispatchAsyncTask: no authority resolver is configured");
-  const inference = resolveAgentInference(config.snapshot(), agentId);
+  const inference = resolveAgentInference(config.view(), agentId);
   const authority: ProviderCapabilityGrant = {
     ...requested,
     parentAgentId: agentId,
@@ -147,24 +147,24 @@ export function registerAsyncTaskHandlers(gateway: Gateway, options: AsyncTaskRp
     const agentId = scopedAgent(options.config, b, "steerAsyncTask");
     const taskId = requiredString(b, "taskId", "steerAsyncTask");
     const task = scopedTask(options.store, agentId, taskId, "steerAsyncTask");
-    return options.store.steer({
+    return taskMutation("steerAsyncTask", () => options.store.steer({
       taskId, agentId, parentTurnId: task.parentTurnId,
       intentId: requiredString(b, "intentId", "steerAsyncTask"),
       expectedSteerVersion: typeof b.expectedSteerVersion === "number" ? b.expectedSteerVersion : task.steerVersion,
       requestedAtMs: Date.now(), message: requiredString(b, "message", "steerAsyncTask"),
-    });
+    }));
   });
   gateway.registerHandler("abortAsyncTask", (body) => {
     const b = record(body, "abortAsyncTask");
     const agentId = scopedAgent(options.config, b, "abortAsyncTask");
     const taskId = requiredString(b, "taskId", "abortAsyncTask");
     const task = scopedTask(options.store, agentId, taskId, "abortAsyncTask");
-    const result = options.store.abort({
+    const result = taskMutation("abortAsyncTask", () => options.store.abort({
       taskId, agentId, parentTurnId: task.parentTurnId,
       intentId: requiredString(b, "intentId", "abortAsyncTask"),
       expectedAbortVersion: typeof b.expectedAbortVersion === "number" ? b.expectedAbortVersion : task.abortVersion,
       requestedAtMs: Date.now(), reason: b.reason === "parent" || b.reason === "shutdown" || b.reason === "budget_exhausted" ? b.reason : "user",
-    });
+    }));
     options.wake?.();
     return result;
   });
@@ -175,6 +175,6 @@ export function registerAsyncTaskHandlers(gateway: Gateway, options: AsyncTaskRp
     if (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
       throw new RpcError(409, "settleAsyncTask: tarefa ainda não terminou");
     }
-    return options.store.settleTask(task.taskId, agentId, requiredString(b, "settlementNonce", "settleAsyncTask"));
+    return taskMutation("settleAsyncTask", () => options.store.settleTask(task.taskId, agentId, requiredString(b, "settlementNonce", "settleAsyncTask")));
   });
 }

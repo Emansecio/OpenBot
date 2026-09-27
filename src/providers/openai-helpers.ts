@@ -1,35 +1,26 @@
 /**
- * T6 — Helpers compartilhados dos adapters "OpenAI-like" (src/providers/).
+ * Shared transport of the OpenAI-like adapters (OpenAI, xAI, OpenAI-compatible)
+ * and of the OpenCode "messages" transport:
  *
- * Base comum para T6 (OpenAI), T7 (xAI/Grok) e T8 (OpenAI-compat com baseURL
- * custom). Tudo que é reutilizável de um adapter chat.completions `stream:true`
- * vive aqui, para os três não duplicarem:
- *
- *   - `OpenAiChatBody` + `buildChatBody(req)` — corpo JSON normalizado do
- *     endpoint chat/completions (`stream:true`, `tools` opcionais, system
- *     inline na lista de mensagens — não dependemos de convenções de
- *     separação de `system` por provider);
- *   - `parseOpenAiSseChunk` — parser linha-a-linha do SSE da OpenAI
- *     (linhas `data:`/`event:`/`:` + JSON; termina com `[DONE]`; sem
- *     dependência de fetch stream, funciona para qualquer Reader);
- *   - `OpenAiToolCallAccumulator` — acumulador de `delta.tool_calls` → tool
- *     call COMPLETA (id/name/arguments concatenados por índice, ordem de
- *     chegada preservada — shape `ProviderToolCall` do roteador);
- *   - `OpenAiSseFrame` — uma linha `data:` já parseada (nula no heartbeat
- *     `:ping`/comentários);
- *   - `normalizeOpenAiError(err)` — enriquece erros crus do transporte com
- *     `status`/`code` para o `classifyProviderError` do roteador (429/5xx/
- *     rede/auth/validação — transiente vs permanente, spec §3.1);
- *   - `extractOpenAiErrorMessage(body)` — extrai a mensagem legível do corpo
- *     de erro JSON da OpenAI (`error.message`), com fallbacks robustos.
+ *   - request bodies: `buildChatBody` / `toOpenAiMessage`;
+ *   - SSE reading: `readSseFrames` (frame boundaries, 1 MiB caps, EOF flush,
+ *     reader always cancelled) and `sseFrameData`;
+ *   - Chat Completions stream handling: `createChatCompletionsStreamHandler`
+ *     (deltas, usage, tool-call accumulation, fail-closed finish reasons);
+ *   - request deadlines: `startProviderDeadline` (idle + absolute timeouts
+ *     bound to the caller's abort signal);
+ *   - errors: `providerHttpError` (bounded body, provider message,
+ *     Retry-After), `normalizeOpenAiError`, `ApiError` / `OpenAIError`.
  */
 
 import type {
   ProviderChatMessage,
   ProviderChatRequest,
+  ProviderStreamEvent,
   ProviderTool,
   ProviderToolCall,
 } from "./router.js";
+import { parseProviderUsage } from "./usage.js";
 import { providerToolResultContent } from "./tool-calls.js";
 
 /** Dado de uma tool call no formato nativo do chat.completions (delta ou completo). */
@@ -41,22 +32,6 @@ export interface OpenAiToolCallChunk {
     name?: string;
     arguments?: string;
   };
-}
-
-/** Frame `data:` do SSE da OpenAI já parseado (nulo para heartbeat/comentário). */
-export type OpenAiSseFrame =
-  | {
-      /** `null` quando `data: [DONE]` (fim do stream). */
-      data: unknown;
-      /** `event:` do SSE quando presente (ex.: `error`). */
-      event?: string;
-    }
-  | null;
-
-/** Uma linha SSE bruta ("data: {...}" | "event: x" | ":" comentário | ""). */
-export interface OpenAiSseLine {
-  field: string;
-  value: string;
 }
 
 /** Corpo JSON do POST chat/completions (OpenAI-like). */
@@ -82,31 +57,13 @@ export function splitSseLines(raw: string): string[] {
 }
 
 /**
- * Interpreta uma linha SSE bruta. Linhas que começam com `:` são comentários
- * (heartbeat `:ping` do gateway — ignorados); `event:` opcional; `data:` pode
- * aparecer múltiplas vezes (campos SSE são multi-linha) — juntamos com `\n`.
- */
-export function parseSseLine(line: string): OpenAiSseLine | null {
-  if (line.length === 0 || line.startsWith(":")) return null;
-  const colon = line.indexOf(":");
-  if (colon === -1) {
-    // Linha sem campo (ex.: "data" sem valor) — tratada como data vazia.
-    return { field: line.trim(), value: "" };
-  }
-  const field = line.slice(0, colon).trim();
-  // Após o `:` um espaço único é opcional e removido (spec SSE).
-  let value = line.slice(colon + 1);
-  if (value.startsWith(" ")) value = value.slice(1);
-  return { field, value };
-}
-
-/**
  * Localiza o primeiro delimitador de frame SSE sem confundir um `\r\n`
  * dividido entre chunks com duas quebras de linha. Um `\r` no fim do buffer é
  * mantido pendente até o próximo chunk, quando pode ser distinguido de CR puro.
  */
 export function findSseFrameBoundary(
   buffer: string,
+  start = 0,
 ): { index: number; length: number } | undefined {
   const lineEndingLength = (index: number): number => {
     const char = buffer[index];
@@ -116,7 +73,7 @@ export function findSseFrameBoundary(
     return buffer[index + 1] === "\n" ? 2 : 1;
   };
 
-  for (let index = 0; index < buffer.length; index += 1) {
+  for (let index = Math.max(0, start); index < buffer.length; index += 1) {
     const first = lineEndingLength(index);
     if (first < 0) return undefined;
     if (first === 0) continue;
@@ -214,36 +171,6 @@ export function normalizeToolCallArguments(argumentsText: string, label: string)
     throw new ApiError(`${label}: argumentos de tool call devem ser um objeto JSON`, 502);
   }
   return normalized;
-}
-
-/**
- * Parser de um chunk SSE completo: interpreta cada linha `data:` como um frame
- * (`[DONE]` → `{data: null}`). Heartbeats (`:ping`), linhas vazias e campos
- * não-`data` são ignorados. Pensado para chunks COMPLETOS (fixtures, testes,
- * reuso por T7/T8); o adapter lê linha a linha o corpo do fetch com a mesma
- * semântica (`data: [DONE]` encerra).
- */
-export function parseOpenAiSseChunk(chunk: string): OpenAiSseFrame[] {
-  const frames: OpenAiSseFrame[] = [];
-  for (const line of splitSseLines(chunk)) {
-    const parsed = parseSseLine(line);
-    if (parsed === null) continue;
-    if (parsed.field !== "data") continue;
-    if (parsed.value === "[DONE]") {
-      frames.push({ data: null });
-      continue;
-    }
-    let data: unknown;
-    try {
-      data = JSON.parse(parsed.value);
-    } catch {
-      // JSON inválido em um frame `data:` → frame descartável (o stream
-      // continua; erros reais do provider vêm como HTTP status ≠ 200).
-      continue;
-    }
-    frames.push({ data, event: undefined });
-  }
-  return frames;
 }
 
 /**
@@ -395,6 +322,249 @@ export class OpenAiToolCallAccumulator {
     this.byIndex.clear();
     this.order.length = 0;
   }
+}
+
+/** The `data:` payload of one SSE frame (multi-line data joined), or "" when it has none. */
+export function sseFrameData(frame: string): string {
+  return splitSseLines(frame)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).replace(/^ /, ""))
+    .join("\n");
+}
+
+const MAX_SSE_FRAME_BYTES = 1_048_576;
+
+/**
+ * Reads an SSE body frame by frame until `onFrame` returns true (a terminal
+ * frame). A frame still in the buffer at EOF — a server that closes right
+ * after `data: [DONE]\n` without the blank line — is dispatched as well.
+ * Resolves true when a terminal frame was seen. The reader is always
+ * cancelled and released, also on parse/emit errors.
+ */
+export async function readSseFrames(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+  onActivity: () => void,
+  label: string,
+  onFrame: (frame: string) => boolean,
+): Promise<boolean> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await raceWithAbort(reader.read(), signal);
+      if (done) break;
+      onActivity();
+      // A delimiter can straddle chunks by at most three characters (\r\n\r).
+      let scanFrom = Math.max(0, buffer.length - 3);
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = findSseFrameBoundary(buffer, scanFrom);
+      while (boundary !== undefined) {
+        const frame = buffer.slice(0, boundary.index);
+        buffer = buffer.slice(boundary.index + boundary.length);
+        if (Buffer.byteLength(frame, "utf8") > MAX_SSE_FRAME_BYTES) throw new ApiError(`${label}: frame SSE excedeu 1 MiB`, 502);
+        if (onFrame(frame)) return true;
+        scanFrom = 0;
+        boundary = findSseFrameBoundary(buffer, scanFrom);
+      }
+      if (Buffer.byteLength(buffer, "utf8") > MAX_SSE_FRAME_BYTES) throw new ApiError(`${label}: buffer SSE residual excedeu 1 MiB`, 502);
+    }
+    const trailing = (buffer + decoder.decode()).replace(/[\r\n]+$/u, "");
+    return trailing.length > 0 && onFrame(trailing);
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
+/**
+ * Chat Completions stream (OpenAI, xAI, OpenAI-compatible): `dispatchFrame`
+ * emits deltas and usage and accumulates tool calls, returning true on
+ * `[DONE]`; `finish` rejects incomplete/unknown finish reasons and emits the
+ * completed tool calls.
+ */
+export function createChatCompletionsStreamHandler(
+  label: string,
+  emit: (event: ProviderStreamEvent) => void,
+): { dispatchFrame(frame: string): boolean; finish(): void } {
+  const toolAccumulator = new OpenAiToolCallAccumulator();
+  let finishReason: string | undefined;
+  let finishPayload: unknown;
+  return {
+    dispatchFrame(frame) {
+      const data = sseFrameData(frame);
+      if (data.length === 0) return false;
+      if (data === "[DONE]") return true;
+      let parsed: unknown;
+      try { parsed = JSON.parse(data); } catch {
+        throw new ApiError(`${label}: frame SSE inválido`, 502, data);
+      }
+      if (typeof parsed !== "object" || parsed === null) return false;
+      const payload = parsed as Record<string, unknown>;
+      const usage = parseProviderUsage(payload.usage, "chat");
+      if (usage) emit({ type: "usage", usage });
+      if (typeof payload.error === "object" && payload.error !== null) {
+        const error = payload.error as Record<string, unknown>;
+        throw new ApiError(
+          typeof error.message === "string" ? error.message : `${label}: erro no stream`,
+          openAiStreamErrorStatus(error),
+          parsed,
+        );
+      }
+      const choices = payload.choices;
+      if (!Array.isArray(choices)) throw new ApiError(`${label}: frame SSE sem choices`, 502, parsed);
+      if (choices.length === 0) return false;
+      const choice = choices[0] as Record<string, unknown> | undefined;
+      const currentFinishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : undefined;
+      const delta = choice?.delta;
+      // A final chunk may carry both the last text/tool delta and
+      // `finish_reason`; preserve that delta before recording the reason.
+      if (finishReason === undefined && typeof delta === "object" && delta !== null) {
+        const record = delta as Record<string, unknown>;
+        if (typeof record.content === "string" && record.content.length > 0) emit({ type: "delta", delta: record.content });
+        if (Array.isArray(record.tool_calls)) for (const chunk of record.tool_calls) {
+          if (typeof chunk === "object" && chunk !== null) toolAccumulator.add(chunk as OpenAiToolCallChunk);
+        }
+      }
+      if (finishReason === undefined && currentFinishReason !== undefined) {
+        finishReason = currentFinishReason;
+        finishPayload = parsed;
+      }
+      return false;
+    },
+    finish() {
+      const disposition = classifyOpenAiFinishReason(finishReason);
+      if (disposition === "incomplete" || disposition === "unknown") {
+        throw new ApiError(`${label}: geração interrompida (${finishReason})`, disposition === "incomplete" ? 400 : 502, finishPayload, { code: finishReason });
+      }
+      if (toolAccumulator.hasAny) {
+        for (const call of toolAccumulator.finalizedCalls(label)) emit({ type: "tool-call", call });
+      }
+    },
+  };
+}
+
+/** Idle + absolute deadlines of one provider request, bound to the caller's signal. */
+export interface ProviderDeadline {
+  readonly signal: AbortSignal;
+  /** The timeout that aborted the request, if one did. */
+  readonly timeoutError: OpenAIError | undefined;
+  /** Restart the idle timer (every response chunk counts as activity). */
+  resetIdle(): void;
+  dispose(): void;
+}
+
+export function startProviderDeadline(parent: AbortSignal | undefined, idleMs: number, maxMs: number): ProviderDeadline {
+  const controller = new AbortController();
+  let timeoutError: OpenAIError | undefined;
+  const onAbort = (): void => {
+    if (!controller.signal.aborted) controller.abort(parent?.reason);
+  };
+  parent?.addEventListener("abort", onAbort, { once: true });
+  if (parent?.aborted) onAbort();
+  const expire = (ms: number): void => {
+    if (controller.signal.aborted) return;
+    timeoutError = providerTimeoutError(ms);
+    controller.abort(timeoutError);
+  };
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  const resetIdle = (): void => {
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    if (controller.signal.aborted) return;
+    idleTimer = setTimeout(() => expire(idleMs), idleMs);
+  };
+  resetIdle();
+  const maxTimer = setTimeout(() => expire(maxMs), maxMs);
+  return {
+    signal: controller.signal,
+    get timeoutError() { return timeoutError; },
+    resetIdle,
+    dispose() {
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
+      clearTimeout(maxTimer);
+      parent?.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+const MAX_ERROR_BODY_BYTES = 64 * 1024;
+export const ERROR_BODY_TRUNCATION_MESSAGE = "corpo de erro truncado";
+const ERROR_BODY_TRUNCATION_MARKER = `\n[${ERROR_BODY_TRUNCATION_MESSAGE} após ${MAX_ERROR_BODY_BYTES} bytes]`;
+
+/** Reads at most 64 KiB of an error response body. */
+export async function readErrorBody(
+  response: Response,
+  signal: AbortSignal,
+  onActivity?: () => void,
+): Promise<{ text: string; truncated: boolean }> {
+  if (response.body === null) return { text: "", truncated: false };
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const parts: string[] = [];
+  let remaining = MAX_ERROR_BODY_BYTES;
+  let truncated = false;
+  try {
+    while (remaining > 0) {
+      const { done, value } = await raceWithAbort(reader.read(), signal);
+      if (done) {
+        parts.push(decoder.decode());
+        return { text: parts.join(""), truncated: false };
+      }
+      onActivity?.();
+      const retained = value.subarray(0, remaining);
+      parts.push(decoder.decode(retained, { stream: true }));
+      remaining -= retained.byteLength;
+      if (retained.byteLength < value.byteLength) {
+        truncated = true;
+        break;
+      }
+    }
+    if (!truncated) {
+      const next = await raceWithAbort(reader.read(), signal);
+      truncated = !next.done;
+    }
+    // A cut in the middle of a multi-byte character must not flush as U+FFFD.
+    if (!truncated) parts.push(decoder.decode());
+    if (truncated) parts.push(ERROR_BODY_TRUNCATION_MARKER);
+    return { text: parts.join(""), truncated };
+  } finally {
+    if (truncated) await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
+/**
+ * A non-2xx provider response as an `ApiError`: the provider's own message
+ * (so context-overflow and auth errors stay recognizable), the parsed body and
+ * the Retry-After hint.
+ */
+export async function providerHttpError(
+  label: string,
+  response: Response,
+  signal: AbortSignal,
+  onActivity?: () => void,
+): Promise<ApiError> {
+  let message = `${label}: HTTP ${response.status}`;
+  let responseBody: unknown;
+  try {
+    const errorBody = await readErrorBody(response, signal, onActivity);
+    let parsed: unknown = errorBody.text;
+    try {
+      parsed = JSON.parse(errorBody.text);
+    } catch {
+      // not JSON: keep the raw text
+    }
+    const extracted = extractOpenAiErrorMessage(parsed);
+    if (extracted !== undefined) message = `${message} — ${extracted}`;
+    if (errorBody.truncated) message = `${message} — ${ERROR_BODY_TRUNCATION_MESSAGE}`;
+    responseBody = parsed;
+  } catch {
+    // unreadable body: the status line is all we have
+  }
+  return new ApiError(message, response.status, responseBody, {
+    retryAfterMs: parseRetryAfterMs(response.headers.get("retry-after")),
+  });
 }
 
 /** Extrai a mensagem legível do corpo de erro JSON da OpenAI. */

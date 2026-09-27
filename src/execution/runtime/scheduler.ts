@@ -83,14 +83,6 @@ export class RuntimeScheduler {
     }
   }
 
-  reserve(leaseId: string): boolean {
-    return this.reserveFor(leaseId, leaseId);
-  }
-
-  async reserveOrWait(leaseId: string, signal?: AbortSignal): Promise<void> {
-    return this.reserveOrWaitFor(leaseId, leaseId, signal);
-  }
-
   async reserveOrWaitFor(leaseId: string, ownerId: string, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) { this.aborted = Math.min(Number.MAX_SAFE_INTEGER, this.aborted + 1); throw abortReason(signal); }
     if (this.reserveFor(leaseId, ownerId)) { this.admittedAfter(0); return; }
@@ -143,24 +135,12 @@ export class RuntimeScheduler {
     }
   }
 
-  has(leaseId: string): boolean {
-    return this.active.has(leaseId);
-  }
-
   get activeCount(): number {
     return this.active.size;
   }
 
   get waitingCount(): number {
     return this.pending.length;
-  }
-
-  get capacity(): number {
-    return this.maxActiveLeases;
-  }
-
-  shouldStop(): boolean {
-    return this.active.size === 0 && this.pending.length === 0;
   }
 
   private reserveFor(leaseId: string, ownerId: string): boolean {

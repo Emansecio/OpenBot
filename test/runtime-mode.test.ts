@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createProviderRegistry, type ProviderAdapter, type ProviderChatRequest, type ProviderStreamEvent } from "../src/providers/router.js";
 import type { AgentRuntimeManager, RuntimeCapability, RuntimeLease, RuntimeStatus } from "../src/execution/runtime/contracts.js";
-import type { RuntimeProcessRunner } from "../src/execution/runtime/wsl/process-backend.js";
+import type { RuntimeProcessRunner } from "../src/execution/runtime/process-backend.js";
 import { ConfigStore } from "../src/config/store.js";
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
 

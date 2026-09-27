@@ -876,3 +876,54 @@ async function readSseFrame(res: http.IncomingMessage): Promise<string> {
     buffered += queued ?? await new Promise<string>((resolve) => queue.waiters.push(resolve));
   }
 }
+
+describe("SSE channel allowlist", () => {
+  it("ignores a requested channel outside the allowlist", async () => {
+    const gateway = createGateway({ sseChannels: new Set(["transcript"]) });
+    const server = http.createServer(gateway.createHandler());
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+    const within = async <T>(promise: Promise<T>, label: string): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`${label} timed out after 2000ms`)), 2_000);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/api/events?channels=transcript,secrets-leak`, {
+        headers: { accept: "text/event-stream" },
+      });
+      expect(response.status).toBe(200);
+      const reader = response.body!.getReader();
+      try {
+        const forbidden = gateway.publish("secrets-leak", { marker: "forbidden-channel" });
+        const allowed = gateway.publish("transcript", { marker: "allowed-channel" });
+        expect(forbidden.eligibleClients).toBe(0);
+        expect(allowed.eligibleClients).toBe(1);
+
+        const decoder = new TextDecoder();
+        let received = "";
+        while (!received.includes("allowed-channel")) {
+          const chunk = await within(reader.read(), "SSE frame");
+          expect(chunk.done).toBe(false);
+          received += decoder.decode(chunk.value, { stream: true });
+        }
+        expect(received).toContain('"channel":"transcript"');
+        expect(received).not.toContain("forbidden-channel");
+      } finally {
+        await reader.cancel();
+      }
+    } finally {
+      gateway.close();
+      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+});

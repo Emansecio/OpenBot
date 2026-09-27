@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { createServer } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -64,6 +65,26 @@ async function waitForConnected(oauth: ProviderOAuthManager, provider: "openai" 
 }
 
 describe("ProviderOAuthManager", () => {
+  it("expires an abandoned browser login and frees its callback port", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-oauth-expiry-"));
+    roots.push(root);
+    const key = Buffer.alloc(32, 7);
+    const keystore = createKeystore({ dir: root, writeBackend: localFileBackend(key), legacyReadBackend: localFileBackend(key) });
+    const oauth = new ProviderOAuthManager({ keystore, fetchImpl: fetch, callbackPort: 0, loginTimeoutMs: 50 });
+    const started = await oauth.start("openai");
+    expect(started.state).toBe("pending");
+    const port = Number(new URL(new URL(started.authorizationUrl!).searchParams.get("redirect_uri")!).port);
+
+    const settled = await waitForConnected(oauth, "openai");
+    expect(settled).toMatchObject({ state: "error", message: expect.stringContaining("expirou") });
+    await new Promise<void>((resolve, reject) => {
+      const probe = createServer();
+      probe.once("error", reject);
+      probe.listen(port, "127.0.0.1", () => probe.close(() => resolve()));
+    });
+    await oauth.close();
+  });
+
   it("extracts the ChatGPT account id without exposing the token", () => {
     expect(decodeCodexAccountId(jwt("acct-123"))).toBe("acct-123");
     expect(() => decodeCodexAccountId("invalid")).toThrow("accountId");
@@ -427,6 +448,41 @@ describe("ProviderOAuthManager", () => {
     await oauth.rejectCredential("xai", "old-access");
     expect(await oauth.status("xai")).toMatchObject({ state: "connected" });
     await expect(oauth.resolveCredential("xai")).resolves.toMatchObject({ accessToken: "new-access" });
+  });
+
+  it("reads the absent rejection marker once and keeps it in step with its own writes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-oauth-marker-"));
+    roots.push(root);
+    const keystore = createKeystore({
+      dir: root,
+      writeBackend: localFileBackend(Buffer.alloc(32, 7)),
+      legacyReadBackend: localFileBackend(Buffer.alloc(32, 7)),
+    });
+    const realReveal = keystore.reveal.bind(keystore);
+    let markerReads = 0;
+    keystore.reveal = async (provider: string, agentId?: string) => {
+      if (provider === "xai-oauth-rejection") markerReads += 1;
+      return realReveal(provider, agentId);
+    };
+    const fetchImpl: typeof fetch = async (input) => String(input).endsWith("/device/code")
+      ? Response.json({ device_code: "device", user_code: "ABCD-EFGH", verification_uri: "https://auth.x.ai/device", interval: 1 })
+      : Response.json({ access_token: "xai-access", refresh_token: "xai-refresh", expires_in: 3600 });
+    const oauth = await managerWithKeystore(fetchImpl, keystore);
+    await oauth.start("xai");
+    expect(await waitForConnected(oauth, "xai")).toMatchObject({ state: "connected" });
+
+    markerReads = 0;
+    for (let turn = 0; turn < 5; turn += 1)
+      await expect(oauth.resolveCredential("xai")).resolves.toMatchObject({ accessToken: "xai-access" });
+    expect(markerReads).toBeLessThanOrEqual(1);
+
+    await oauth.rejectCredential("xai", "xai-access");
+    const readsBefore = markerReads;
+    await expect(oauth.resolveCredential("xai")).rejects.toThrow(/recusada/);
+    expect(markerReads).toBe(readsBefore);
+    // The marker is durable: a fresh manager over the same keystore sees it.
+    const reopened = await managerWithKeystore(fetchImpl, keystore);
+    await expect(reopened.resolveCredential("xai")).rejects.toThrow(/recusada/);
   });
 
   it("releases the mutation lock after rejection write and disconnect delete failures", async () => {

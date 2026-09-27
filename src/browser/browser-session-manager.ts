@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { readdir, rm } from "node:fs/promises";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { lstat, readdir, rm } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { createInterface, type Interface } from "node:readline";
+import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import {
   EgressProxy,
@@ -14,7 +15,6 @@ import {
 } from "./egress-proxy.js";
 
 import {
-  assertSafeBrowserUrl,
   createAuthToken,
   createRequestId,
   encodeBrowserFrame,
@@ -23,6 +23,8 @@ import {
   type BrowserCommand,
   type BrowserCommandResult,
   type BrowserHostCommandResult,
+  type BrowserHostDownloadEvent,
+  type BrowserHostHandoffEvent,
   type BrowserHostMessage,
   type BrowserHostRequest,
   type BrowserInternalCommand,
@@ -33,8 +35,13 @@ export const DEFAULT_BROWSER_COMMAND_TIMEOUT_MS = 30_000;
 export const MAX_BROWSER_COMMAND_TIMEOUT_MS = 60_000;
 export const DEFAULT_BROWSER_LEASE_TTL_MS = 15 * 60_000;
 export const MAX_BROWSER_LEASE_TTL_MS = 24 * 60 * 60_000;
-export const DEFAULT_BROWSER_MAX_PENDING_REQUESTS = 256;
-export const DEFAULT_BROWSER_MAX_PENDING_PER_AGENT = 32;
+// The host queues at most 16 requests per agent and 64 overall (plus one
+// running per agent); larger manager limits only turned into host rejections.
+export const DEFAULT_BROWSER_MAX_PENDING_REQUESTS = 64;
+export const DEFAULT_BROWSER_MAX_PENDING_PER_AGENT = 16;
+/** Chromium caches of an idle partition are dropped only above this size. */
+export const DEFAULT_BROWSER_MAX_PARTITION_CACHE_BYTES = 200 * 1024 * 1024;
+const LEASE_CLEANUP_RETRY_MS = 30_000;
 const MAX_AGENT_ID_BYTES = 256;
 
 export interface BrowserHostProcess {
@@ -69,8 +76,11 @@ export type BrowserHostLauncher = (options: BrowserHostLaunchOptions) => Browser
 
 export interface BrowserSessionManagerOptions {
   /** Managed ancestor for per-agent Downloads directories. */
-  downloadsRoot?: string;
-  /** Managed Electron userData/profile root, outside every agent home. */
+  downloadsRoot: string;
+  /**
+   * Managed Electron userData/profile root, outside every agent home.
+   * Defaults to a sibling of downloadsRoot, never a folder inside it.
+   */
   userDataRoot?: string;
   /** Resolves the already-authorized agent home Downloads directory. */
   resolveDownloadRoot?: (agentId: string) => string | Promise<string>;
@@ -90,6 +100,8 @@ export interface BrowserSessionManagerOptions {
   leaseTtlMs?: number;
   maxPendingRequests?: number;
   maxPendingPerAgent?: number;
+  /** Idle partitions whose Chromium caches exceed this are trimmed on host stop. */
+  maxPartitionCacheBytes?: number;
   now?: () => number;
 }
 
@@ -140,9 +152,15 @@ export async function waitForBrowserCommandPipe<T>(connection: Promise<T>): Prom
 }
 
 interface LeaseState extends BrowserLeaseDescriptor {
+  /** Idle TTL: each command moves expiresAt this far into the future. */
+  ttlMs: number;
   released: boolean;
   expired?: boolean;
+  /** The user controls the tab's window; the lease does not expire meanwhile. */
+  handoffActive?: boolean;
   cleanup?: Promise<BrowserHostCommandResult | undefined>;
+  /** Set when a cleanup failed; the sweep retries it at this time. */
+  cleanupRetryAt?: number;
   /** Trusted home root supplied by the server, never model-controlled. */
   homeRoot?: string;
 }
@@ -164,7 +182,8 @@ interface HostConnection {
   ready: Promise<void>;
   resolveReady(): void;
   rejectReady(error: Error): void;
-  readySettled: boolean;
+  /** The host sent its ready frame; later protocol errors end the host. */
+  readyObserved: boolean;
   writeTail: Promise<void>;
 }
 
@@ -174,12 +193,13 @@ interface HostConnection {
  * Electron process, while each agent keeps a persistent Electron partition.
  */
 export class BrowserSessionManager {
-  private readonly downloadsRoot?: string;
+  private readonly downloadsRoot: string;
   private readonly userDataRoot: string;
   private readonly resolveDownloadRoot?: (agentId: string) => string | Promise<string>;
   private readonly resolveHomeRoot?: (agentId: string) => string | Promise<string>;
   private readonly hostPath: string;
-  private readonly electronPath: string;
+  /** Resolved on first launch: a missing Electron must only disable the browser. */
+  private electronPath?: string;
   private readonly launchHost: BrowserHostLauncher;
   private readonly proxy: EgressProxy;
   private readonly maxDownloadBytes: number;
@@ -190,6 +210,7 @@ export class BrowserSessionManager {
   private readonly leaseTtlMs: number;
   private readonly maxPendingRequests: number;
   private readonly maxPendingPerAgent: number;
+  private readonly maxPartitionCacheBytes: number;
   private readonly now: () => number;
   private readonly leases = new Map<string, LeaseState>();
   private readonly pending = new Map<string, PendingRequest>();
@@ -205,23 +226,29 @@ export class BrowserSessionManager {
   private leaseSweepTimer?: ReturnType<typeof setTimeout>;
   private readonly agentTeardowns = new Map<string, Promise<void>>();
   private readonly downloadObservers = new Map<string, Set<Promise<void>>>();
+  /**
+   * Agents purged while a shared host kept their partition folder open. The
+   * reset already cleared the storage; the folder is removed once no host
+   * runs, unless the agent acquired a lease (and reused it) meanwhile.
+   */
+  private readonly pendingPartitionPurges = new Set<string>();
   private closed = false;
   private closing?: Promise<void>;
 
   constructor(options: BrowserSessionManagerOptions) {
-    if ((options.downloadsRoot === undefined || options.downloadsRoot.length === 0) && options.resolveDownloadRoot === undefined) {
-      throw new Error("downloadsRoot or resolveDownloadRoot is required");
+    if (typeof options.downloadsRoot !== "string" || options.downloadsRoot.length === 0 || !isAbsolute(options.downloadsRoot)) {
+      throw new Error("downloadsRoot must be an absolute path");
     }
-    this.downloadsRoot = options.downloadsRoot === undefined ? undefined : resolve(options.downloadsRoot);
-    const userDataRoot = options.userDataRoot ?? join(this.downloadsRoot ?? resolve("."), ".browser-user-data");
+    this.downloadsRoot = resolve(options.downloadsRoot);
+    const userDataRoot = options.userDataRoot ?? join(dirname(this.downloadsRoot), `${basename(this.downloadsRoot)}.browser-user-data`);
     if (!isAbsolute(userDataRoot)) throw new BrowserHostError("BROWSER_USER_DATA_ROOT_INVALID", "userDataRoot must be absolute");
     this.userDataRoot = resolve(userDataRoot);
     this.resolveDownloadRoot = options.resolveDownloadRoot;
     this.resolveHomeRoot = options.resolveHomeRoot;
     this.hostPath = options.hostPath ?? fileURLToPath(new URL("../../scripts/openbot-browser-host.cjs", import.meta.url));
-    this.electronPath = options.electronPath === undefined
-      ? resolvePackagedElectronCliPath()
-      : resolveExplicitElectronPath(options.electronPath);
+    // An explicit path is configuration and is checked now; the packaged
+    // runtime is looked up when the first browser command needs it.
+    if (options.electronPath !== undefined) this.electronPath = resolveExplicitElectronPath(options.electronPath);
     this.launchHost = options.launchHost ?? defaultBrowserHostLauncher;
     this.proxy = options.egressProxy ?? new EgressProxy(options.egressProxyOptions);
     this.maxDownloadBytes = clampDownloadLimit(options.maxDownloadBytes ?? DEFAULT_BROWSER_MAX_DOWNLOAD_BYTES);
@@ -232,6 +259,9 @@ export class BrowserSessionManager {
     this.leaseTtlMs = clampLeaseTtl(options.leaseTtlMs ?? DEFAULT_BROWSER_LEASE_TTL_MS);
     this.maxPendingRequests = clampPendingLimit(options.maxPendingRequests ?? DEFAULT_BROWSER_MAX_PENDING_REQUESTS, "maxPendingRequests");
     this.maxPendingPerAgent = clampPendingLimit(options.maxPendingPerAgent ?? DEFAULT_BROWSER_MAX_PENDING_PER_AGENT, "maxPendingPerAgent");
+    const maxPartitionCacheBytes = options.maxPartitionCacheBytes ?? DEFAULT_BROWSER_MAX_PARTITION_CACHE_BYTES;
+    if (!Number.isSafeInteger(maxPartitionCacheBytes) || maxPartitionCacheBytes < 0) throw new Error("maxPartitionCacheBytes must be a non-negative integer");
+    this.maxPartitionCacheBytes = maxPartitionCacheBytes;
     this.now = options.now ?? Date.now;
   }
 
@@ -286,8 +316,12 @@ export class BrowserSessionManager {
       downloadRoot,
       ...(homeRoot === undefined ? {} : { homeRoot }),
       expiresAt: this.now() + ttlMs,
+      ttlMs,
       released: false,
     };
+    // The agent uses its partition again: the storage was cleared by the
+    // purge, and deleting the folder later would now erase new data.
+    this.pendingPartitionPurges.delete(agentId);
     this.leases.set(leaseId, state);
     this.scheduleLeaseSweep();
     return this.asPublicLease(state);
@@ -303,15 +337,20 @@ export class BrowserSessionManager {
     await this.assertLeaseActive(state);
     if (signal?.aborted) throw browserAbortError();
     const safeCommand = validateBrowserCommand(command);
-    if (safeCommand.command === "navigate") {
-      assertSafeBrowserUrl(safeCommand.url);
+    this.renewLease(state);
+    // Closing always runs to completion: cancelling a turn must not leave
+    // the window open or the lease half released.
+    if (safeCommand.command === "close") return await this.closeLease(state);
+    try {
+      return await this.sendCommand(state, safeCommand, undefined, signal, options?.homeRoot) as BrowserCommandResult;
+    } catch (error) {
+      // The host no longer has this tab (never opened, or closed by the
+      // user). Release the lease so it cannot keep the host running.
+      if (error instanceof BrowserHostError && error.code === "BROWSER_TAB_NOT_FOUND") {
+        await this.beginLeaseCleanup(state).catch(() => undefined);
+      }
+      throw error;
     }
-    if (safeCommand.command === "close") return await this.closeLease(state, signal);
-    return await this.sendCommand(state, safeCommand, undefined, signal, options?.homeRoot) as BrowserCommandResult;
-  }
-
-  run(lease: BrowserLeaseDescriptor | string, command: BrowserCommand, signal?: AbortSignal): Promise<BrowserCommandResult> {
-    return this.execute(lease, command, signal);
   }
 
   open(lease: BrowserLeaseDescriptor | string, url = "about:blank", signal?: AbortSignal): Promise<BrowserCommandResult> {
@@ -408,12 +447,26 @@ export class BrowserSessionManager {
         downloadRoot: await this.resolveAgentDownloadRoot(agentId),
         ...(homeRoot === undefined ? {} : { homeRoot }),
         expiresAt: this.now() + this.commandTimeoutMs,
+        ttlMs: this.commandTimeoutMs,
         released: false,
       };
       await this.sendCommand(state, { command: "reset" }, this.host);
+      // The running host keeps the folder open; delete it once no host runs.
+      this.pendingPartitionPurges.add(agentId);
       return;
     }
     await this.removePartitionRoot(agentId);
+  }
+
+  private async removePendingPartitions(): Promise<void> {
+    for (const agentId of [...this.pendingPartitionPurges]) {
+      try {
+        await this.removePartitionRoot(agentId);
+        this.pendingPartitionPurges.delete(agentId);
+      } catch {
+        // Kept for the next host stop or start.
+      }
+    }
   }
 
   close(): Promise<void> {
@@ -617,13 +670,16 @@ export class BrowserSessionManager {
   }
 
   private async startHost(): Promise<HostConnection> {
+    const electronPath = this.electronPath ??= resolvePackagedElectronPath();
     const token = createAuthToken();
+    // No host is running here, so purged partition folders are free to go.
+    await this.removePendingPartitions();
     const proxy = await this.ensureProxy();
     const processHandle = await this.launchHost({
       authToken: token,
       hostPath: this.hostPath,
-      electronPath: this.electronPath,
-      downloadsRoot: this.downloadsRoot ?? resolve("."),
+      electronPath,
+      downloadsRoot: this.downloadsRoot,
       userDataRoot: this.userDataRoot,
       proxyUrl: `http://${proxy.host}:${proxy.port}`,
       proxyToken: proxy.token,
@@ -669,7 +725,7 @@ export class BrowserSessionManager {
       ready,
       resolveReady,
       rejectReady,
-      readySettled,
+      readyObserved: false,
       writeTail: Promise.resolve(),
     };
     lines.on("line", (line) => {
@@ -704,14 +760,20 @@ export class BrowserSessionManager {
     } catch (error) {
       const protocolError = error instanceof Error ? error : new Error(String(error));
       connection.rejectReady(new BrowserHostError("BROWSER_PROTOCOL_ERROR", protocolError.message));
+      // After ready, a malformed frame means the command stream can no longer
+      // be trusted. Ending the host fails pending commands now instead of
+      // leaving them to time out.
+      if (connection.readyObserved) connection.process.kill("SIGTERM");
       return;
     }
     if (message.kind === "ready") {
+      connection.readyObserved = true;
       connection.resolveReady();
       return;
     }
     if (message.kind === "event") {
       if (message.event === "download") this.handleDownloadEvent(message);
+      else this.handleHandoffEvent(message);
       return;
     }
     const pending = this.pending.get(message.id);
@@ -747,7 +809,16 @@ export class BrowserSessionManager {
     }
   }
 
-  private handleDownloadEvent(message: Extract<BrowserHostMessage, { kind: "event" }>): void {
+  private handleHandoffEvent(message: BrowserHostHandoffEvent): void {
+    const state = [...this.leases.values()].find((lease) => lease.tabId === message.tabId && !lease.released);
+    if (state === undefined) return;
+    state.handoffActive = message.active;
+    // The user takes as long as needed; the idle TTL restarts when they return.
+    if (!message.active) state.expiresAt = this.now() + state.ttlMs;
+    this.scheduleLeaseSweep();
+  }
+
+  private handleDownloadEvent(message: BrowserHostDownloadEvent): void {
     const state = [...this.leases.values()].find((lease) => lease.tabId === message.tabId);
     if (state === undefined) return;
     if (!isAbsolute(message.path) || message.path.includes("\0")) return;
@@ -792,17 +863,14 @@ export class BrowserSessionManager {
 
   private async resolveAgentDownloadRoot(agentId: string): Promise<string> {
     const raw = this.resolveDownloadRoot === undefined
-      ? join(this.downloadsRoot!, hashAgentId(agentId), "Downloads")
+      ? join(this.downloadsRoot, hashAgentId(agentId), "Downloads")
       : await this.resolveDownloadRoot(agentId);
     if (typeof raw !== "string" || raw.length === 0 || raw.includes("\0") || !isAbsolute(raw)) {
       throw new BrowserHostError("BROWSER_DOWNLOAD_ROOT_INVALID", "download root resolver returned an invalid absolute path");
     }
     const candidate = resolve(raw);
-    if (this.downloadsRoot !== undefined) {
-      const base = resolve(this.downloadsRoot);
-      if (!isPathWithin(base, candidate)) {
-        throw new BrowserHostError("BROWSER_DOWNLOAD_ROOT_INVALID", "download root is outside the managed browser root");
-      }
+    if (!isPathWithin(this.downloadsRoot, candidate)) {
+      throw new BrowserHostError("BROWSER_DOWNLOAD_ROOT_INVALID", "download root is outside the managed browser root");
     }
     if (this.resolveDownloadRoot !== undefined && candidate.toLowerCase().split(/[\\/]/u).pop() !== "downloads") {
       throw new BrowserHostError("BROWSER_DOWNLOAD_ROOT_INVALID", "download root must point to the agent Downloads directory");
@@ -834,9 +902,14 @@ export class BrowserSessionManager {
         state.expired === true ? "browser lease has expired" : "browser lease is no longer active",
       );
     }
-    if (this.now() < state.expiresAt) return;
+    if (state.handoffActive === true || this.now() < state.expiresAt) return;
     await this.beginLeaseCleanup(state, { expired: true });
     throw new BrowserHostError("BROWSER_LEASE_EXPIRED", "browser lease has expired");
+  }
+
+  private renewLease(state: LeaseState): void {
+    state.expiresAt = this.now() + state.ttlMs;
+    this.scheduleLeaseSweep();
   }
 
   private scheduleLeaseSweep(): void {
@@ -844,7 +917,8 @@ export class BrowserSessionManager {
     if (this.closed || this.leases.size === 0) return;
     let nextExpiry = Number.POSITIVE_INFINITY;
     for (const lease of this.leases.values()) {
-      if (!lease.released && lease.expiresAt < nextExpiry) nextExpiry = lease.expiresAt;
+      const due = this.sweepDueAt(lease);
+      if (due !== undefined && due < nextExpiry) nextExpiry = due;
     }
     if (!Number.isFinite(nextExpiry)) return;
     const delay = Math.max(0, Math.min(nextExpiry - this.now(), 2_147_483_647));
@@ -860,41 +934,52 @@ export class BrowserSessionManager {
     this.leaseSweepTimer = undefined;
   }
 
+  /** Expiry of an idle lease, or the retry time of a cleanup that failed. */
+  private sweepDueAt(lease: LeaseState): number | undefined {
+    if (!lease.released) return lease.handoffActive === true ? undefined : lease.expiresAt;
+    return lease.cleanup === undefined ? lease.cleanupRetryAt : undefined;
+  }
+
   private async sweepExpiredLeases(): Promise<void> {
     if (this.closed) return;
-    const expired = [...this.leases.values()].filter((lease) => !lease.released && this.now() >= lease.expiresAt);
-    await Promise.all(expired.map((lease) => this.beginLeaseCleanup(lease, { expired: true }).catch(() => undefined)));
+    const due = [...this.leases.values()].filter((lease) => {
+      const at = this.sweepDueAt(lease);
+      return at !== undefined && this.now() >= at;
+    });
+    await Promise.all(due.map((lease) => this.beginLeaseCleanup(lease, { expired: !lease.released }).catch(() => undefined)));
     this.scheduleLeaseSweep();
   }
 
-  private async closeLease(state: LeaseState, signal?: AbortSignal): Promise<BrowserCommandResult> {
-    const result = await this.beginLeaseCleanup(state, { signal });
+  private async closeLease(state: LeaseState): Promise<BrowserCommandResult> {
+    const result = await this.beginLeaseCleanup(state);
     if (result?.command === "close") return result as BrowserCommandResult;
     return { command: "close", tabId: state.tabId, visible: false };
   }
 
   private async beginLeaseCleanup(
     state: LeaseState,
-    options: { expired?: boolean; signal?: AbortSignal } = {},
+    options: { expired?: boolean } = {},
   ): Promise<BrowserHostCommandResult | undefined> {
     if (state.cleanup !== undefined) return await state.cleanup;
     state.released = true;
+    state.cleanupRetryAt = undefined;
     if (options.expired) state.expired = true;
-    state.cleanup = this.cleanupLease(state, options.signal);
+    state.cleanup = this.cleanupLease(state);
     try {
       const result = await state.cleanup;
       this.leases.delete(state.leaseId);
       return result;
     } catch (error) {
-      // Keep ownership for a later cleanup attempt; never hide a live tab.
+      // Keep ownership and let the sweep retry; never hide a live tab.
       state.cleanup = undefined;
+      state.cleanupRetryAt = this.now() + LEASE_CLEANUP_RETRY_MS;
       throw error;
     } finally {
       this.scheduleLeaseSweep();
     }
   }
 
-  private async cleanupLease(state: LeaseState, signal?: AbortSignal): Promise<BrowserHostCommandResult | undefined> {
+  private async cleanupLease(state: LeaseState): Promise<BrowserHostCommandResult | undefined> {
     // Include launch reservations, not only commands already written to a pipe.
     if (this.starting !== undefined) await this.starting.catch(() => undefined);
     if (this.stopping !== undefined) await this.stopping;
@@ -902,19 +987,16 @@ export class BrowserSessionManager {
     if (host === undefined) return;
 
     try {
-      return await this.sendCommand(state, { command: "close" }, host, signal);
+      return await this.sendCommand(state, { command: "close" }, host);
     } catch (error) {
       const lastLease = this.host === host && !this.hasActiveLeaseExcept(state);
-      // A missing tab is already clean. A shared-host close failure must
-      // propagate: resetting here would erase cookies and application data.
-      if (error instanceof BrowserHostError && error.code === "BROWSER_TAB_NOT_FOUND") {
+      // A missing tab, or a host that exited with all its tabs, is already
+      // clean. A shared-host close failure must propagate: resetting here
+      // would erase cookies and application data.
+      if (error instanceof BrowserHostError && (error.code === "BROWSER_TAB_NOT_FOUND" || error.code === "BROWSER_HOST_EXITED")) {
         return { command: "close", tabId: state.tabId, visible: false };
       }
-      if (
-        lastLease &&
-        error instanceof BrowserHostError &&
-        (error.code === "BROWSER_COMMAND_TIMEOUT" || error.code === "BROWSER_HOST_EXITED")
-      ) {
+      if (lastLease && error instanceof BrowserHostError && error.code === "BROWSER_COMMAND_TIMEOUT") {
         return { command: "close", tabId: state.tabId, visible: false };
       }
       throw error;
@@ -970,8 +1052,15 @@ export class BrowserSessionManager {
     await Promise.all(children.map(async (child) => {
       if (!child.isDirectory() || child.isSymbolicLink() || !child.name.startsWith("openbot-agent-")) return;
       const root = join(partitionsRoot, child.name);
-      await Promise.all(cacheSegments.map((segments) =>
-        rm(join(root, ...segments), { recursive: true, force: true }).catch(() => undefined)));
+      const targets = cacheSegments.map((segments) => join(root, ...segments));
+      // Warm caches make the next session fast; drop them only when large.
+      let total = 0;
+      for (const target of targets) {
+        total += await directorySize(target, this.maxPartitionCacheBytes - total + 1);
+        if (total > this.maxPartitionCacheBytes) break;
+      }
+      if (total <= this.maxPartitionCacheBytes) return;
+      await Promise.all(targets.map((target) => rm(target, { recursive: true, force: true }).catch(() => undefined)));
     }));
   }
 
@@ -991,8 +1080,11 @@ export class BrowserSessionManager {
       resolveStop = resolve;
       rejectStop = reject;
     });
-    // Keep host admission blocked through cache cleanup, not just process exit.
-    const stopping = exited.then(() => this.purgeIdlePartitionCaches().catch(() => undefined));
+    // Keep host admission blocked through profile cleanup, not just process exit.
+    const stopping = exited.then(async () => {
+      await this.removePendingPartitions();
+      await this.purgeIdlePartitionCaches().catch(() => undefined);
+    });
     this.stopping = stopping;
     let exitObserved = false;
     try {
@@ -1113,17 +1205,38 @@ export function buildBrowserHostEnvironment(
 async function launchBrowserHostWithPipe(options: BrowserHostLaunchOptions): Promise<BrowserHostProcess> {
   const commandPipe = await createBrowserCommandPipe();
   const environment = buildBrowserHostEnvironment({ ...options, commandPipe: commandPipe.path });
-  const launcher = isJavaScriptLauncher(options.electronPath)
+  const javaScriptLauncher = isJavaScriptLauncher(options.electronPath);
+  const launcher = javaScriptLauncher
     ? { command: process.execPath, args: [options.electronPath, options.hostPath] }
     : { command: options.electronPath, args: [options.hostPath] };
-  const child = spawn(launcher.command, launcher.args, {
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-    env: environment,
+  let child: ChildProcessByStdio<null, Readable, Readable>;
+  try {
+    child = spawn(launcher.command, launcher.args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      // Only a console launcher needs hiding. For electron.exe (a GUI program)
+      // SW_HIDE would override the first window it shows.
+      windowsHide: javaScriptLauncher,
+      env: environment,
+    });
+  } catch (error) {
+    // Windows reports some invalid executables synchronously.
+    await closeServer(commandPipe.server);
+    throw new BrowserHostError("BROWSER_HOST_LAUNCH_FAILED", `browser host could not start: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  // Spawn failures and early exits arrive as events; without these listeners
+  // an 'error' event would be thrown in the gateway process.
+  const launchFailure = new Promise<never>((_resolve, reject) => {
+    child.once("error", (error) => {
+      reject(new BrowserHostError("BROWSER_HOST_LAUNCH_FAILED", `browser host could not start: ${error.message}`));
+    });
+    child.once("exit", (code, signal) => {
+      reject(new BrowserHostError("BROWSER_HOST_LAUNCH_FAILED", `browser host exited during launch (${code ?? signal ?? "unknown"})`));
+    });
   });
+  launchFailure.catch(() => undefined);
   let command: Socket;
   try {
-    command = await waitForBrowserCommandPipe(commandPipe.connection);
+    command = await waitForBrowserCommandPipe(Promise.race([commandPipe.connection, launchFailure]));
   } catch (error) {
     child.kill("SIGTERM");
     await closeServer(commandPipe.server);
@@ -1138,6 +1251,8 @@ async function launchBrowserHostWithPipe(options: BrowserHostLaunchOptions): Pro
     stdin: {
       write: (chunk: string) => command.write(chunk),
       end: () => command.end(),
+      once: (event, listener) => command.once(event, listener),
+      removeListener: (event, listener) => command.removeListener(event, listener),
     },
     stdout: child.stdout,
     stderr: child.stderr,
@@ -1163,6 +1278,8 @@ async function createBrowserCommandPipe(): Promise<{ path: string; server: Serve
     });
     server.once("error", rejectConnection);
   });
+  // A listen failure rejects both this and the listen promise below.
+  connection.catch(() => undefined);
   await new Promise<void>((resolveListen, rejectListen) => {
     server.once("error", rejectListen);
     server.listen(path, () => {
@@ -1179,11 +1296,24 @@ function closeServer(server: Server): Promise<void> {
   });
 }
 
-function resolvePackagedElectronCliPath(): string {
+/**
+ * The packaged electron.exe itself, as `require("electron")` resolves it.
+ * Launching node + electron/cli.js made electron.exe a grandchild that
+ * survived when the manager killed the wrapper on Windows.
+ */
+function resolvePackagedElectronPath(): string {
   const configured = process.env.OPENBOT_BROWSER_ELECTRON_PATH?.trim();
   if (configured !== undefined && configured.length > 0) return resolveExplicitElectronPath(configured);
-  const candidate = resolve(fileURLToPath(new URL("../../node_modules/electron/cli.js", import.meta.url)));
-  if (!existsSync(candidate)) {
+  const packageRoot = resolve(fileURLToPath(new URL("../../node_modules/electron/", import.meta.url)));
+  const distRoot = join(packageRoot, "dist");
+  let executable = "";
+  try {
+    executable = readFileSync(join(packageRoot, "path.txt"), "utf8").trim();
+  } catch {
+    // Reported below as a missing runtime.
+  }
+  const candidate = resolve(distRoot, executable);
+  if (executable.length === 0 || candidate === distRoot || !isPathWithin(distRoot, candidate) || !existsSync(candidate)) {
     throw new BrowserHostError(
       "BROWSER_ELECTRON_NOT_INSTALLED",
       "local Electron runtime is missing; install the packaged electron dependency before using browser mode",
@@ -1265,6 +1395,32 @@ function clampDownloadLimit(value: number): number {
     throw new Error("maxDownloadBytes must be between 1 and 2147483648");
   }
   return value;
+}
+
+/** Bytes under a directory, without following links; stops once above `stopAbove`. */
+async function directorySize(root: string, stopAbove: number): Promise<number> {
+  let total = 0;
+  const pending = [root];
+  while (pending.length > 0 && total <= stopAbove) {
+    const current = pending.pop()!;
+    let entries;
+    try {
+      entries = await readdir(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const target = join(current, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        pending.push(target);
+      } else if (entry.isFile()) {
+        total += await lstat(target).then((metadata) => metadata.size, () => 0);
+        if (total > stopAbove) break;
+      }
+    }
+  }
+  return total;
 }
 
 function isPathWithin(root: string, candidate: string): boolean {

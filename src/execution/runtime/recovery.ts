@@ -226,6 +226,8 @@ export async function reconcileRuntimeLeases(
   currentBootId: string,
   reconciler: RuntimeResourceReconciler,
   activeBoot?: RuntimeBoot,
+  /** Leases this process still tracks: a restart keeps them running instead of treating them as orphans. */
+  isLive: (record: RuntimeLeaseRecord) => boolean = () => false,
 ): Promise<RuntimeRecoveryResult> {
   if (!validRuntimeIdentifier(currentBootId)) throw new Error("runtime boot id is invalid");
 
@@ -239,7 +241,7 @@ export async function reconcileRuntimeLeases(
   for (const record of records) {
     // Same-boot leases are not orphans. A crash recovery caller can safely
     // invoke this function before it has finished rebuilding its live table.
-    if (record.runtimeBootId === currentBootId) continue;
+    if (record.runtimeBootId === currentBootId || isLive(record)) continue;
 
     let cleanupFailed = false;
     if (reconciler.reconcileLease) {

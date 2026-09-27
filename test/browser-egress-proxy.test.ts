@@ -9,7 +9,6 @@ import {
 import {
   classifyIpAddress,
   isBlockedHostname,
-  isBlockedNetworkAddress,
 } from "../src/browser/network-policy.js";
 
 const proxies: EgressProxy[] = [];
@@ -61,9 +60,21 @@ describe("browser egress policy", () => {
     expect(classifyIpAddress("fe80::1")).toBe("link-local");
     expect(classifyIpAddress("ff02::1")).toBe("multicast");
     expect(classifyIpAddress("::")).toBe("unspecified");
-    expect(isBlockedNetworkAddress("::ffff:127.0.0.1")).toBe(true);
+    expect(classifyIpAddress("::ffff:127.0.0.1")).toBe("loopback");
     expect(isBlockedHostname("localhost")).toBe(true);
     expect(isBlockedHostname("metadata.google.internal")).toBe(true);
+  });
+
+  it("reserves only 192.0.0.0/24 and 192.0.2.0/24, blocks 6to4/Teredo and accepts underscores", () => {
+    expect(classifyIpAddress("192.0.78.9")).toBeNull();
+    expect(classifyIpAddress("192.2.10.1")).toBeNull();
+    expect(classifyIpAddress("192.0.0.8")).toBe("reserved");
+    expect(classifyIpAddress("192.0.2.44")).toBe("reserved");
+    expect(classifyIpAddress("2002:a00:1::1")).toBe("reserved");
+    expect(classifyIpAddress("2001:0:4136:e378::1")).toBe("reserved");
+    expect(classifyIpAddress("2001:4860:4860::8888")).toBeNull();
+    expect(isBlockedHostname("foo_bar.example.com")).toBe(false);
+    expect(isBlockedHostname("bad host.example.com")).toBe(true);
   });
 
   it("applies IPv4 policy to NAT64 addresses and blocks the local-use NAT64 prefix", () => {
@@ -135,7 +146,7 @@ describe("browser egress policy", () => {
     expect(basic).toEqual({ status: 200, body: "ok" });
   });
 
-  it("can disable proxy authentication for loopback-only browser hosts", async () => {
+  it("always requires proxy authentication, even for loopback clients", async () => {
     const target = createServer((_req, res) => {
       res.end("ok");
     });
@@ -144,7 +155,6 @@ describe("browser egress policy", () => {
     const targetPort = (target.address() as { port: number }).port;
 
     const proxy = new EgressProxy({
-      requireAuthorization: false,
       resolve: async () => ["93.184.216.34"],
       httpRequest: ((options: RequestOptions, callback: (response: IncomingMessage) => void) => httpRequest({ ...options, hostname: "127.0.0.1", port: targetPort }, callback)) as never,
     });
@@ -166,7 +176,7 @@ describe("browser egress policy", () => {
       client.end();
     });
 
-    expect(response).toEqual({ status: 200, body: "ok" });
+    expect(response.status).toBe(407);
   });
 
   it("rejects ambiguous Host headers and every blocked DNS answer for HTTP", async () => {
@@ -251,6 +261,43 @@ describe("browser egress policy", () => {
     socket.write("echo-through-tunnel");
     const echoed = await new Promise<string>((resolve) => socket.once("data", (chunk) => resolve(String(chunk))));
     expect(echoed).toBe("echo-through-tunnel");
+    socket.destroy();
+  });
+
+  it("keeps a connected tunnel alive past the connect timeout until the tunnel idle limit", async () => {
+    const target = netCreateServer((socket) => {
+      socket.on("data", (chunk) => socket.write(chunk));
+    });
+    servers.push(target);
+    await new Promise<void>((resolve) => target.listen(0, "127.0.0.1", () => resolve()));
+    const targetPort = (target.address() as { port: number }).port;
+    const proxy = new EgressProxy({
+      resolve: async () => ["93.184.216.34"],
+      connectTimeoutMs: 150,
+      idleTimeoutMs: 150,
+      tunnelIdleTimeoutMs: 5_000,
+      connect: ((options: NetConnectOpts) => netConnect({ ...options, host: "127.0.0.1", port: targetPort })) as never,
+    });
+    proxies.push(proxy);
+    const address = await proxy.start();
+    const socket = netConnect({ host: address.host, port: address.port });
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    socket.write(`CONNECT public.test:443 HTTP/1.1\r\nHost: public.test:443\r\nProxy-Authorization: Bearer ${address.token}\r\n\r\n`);
+    await new Promise<void>((resolve) => {
+      let data = "";
+      socket.on("data", function onData(chunk) {
+        data += String(chunk);
+        if (data.includes("\r\n\r\n")) { socket.off("data", onData); resolve(); }
+      });
+    });
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(socket.destroyed).toBe(false);
+    socket.write("still-alive");
+    const echoed = await new Promise<string>((resolve, reject) => {
+      socket.once("data", (chunk) => resolve(String(chunk)));
+      socket.once("close", () => reject(new Error("tunnel closed while idle")));
+    });
+    expect(echoed).toBe("still-alive");
     socket.destroy();
   });
 });

@@ -21,6 +21,26 @@
  *    pode travar em silêncio.
  */
 
+import { createServer } from "node:net";
+
+export function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A loopback TCP port the OS reported free; another process may still take it. */
+export async function getFreePort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  await new Promise((resolve) => server.close(resolve));
+  if (!port) throw new Error("Could not allocate a free port");
+  return port;
+}
+
 const STRIPPED_ENV_KEYS = [
   // Runner de teste que vaza para o filho
   "VITEST", "VITEST_WORKER_ID", "VITEST_POOL_ID",

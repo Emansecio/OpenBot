@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { Dirent } from "node:fs";
 import { link, lstat, mkdir, open, readFile, readdir, realpath, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -6,10 +7,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   discardStage,
   exportHomeArchive,
-  HomeArchiveError,
-  readHomeArchiveSummary,
   stageHomeArchive,
-  validateHomeArchive,
   type ExportHomeArchiveOptions,
   type ImportHomeArchiveOptions,
 } from "./home-archive.js";
@@ -19,15 +17,7 @@ import {
   type HomeAclContext,
   type HomeAclResult,
 } from "./home-acl.js";
-import { HomeWorkspaceBackend } from "./home-backend.js";
 import { emptyGrants, writeSharedGrants } from "./home-grants.js";
-import {
-  calculateVisibleUsage,
-  detectDrift,
-  readUsageBaseline,
-  writeUsageBaseline,
-  type DriftReport,
-} from "./home-drift.js";
 import { inventoryHome, validateHomeTree, WORKSPACE_ACL_STAMP_NAME, type HomeInventory } from "./home-inventory.js";
 import { renameWithRetry, writeFileExclusive } from "../shared/fs-atomic.js";
 import { WorkspaceError, WorkspaceSandbox } from "./workspace.js";
@@ -58,6 +48,7 @@ export interface AgentHomeManifest {
 
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 const RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu;
+const STALE_STAGE_AGE_MS = 24 * 60 * 60_000;
 // Process-local queue: the default gateway is single-process, so serializing
 // workspace ACL writes within this process is sufficient for the confirmed race.
 const workspaceAclQueues = new Map<string, Promise<void>>();
@@ -208,11 +199,6 @@ export interface HomeRepairResult {
 }
 
 export class AgentHomeStore {
-  private readonly backends = new Map<string, Promise<HomeWorkspaceBackend>>();
-
-  /** Snapshots live in a sibling of the workspaces root and never count against the bot quota. */
-  static readonly MAX_SNAPSHOTS_PER_AGENT = 5;
-
   private constructor(
     readonly root: string,
     readonly quarantineRoot: string,
@@ -269,7 +255,33 @@ export class AgentHomeStore {
       options.stageDiscarder ?? discardStage,
     );
     if (options.parentAclVerified !== true) await store.applyWorkspaceAcls("create");
+    await store.discardStaleStages();
     return store;
+  }
+
+  /**
+   * A stage outlives its create/import only when the process crashed mid-way.
+   * Another live store may still own a recent stage, so only long-idle direct
+   * children are reclaimed; failures are reported and retried on the next boot.
+   */
+  private async discardStaleStages(nowMs = Date.now()): Promise<void> {
+    let children: string[];
+    try {
+      children = await readdir(this.stagingRoot);
+    } catch {
+      return;
+    }
+    for (const name of children) {
+      const target = join(this.stagingRoot, name);
+      try {
+        const metadata = await lstat(target);
+        if (metadata.isSymbolicLink() || !metadata.isDirectory() || !isWithinRoot(this.stagingRoot, target)) continue;
+        if (nowMs - metadata.mtimeMs < STALE_STAGE_AGE_MS) continue;
+        await this.stageDiscarder(target);
+      } catch (error) {
+        console.warn(`[openbot] staging órfão não pôde ser removido (${name}):`, error instanceof Error ? error.message : String(error));
+      }
+    }
   }
 
   pathFor(agentId: string): string {
@@ -391,10 +403,11 @@ export class AgentHomeStore {
         await this.migrateLayout(sandbox, id, racedManifest);
       }
     }
-    await this.writeWelcome(sandbox);
     if (!created) {
       return { agentId: id, root: sandbox.root };
     }
+    // Seeded once with a new home: a welcome file the user deleted stays deleted.
+    await this.writeWelcome(sandbox);
     return { agentId: id, root: sandbox.root, created: true };
   }
 
@@ -416,7 +429,6 @@ export class AgentHomeStore {
 
   private async moveToQuarantine(agentId: string, verifyInventory: boolean): Promise<string | undefined> {
     const id = sanitizeAgentId(agentId);
-    this.backends.delete(id);
     const source = join(this.root, id);
     const quarantineName = `${id}-${Date.now()}-${randomUUID()}`;
     const destination = join(this.quarantineRoot, quarantineName);
@@ -493,39 +505,53 @@ export class AgentHomeStore {
   }
 
   /** Lists validated quarantine identities without reading/hash-walking user files. */
-  async listQuarantineMetadata(): Promise<QuarantineEntryMetadata[]> {
+  /**
+   * Validated quarantine entries. Listing and boot reconciliation fail closed
+   * on any damaged entry; restore and purge act on one agent and pass
+   `skipInvalid` so an unrelated damaged entry (left on disk untouched) cannot
+   * block them.
+   */
+  async listQuarantineMetadata(options: { skipInvalid?: boolean } = {}): Promise<QuarantineEntryMetadata[]> {
     const children = await readdir(this.quarantineRoot, { withFileTypes: true });
     const entries: QuarantineEntryMetadata[] = [];
     for (const child of children) {
-      if (child.isSymbolicLink() || !child.isDirectory()) {
-        throw new HomeLifecycleError("unsafe_path", "Workspace quarantine contains an unsafe entry.");
-      }
-      const quarantineId = child.name;
-      const root = join(this.quarantineRoot, quarantineId);
-      const markerPath = join(root, ".openbot", "quarantine.json");
-      let marker: unknown;
       try {
-        marker = JSON.parse(await readFile(markerPath, "utf8")) as unknown;
-      } catch {
-        throw new HomeLifecycleError("integrity_error", `Quarantine marker is invalid: ${quarantineId}.`);
+        entries.push(await this.readQuarantineEntry(child));
+      } catch (error) {
+        if (options.skipInvalid !== true || !(error instanceof HomeLifecycleError || error instanceof WorkspaceError)) throw error;
       }
-      if (
-        typeof marker !== "object" || marker === null ||
-        typeof (marker as { agentId?: unknown }).agentId !== "string" ||
-        typeof (marker as { quarantinedAt?: unknown }).quarantinedAt !== "string" ||
-        ((marker as { quarantineId?: unknown }).quarantineId !== undefined && (marker as { quarantineId?: unknown }).quarantineId !== quarantineId)
-      ) {
-        throw new HomeLifecycleError("integrity_error", `Quarantine marker identity is invalid: ${quarantineId}.`);
-      }
-      entries.push({
-        quarantineId,
-        agentId: sanitizeAgentId((marker as { agentId: string }).agentId),
-        quarantinedAt: (marker as { quarantinedAt: string }).quarantinedAt,
-        root,
-      });
     }
     entries.sort((left, right) => right.quarantinedAt.localeCompare(left.quarantinedAt));
     return entries;
+  }
+
+  private async readQuarantineEntry(child: Dirent): Promise<QuarantineEntryMetadata> {
+    if (child.isSymbolicLink() || !child.isDirectory()) {
+      throw new HomeLifecycleError("unsafe_path", "Workspace quarantine contains an unsafe entry.");
+    }
+    const quarantineId = child.name;
+    const root = join(this.quarantineRoot, quarantineId);
+    const markerPath = join(root, ".openbot", "quarantine.json");
+    let marker: unknown;
+    try {
+      marker = JSON.parse(await readFile(markerPath, "utf8")) as unknown;
+    } catch {
+      throw new HomeLifecycleError("integrity_error", `Quarantine marker is invalid: ${quarantineId}.`);
+    }
+    if (
+      typeof marker !== "object" || marker === null ||
+      typeof (marker as { agentId?: unknown }).agentId !== "string" ||
+      typeof (marker as { quarantinedAt?: unknown }).quarantinedAt !== "string" ||
+      ((marker as { quarantineId?: unknown }).quarantineId !== undefined && (marker as { quarantineId?: unknown }).quarantineId !== quarantineId)
+    ) {
+      throw new HomeLifecycleError("integrity_error", `Quarantine marker identity is invalid: ${quarantineId}.`);
+    }
+    return {
+      quarantineId,
+      agentId: sanitizeAgentId((marker as { agentId: string }).agentId),
+      quarantinedAt: (marker as { quarantinedAt: string }).quarantinedAt,
+      root,
+    };
   }
 
   /** Lists quarantine entries with validated metadata and a complete inventory. */
@@ -546,7 +572,7 @@ export class AgentHomeStore {
     const sandbox = await WorkspaceSandbox.create(this.root, { allowAncestorLinks: true });
     await sandbox.resolveExisting(".quarantine");
     await sandbox.resolveExisting(".snapshots");
-    const quarantines = (await this.listQuarantineMetadata()).filter((entry) => sameAgentId(entry.agentId, id));
+    const quarantines = (await this.listQuarantineMetadata({ skipInvalid: true })).filter((entry) => sameAgentId(entry.agentId, id));
     const targets: Array<{ root: string; marker?: string }> = [];
     let snapshotsRemoved = 0;
     for (const entry of quarantines) {
@@ -588,7 +614,7 @@ export class AgentHomeStore {
     const id = sanitizeAgentId(agentId);
     const active = join(this.root, id);
     if (await this.exists(active)) throw new HomeLifecycleError("conflict", "An active home already exists for this agent.");
-    const candidates = (await this.listQuarantineMetadata()).filter((entry) => sameAgentId(entry.agentId, id) && (quarantineId === undefined || entry.quarantineId === quarantineId));
+    const candidates = (await this.listQuarantineMetadata({ skipInvalid: true })).filter((entry) => sameAgentId(entry.agentId, id) && (quarantineId === undefined || entry.quarantineId === quarantineId));
     if (candidates.length === 0) throw new HomeLifecycleError("not_found", "No matching quarantined home exists.");
     if (candidates.length > 1) throw new HomeLifecycleError("conflict", "More than one quarantined home matches this agent; select one explicitly.");
     const candidate = candidates[0]!;
@@ -612,7 +638,6 @@ export class AgentHomeStore {
         throw new HomeLifecycleError("integrity_error", "Quarantine marker could not be removed.");
       }
       const home = await WorkspaceSandbox.create(active, { allowAncestorLinks: true });
-      this.backends.delete(id);
       const acl = await this.applyAcl(id, home.root, "restore");
       this.assertAcl(acl);
       await this.applyWorkspaceAcls("restore");
@@ -640,98 +665,14 @@ export class AgentHomeStore {
     const id = sanitizeAgentId(agentId);
     const home = await this.ensureExisting(id);
     await this.readHomeManifest(home.root, id);
-    try {
-      return await exportHomeArchive(home.root, id, destination, options);
-    } catch (error) {
-      if (error instanceof HomeArchiveError) throw error;
-      throw error;
-    }
+    return exportHomeArchive(home.root, id, destination, options);
   }
 
-  // ── snapshots (melhoria 3) ─────────────────────────────────────────────
+  // ── snapshots legados (melhoria 3, removida) ───────────────────────────
 
-  /** Snapshots live under the workspaces root, outside every agent home, so they never count against a bot quota. */
+  /** Snapshots from older versions stay under the workspaces root until the agent's data is purged. */
   private get snapshotsRoot(): string {
     return join(this.root, ".snapshots");
-  }
-
-  private snapshotDirectory(agentId: string): string {
-    return join(this.snapshotsRoot, sanitizeAgentId(agentId));
-  }
-
-  /** Captures a streamed v2 archive under snapshots/<id>/<seq>.obhome. */
-  async snapshot(agentId: string): Promise<{ seq: number; path: string; manifest: import("./home-archive.js").HomeArchiveManifest }> {
-    const id = sanitizeAgentId(agentId);
-    const home = await this.ensureExisting(id);
-    await this.readHomeManifest(home.root, id);
-    const directory = this.snapshotDirectory(id);
-    await mkdir(directory, { recursive: true });
-    const seq = await this.nextSnapshotSeq(directory);
-    const { path, manifest } = await exportHomeArchive(home.root, id, join(directory, `${seq}.obhome`));
-    await this.pruneSnapshots(id);
-    return { seq, path, manifest };
-  }
-
-  async listSnapshots(agentId: string): Promise<Array<{ seq: number; exportedAt: string; totalBytes: number; entryCount: number; path: string }>> {
-    const id = sanitizeAgentId(agentId);
-    const directory = this.snapshotDirectory(id);
-    const snapshots: Array<{ seq: number; exportedAt: string; totalBytes: number; entryCount: number; path: string }> = [];
-    for (const name of (await readdir(directory).catch((error: unknown) => {
-      if (isMissing(error)) return [];
-      throw error;
-    })).sort((left, right) => this.snapshotSeq(left) - this.snapshotSeq(right))) {
-      if (!Number.isSafeInteger(this.snapshotSeq(name))) continue;
-      const path = join(directory, name);
-      try {
-        const manifest = await readHomeArchiveSummary(path, id);
-        snapshots.push({ seq: this.snapshotSeq(name), exportedAt: manifest.exportedAt, totalBytes: manifest.totalBytes, entryCount: manifest.entryCount, path });
-      } catch {
-        // Unreadable snapshot: skip instead of failing the listing.
-      }
-    }
-    return snapshots;
-  }
-
-  /**
-   * Restores a snapshot atomically: the active home is quarantined first and
-   * rolled back when the import fails, so the bot never ends up homeless.
-   */
-  async restoreSnapshot(agentId: string, seq: number): Promise<AgentHome> {
-    const id = sanitizeAgentId(agentId);
-    if (!Number.isSafeInteger(seq) || seq < 1) throw new HomeLifecycleError("not_found", "Snapshot does not exist.");
-    const matches = [];
-    for (const extension of ["obhome", "json"]) {
-      const path = join(this.snapshotDirectory(id), `${seq}.${extension}`);
-      if (await this.exists(path)) matches.push(path);
-    }
-    if (matches.length > 1) throw new HomeLifecycleError("conflict", "More than one snapshot has this sequence.");
-    const snapshotPath = matches[0];
-    if (snapshotPath === undefined) throw new HomeLifecycleError("not_found", "Snapshot does not exist.");
-    const snapshotMetadata = await lstat(snapshotPath).catch((error: unknown) => {
-      if (isMissing(error)) throw new HomeLifecycleError("not_found", "Snapshot does not exist.");
-      throw error;
-    });
-    if (snapshotMetadata.isSymbolicLink() || !snapshotMetadata.isFile()) {
-      throw new HomeLifecycleError("unsafe_path", "Snapshot is unsafe.");
-    }
-    // Reject corruption before moving the active home. Import rechecks while staging.
-    await validateHomeArchive(snapshotPath, id);
-    let quarantineName: string | undefined;
-    if (await this.exists(join(this.root, id))) {
-      quarantineName = await this.moveToQuarantine(id, true);
-    }
-    try {
-      return await this.importArchive(id, snapshotPath, { preserveGrants: true });
-    } catch (error) {
-      if (quarantineName !== undefined) {
-        try {
-          await this.restore(id, quarantineName);
-        } catch (rollbackError) {
-          throw new AggregateError([error, rollbackError], "Failed to restore the snapshot; the previous home was rolled back.", { cause: rollbackError });
-        }
-      }
-      throw error;
-    }
   }
 
   private snapshotSeq(name: string): number {
@@ -739,35 +680,7 @@ export class AgentHomeStore {
     return match === null ? Number.NEGATIVE_INFINITY : Number(match[1]);
   }
 
-  private async nextSnapshotSeq(directory: string): Promise<number> {
-    const children = await readdir(directory).catch((error: unknown) => {
-      if (isMissing(error)) return [];
-      throw error;
-    });
-    let max = 0;
-    for (const name of children) {
-      const seq = this.snapshotSeq(name);
-      if (Number.isFinite(seq) && seq > max) max = seq;
-    }
-    return max + 1;
-  }
-
-  private async pruneSnapshots(agentId: string): Promise<void> {
-    const directory = this.snapshotDirectory(agentId);
-    const children = (await readdir(directory).catch((error: unknown) => {
-      if (isMissing(error)) return [];
-      throw error;
-    })).filter((name) => Number.isFinite(this.snapshotSeq(name))).sort((left, right) => this.snapshotSeq(right) - this.snapshotSeq(left));
-    for (const name of children.slice(AgentHomeStore.MAX_SNAPSHOTS_PER_AGENT)) {
-      const target = join(directory, name);
-      if (!isWithinRoot(this.snapshotsRoot, target)) {
-        throw new HomeLifecycleError("unsafe_path", "Snapshot path is outside the managed snapshots root.");
-      }
-      await rm(target, { force: true }).catch(() => undefined);
-    }
-  }
-
-  async importArchive(agentId: string, archivePath: string, options: ImportHomeArchiveOptions & { preserveGrants?: boolean } = {}): Promise<AgentHome> {
+  async importArchive(agentId: string, archivePath: string, options: ImportHomeArchiveOptions = {}): Promise<AgentHome> {
     const id = sanitizeAgentId(agentId);
     const target = join(this.root, id);
     if (await this.exists(target)) throw new HomeLifecycleError("conflict", "An active home already exists for this agent.");
@@ -777,13 +690,10 @@ export class AgentHomeStore {
     try {
       await stageHomeArchive(resolve(archivePath), id, stage, options);
       await this.validateCompleteHome(stage, id);
-      if (options.preserveGrants !== true) {
-        // Grants are consent, not content: an archive from outside the managed
-        // snapshots root must not arrive carrying pre-approved access to the
-        // user's real folders. Reseed empty so the imported home starts with
-        // no grants and the user grants explicitly on this machine.
-        await writeSharedGrants(stage, emptyGrants());
-      }
+      // Grants are consent, not content: an imported archive must not arrive
+      // carrying pre-approved access to the user's real folders. Reseed empty
+      // so the imported home starts with no grants on this machine.
+      await writeSharedGrants(stage, emptyGrants());
       if (await this.exists(target)) throw new HomeLifecycleError("conflict", "An active home already exists for this agent.");
       try {
         await renameWithRetry(stage, target);
@@ -793,7 +703,6 @@ export class AgentHomeStore {
         throw error;
       }
       const home = await WorkspaceSandbox.create(target, { allowAncestorLinks: true });
-      this.backends.delete(id);
       const acl = await this.applyAcl(id, home.root, "import");
       this.assertAcl(acl);
       await this.applyWorkspaceAcls("import");
@@ -886,56 +795,21 @@ export class AgentHomeStore {
       if (!repairedMetadata.isDirectory()) throw new HomeLifecycleError("integrity_error", `Home directory ${name} is not a directory.`);
       if (!existed) actions.push(`created-${name}`);
     }
-    const welcomeCreated = await this.writeWelcome(sandbox);
-    if (welcomeCreated) actions.push("created-welcome");
-    // Refresh the usage baseline as part of a repair (best-effort).
-    try {
-      await writeUsageBaseline(sandbox.root, await calculateVisibleUsage(sandbox.root));
-      actions.push("refreshed-usage-baseline");
-    } catch {
-      // Baseline refresh is observational.
-    }
     const acl = await this.applyAcl(id, sandbox.root, "repair");
     this.assertAcl(acl);
     await this.applyWorkspaceAcls("repair");
     return { agentId: id, repaired: actions.length > 0, actions, inventory: await inventoryHome(sandbox.root, id), acl };
   }
 
-  async backendFor(agentId: string): Promise<HomeWorkspaceBackend> {
-    const id = sanitizeAgentId(agentId);
-    const cached = this.backends.get(id);
-    if (cached) return cached;
-    const pending = this.ensure(id).then((home) => HomeWorkspaceBackend.create(home.root));
-    this.backends.set(id, pending);
-    try {
-      return await pending;
-    } catch (error) {
-      this.backends.delete(id);
-      throw error;
-    }
-  }
-
-  // ── uso e drift (melhoria 6) ───────────────────────────────────────────
-
   /**
-   * Full-usage audit for one bot: compares the persisted baseline with the
-   * current disk usage, refreshes the baseline and reports drift. Drift is
-   * a signal, never a blocker.
+   * Cheap readiness probe: the home exists, is a real directory and its
+   * manifest names this agent. Unlike `inventory`, it reads no user files.
    */
-  async auditUsage(agentId: string): Promise<DriftReport> {
+  async assertReady(agentId: string): Promise<void> {
     const id = sanitizeAgentId(agentId);
     const home = await this.ensureExisting(id);
-    const baseline = await readUsageBaseline(home.root);
-    const current = await calculateVisibleUsage(home.root);
-    await writeUsageBaseline(home.root, current);
-    return detectDrift(baseline, current);
-  }
-
-  /** Read-only drift check; does not refresh the baseline. */
-  async driftReport(agentId: string): Promise<DriftReport> {
-    const id = sanitizeAgentId(agentId);
-    const home = await this.ensureExisting(id);
-    return detectDrift(await readUsageBaseline(home.root), await calculateVisibleUsage(home.root));
+    const manifest = await this.readHomeManifest(home.root, id);
+    if (!sameAgentId(manifest.agentId, id)) throw new HomeLifecycleError("integrity_error", "Home manifest identity does not match the requested agent.");
   }
 
   private async ensureExisting(agentId: string): Promise<AgentHome> {
@@ -952,18 +826,15 @@ export class AgentHomeStore {
     return { agentId, root: sandbox.root };
   }
 
-  private async writeWelcome(sandbox: WorkspaceSandbox): Promise<boolean> {
-    let created = false;
+  private async writeWelcome(sandbox: WorkspaceSandbox): Promise<void> {
     for (const relative of ["Desktop/Bem-vindo.md", "Projects/Bem-vindo.md"]) {
       const welcome = await sandbox.resolveDestination(relative);
       try {
         await writeFileExclusive(welcome, WELCOME);
-        created = true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
     }
-    return created;
   }
 
   private async exists(path: string): Promise<boolean> {
@@ -1033,17 +904,14 @@ export class AgentHomeStore {
     return pending;
   }
 
+  /**
+   * One pass over the workspaces root: .quarantine, .staging and .snapshots
+   * live inside it and are covered by the same recursive apply (or inherit
+   * from it when a link forces a root-only apply). Separate passes repeated
+   * the full-tree icacls work for every quarantined home.
+   */
   private async runWorkspaceAclPass(operation: HomeAclContext["operation"]): Promise<void> {
-    let failure: unknown;
-    for (const target of [this.root, this.quarantineRoot, this.stagingRoot, this.snapshotsRoot]) {
-      const result = await this.applyAcl("workspace", target, operation);
-      try {
-        this.assertAcl(result);
-      } catch (error) {
-        failure ??= error;
-      }
-    }
-    if (failure) throw failure;
+    this.assertAcl(await this.applyAcl("workspace", this.root, operation));
   }
 
   private assertAcl(result: HomeAclResult): void {

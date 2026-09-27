@@ -1,5 +1,5 @@
-import { validateReflectionCandidates, MEMORY_POLICY_LIMITS, type PolicyRejection } from "./policy.js";
-import { isExplicitMemoryIntent, ReflectionRequestTooLargeError, type ReflectionExistingMemory, type ReflectionPreviousSummary } from "./context.js";
+import { canonicalKeyForm, validateReflectionCandidates, MEMORY_POLICY_LIMITS, type PolicyRejection } from "./policy.js";
+import { isExplicitMemoryForgetIntent, isExplicitMemoryIntent, ReflectionRequestTooLargeError, type ReflectionExistingMemory, type ReflectionPreviousSummary } from "./context.js";
 import { ProviderError } from "../providers/router.js";
 import { ProviderAdmissionError } from "../providers/admission.js";
 import type {
@@ -176,7 +176,6 @@ export function parseReflectionResult(input: string | unknown): ReflectionResult
   };
 }
 
-export const parseReflectionOutput = parseReflectionResult;
 
 class ReflectionStaleInputError extends Error {}
 
@@ -185,12 +184,20 @@ class ReflectionStaleInputError extends Error {}
  * retryability, output-format errors are retryable (next attempt may parse),
  * and permanent conditions stop the job without burning every attempt.
  */
+/** The loaded input no longer matches its job (range, provider or conversation changed). */
+class ReflectionInputMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReflectionInputMismatchError";
+  }
+}
+
 const classifyReflectionFailure = (error: unknown, aborted: boolean): { code: string; retryable: boolean } => {
   if (aborted) return { code: "timeout", retryable: true };
   if (error instanceof ReflectionRequestTooLargeError) return { code: "reflection_input_too_large", retryable: false };
   if (error instanceof ProviderError) return { code: `provider_${error.kind}`, retryable: error.retryable };
   if (error instanceof ProviderAdmissionError) return { code: `admission_${error.code}`, retryable: error.retryable };
-  if (error instanceof Error && error.message.includes("indisponível ou incompatível")) return { code: "reflection_input", retryable: false };
+  if (error instanceof ReflectionInputMismatchError) return { code: "reflection_input", retryable: false };
   if (error instanceof Error && error.message.startsWith("reflection:")) return { code: "reflection_format", retryable: true };
   return { code: "reflection_failed", retryable: true };
 };
@@ -246,7 +253,8 @@ function explicitUserMemoryEntryIds(entries: readonly unknown[]): ReadonlySet<st
   return ids;
 }
 
-function latestHumanUserHasExplicitMemoryIntent(entries: readonly unknown[]): boolean {
+/** What the latest human (not agent-relayed) user message asks of memory, in explicit mode. */
+function latestHumanMemoryRequest(entries: readonly unknown[]): "remember" | "forget" | undefined {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
     if (
@@ -255,18 +263,20 @@ function latestHumanUserHasExplicitMemoryIntent(entries: readonly unknown[]): bo
       || (entry as { kind?: unknown }).kind !== "message"
       || (entry as { role?: unknown }).role !== "user"
     ) continue;
-    return typeof (entry as { content?: unknown }).content === "string"
+    const human = typeof (entry as { content?: unknown }).content === "string"
       && typeof (entry as { fromUser?: unknown }).fromUser === "object"
       && (entry as { fromUser?: unknown }).fromUser !== null
-      && (entry as { fromAgent?: unknown }).fromAgent === undefined
-      && isExplicitMemoryIntent((entry as { content: string }).content);
+      && (entry as { fromAgent?: unknown }).fromAgent === undefined;
+    if (!human) return undefined;
+    const content = (entry as { content: string }).content;
+    if (isExplicitMemoryIntent(content)) return "remember";
+    if (isExplicitMemoryForgetIntent(content)) return "forget";
+    return undefined;
   }
-  return false;
+  return undefined;
 }
 
-function normalizeCanonicalKey(value: string): string {
-  return value.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/gu, " ");
-}
+const normalizeCanonicalKey = canonicalKeyForm;
 
 function successfulRememberedCanonicalKeys(entries: readonly unknown[]): ReadonlySet<string> {
   const keys = new Set<string>();
@@ -429,7 +439,17 @@ function validateReplacement(
 }
 
 /** Applies a parsed result in one logical store transaction. */
-export function applyReflectionResult(store: MemoryStore, input: MemoryReflectionInput, result: ReflectionResult | string | unknown): { memories: Memory[]; rejected: PolicyRejection[] } {
+export interface ApplyReflectionOptions {
+  /** Explicit memory mode: an upsert may cite only the messages that asked to remember. */
+  explicitEvidenceOnly?: boolean;
+}
+
+export function applyReflectionResult(
+  store: MemoryStore,
+  input: MemoryReflectionInput,
+  result: ReflectionResult | string | unknown,
+  options: ApplyReflectionOptions = {},
+): { memories: Memory[]; rejected: PolicyRejection[] } {
   validateInput(input);
   const parsed = parseReflectionResult(result);
   const forgotten = store.getForgottenSourceIds(input.agentId, input.conversationId);
@@ -451,6 +471,15 @@ export function applyReflectionResult(store: MemoryStore, input: MemoryReflectio
     ));
   const jobSourceEntryIds = deriveJobSourceEntryIds(coveredEntries, input.conversationId);
   const explicitEntryIds = explicitUserMemoryEntryIds(coveredEntries);
+  // A tool result is the only evidence that makes a memory "verified_tool".
+  const toolEntryIds = new Set(coveredEntries.flatMap((entry) => (
+    typeof entry === "object" && entry !== null
+    && (entry as { kind?: unknown }).kind === "tool-call"
+    && (entry as { status?: unknown }).status === "completed"
+    && typeof (entry as { id?: unknown }).id === "string"
+      ? [(entry as { id: string }).id]
+      : []
+  )));
   const directlyRememberedKeys = successfulRememberedCanonicalKeys(input.entries);
   const usedExplicitEvidenceIds = new Set<string>();
   const candidates = parsed.operations.flatMap((operation, index) => (
@@ -503,7 +532,21 @@ export function applyReflectionResult(store: MemoryStore, input: MemoryReflectio
         });
         return result;
       }
-      scopedCandidate = { ...candidate, sourceEntryIds: sources };
+      const sourceIds = sources.map((source) => typeof source === "string" ? source : source.entryId);
+      if (options.explicitEvidenceOnly === true && sourceIds.some((entryId) => !explicitEntryIds.has(entryId))) {
+        result.rejected.push({
+          index,
+          code: "explicit_scope",
+          message: "no modo explícito a memória só pode vir das mensagens que pediram para lembrar",
+        });
+        return result;
+      }
+      // The model cannot self-assert tool verification: without a completed
+      // tool call among its sources the memory is an external observation.
+      const trust = candidate.trust === "verified_tool" && !sourceIds.some((entryId) => toolEntryIds.has(entryId))
+        ? "external_observation" as const
+        : candidate.trust;
+      scopedCandidate = { ...candidate, trust, sourceEntryIds: sources };
     }
     const validation = validateReflectionCandidates([scopedCandidate], {
       allowPinned: false,
@@ -527,7 +570,7 @@ export function applyReflectionResult(store: MemoryStore, input: MemoryReflectio
   }
   const memories: Memory[] = [];
   const rejected: PolicyRejection[] = [...checked.rejected];
-    let acceptedIndex = 0;
+  let acceptedIndex = 0;
   const rejectedIndexes = new Set(checked.rejected.map((rejection) => rejection.index));
   store.transaction(() => {
     if (requestedSummary !== undefined) {
@@ -848,17 +891,16 @@ export class MemoryReflectionWorker {
     const failure = classifyReflectionFailure(error, aborted);
     const current = this.store.getJob(job.agentId, job.id);
     if (current === null || current.status !== "running" || !this.store.isConversationActive(job.agentId, job.conversationId)) return;
-    if (!failure.retryable || current.attempts >= this.maxAttempts) {
-      this.store.deadJob(job.agentId, job.id, { code: failure.code, text });
+    // The store owns the attempts limit: a retry past it answers "dead".
+    const settled = failure.retryable
+      ? this.store.retryJob(job.agentId, job.id, { code: failure.code, text }, undefined, { maxAttempts: this.maxAttempts, backoffMs: this.backoffMs })
+      : this.store.deadJob(job.agentId, job.id, { code: failure.code, text });
+    if (settled?.status === "dead") {
       try {
         this.onJobDead?.({ agentId: job.agentId, conversationId: job.conversationId, jobId: job.id, provider: job.provider, model: job.model, error: { code: failure.code, text } });
       } catch {
         // Notification is best-effort; the terminal job state is durable.
       }
-    } else {
-      this.store.retryJob(job.agentId, job.id, { code: failure.code, text }, undefined, {
-        maxAttempts: this.maxAttempts, backoffMs: this.backoffMs,
-      });
     }
   }
 
@@ -893,7 +935,7 @@ export class MemoryReflectionWorker {
         )) ||
         input.throughSequenceId !== job.throughSequenceId
       ) {
-        throw new Error("reflection input indisponível ou incompatível com job");
+        throw new ReflectionInputMismatchError("reflection input indisponível ou incompatível com job");
       }
       const reflected = await Promise.race([Promise.resolve(this.reflect(input, controller.signal)), timeout, aborted]);
       if (controller.signal.aborted) throw new Error("reflection timeout");
@@ -922,12 +964,27 @@ export class MemoryReflectionWorker {
           throw new ReflectionStaleInputError("reflection: revisão do resumo mudou antes da gravação");
         }
         const currentMode = this.store.getSettings(input.agentId).mode;
-        const memoryWritesAllowed = currentMode === "automatic"
-          || (currentMode === "explicit" && latestHumanUserHasExplicitMemoryIntent(input.entries));
-        if (memoryWritesAllowed) {
-          applyReflectionResult(this.store, input, parsed);
+        // Explicit mode acts only on what the latest human message asked:
+        // "remember" allows new memories from those very messages, "forget"
+        // allows only forgetting or replacing existing ones.
+        const request = currentMode === "explicit" ? latestHumanMemoryRequest(input.entries) : undefined;
+        const operations = currentMode === "automatic"
+          ? parsed.operations
+          : request === "remember"
+            ? parsed.operations.filter((operation) => operation.op === "upsert")
+            : request === "forget"
+              ? parsed.operations.filter((operation) => operation.op !== "upsert")
+              : [];
+        let applied: { rejected: PolicyRejection[] } | undefined;
+        if (currentMode === "automatic" || request !== undefined) {
+          applied = applyReflectionResult(this.store, input, { ...parsed, operations }, { explicitEvidenceOnly: request === "remember" });
         } else if (input.summaryRequested === true) {
-          applyReflectionResult(this.store, { ...input, memoryRequested: false }, { ...parsed, operations: [] });
+          applied = applyReflectionResult(this.store, { ...input, memoryRequested: false }, { ...parsed, operations: [] });
+        }
+        const discarded = parsed.operations.length - operations.length;
+        if ((applied?.rejected.length ?? 0) > 0 || discarded > 0) {
+          const codes = [...new Set(applied?.rejected.map((rejection) => rejection.code) ?? [])].join(",");
+          console.warn(`[openbot] memory reflection kept ${operations.length - (applied?.rejected.length ?? 0)} of ${parsed.operations.length} operations (rejected: ${applied?.rejected.length ?? 0}${codes ? ` [${codes}]` : ""}, outside the requested scope: ${discarded})`);
         }
         resultApplied = true;
         // When the request payload could only cover a contiguous prefix of the
@@ -946,15 +1003,12 @@ export class MemoryReflectionWorker {
     } catch (error) {
       if (this.closed) {
         // Return the claimed job to the durable queue instead of leaving it
-        // `running` ownerless until the next boot recovery. Immediate retry
-        // (no backoff): this is a shutdown handoff, not a failure, so the
-        // next boot's worker must be able to pick it up at once.
+        // `running` ownerless until the next boot recovery. A shutdown
+        // handoff is not a failure: the job is pending again at once and the
+        // attempt is not spent, even when it was the last one.
         // Best-effort: the store may already be closed during shutdown.
         try {
-          this.store.retryJob(job.agentId, job.id, { code: "aborted", text: "reflection worker fechado" }, undefined, {
-            maxAttempts: this.maxAttempts,
-            backoffMs: [0],
-          });
+          this.store.releaseJob(job.agentId, job.id);
         } catch {
           // Shutdown path: the next boot's recoverAbandonedJobs owns it.
         }

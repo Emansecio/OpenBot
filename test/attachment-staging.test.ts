@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
 import { defaultAttachmentRoots } from "../src/rpc/attachments.js";
+import { createTurnAttachmentReader } from "../src/attachments/turn-reader.js";
 import {
   AttachmentStagingStore,
   STAGED_PATH_PREFIX,
@@ -256,6 +257,19 @@ describe("P2.3 staging security (direct store)", () => {
     expect(existsSync(survivor.storedPath)).toBe(true);
   });
 
+  it("purges only the deleted conversation's attachments, bytes and rows", async () => {
+    const staging = directStaging();
+    const gone = await staging.stageBytes("agent-a", { filename: "gone.txt", bytes: TEXT, conversationId: "conv-gone" });
+    const kept = await staging.stageBytes("agent-a", { filename: "kept.txt", bytes: TEXT, conversationId: "conv-keep" });
+
+    await expect(staging.purgeConversation("agent-a", "conv-gone")).resolves.toBe(1);
+
+    expect(staging.get("agent-a", gone.id)).toBeNull();
+    expect(existsSync(gone.storedPath)).toBe(false);
+    expect(staging.get("agent-a", kept.id)).not.toBeNull();
+    expect(existsSync(kept.storedPath)).toBe(true);
+  });
+
   it("retains rows for a retry when strict purge cannot remove bytes", async () => {
     const staging = directStaging();
     const staged = await staging.stageBytes("agent-a", { filename: "retry.txt", bytes: TEXT });
@@ -363,6 +377,48 @@ describe("P2.3 staging + image-gating RPC", () => {
     expect(handle.store.getEntries("agent-a", conversation.id)).toContainEqual(expect.objectContaining({
       kind: "notice", level: "error", text: expect.stringContaining("Anexe a imagem novamente"),
     }));
+  });
+
+  it("sends a staged JPEG with its real MIME type and no false 'history truncated' notice", async () => {
+    const handle = await harness();
+    const requests: ProviderChatRequest[] = [];
+    handle.registry.register({
+      name: "xai",
+      async streamChat(request, emit) {
+        // Memory reflection runs after the turn through the same provider.
+        if (request.purpose === "turn") requests.push(structuredClone({ ...request, signal: undefined, onTransportStart: undefined }));
+        emit({ type: "delta", delta: "Uma foto." });
+      },
+    });
+    const conversation = handle.conversationStore.ensureDefault("agent-a");
+    const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from("jfif-fixture".repeat(8), "utf8")]);
+    const staged = await handle.attachmentStaging.stageBytes("agent-a", { filename: "foto.jpg", bytes: jpeg, conversationId: conversation.id });
+    expect(staged.mime).toBe("image/jpeg");
+    await handle.runner.sendPrompt({
+      agentId: "agent-a", conversationId: conversation.id, prompt: "O que é isto?", clientNonce: "jpeg-1",
+      attachments: [{ name: "foto.jpg", path: STAGED_PATH_PREFIX + staged.id }],
+    });
+    await handle.runner.flush("agent-a");
+    expect(requests).toHaveLength(1);
+    const images = requests[0]!.messages.flatMap((message) => typeof message.content === "string"
+      ? [] : message.content.filter((part) => part.type === "image_url"));
+    expect(images).toEqual([{ type: "image_url", image_url: { url: `data:image/jpeg;base64,${b64(jpeg)}`, detail: "auto" } }]);
+    // A short history with one image fits: attaching the image is not truncation.
+    const notices = handle.store.getEntries("agent-a", conversation.id).filter((entry) => entry.kind === "notice");
+    expect(notices.map((entry) => entry.id)).not.toContainEqual(expect.stringMatching(/:context-truncated$/u));
+  });
+
+  it("the turn reader follows the turn's image decision (live catalog) over the static matrix", async () => {
+    const handle = await harness();
+    const staged = await handle.attachmentStaging.stageBytes("agent-a", { filename: "pic.png", bytes: PNG });
+    const reader = createTurnAttachmentReader({ homes: handle.homes, attachmentStaging: handle.attachmentStaging });
+    const refs = [{ name: "pic.png", path: STAGED_PATH_PREFIX + staged.id }];
+    // openai-compat is text-only in the static matrix; a vision model known only
+    // to the live catalog is decided by the turn and passed in.
+    const staticOnly = await reader("agent-a", refs, undefined, { provider: "openai-compat", model: "vision-model" });
+    expect(staticOnly[0]?.skipped).toBe("unsupported_feature");
+    const catalogVision = await reader("agent-a", refs, undefined, { provider: "openai-compat", model: "vision-model", supportsImages: true });
+    expect(catalogVision[0]?.imageDataUrl).toMatch(/^data:image\/png;base64,/u);
   });
 
   it("stageAttachment returns only an opaque id + metadata", async () => {

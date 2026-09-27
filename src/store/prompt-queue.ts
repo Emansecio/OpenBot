@@ -46,6 +46,25 @@ export const promptPayloadDigest = (args: SandSendPromptArgs) => createHash("sha
 export function createPromptQueue(db?: Database.Database): PromptQueueStore {
   const rows = new Map<string, QueuedPrompt>();
   let sequence = 0;
+  const statements = new Map<string, Database.Statement>();
+  // Prepared once per SQL text: every queue operation runs on each turn.
+  const sql = <R = unknown>(text: string): Database.Statement<unknown[], R> => {
+    let statement = statements.get(text);
+    if (statement === undefined) {
+      statement = db!.prepare(text);
+      statements.set(text, statement);
+    }
+    return statement as unknown as Database.Statement<unknown[], R>;
+  };
+  /** A row this build cannot decode is reported and read as absent. */
+  const tryDecode = (row: QueueRow): QueuedPrompt | undefined => {
+    try {
+      return decode(row);
+    } catch (error) {
+      console.warn(`[openbot] prompt queue: entrada ${row.sequence} ilegível ignorada: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+  };
   const decode = (row: QueueRow | undefined): QueuedPrompt | undefined => {
     if (!row) return undefined;
     const args = parsePayload(row.args_json);
@@ -62,14 +81,14 @@ export function createPromptQueue(db?: Database.Database): PromptQueueStore {
     if (row.compacted || (row.state !== "completed" && row.state !== "cancelled")) return;
     const args = { agentId: row.args.agentId, conversationId: row.args.conversationId, clientNonce: row.args.clientNonce, prompt: "" };
     const inference = { provider: row.inference.provider, model: row.inference.model };
-    if (db) db.prepare("UPDATE prompt_queue SET args_json=?,inference_json=?,payload_digest=?,payload_compacted=1 WHERE sequence=? AND state IN ('completed','cancelled') AND payload_compacted=0")
+    if (db) sql("UPDATE prompt_queue SET args_json=?,inference_json=?,payload_digest=?,payload_compacted=1 WHERE sequence=? AND state IN ('completed','cancelled') AND payload_compacted=0")
       .run(JSON.stringify(args), JSON.stringify(inference), row.digest, row.sequence);
     else Object.assign(rows.get(key(args.agentId, args.conversationId!, args.clientNonce!))!, { args, inference, compacted: true });
   };
   const store: PromptQueueStore = {
     get,
     clear(agentId) {
-      if (db) db.prepare("DELETE FROM prompt_queue WHERE agent_id=?").run(agentId);
+      if (db) sql("DELETE FROM prompt_queue WHERE agent_id=?").run(agentId);
       else for (const [id, row] of rows) if (row.args.agentId === agentId) rows.delete(id);
     },
     put(args, inference) {
@@ -84,12 +103,12 @@ export function createPromptQueue(db?: Database.Database): PromptQueueStore {
           return existing;
         }
         if (db) {
-          db.prepare("INSERT INTO prompt_queue(agent_id,conversation_id,nonce,args_json,inference_json,payload_digest,state) VALUES(?,?,?,?,?,?,'queued')")
+          sql("INSERT INTO prompt_queue(agent_id,conversation_id,nonce,args_json,inference_json,payload_digest,state) VALUES(?,?,?,?,?,?,'queued')")
             .run(args.agentId, args.conversationId, args.clientNonce, payload, JSON.stringify(inference), hash);
           for (const attachment of args.attachments ?? []) {
             if (!attachment.path.startsWith("attachment:")) continue;
             const id = attachment.path.slice(11);
-            const result = db.prepare("UPDATE attachment_staging SET expires_at_ms=?,state='committed' WHERE id=? AND agent_id=? AND (conversation_id IS NULL OR conversation_id=?) AND state!='discarded' AND consumed_at_ms IS NULL AND expires_at_ms>?")
+            const result = sql("UPDATE attachment_staging SET expires_at_ms=?,state='committed' WHERE id=? AND agent_id=? AND (conversation_id IS NULL OR conversation_id=?) AND state!='discarded' AND consumed_at_ms IS NULL AND expires_at_ms>?")
               .run(Number.MAX_SAFE_INTEGER, id, args.agentId, args.conversationId, Date.now());
             if (result.changes !== 1) throw new Error("Queued attachment is unavailable or belongs to another conversation");
           }
@@ -104,21 +123,32 @@ export function createPromptQueue(db?: Database.Database): PromptQueueStore {
     list(agentId, state = "queued", limit) {
       if (state !== "queued" && state !== "interrupted") throw new Error("Invalid prompt queue state");
       if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)) throw new Error("Invalid prompt queue limit");
-      if (db) return db.prepare<unknown[], QueueRow>(`SELECT * FROM prompt_queue WHERE state=?${agentId === undefined ? "" : " AND agent_id=?"} ORDER BY sequence${limit === undefined ? "" : " LIMIT ?"}`)
-        .all(state, ...(agentId === undefined ? [] : [agentId]), ...(limit === undefined ? [] : [limit])).map(row => decode(row)!);
+      if (db) {
+        const found = sql<QueueRow>(`SELECT * FROM prompt_queue WHERE state=?${agentId === undefined ? "" : " AND agent_id=?"} ORDER BY sequence${limit === undefined ? "" : " LIMIT ?"}`)
+          .all(state, ...(agentId === undefined ? [] : [agentId]), ...(limit === undefined ? [] : [limit]));
+        return found.flatMap((row) => {
+          const decoded = tryDecode(row);
+          if (decoded !== undefined) return [decoded];
+          // Boot recovery lists queued prompts: an undecodable one can never run,
+          // so it leaves the queue instead of failing every later start.
+          sql("UPDATE prompt_queue SET state='cancelled' WHERE sequence=? AND state=?").run(row.sequence, row.state);
+          return [];
+        });
+      }
       return [...rows.values()].filter(row => row.state === state && (agentId === undefined || row.args.agentId === agentId)).slice(0, limit).map(row => structuredClone(row));
     },
     transition(agent, conversation, nonce, from, to) {
       if (db) return db.transaction(() => {
-        const row = get(agent, conversation, nonce);
-        if (db.prepare("UPDATE prompt_queue SET state=? WHERE agent_id=? AND conversation_id=? AND nonce=? AND state=?").run(to, agent, conversation, nonce, from).changes !== 1) return false;
+        const stored = find!.get(agent, conversation, nonce);
+        const row = stored === undefined ? undefined : tryDecode(stored);
+        if (sql("UPDATE prompt_queue SET state=? WHERE agent_id=? AND conversation_id=? AND nonce=? AND state=?").run(to, agent, conversation, nonce, from).changes !== 1) return false;
         if (to !== "running" && to !== "queued") {
           for (const attachment of row?.args.attachments ?? []) {
             if (!attachment.path.startsWith("attachment:")) continue;
             // Retain the usual recovery window, but never leave cancelled attachments immortal.
-            const held = db.prepare("SELECT 1 FROM prompt_queue q, json_each(q.args_json,'$.attachments') a WHERE q.agent_id=? AND q.state IN ('queued','running') AND json_extract(a.value,'$.path')=? LIMIT 1").get(agent, attachment.path);
+            const held = sql("SELECT 1 FROM prompt_queue q, json_each(q.args_json,'$.attachments') a WHERE q.agent_id=? AND q.state IN ('queued','running') AND json_extract(a.value,'$.path')=? LIMIT 1").get(agent, attachment.path);
             if (held) continue;
-            db.prepare("UPDATE attachment_staging SET expires_at_ms=? WHERE id=? AND agent_id=? AND expires_at_ms=?")
+            sql("UPDATE attachment_staging SET expires_at_ms=? WHERE id=? AND agent_id=? AND expires_at_ms=?")
               .run(Date.now() + 24 * 60 * 60_000, attachment.path.slice(11), agent, Number.MAX_SAFE_INTEGER);
           }
         }
@@ -142,7 +172,7 @@ export function createPromptQueue(db?: Database.Database): PromptQueueStore {
         const original = get(agent, conversation, nonce);
         if (!original || original.state !== "interrupted" || original.compacted) throw new Error("Message is no longer available for recovery");
         const replacement = store.put(args, original.inference);
-        if (db) db.prepare("UPDATE prompt_queue SET recovery_of=? WHERE sequence=?").run(nonce, replacement.sequence);
+        if (db) sql("UPDATE prompt_queue SET recovery_of=? WHERE sequence=?").run(nonce, replacement.sequence);
         else rows.get(key(agent, conversation, args.clientNonce!))!.recoveryOf = nonce;
         if (!store.transition(agent, conversation, nonce, "interrupted", "cancelled")) throw new Error("Recovery state changed");
         return get(agent, conversation, args.clientNonce!)!;
@@ -153,10 +183,13 @@ export function createPromptQueue(db?: Database.Database): PromptQueueStore {
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error("Invalid compaction limit");
       // Runs while the store opens: an undecodable terminal row is left as-is instead of failing boot.
       const candidates = db
-        ? db.prepare<unknown[], QueueRow>("SELECT * FROM prompt_queue WHERE payload_compacted=0 AND state IN ('completed','cancelled') ORDER BY sequence LIMIT ?").all(limit).flatMap((row) => {
+        ? sql<QueueRow>("SELECT * FROM prompt_queue WHERE payload_compacted=0 AND state IN ('completed','cancelled') ORDER BY sequence LIMIT ?").all(limit).flatMap((row) => {
           try { return [decode(row)!]; } catch { return []; }
         })
         : [...rows.values()].filter(row => !row.compacted && (row.state === "completed" || row.state === "cancelled")).slice(0, limit);
+      // Compacted terminal rows are kept: a prompt cancelled while queued never
+      // reaches the accepted-nonce ledger, so its row is the only record that
+      // stops a resend of the same nonce from running it again.
       const apply = () => { for (const row of candidates) compact(row); return candidates.length; };
       return db ? db.transaction(apply)() : apply();
     },

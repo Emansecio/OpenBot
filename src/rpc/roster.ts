@@ -638,10 +638,10 @@ export function registerRosterHandlers(
         agent.id,
       ).model;
     }
-    return resolveAgentInference(state ?? config.snapshot(), agent.id).model;
+    return resolveAgentInference(state ?? config.view(), agent.id).model;
   };
   const agents = () => {
-    const list = config.snapshot().agents;
+    const list = config.view().agents;
     if (list.some((entry) => entry.createdAt === undefined || entry.updatedAt === undefined)) {
       const now = Date.now();
       return config.mutate((current) => ({
@@ -672,7 +672,7 @@ export function registerRosterHandlers(
     const list = agents();
     // One snapshot shared by every legacy agent that lacks an explicit model —
     // avoids a full structuredClone per agent.
-    const state = list.some((entry) => entry.model === undefined) ? config.snapshot() : undefined;
+    const state = list.some((entry) => entry.model === undefined) ? config.view() : undefined;
     gateway.publish("agents", {
       agents: list.map((entry) => summarize(entry, modelOf(entry, state), activeAgentId, activity)),
       activeAgentId,
@@ -758,11 +758,14 @@ export function registerRosterHandlers(
   }));
   gateway.registerHandler("listAgents", () => {
     const list = agents();
-    const state = list.some((entry) => entry.model === undefined) ? config.snapshot() : undefined;
+    const state = list.some((entry) => entry.model === undefined) ? config.view() : undefined;
     return list.map((entry) => summarize(entry, modelOf(entry, state), activeAgentId, activity));
   });
   gateway.registerHandler("countAgents", () => agents().length);
-  gateway.registerHandler("getAgent", (body) => summarize(requireAgent(body, true), modelOf(requireAgent(body, true)), activeAgentId, activity));
+  gateway.registerHandler("getAgent", (body) => {
+    const agent = requireAgent(body, true);
+    return summarize(agent, modelOf(agent), activeAgentId, activity);
+  });
   gateway.registerHandler("openAgent", (body) => {
     const current = requireAgent(body, true);
     activateAgent(current.id);
@@ -788,7 +791,7 @@ export function registerRosterHandlers(
     if (q !== undefined && typeof q !== "string") return bad("searchAgents: query deve ser string");
     const list = agents()
       .filter((entry) => !q || entry.name.toLowerCase().includes(q.toLowerCase()));
-    const state = list.some((entry) => entry.model === undefined) ? config.snapshot() : undefined;
+    const state = list.some((entry) => entry.model === undefined) ? config.view() : undefined;
     return list.map((entry) => summarize(entry, modelOf(entry, state), activeAgentId, activity));
   });
   gateway.registerHandler("createAgent", async (body) => {
@@ -855,36 +858,7 @@ export function registerRosterHandlers(
       } catch (error) {
         return toHomeRpcError("createAgent", error);
       }
-      try {
-        config.mutate((current) => {
-          if (current.agents.some((entry) => entry.id.toLowerCase() === id.toLowerCase())) {
-            return bad("createAgent: id já existe");
-          }
-          requireAgentCapacity(current, "createAgent");
-          return { agents: [...current.agents, created] };
-        });
-      } catch (error) {
-        if (home?.created && homes) {
-          try {
-            await homes.discardCreated(home);
-          } catch (rollbackError) {
-            throw new AggregateError([error, rollbackError], "createAgent: failed to rollback home after config commit failure", { cause: rollbackError });
-          }
-        }
-        throw error;
-      }
-      try {
-        conversationStore?.ensureDefault(id);
-      } catch (error) {
-        try {
-          config.mutate((current) => ({ agents: current.agents.filter((entry) => entry.id !== id) }));
-          if (home?.created && homes) await homes.discardCreated(home);
-          conversationStore?.clear?.(id);
-        } catch (rollbackError) {
-          throw new AggregateError([error, rollbackError], "createAgent: failed to rollback conversation after initialization failure", { cause: rollbackError });
-        }
-        throw error;
-      }
+      await commitNewAgent("createAgent", created, home);
       // Bots created by another bot must not yank the user's open chat:
       // only user-initiated creations switch the active agent.
       const keepCurrentChat = origin.startsWith("agent:") && activeAgentId !== undefined;
@@ -1057,9 +1031,8 @@ export function registerRosterHandlers(
     const quarantineId = typeof rawQuarantineId === "string" ? rawQuarantineId.trim() : undefined;
     return runHomeLifecycle(method, agentId, async () => {
       const restored = await homes.restore(agentId, quarantineId);
-      const result = { ...restored, inventory: await homes.inventory(agentId) };
       clearAgentHomeRepair(agentId);
-      return result;
+      return { ...restored, inventory: await homes.inventory(agentId) };
     });
   });
 
@@ -1088,9 +1061,8 @@ export function registerRosterHandlers(
       const extraBytes = await stat(archivePath).then((info) => info.size).catch(() => 0);
       await admitManagedDisk(method, extraBytes);
       const imported = await homes.importArchive(agentId, archivePath, options);
-      const result = { ...imported, inventory: await homes.inventory(agentId) };
       clearAgentHomeRepair(agentId);
-      return result;
+      return { ...imported, inventory: await homes.inventory(agentId) };
     });
   });
 
@@ -1285,12 +1257,58 @@ export function registerRosterHandlers(
       } finally {
         for (const agentId of lockedUniqueIds) {
           reservedAgentSlots.delete(agentId.toLowerCase());
-          runtimeFence?.releaseAgentFence?.(agentId);
+          // With a deletion hook the runtime fence is released after the drain
+          // settles (afterDeleteAgents); releasing it here could let a late
+          // runtime stop tombstone an agent whose deletion was rolled back.
+          if (afterDeleteAgents === undefined) runtimeFence?.releaseAgentFence?.(agentId);
         }
       }
     }
     });
   });
+  /**
+   * Adds a new agent whose home was just ensured: commits it to the roster and
+   * creates its default conversation, undoing both (and a freshly created
+   * home) when either step fails.
+   */
+  const commitNewAgent = async (
+    method: "createAgent" | "duplicateAgent",
+    agent: LocalAgent,
+    home: Awaited<ReturnType<NonNullable<typeof homes>["ensure"]>> | undefined,
+  ): Promise<void> => {
+    const id = agent.id;
+    try {
+      config.mutate((current) => {
+        if (current.agents.some((entry) => entry.id.toLowerCase() === id.toLowerCase())) {
+          return bad(`${method}: id já existe`);
+        }
+        requireAgentCapacity(current, method);
+        return { agents: [...current.agents, agent] };
+      });
+    } catch (error) {
+      if (home?.created && homes) {
+        try {
+          await homes.discardCreated(home);
+        } catch (rollbackError) {
+          throw new AggregateError([error, rollbackError], `${method}: failed to rollback home after config commit failure`, { cause: rollbackError });
+        }
+      }
+      throw error;
+    }
+    try {
+      conversationStore?.ensureDefault(id);
+    } catch (error) {
+      try {
+        config.mutate((current) => ({ agents: current.agents.filter((entry) => entry.id !== id) }));
+        if (home?.created && homes) await homes.discardCreated(home);
+        conversationStore?.clear?.(id);
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], `${method}: failed to rollback conversation after initialization failure`, { cause: rollbackError });
+      }
+      throw error;
+    }
+  };
+
   gateway.registerHandler("duplicateAgent", async (body) => {
     const source = requireAgent(body);
     requireAgentCapacity(config.snapshot(), "duplicateAgent");
@@ -1308,7 +1326,7 @@ export function registerRosterHandlers(
       avatarShape: source.avatarShape,
       avatarColor: source.avatarColor,
       ...(source.runtimeMode === undefined ? {} : { runtimeMode: source.runtimeMode }),
-      ...inheritInference(source, config.snapshot()),
+      ...inheritInference(source, config.view()),
       createdAt: now,
       updatedAt: now,
     };
@@ -1340,36 +1358,7 @@ export function registerRosterHandlers(
     if (copy.hasCustomAvatar !== true && source.avatarPngBase64 !== undefined) {
       copy.avatarPngBase64 = source.avatarPngBase64;
     }
-    try {
-      config.mutate((current) => {
-        if (current.agents.some((agent) => agent.id.toLowerCase() === id.toLowerCase())) {
-          return bad("duplicateAgent: id já existe");
-        }
-        requireAgentCapacity(current, "duplicateAgent");
-        return { agents: [...current.agents, copy] };
-      });
-    } catch (error) {
-      if (home?.created && homes) {
-        try {
-          await homes.discardCreated(home);
-        } catch (rollbackError) {
-          throw new AggregateError([error, rollbackError], "duplicateAgent: failed to rollback home after config commit failure", { cause: rollbackError });
-        }
-      }
-      throw error;
-    }
-    try {
-      conversationStore?.ensureDefault(id);
-    } catch (error) {
-      try {
-        config.mutate((current) => ({ agents: current.agents.filter((entry) => entry.id !== id) }));
-        if (home?.created && homes) await homes.discardCreated(home);
-        conversationStore?.clear?.(id);
-      } catch (rollbackError) {
-        throw new AggregateError([error, rollbackError], "duplicateAgent: failed to rollback conversation after initialization failure", { cause: rollbackError });
-      }
-      throw error;
-    }
+    await commitNewAgent("duplicateAgent", copy, home);
     const wrapped = wrapAgent(copy, modelOf(copy), id, activity);
     gateway.publish("agent-upserted", { ...wrapped, activeAgentId: id });
     publishRoster(id);
@@ -1418,10 +1407,10 @@ export function registerRosterHandlers(
     const provider = (catalogProvider ?? requestedProvider ?? (isKnownCatalogModel(nextModel) ? undefined : "openai-compat")) as ProviderKind | undefined;
     if (catalogProvider === undefined && provider !== "openai-compat") return bad(`modelo não suportado: ${nextModel}`);
     if (provider && !(["openai", "xai", "opencode-go", "openai-compat"] as string[]).includes(provider)) return bad("provider não suportado");
-    if (provider === "openai-compat") ensureCompatAdapter(config.snapshot().compatBaseUrl, keystore, registry, config.snapshot().compatReasoningEffort === true);
+    if (provider === "openai-compat") ensureCompatAdapter(config.view().compatBaseUrl, keystore, registry, config.view().compatReasoningEffort === true);
     if (!target) {
       config.update({ globalModel: nextModel, activeProvider: catalogProvider! });
-      const inference = resolveAgentInference(config.snapshot());
+      const inference = resolveAgentInference(config.view());
       return { model: inference.model, ...toClientDefaultModel(inference.model, inference) };
     }
     if (target) {
@@ -1432,12 +1421,12 @@ export function registerRosterHandlers(
       }));
       publishRoster();
     }
-    const inference = resolveAgentInference(config.snapshot(), target.id);
+    const inference = resolveAgentInference(config.view(), target.id);
     return { model: inference.model, ...toClientDefaultModel(inference.model, inference) };
   });
   gateway.registerHandler("getActiveProvider", (body) => {
     const target = agentIdOf(body) !== undefined ? requireAgent(body) : agents().find((entry) => entry.id === activeAgentId);
-    return { provider: resolveAgentInference(config.snapshot(), target?.id).provider };
+    return { provider: resolveAgentInference(config.view(), target?.id).provider };
   });
   gateway.registerHandler("setActiveProvider", async (body) => {
     await modelCatalog?.initialize();
@@ -1445,7 +1434,7 @@ export function registerRosterHandlers(
     const provider = b.provider;
     if (typeof provider !== "string") return bad("provider é obrigatório");
     if (!(["openai", "xai", "opencode-go", "openai-compat"] as string[]).includes(provider)) return bad("provider não suportado");
-    if (provider === "openai-compat") ensureCompatAdapter(config.snapshot().compatBaseUrl, keystore, registry, config.snapshot().compatReasoningEffort === true);
+    if (provider === "openai-compat") ensureCompatAdapter(config.view().compatBaseUrl, keystore, registry, config.view().compatReasoningEffort === true);
     const catalog = defaultModelForProvider(provider, catalogModels());
     if (!catalog) return bad("provider sem modelo configurado");
     const target = agentIdOf(b) !== undefined ? requireAgent(b) : agents().find((entry) => entry.id === activeAgentId);
@@ -1615,10 +1604,10 @@ export function registerRosterHandlers(
     if (typeof next.compatBaseUrl === "string" && next.compatBaseUrl.length > 0) {
       void modelCatalog?.get("openai-compat", true).catch(() => undefined);
     }
-    const resolved = resolveAgentInference(config.snapshot(), target?.id);
+    const resolved = resolveAgentInference(config.view(), target?.id);
     return { provider: resolved.provider, model: resolved.model, reasoningEffort: resolved.reasoningEffort, serviceTier: resolved.serviceTier ?? "default", baseURL: next.compatBaseUrl, compatReasoningEffort: next.compatReasoningEffort === true, agentId: target?.id };
   });
-  gateway.registerHandler("getHostSettings", () => config.snapshot().hostSettings);
+  gateway.registerHandler("getHostSettings", () => config.view().hostSettings);
   gateway.registerHandler("setHostSettings", (body) => {
     const b = record(body);
     const settings = (b.settings ?? b) as SandHostSettings;
@@ -1740,9 +1729,9 @@ export function registerRosterHandlers(
     return { agentId: id, state: "ready", vncUrl: null, root: home.root };
   });
   gateway.registerHandler("handBackForeverBox", () => ({ ok: true }));
-  gateway.registerHandler("isAgentNetworkEnabled", () => config.snapshot().flags.isAgentNetworkEnabled);
-  gateway.registerHandler("isGlobalSearchEnabled", () => config.snapshot().flags.isGlobalSearchEnabled);
-  gateway.registerHandler("isEgressTunnelAvailable", () => config.snapshot().flags.isEgressTunnelAvailable);
+  gateway.registerHandler("isAgentNetworkEnabled", () => config.view().flags.isAgentNetworkEnabled);
+  gateway.registerHandler("isGlobalSearchEnabled", () => config.view().flags.isGlobalSearchEnabled);
+  gateway.registerHandler("isEgressTunnelAvailable", () => config.view().flags.isEgressTunnelAvailable);
   gateway.registerHandler("getComputerCapabilities", () => ({ local: false, remoteExecution: false, audioTranscription: false }));
   gateway.registerHandler("transcribeAudio", () => ({ supported: false, text: "" }));
   return { activateAgent };

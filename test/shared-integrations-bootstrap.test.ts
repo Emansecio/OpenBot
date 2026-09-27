@@ -8,6 +8,7 @@ import { defaultSkillRoots, startServer, stopServer, type ServerHandle } from ".
 import { McpManager } from "../src/mcp/manager.js";
 import { createProviderRegistry, type ProviderAdapter, type ProviderChatRequest } from "../src/providers/router.js";
 import { SkillCatalog } from "../src/skills/catalog.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 const roots: string[] = [];
 const handles: ServerHandle[] = [];
@@ -113,5 +114,49 @@ describe("shared integrations bootstrap", () => {
       role: "user",
       content: commandPrompt,
     }));
+  });
+});
+
+describe("bootstrap provider-tools resolver", () => {
+  const temp = new TempRoots();
+  afterEach(async () => {
+    await temp.cleanup();
+  });
+
+  it("passes the TurnRunner AbortSignal through the bootstrap provider-tools resolver", async () => {
+    const root = temp.make("openbot-bootstrap-signal-");
+    const config = new ConfigStore({ configPath: join(root, "config.json") });
+    config.update({ agents: [{ id: "signal-agent", name: "Signal agent", avatarId: "signal-agent" }] });
+    const registry = createProviderRegistry();
+    registry.register({
+      name: "xai",
+      async streamChat(_request, emit) {
+        emit({ type: "delta", delta: "ok" });
+      },
+    });
+    let signal: AbortSignal | undefined;
+    const handle = await startServer(0, {
+      config,
+      storePath: join(root, "store.db"),
+      keystoreDir: join(root, "keys"),
+      runtimeRoot: join(root, "runtime"),
+      disableAgentHome: true,
+      allowUnauthenticatedLocalGateway: true,
+      registry,
+      sharedIntegrationsEnabled: true,
+      skillCatalog: new SkillCatalog({ roots: [] }),
+      mcpManager: new McpManager(),
+      tools: (_agentId, receivedSignal) => {
+        signal = receivedSignal;
+        return [];
+      },
+    });
+    try {
+      handle.runner.sendPrompt({ agentId: "signal-agent", prompt: "signal" });
+      await handle.runner.flush("signal-agent");
+      expect(signal).toBeInstanceOf(AbortSignal);
+    } finally {
+      await stopServer(handle);
+    }
   });
 });

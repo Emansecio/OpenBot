@@ -1,6 +1,7 @@
 import { lstatSync, readdirSync } from "node:fs";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isMainModule } from "./common.mjs";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const defaultRoot = resolve(scriptDirectory, "..");
@@ -9,6 +10,7 @@ const requiredOutputs = [
   "server/webauthn-bridge.js",
   "execution/runtime/local/driver.js",
   "main.js",
+  "entry.js",
 ];
 
 function displayPath(root, file) {
@@ -174,11 +176,7 @@ function optionValue(argv, name) {
   return index >= 0 ? argv[index + 1] : undefined;
 }
 
-function isMainModule() {
-  return process.argv[1] !== undefined && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-}
-
-if (isMainModule()) {
+if (isMainModule(import.meta.url)) {
   const argv = process.argv.slice(2);
   const result = verifyBackendArtifacts({
     sourceRoot: optionValue(argv, "--source-root") ?? process.env.OPENBOT_ROOT,

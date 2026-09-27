@@ -4,9 +4,10 @@ import fs from "node:fs";
 import nodePath from "node:path";
 import { REASONING_EFFORTS } from "../shared/contracts.js";
 
-import { migrateOpenBotSchema, rebuildOpenBotFts } from "../store/schema.js";
+import { ensureOpenBotSchema, rebuildOpenBotFts } from "../store/schema.js";
 import {
   assertNoMemoryInstructionContent,
+  canonicalKeyForm,
   assertNoSensitiveMemoryContent,
   MEMORY_POLICY_LIMITS,
   validateMemoryCandidate,
@@ -224,7 +225,7 @@ function bytes(value: string): number {
 
 function normalizeCanonicalKey(value: string): string {
   if (typeof value !== "string") throw new Error("canonicalKey deve ser texto");
-  const normalized = value.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/gu, " ");
+  const normalized = canonicalKeyForm(value);
   if (bytes(normalized) === 0 || bytes(normalized) > MEMORY_POLICY_LIMITS.canonicalKeyBytes) {
     throw new Error("canonicalKey excede o limite");
   }
@@ -480,6 +481,53 @@ function ensureTrust(value: unknown): asserts value is MemoryTrust {
   if (value !== "user" && value !== "verified_tool" && value !== "external_observation") throw new Error("trust de memória inválido");
 }
 
+/**
+ * WHERE clauses shared by memory lists, pages and searches over table alias
+ * `t`: owner, temporary-conversation exclusion, status, validity window,
+ * kinds and conversation provenance (object refs and legacy "conv:entry").
+ */
+function memoryFilterClauses(
+  t: string,
+  agentId: string,
+  options: Pick<MemoryListOptions, "includeInactive" | "includeExpired" | "conversationId">,
+  kinds: readonly string[],
+  now: number,
+): { clauses: string[]; args: unknown[] } {
+  const clauses = [
+    `${t}.agent_id = ?`,
+    `NOT EXISTS (SELECT 1 FROM agent_conversations AS c WHERE c.id = ${t}.source_conversation_id AND c.agent_id = ${t}.agent_id AND c.temporary = 1)`,
+  ];
+  const args: unknown[] = [agentId];
+  if (!(options.includeInactive ?? false)) clauses.push(`${t}.status = 'active'`);
+  clauses.push(`${t}.valid_from_ms <= ?`);
+  args.push(now);
+  if (!(options.includeExpired ?? false)) {
+    clauses.push(`(${t}.valid_to_ms IS NULL OR ${t}.valid_to_ms > ?)`, `(${t}.expires_at_ms IS NULL OR ${t}.expires_at_ms > ?)`);
+    args.push(now, now);
+  }
+  if (kinds.length > 0) {
+    clauses.push(`${t}.kind IN (${kinds.map(() => "?").join(",")})`);
+    args.push(...kinds);
+  }
+  if (options.conversationId !== undefined) {
+    assertConversationId(options.conversationId);
+    clauses.push(`(
+      ${t}.source_conversation_id = ?
+      OR EXISTS (
+        SELECT 1
+        FROM json_each(${t}.source_entry_ids_json) AS source
+        WHERE (source.type = 'object' AND json_extract(source.value, '$.conversationId') = ?)
+          OR (source.type = 'text' AND instr(source.value, ':') > 0 AND substr(source.value, 1, instr(source.value, ':') - 1) = ?)
+      )
+    )`);
+    args.push(options.conversationId, options.conversationId, options.conversationId);
+  }
+  return { clauses, args };
+}
+
+/** Text left in a forgotten tombstone once its content is purged. */
+const PURGED_MEMORY_TEXT = "[conteúdo apagado]";
+
 function mutationRejection(code: "protected_target" | "revision_conflict" | "invalid_authority" | "policy", message: string): Error & { code: string } {
   return Object.assign(new Error(message), { code });
 }
@@ -602,7 +650,7 @@ export class SqliteMemoryStore implements MemoryStore {
         this.db.pragma("synchronous = NORMAL");
         this.db.pragma("busy_timeout = 5000");
       }
-      migrateOpenBotSchema(this.db);
+      ensureOpenBotSchema(this.db);
     } catch (error) {
       if (this.ownsDatabase) database?.close();
       throw error;
@@ -699,10 +747,6 @@ export class SqliteMemoryStore implements MemoryStore {
     return row === undefined ? null : fromMemoryRow(row);
   }
 
-  get(agentId: string, memoryId: string): Memory | null {
-    return this.getMemory(agentId, memoryId);
-  }
-
   getMemoryByCanonicalKey(agentId: string, canonicalKey: string): Memory | null {
     assertAgentId(agentId);
     this.ensureOpen();
@@ -751,9 +795,19 @@ export class SqliteMemoryStore implements MemoryStore {
     const sourceEntryIds = normalizeSources(input.sourceEntryIds);
     assertNoSensitiveMemoryContent(`${canonicalKey}\n${text}\n${valueJson ?? ""}\n${json(sourceEntryIds)}`, this.policyOptions());
     const sourceConversationId = input.sourceConversationId ?? null;
-    if (sourceConversationId !== null) this.validateConversation(agentId!, sourceConversationId, true);
+    // A manual edit may keep the conversation references the memory already
+    // records, even after that conversation was deleted with "retain" or its
+    // bot was removed; any new reference, and every automatic one, must name a
+    // conversation that exists.
+    const recorded = authority.kind === "automatic" || input.id === undefined
+      ? new Set<string>()
+      : this.recordedSourceConversations(agentId!, input.id);
+    const checkConversation = (conversationId: string): void => {
+      if (!recorded.has(conversationId)) this.validateConversation(agentId!, conversationId, true);
+    };
+    if (sourceConversationId !== null) checkConversation(sourceConversationId);
     for (const source of sourceEntryIds) {
-      if (typeof source !== "string") this.validateConversation(agentId!, source.conversationId, true);
+      if (typeof source !== "string") checkConversation(source.conversationId);
     }
     if (authority.kind === "automatic") {
       if (sourceConversationId !== authority.conversationId) {
@@ -870,18 +924,6 @@ export class SqliteMemoryStore implements MemoryStore {
     return transaction();
   }
 
-  upsert(input: MemoryUpsertInput & { agentId: string; authority: MemoryMutationAuthority }): Memory;
-  upsert(agentId: string, input: MemoryUpsertInput, authority: MemoryMutationAuthority): Memory;
-  upsert(
-    first: string | (MemoryUpsertInput & { agentId?: string; authority?: MemoryMutationAuthority }),
-    second?: MemoryUpsertInput,
-    third?: MemoryMutationAuthority,
-  ): Memory {
-    if (typeof first === "string") return this.upsertMemory(first, second!, third!);
-    if (typeof first.agentId !== "string" || first.authority === undefined) throw new Error("agentId e authority são obrigatórios");
-    return this.upsertMemory(first as MemoryUpsertInput & { agentId: string; authority: MemoryMutationAuthority });
-  }
-
   private recordRevision(memory: Memory, reason: string): void {
     const safeReason = safeError(reason, this.policyOptions()) ?? "memory-change";
     this.db.prepare("INSERT OR IGNORE INTO memory_revisions(memory_id, revision, snapshot_json, reason, created_at_ms) VALUES (?, ?, ?, ?, ?)")
@@ -951,56 +993,54 @@ export class SqliteMemoryStore implements MemoryStore {
     return result();
   }
 
+  /** Conversations a stored memory already cites (its own conversation and object source refs). */
+  private recordedSourceConversations(agentId: string, memoryId: string): Set<string> {
+    const row = this.db.prepare<unknown[], { source_conversation_id: string | null; source_entry_ids_json: string }>(
+      "SELECT source_conversation_id, source_entry_ids_json FROM agent_memories WHERE agent_id = ? AND id = ?",
+    ).get(agentId, memoryId);
+    const recorded = new Set<string>();
+    if (row === undefined) return recorded;
+    if (row.source_conversation_id !== null) recorded.add(row.source_conversation_id);
+    for (const source of parseSources(row.source_entry_ids_json)) {
+      if (typeof source !== "string") recorded.add(source.conversationId);
+    }
+    return recorded;
+  }
+
   listMemories(agentId: string, options: MemoryListOptions = {}): readonly Memory[] {
     assertAgentId(agentId);
     this.ensureOpen();
     const now = this.nowFn();
     this.expireDue(agentId, now);
-    const includeInactive = options.includeInactive ?? false;
-    const includeExpired = options.includeExpired ?? false;
-    const kinds = options.kind === undefined ? undefined : (Array.isArray(options.kind) ? options.kind : [options.kind]);
-    for (const kind of kinds ?? []) ensureKind(kind);
+    const kinds = options.kind === undefined ? [] : (Array.isArray(options.kind) ? options.kind : [options.kind]);
+    for (const kind of kinds) ensureKind(kind);
     const limit = options.limit ?? 100;
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error("limit de memórias inválido");
-    const clauses = ["agent_id = ?", "NOT EXISTS (SELECT 1 FROM agent_conversations AS c WHERE c.id = agent_memories.source_conversation_id AND c.agent_id = agent_memories.agent_id AND c.temporary = 1)"];
-    const args: unknown[] = [agentId];
-    if (!includeInactive) clauses.push("status = 'active'");
-    clauses.push("valid_from_ms <= ?");
-    args.push(now);
-    if (!includeExpired) {
-      clauses.push("(valid_to_ms IS NULL OR valid_to_ms > ?)");
-      clauses.push("(expires_at_ms IS NULL OR expires_at_ms > ?)");
-      args.push(now, now);
-    }
-    if (kinds !== undefined && kinds.length > 0) {
-      clauses.push(`kind IN (${kinds.map(() => "?").join(",")})`);
-      args.push(...kinds);
-    }
-    if (options.conversationId !== undefined) {
-      assertConversationId(options.conversationId);
-      clauses.push(`(
-        source_conversation_id = ?
-        OR EXISTS (
-          SELECT 1
-          FROM json_each(source_entry_ids_json) AS source
-          WHERE (
-            source.type = 'object'
-            AND json_extract(source.value, '$.conversationId') = ?
-          ) OR (
-            source.type = 'text'
-            AND instr(source.value, ':') > 0
-            AND substr(source.value, 1, instr(source.value, ':') - 1) = ?
-          )
-        )
-      )`);
-      args.push(options.conversationId, options.conversationId, options.conversationId);
-    }
-    const rows = this.db.prepare<unknown[], MemoryRow>(`SELECT * FROM agent_memories WHERE ${clauses.join(" AND ")} ORDER BY pinned DESC, importance DESC, confidence DESC, updated_at_ms DESC, id ASC LIMIT ?`).all(...args, limit);
-    return rows.map(fromMemoryRow).filter((memory) => !options.automatic || memory.trust === "user" || !this.hasForgottenContextSources(agentId, memoryContextSources(memory)));
+    const { clauses, args } = memoryFilterClauses("m", agentId, options, kinds, now);
+    const statement = this.db.prepare<unknown[], MemoryRow>(`SELECT * FROM agent_memories AS m WHERE ${clauses.join(" AND ")} ORDER BY pinned DESC, importance DESC, confidence DESC, updated_at_ms DESC, id ASC LIMIT ? OFFSET ?`);
+    return this.untaintedRows(agentId, options.automatic === true, limit, (count, offset) => statement.all(...args, count, offset), fromMemoryRow)
+      .map(fromMemoryRow);
   }
 
-  list(agentId: string, options: MemoryListOptions = {}): readonly Memory[] {
-    return this.listMemories(agentId, options);
+  /**
+   * The first `limit` rows that pass the automatic forgotten-content filter.
+   * The filter runs outside SQL, so rows are fetched in batches until the
+   * limit is filled instead of cutting the page short.
+   */
+  private untaintedRows<T>(agentId: string, automatic: boolean, limit: number, fetch: (count: number, offset: number) => T[], memoryOf: (row: T) => Memory): T[] {
+    if (!automatic) return fetch(limit, 0);
+    const batch = Math.max(limit, 32);
+    const kept: T[] = [];
+    for (let offset = 0; kept.length < limit; offset += batch) {
+      const rows = fetch(batch, offset);
+      for (const row of rows) {
+        const memory = memoryOf(row);
+        if (memory.trust === "user" || !this.hasForgottenContextSources(agentId, memoryContextSources(memory))) kept.push(row);
+        if (kept.length === limit) break;
+      }
+      if (rows.length < batch) break;
+    }
+    return kept;
   }
 
   listMemoriesPage(agentId: string, options: MemoryPageOptions = {}): MemoryPage {
@@ -1008,8 +1048,6 @@ export class SqliteMemoryStore implements MemoryStore {
     this.ensureOpen();
     const now = this.nowFn();
     this.expireDue(agentId, now);
-    const includeInactive = options.includeInactive ?? false;
-    const includeExpired = options.includeExpired ?? false;
     const kinds = options.kind === undefined ? [] : (Array.isArray(options.kind) ? [...options.kind] : [options.kind]);
     for (const kind of kinds) ensureKind(kind);
     const limit = options.limit ?? 50;
@@ -1020,41 +1058,7 @@ export class SqliteMemoryStore implements MemoryStore {
     if (bytes(query) > 512) throw new Error("query de memórias muito longa");
     const filter = memoryPageFilter(options, kinds, query);
     const cursor = options.cursor === undefined ? undefined : decodeMemoryPageCursor(agentId, filter, options.cursor);
-    const clauses = [
-      "agent_id = ?",
-      "NOT EXISTS (SELECT 1 FROM agent_conversations AS c WHERE c.id = agent_memories.source_conversation_id AND c.agent_id = agent_memories.agent_id AND c.temporary = 1)",
-    ];
-    const args: unknown[] = [agentId];
-    if (!includeInactive) clauses.push("status = 'active'");
-    clauses.push("valid_from_ms <= ?");
-    args.push(now);
-    if (!includeExpired) {
-      clauses.push("(valid_to_ms IS NULL OR valid_to_ms > ?)");
-      clauses.push("(expires_at_ms IS NULL OR expires_at_ms > ?)");
-      args.push(now, now);
-    }
-    if (kinds.length > 0) {
-      clauses.push(`kind IN (${kinds.map(() => "?").join(",")})`);
-      args.push(...kinds);
-    }
-    if (options.conversationId !== undefined) {
-      clauses.push(`(
-        source_conversation_id = ?
-        OR EXISTS (
-          SELECT 1
-          FROM json_each(source_entry_ids_json) AS source
-          WHERE (
-            source.type = 'object'
-            AND json_extract(source.value, '$.conversationId') = ?
-          ) OR (
-            source.type = 'text'
-            AND instr(source.value, ':') > 0
-            AND substr(source.value, 1, instr(source.value, ':') - 1) = ?
-          )
-        )
-      )`);
-      args.push(options.conversationId, options.conversationId, options.conversationId);
-    }
+    const { clauses, args } = memoryFilterClauses("m", agentId, options, kinds, now);
     if (query.length > 0) {
       clauses.push(`(
         instr(lower(text), lower(?)) > 0
@@ -1082,7 +1086,7 @@ export class SqliteMemoryStore implements MemoryStore {
     }
     const rows = this.db.prepare<unknown[], MemoryRow>(`
       SELECT *
-      FROM agent_memories
+      FROM agent_memories AS m
       WHERE ${clauses.join(" AND ")}
       ORDER BY pinned DESC, importance DESC, confidence DESC, updated_at_ms DESC, id ASC
       LIMIT ?
@@ -1123,46 +1127,26 @@ export class SqliteMemoryStore implements MemoryStore {
         provenance: { sourceConversationId: memory.sourceConversationId, sourceEntryIds: memory.sourceEntryIds },
       }));
     }
-    this.expireDue(agentId);
     const searchNow = this.nowFn();
-    const clauses = ["f.agent_id = ?", "memory_fts MATCH ?", "m.status = 'active'", "m.valid_from_ms <= ?", "(m.valid_to_ms IS NULL OR m.valid_to_ms > ?)", "(m.expires_at_ms IS NULL OR m.expires_at_ms > ?)"];
-    const args: unknown[] = [agentId, match, searchNow, searchNow, searchNow];
-    if (options.conversationId !== undefined) {
-      assertConversationId(options.conversationId);
-      clauses.push(`(
-        m.source_conversation_id = ?
-        OR EXISTS (
-          SELECT 1
-          FROM json_each(m.source_entry_ids_json) AS source
-          WHERE (
-            source.type = 'object'
-            AND json_extract(source.value, '$.conversationId') = ?
-          ) OR (
-            source.type = 'text'
-            AND instr(source.value, ':') > 0
-            AND substr(source.value, 1, instr(source.value, ':') - 1) = ?
-          )
-        )
-      )`);
-      args.push(options.conversationId, options.conversationId, options.conversationId);
-    }
-    const rows = this.db.prepare<unknown[], MemoryRow & { fts_text: string; score: number }>(`
+    this.expireDue(agentId, searchNow);
+    const kinds = options.kind === undefined ? [] : (Array.isArray(options.kind) ? options.kind : [options.kind]);
+    for (const kind of kinds) ensureKind(kind);
+    const filter = memoryFilterClauses("m", agentId, options, kinds, searchNow);
+    const statement = this.db.prepare<unknown[], MemoryRow & { fts_text: string; score: number }>(`
       SELECT m.*, f.text AS fts_text, bm25(memory_fts) AS score
       FROM memory_fts AS f JOIN agent_memories AS m ON m.id = f.memory_id AND m.agent_id = f.agent_id
-      WHERE ${clauses.join(" AND ")}
+      WHERE f.agent_id = ? AND memory_fts MATCH ? AND ${filter.clauses.join(" AND ")}
       ORDER BY m.pinned DESC, score ASC, m.importance DESC, m.updated_at_ms DESC
-      LIMIT ?
-    `).all(...args, limit);
+      LIMIT ? OFFSET ?
+    `);
+    const rows = this.untaintedRows(agentId, options.automatic === true, limit,
+      (count, offset) => statement.all(agentId, match, ...filter.args, count, offset), fromMemoryRow);
     return rows.map((row) => ({
       memory: fromMemoryRow(row),
       snippet: snippet(row.text, query),
       score: typeof row.score === "number" ? row.score : 0,
       provenance: { sourceConversationId: row.source_conversation_id, sourceEntryIds: parseSources(row.source_entry_ids_json) },
-    })).filter(({ memory }) => !options.automatic || memory.trust === "user" || !this.hasForgottenContextSources(agentId, memoryContextSources(memory)));
-  }
-
-  search(agentId: string, query: string, options: MemorySearchOptions = {}): readonly MemorySearchResult[] {
-    return this.searchMemories(agentId, query, options);
+    }));
   }
 
   /** Resolve tombstones and their revisions, including shared-profile origins. */
@@ -1454,6 +1438,13 @@ export class SqliteMemoryStore implements MemoryStore {
         clauses.push("conversation_id <> ?");
         args.push(options.excludeConversationId);
       }
+      // A cross-chat search skips archived conversations; a search scoped to
+      // one conversation still finds it. Retained summaries of deleted
+      // conversations have no conversation row and stay searchable.
+      if (options.conversationId === undefined) {
+        clauses.push("NOT EXISTS (SELECT 1 FROM agent_conversations AS c WHERE c.id = history_fts.conversation_id AND c.archived_at_ms IS NOT NULL)");
+      }
+      const entryOf = this.db.prepare<unknown[], { entry_id: string }>("SELECT entry_id FROM transcript_entries WHERE agent_id = ? AND sequence_id = ?");
       const rows = this.db.prepare<unknown[], {
         source_id: string;
         agent_id: string;
@@ -1465,12 +1456,12 @@ export class SqliteMemoryStore implements MemoryStore {
       }>(`SELECT *, bm25(history_fts) AS score FROM history_fts WHERE ${clauses.join(" AND ")} ORDER BY score ASC, sequence_id DESC LIMIT ?`).all(...args, limit);
       for (const row of rows) {
         const summary = row.source_type === "summary" && row.conversation_id !== null ? this.getSummary(agentId, row.conversation_id) ?? undefined : undefined;
+        // The transcript entry behind a message hit, read once for both the
+        // forgotten-source check and the provenance.
+        const sourceEntry = row.source_type === "message" && row.conversation_id !== null ? entryOf.get(agentId, row.sequence_id) : undefined;
         if (options.automatic && row.conversation_id !== null) {
           if (row.source_type === 'summary' && this.getSummary(agentId, row.conversation_id, true) === null) continue;
-          if (row.source_type === 'message') {
-            const source = this.db.prepare<unknown[], { entry_id: string }>('SELECT entry_id FROM transcript_entries WHERE agent_id = ? AND sequence_id = ?').get(agentId, row.sequence_id);
-            if (source && this.getForgottenSourceIds(agentId, row.conversation_id).has(source.entry_id)) continue;
-          }
+          if (sourceEntry !== undefined && this.getForgottenSourceIds(agentId, row.conversation_id).has(sourceEntry.entry_id)) continue;
         }
         result.push({
           kind: row.source_type === "summary" ? "summary" : "message",
@@ -1482,8 +1473,7 @@ export class SqliteMemoryStore implements MemoryStore {
           provenance: {
             source: row.source_type === "summary" ? "summary" : "transcript",
             ...(row.source_type !== "message" || row.conversation_id === null ? {} : {
-              sourceEntryIds: this.db.prepare<unknown[], { entry_id: string }>('SELECT entry_id FROM transcript_entries WHERE agent_id = ? AND sequence_id = ?').all(agentId, row.sequence_id)
-                .map((entry) => ({ conversationId: row.conversation_id!, entryId: entry.entry_id })),
+              sourceEntryIds: sourceEntry === undefined ? [] : [{ conversationId: row.conversation_id, entryId: sourceEntry.entry_id }],
             }),
           },
           ...(summary === undefined ? {} : { summary }),
@@ -1626,18 +1616,26 @@ export class SqliteMemoryStore implements MemoryStore {
       if (pending !== undefined) {
         const fromSequenceId = Math.min(pending.from_sequence_id, input.fromSequenceId);
         const throughSequenceId = Math.max(pending.through_sequence_id, input.throughSequenceId);
-        const nextAttemptAtMs = Math.min(pending.next_attempt_at_ms, input.nextAttemptAtMs ?? timestamp);
+        // Widening keeps the attempts and a retry's backoff, so a job that keeps
+        // failing still reaches dead; a newer turn moves it to the provider
+        // chosen now. Re-enqueuing the same range (a race) changes nothing.
+        const nextAttemptAtMs = pending.status === "retry"
+          ? pending.next_attempt_at_ms
+          : Math.min(pending.next_attempt_at_ms, input.nextAttemptAtMs ?? timestamp);
+        const widened = input.throughSequenceId > pending.through_sequence_id;
         this.db.prepare(`
           UPDATE memory_jobs
           SET from_sequence_id = ?, through_sequence_id = ?, summary_requested = ?, memory_requested = ?,
-              status = 'pending', attempts = 0, next_attempt_at_ms = ?, last_error_code = NULL,
-              last_error_text = NULL, updated_at_ms = ?
+              provider = ?, model = ?, reasoning_effort = ?, next_attempt_at_ms = ?, updated_at_ms = ?
           WHERE id = ?
         `).run(
           fromSequenceId,
           throughSequenceId,
           pending.summary_requested === 1 || summaryRequested ? 1 : 0,
           pending.memory_requested === 1 || memoryRequested ? 1 : 0,
+          widened ? provider : pending.provider,
+          widened ? model : pending.model,
+          widened ? input.reasoningEffort ?? null : pending.reasoning_effort,
           nextAttemptAtMs,
           timestamp,
           pending.id,
@@ -1757,6 +1755,19 @@ export class SqliteMemoryStore implements MemoryStore {
     `).run(fromSequenceId, at, at, agentId, jobId);
     const row = this.db.prepare<unknown[], JobRow>("SELECT * FROM memory_jobs WHERE agent_id = ? AND id = ?").get(agentId, jobId);
     return row === undefined ? null : fromJobRow(row);
+  }
+
+  /** Hands a claimed job back (shutdown): pending again at once, without spending the attempt. */
+  releaseJob(agentId: string, jobId: string, at = this.nowFn()): MemoryJob | null {
+    assertAgentId(agentId);
+    assertMemoryId(jobId);
+    this.ensureOpen();
+    this.db.prepare(`
+      UPDATE memory_jobs
+      SET status = 'pending', attempts = MAX(attempts - 1, 0), next_attempt_at_ms = ?, updated_at_ms = ?
+      WHERE agent_id = ? AND id = ? AND status = 'running'
+    `).run(at, at, agentId, jobId);
+    return this.getJob(agentId, jobId);
   }
 
   retryJob(agentId: string, jobId: string, error: MemoryJobError = {}, at = this.nowFn(), policy: MemoryJobRetryPolicy = {}): MemoryJob | null {
@@ -1951,22 +1962,7 @@ export class SqliteMemoryStore implements MemoryStore {
     const rows = this.db.prepare<unknown[], JobRow>(`
       WITH runnable AS (
         SELECT
-          id,
-          agent_id,
-          conversation_id,
-          provider,
-          model,
-          from_sequence_id,
-          through_sequence_id,
-          summary_requested,
-          memory_requested,
-          status,
-          attempts,
-          next_attempt_at_ms,
-          last_error_code,
-          last_error_text,
-          created_at_ms,
-          updated_at_ms,
+          memory_jobs.*,
           ROW_NUMBER() OVER (
             PARTITION BY agent_id
             ORDER BY next_attempt_at_ms ASC, created_at_ms ASC, id ASC
@@ -1976,23 +1972,7 @@ export class SqliteMemoryStore implements MemoryStore {
           AND next_attempt_at_ms <= ?
           AND ${activeConversationExistsClause()}
       )
-      SELECT
-        id,
-        agent_id,
-        conversation_id,
-        provider,
-        model,
-        from_sequence_id,
-        through_sequence_id,
-        summary_requested,
-        memory_requested,
-        status,
-        attempts,
-        next_attempt_at_ms,
-        last_error_code,
-        last_error_text,
-        created_at_ms,
-        updated_at_ms
+      SELECT *
       FROM runnable
       ORDER BY agent_rank ASC, next_attempt_at_ms ASC, created_at_ms ASC, id ASC
       LIMIT ?
@@ -2036,32 +2016,89 @@ export class SqliteMemoryStore implements MemoryStore {
       }
       this.db.prepare("DELETE FROM conversation_summaries WHERE agent_id = ? AND conversation_id = ?").run(agentId, conversationId);
       const memoryOwners = agentId === USER_PROFILE_AGENT_ID ? [agentId] : [agentId, USER_PROFILE_AGENT_ID];
-      const rows = this.db.prepare<unknown[], MemoryRow>(`SELECT * FROM agent_memories WHERE agent_id IN (${memoryOwners.map(() => "?").join(",")}) AND status = 'active'`).all(...memoryOwners);
-      for (const row of rows) {
-        const memory = fromMemoryRow(row);
-        const refs = memory.sourceEntryIds;
-        const hasOtherRef = refs.some((ref) => {
-          const source = sourceConversation(ref);
-          return source !== null && source !== conversationId;
-        });
-        const hasTargetRef = refs.some((ref) => sourceConversation(ref) === conversationId);
-        if (memory.sourceConversationId === conversationId && !hasOtherRef) {
-          this.forgetMemory(memory.agentId, memory.id, { kind: "admin" }, "conversation-deleted");
-          continue;
-        }
-        if (memory.sourceConversationId === conversationId || hasTargetRef) {
-          const kept = refs.filter((ref) => sourceConversation(ref) !== conversationId);
-          const nextConversation = kept.map(sourceConversation).find((source): source is string => source !== null) ?? (memory.sourceConversationId === conversationId ? null : memory.sourceConversationId);
-          if (nextConversation === null && kept.length === 0) {
-            this.forgetMemory(memory.agentId, memory.id, { kind: "admin" }, "conversation-deleted");
-            continue;
-          }
-          const updatedAtMs = this.nowFn();
-          this.db.prepare("UPDATE agent_memories SET source_conversation_id = ?, source_entry_ids_json = ?, revision = revision + 1, updated_at_ms = ? WHERE agent_id = ? AND id = ?")
-            .run(nextConversation, json(kept), updatedAtMs, memory.agentId, memory.id);
-          this.recordRevision({ ...memory, sourceConversationId: nextConversation, sourceEntryIds: kept, revision: memory.revision + 1, updatedAtMs }, "conversation-deleted");
-        }
+      this.scrubDeletedConversations(memoryOwners, new Set([conversationId]));
+    });
+  }
+
+  /**
+   * Removes deleted conversations from the memories of `owners` (the
+   * "delete-derived" policy). An active memory supported only by them is
+   * forgotten; an active one with other support keeps only that support.
+   * Rows and source refs are otherwise never dropped: forgotten memories and
+   * every revision of them carry the refs that keep a forget in force over
+   * replies derived from it. What is purged is the text — of every memory left
+   * without other support (forgotten, superseded or expired), and of the older
+   * revisions of every memory that cited those conversations.
+   */
+  private scrubDeletedConversations(owners: readonly string[], removed: ReadonlySet<string>): void {
+    if (removed.size === 0 || owners.length === 0) return;
+    const cites = (conversationId: string | null): boolean => conversationId !== null && removed.has(conversationId);
+    const rows = this.db.prepare<unknown[], MemoryRow>(`SELECT * FROM agent_memories WHERE agent_id IN (${owners.map(() => "?").join(",")})`).all(...owners);
+    for (const row of rows) {
+      const memory = fromMemoryRow(row);
+      const refs = memory.sourceEntryIds;
+      if (!cites(memory.sourceConversationId) && !refs.some((ref) => cites(sourceConversation(ref)))) continue;
+      const kept = refs.filter((ref) => !cites(sourceConversation(ref)));
+      const hasOtherRef = kept.some((ref) => sourceConversation(ref) !== null);
+      const nextConversation = kept.map(sourceConversation).find((source): source is string => source !== null)
+        ?? (cites(memory.sourceConversationId) ? null : memory.sourceConversationId);
+      const unsupported = (cites(memory.sourceConversationId) && !hasOtherRef) || (nextConversation === null && kept.length === 0);
+      if (memory.status === "active" && unsupported) {
+        this.forgetMemory(memory.agentId, memory.id, { kind: "admin" }, "conversation-deleted");
+      } else if (memory.status === "active") {
+        const updatedAtMs = this.nowFn();
+        this.db.prepare("UPDATE agent_memories SET source_conversation_id = ?, source_entry_ids_json = ?, revision = revision + 1, updated_at_ms = ? WHERE agent_id = ? AND id = ?")
+          .run(nextConversation, json(kept), updatedAtMs, memory.agentId, memory.id);
+        this.recordRevision({ ...memory, sourceConversationId: nextConversation, sourceEntryIds: kept, revision: memory.revision + 1, updatedAtMs }, "conversation-deleted");
       }
+      const current = fromMemoryRow(this.db.prepare<unknown[], MemoryRow>("SELECT * FROM agent_memories WHERE agent_id = ? AND id = ?").get(memory.agentId, memory.id)!);
+      if (current.status !== "active" && (unsupported || current.status === "forgotten")) {
+        this.purgeMemoryText(current.agentId, current.id);
+      } else {
+        // Still supported elsewhere: only its earlier versions are purged.
+        this.purgeRevisionText(current.id, current.revision);
+      }
+    }
+  }
+
+  /** Purges a non-active memory's text and value, in the row and in every revision snapshot. */
+  private purgeMemoryText(agentId: string, memoryId: string): void {
+    this.db.prepare("UPDATE agent_memories SET text = ?, value_json = NULL WHERE agent_id = ? AND id = ?").run(PURGED_MEMORY_TEXT, agentId, memoryId);
+    this.purgeRevisionText(memoryId, Number.MAX_SAFE_INTEGER);
+  }
+
+  /** Purges text and value from the revision snapshots of a memory older than `beforeRevision`. */
+  private purgeRevisionText(memoryId: string, beforeRevision: number): void {
+    this.db.prepare("UPDATE memory_revisions SET snapshot_json = json_set(snapshot_json, '$.text', ?, '$.valueJson', json('null')) WHERE memory_id = ? AND revision < ?")
+      .run(PURGED_MEMORY_TEXT, memoryId, beforeRevision);
+  }
+
+  /**
+   * Bounded history. Memories outside any forget (not forgotten and not
+   * superseded into a forgotten one) drop revisions older than `beforeMs`,
+   * keeping their latest. Forgotten memories keep every revision — their refs
+   * keep the forget in force — but a tombstone older than `beforeMs` loses
+   * its text, in the row and in its revisions. Returns the revisions removed.
+   */
+  pruneHistory(beforeMs: number): number {
+    if (!Number.isSafeInteger(beforeMs) || beforeMs < 0) throw new Error("timestamp inválido");
+    this.ensureOpen();
+    return this.runTransaction(() => {
+      const forgottenChain = `
+        WITH RECURSIVE forgotten(id) AS (
+          SELECT id FROM agent_memories WHERE status = 'forgotten'
+          UNION
+          SELECT m.id FROM agent_memories m JOIN forgotten f ON m.superseded_by = f.id
+        )`;
+      const removed = this.db.prepare(`${forgottenChain}
+        DELETE FROM memory_revisions
+        WHERE created_at_ms < ?
+          AND memory_id NOT IN (SELECT id FROM forgotten)
+          AND revision < (SELECT MAX(latest.revision) FROM memory_revisions AS latest WHERE latest.memory_id = memory_revisions.memory_id)
+      `).run(beforeMs).changes;
+      const stale = this.db.prepare<unknown[], { agent_id: string; id: string }>("SELECT agent_id, id FROM agent_memories WHERE status = 'forgotten' AND updated_at_ms < ? AND text <> ?").all(beforeMs, PURGED_MEMORY_TEXT);
+      for (const { agent_id: agentId, id } of stale) this.purgeMemoryText(agentId, id);
+      return removed;
     });
   }
 
@@ -2096,6 +2133,12 @@ export class SqliteMemoryStore implements MemoryStore {
 
   clearAgentRows(agentId: string): void {
     assertAgentId(agentId);
+    // Shared-profile memories derived from this bot's conversations are
+    // scrubbed like on a single conversation deletion (its rows still exist here).
+    if (agentId !== USER_PROFILE_AGENT_ID) {
+      const conversations = this.db.prepare<unknown[], { id: string }>("SELECT id FROM agent_conversations WHERE agent_id = ?").all(agentId);
+      this.scrubDeletedConversations([USER_PROFILE_AGENT_ID], new Set(conversations.map(({ id }) => id)));
+    }
     this.db.prepare("DELETE FROM conversation_summaries WHERE agent_id = ?").run(agentId);
     this.db.prepare("DELETE FROM memory_jobs WHERE agent_id = ?").run(agentId);
     this.db.prepare("DELETE FROM agent_memory_settings WHERE agent_id = ?").run(agentId);

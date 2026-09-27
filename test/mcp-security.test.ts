@@ -1,12 +1,14 @@
-import { copyFile, mkdir, rm, symlink, writeFile } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
+import { copyFile, mkdir, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { execFileSync, spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   McpSecurityError,
+  isDisallowedHttpAddress,
   resolveAndValidateHttpEndpoint,
   stageValidatedStdioExecutable,
+  sweepStaleStdioSnapshots,
   validateHttpUrl,
   validateStdioConfig,
 } from "../src/mcp/security.js";
@@ -162,5 +164,51 @@ describe("MCP security", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("MCP HTTP address policy", () => {
+  it("rejects IPv6 transition addresses that reach a private or reserved IPv4", () => {
+    // 6to4 embeds its IPv4 destination: 2002:a9fe:a9fe:: is 169.254.169.254.
+    expect(isDisallowedHttpAddress("2002:a9fe:a9fe::1")).toBe(true);
+    expect(isDisallowedHttpAddress("2002:0a00:0001::1")).toBe(true);
+    expect(isDisallowedHttpAddress("2002:0808:0808::1")).toBe(false);
+    // Teredo tunnels to an obfuscated IPv4 and is never a service endpoint.
+    expect(isDisallowedHttpAddress("2001:0:4136:e378:8000:63bf:3fff:fdd2")).toBe(true);
+    // NAT64 (in ::/8) and IPv4-mapped forms stay rejected; public IPv6 stays allowed.
+    expect(isDisallowedHttpAddress("64:ff9b::a9fe:a9fe")).toBe(true);
+    expect(isDisallowedHttpAddress("::ffff:169.254.169.254")).toBe(true);
+    expect(isDisallowedHttpAddress("2606:4700::1111")).toBe(false);
+  });
+});
+
+describe("stdio executable snapshot sweep", () => {
+  it("removes snapshots of exited processes and abandoned legacy ones, never live or linked ones", async () => {
+    const root = temp.make("openbot-snapshot-sweep-");
+    // The PID of a process that has already exited.
+    const exited = spawnSync(process.execPath, ["-e", "0"]).pid!;
+    const make = async (name: string): Promise<string> => {
+      const dir = path.join(root, name);
+      await mkdir(dir);
+      await writeFile(path.join(dir, "mcp-executable.exe"), "x");
+      return dir;
+    };
+    await make(`openbot-mcp-stdio-${exited}-dead`);
+    await make(`openbot-mcp-stdio-${process.pid}-live`);
+    const legacyOld = await make("openbot-mcp-stdio-legacyold");
+    const past = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+    await utimes(legacyOld, past, past);
+    await make("openbot-mcp-stdio-legacynew");
+    const target = await make("unrelated-target");
+    await symlink(target, path.join(root, `openbot-mcp-stdio-${exited}-link`), "junction");
+
+    await expect(sweepStaleStdioSnapshots(root)).resolves.toBe(2);
+    expect((await readdir(root)).sort()).toEqual([
+      `openbot-mcp-stdio-${exited}-link`,
+      `openbot-mcp-stdio-${process.pid}-live`,
+      "openbot-mcp-stdio-legacynew",
+      "unrelated-target",
+    ].sort());
+    expect(await readdir(target)).toEqual(["mcp-executable.exe"]);
   });
 });

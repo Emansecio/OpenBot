@@ -27,25 +27,22 @@
 import type { Keystore } from "../keystore/index.js";
 import { parseProviderUsage } from "./usage.js";
 import {
-  defaultRegistry,
   type ProviderAdapter,
   type ProviderChatRequest,
   type ProviderStreamEvent,
 } from "./router.js";
 import {
   ApiError,
-  OpenAiToolCallAccumulator,
   buildChatBody,
-  classifyOpenAiFinishReason,
-  extractOpenAiErrorMessage,
-  findSseFrameBoundary,
+  createChatCompletionsStreamHandler,
   normalizeOpenAiError,
   normalizeToolCallArguments,
   openAiStreamErrorStatus,
-  parseRetryAfterMs,
-  providerTimeoutError,
+  providerHttpError,
   raceWithAbort,
-  splitSseLines,
+  readSseFrames,
+  sseFrameData,
+  startProviderDeadline,
 } from "./openai-helpers.js";
 import { buildCodexResponsesBody, buildResponsesBody, usesResponsesApi } from "./request-bodies.js";
 
@@ -54,58 +51,6 @@ export const OPENAI_PROVIDER_NAME = "openai" as const;
 
 /** Endpoint default da OpenAI. */
 export const OPENAI_API_BASE_URL = "https://api.openai.com/v1" as const;
-
-const MAX_ERROR_BODY_BYTES = 64 * 1024;
-const ERROR_BODY_TRUNCATION_MESSAGE = "corpo de erro truncado";
-const ERROR_BODY_TRUNCATION_MARKER = `\n[${ERROR_BODY_TRUNCATION_MESSAGE} após ${MAX_ERROR_BODY_BYTES} bytes]`;
-
-async function readErrorBody(
-  response: Response,
-  signal: AbortSignal,
-  onActivity?: () => void,
-): Promise<{ text: string; truncated: boolean }> {
-  if (response.body === null) return { text: "", truncated: false };
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const parts: string[] = [];
-  let remaining = MAX_ERROR_BODY_BYTES;
-  let truncated = false;
-
-  try {
-    while (remaining > 0) {
-      const { done, value } = await raceWithAbort(reader.read(), signal);
-      if (done) {
-        parts.push(decoder.decode());
-        return { text: parts.join(""), truncated: false };
-      }
-      onActivity?.();
-      const retained = value.subarray(0, remaining);
-      parts.push(decoder.decode(retained, { stream: true }));
-      remaining -= retained.byteLength;
-      if (retained.byteLength < value.byteLength) {
-        truncated = true;
-        break;
-      }
-    }
-
-    if (!truncated) {
-      const next = await raceWithAbort(reader.read(), signal);
-      truncated = !next.done;
-    }
-    parts.push(decoder.decode());
-    if (truncated) parts.push(ERROR_BODY_TRUNCATION_MARKER);
-    return { text: parts.join(""), truncated };
-  } finally {
-    if (truncated) await reader.cancel().catch(() => undefined);
-    reader.releaseLock();
-  }
-}
-
-/** Chave da keystore: `scoped:v1:provider:openai:apiKey` (T4). */
-export function openAiApiKeyKey(): string {
-  return `scoped:v1:provider:${OPENAI_PROVIDER_NAME}:apiKey`;
-}
 
 export interface OpenAiAdapterOptions {
   requestHeaders?: (request: ProviderChatRequest) => Record<string, string>;
@@ -204,96 +149,18 @@ export class OpenAiAdapter implements ProviderAdapter {
     );
   }
 
-  /** Lê o corpo SSE e emite `delta`/`tool-call` (acumulador de tool calls). */
+  /** Chat Completions SSE: deltas, usage and tool calls through the shared handler. */
   private async readStream(
     body: ReadableStream<Uint8Array>,
     emit: (event: ProviderStreamEvent) => void,
     signal: AbortSignal,
     onActivity: () => void,
   ): Promise<void> {
-    const reader = body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    const toolAccumulator = new OpenAiToolCallAccumulator();
-    let buffer = "";
-    let terminated = false;
-    let finishReason: string | undefined;
-    let finishPayload: unknown;
-
-    const dispatchFrame = (frame: string): boolean => {
-      const data = splitSseLines(frame).filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).replace(/^ /, "")).join("\n");
-      if (data.length === 0) return false;
-      if (data === "[DONE]") return true;
-      let parsed: unknown;
-      try { parsed = JSON.parse(data); } catch {
-        throw new ApiError("openai: frame SSE inválido", 502, data);
-      }
-      if (typeof parsed !== "object" || parsed === null) return false;
-      const payload = parsed as Record<string, unknown>;
-      const usage = parseProviderUsage(payload.usage, "chat");
-      if (usage) emit({ type: "usage", usage });
-      if (typeof payload.error === "object" && payload.error !== null) {
-        const error = payload.error as Record<string, unknown>;
-        throw new ApiError(
-          typeof error.message === "string" ? error.message : "openai: erro no stream",
-          openAiStreamErrorStatus(error),
-          parsed,
-        );
-      }
-      const choices = payload.choices;
-      if (!Array.isArray(choices)) {
-        throw new ApiError("openai: frame SSE sem choices", 502, parsed);
-      }
-      if (choices.length === 0) return false;
-      const choice = choices[0] as Record<string, unknown> | undefined;
-      const currentFinishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : undefined;
-      const delta = choice?.delta;
-      // A final chunk may carry both the last text/tool delta and
-      // `finish_reason`; preserve that delta before recording the reason.
-      if (finishReason === undefined && typeof delta === "object" && delta !== null) {
-        const record = delta as Record<string, unknown>;
-        if (typeof record.content === "string" && record.content.length > 0) emit({ type: "delta", delta: record.content });
-        if (Array.isArray(record.tool_calls)) for (const chunk of record.tool_calls) {
-          if (typeof chunk === "object" && chunk !== null) toolAccumulator.add(chunk as Parameters<OpenAiToolCallAccumulator["add"]>[0]);
-        }
-      }
-      if (finishReason === undefined && currentFinishReason !== undefined) {
-        finishReason = currentFinishReason;
-        finishPayload = parsed;
-      }
-      return false;
-    };
-
-    try {
-      while (!terminated) {
-        const { done, value } = await raceWithAbort(reader.read(), signal);
-        if (done) break;
-        onActivity();
-        buffer += decoder.decode(value, { stream: true });
-        let boundary = findSseFrameBoundary(buffer);
-        while (boundary !== undefined) {
-          const frame = buffer.slice(0, boundary.index);
-          buffer = buffer.slice(boundary.index + boundary.length);
-          if (Buffer.byteLength(frame, "utf8") > 1_048_576) throw new ApiError("openai: frame SSE excedeu 1 MiB", 502);
-          if (dispatchFrame(frame)) { terminated = true; break; }
-          boundary = findSseFrameBoundary(buffer);
-        }
-        if (!terminated && Buffer.byteLength(buffer, "utf8") > 1_048_576) throw new ApiError("openai: buffer SSE residual excedeu 1 MiB", 502);
-      }
-      if (!terminated) throw new ApiError("openai: stream terminou antes de [DONE]", 502);
-    } finally {
-      // Cancela também em parse/EOF/emit error; não deixa o body produzindo em
-      // background depois que o adapter já falhou.
-      await reader.cancel().catch(() => undefined);
-      reader.releaseLock();
+    const handler = createChatCompletionsStreamHandler("openai", emit);
+    if (!await readSseFrames(body, signal, onActivity, "openai", (frame) => handler.dispatchFrame(frame))) {
+      throw new ApiError("openai: stream terminou antes de [DONE]", 502);
     }
-    const finishDisposition = classifyOpenAiFinishReason(finishReason);
-    if (finishDisposition === "incomplete" || finishDisposition === "unknown") {
-      throw new ApiError(`openai: geração interrompida (${finishReason})`, finishDisposition === "incomplete" ? 400 : 502, finishPayload, { code: finishReason });
-    }
-    if (toolAccumulator.hasAny) {
-      for (const call of toolAccumulator.finalizedCalls("openai")) emit({ type: "tool-call", call });
-    }
+    handler.finish();
   }
 
   private async readResponsesStream(
@@ -304,11 +171,7 @@ export class OpenAiAdapter implements ProviderAdapter {
     reportServiceTier = false,
   ): Promise<void> {
     type ToolSlot = { id: string; name: string; arguments: string; emitted: boolean; itemDone: boolean; argumentsDone: boolean };
-    const reader = body.getReader();
-    const decoder = new TextDecoder("utf-8");
     const tools = new Map<number, ToolSlot>();
-    let buffer = "";
-    let completed = false;
 
     const record = (value: unknown): Record<string, unknown> | undefined =>
       typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
@@ -371,10 +234,7 @@ export class OpenAiAdapter implements ProviderAdapter {
     };
 
     const dispatchFrame = (frame: string): boolean => {
-      const data = splitSseLines(frame)
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).replace(/^ /, ""))
-        .join("\n");
+      const data = sseFrameData(frame);
       if (!data || data === "[DONE]") return false;
       let parsed: unknown;
       try {
@@ -453,29 +313,8 @@ export class OpenAiAdapter implements ProviderAdapter {
       }
     };
 
-    try {
-      while (!completed) {
-        const { done, value } = await raceWithAbort(reader.read(), signal);
-        if (done) break;
-        onActivity();
-        buffer += decoder.decode(value, { stream: true });
-        let boundary = findSseFrameBoundary(buffer);
-        while (boundary !== undefined) {
-          const frame = buffer.slice(0, boundary.index);
-          buffer = buffer.slice(boundary.index + boundary.length);
-          if (Buffer.byteLength(frame, "utf8") > 1_048_576) throw new ApiError("openai: frame SSE Responses excedeu 1 MiB", 502);
-          if (dispatchFrame(frame)) {
-            completed = true;
-            break;
-          }
-          boundary = findSseFrameBoundary(buffer);
-        }
-        if (!completed && Buffer.byteLength(buffer, "utf8") > 1_048_576) throw new ApiError("openai: buffer SSE Responses residual excedeu 1 MiB", 502);
-      }
-      if (!completed) throw new ApiError("openai: stream terminou antes de response.completed", 502);
-    } finally {
-      await reader.cancel().catch(() => undefined);
-      reader.releaseLock();
+    if (!await readSseFrames(body, signal, onActivity, "openai Responses", dispatchFrame)) {
+      throw new ApiError("openai: stream terminou antes de response.completed", 502);
     }
   }
 
@@ -483,40 +322,19 @@ export class OpenAiAdapter implements ProviderAdapter {
     req: ProviderChatRequest,
     emit: (event: ProviderStreamEvent) => void,
   ): Promise<void> {
-    const controller = new AbortController();
-    let timeoutError: ReturnType<typeof providerTimeoutError> | undefined;
-    const onAbort = (): void => {
-      if (!controller.signal.aborted) controller.abort(req.signal?.reason);
-    };
-    req.signal?.addEventListener("abort", onAbort, { once: true });
-    if (req.signal?.aborted) onAbort();
-    let idleTimer: ReturnType<typeof setTimeout> | undefined;
-    const resetIdleTimer = () => {
-      if (idleTimer !== undefined) clearTimeout(idleTimer);
-      if (controller.signal.aborted) return;
-      idleTimer = setTimeout(() => {
-        if (controller.signal.aborted) return;
-        timeoutError = providerTimeoutError(this.timeoutMs);
-        controller.abort(timeoutError);
-      }, this.timeoutMs);
-    };
-    resetIdleTimer();
-    const maxDurationTimer = setTimeout(() => {
-      if (controller.signal.aborted) return;
-      timeoutError = providerTimeoutError(this.maxDurationMs);
-      controller.abort(timeoutError);
-    }, this.maxDurationMs);
+    const deadline = startProviderDeadline(req.signal, this.timeoutMs, this.maxDurationMs);
+    const signal = deadline.signal;
     let response: Response | undefined;
     let succeeded = false;
 
     try {
       let credential: { accessToken: string; accountId?: string };
       try {
-        credential = await raceWithAbort(this.resolveCredential(), controller.signal);
+        credential = await raceWithAbort(this.resolveCredential(), signal);
       } catch (err) {
         // Chave ausente → ApiError 401 → auth. Abort/timeout também cobre a
         // resolução da chave, mesmo que o backend da keystore fique pendente.
-        if (timeoutError !== undefined) throw timeoutError;
+        if (deadline.timeoutError !== undefined) throw deadline.timeoutError;
         throw err instanceof ApiError ? err : normalizeOpenAiError(err);
       }
 
@@ -529,7 +347,7 @@ export class OpenAiAdapter implements ProviderAdapter {
 
       try {
         const body = this.serializeRequest(req);
-        controller.signal.throwIfAborted();
+        signal.throwIfAborted();
         req.onTransportStart?.(codex ? "codex" : responsesApi ? "responses" : "chat");
         response = await raceWithAbort(this.fetchImpl(url, {
           method: "POST",
@@ -546,68 +364,41 @@ export class OpenAiAdapter implements ProviderAdapter {
             } : {}),
           },
           body,
-          signal: controller.signal,
-        }), controller.signal);
-        resetIdleTimer();
+          signal,
+        }), signal);
+        deadline.resetIdle();
       } catch (err) {
-        if (timeoutError !== undefined) throw timeoutError;
+        if (deadline.timeoutError !== undefined) throw deadline.timeoutError;
         throw normalizeOpenAiError(err);
       }
 
       if (!response.ok) {
-        if (response.status === 401) await this.onCredentialRejected?.(credential.accessToken);
-        let message = `openai: HTTP ${response.status}`;
-        let responseBody: unknown = undefined;
-        try {
-          const errorBody = await readErrorBody(response, controller.signal, resetIdleTimer);
-          const text = errorBody.text;
-          let parsed: unknown = text;
+        if (response.status === 401) {
           try {
-            parsed = JSON.parse(text);
+            await this.onCredentialRejected?.(credential.accessToken);
           } catch {
-            // corpo não-JSON — mantém o texto bruto
+            // Recording the rejection is bookkeeping; the 401 stays the error.
           }
-          const extracted = extractOpenAiErrorMessage(parsed);
-          if (extracted !== undefined) message = `openai: HTTP ${response.status} — ${extracted}`;
-          if (errorBody.truncated) message = `${message} — ${ERROR_BODY_TRUNCATION_MESSAGE}`;
-          responseBody = parsed;
-        } catch {
-          // corpo ilegível — mensagem padrão já montada
         }
-        throw new ApiError(message, response.status, responseBody, {
-          retryAfterMs: parseRetryAfterMs(response.headers.get("retry-after")),
-        });
+        throw await providerHttpError("openai", response, signal, deadline.resetIdle);
       }
 
       if (response.body === null) {
         throw new ApiError("openai: resposta sem corpo (stream vazio)", 502);
       }
 
-      if (responsesApi) await this.readResponsesStream(response.body, emit, controller.signal, resetIdleTimer, Boolean(req.modelResolution?.serviceTier));
-      else await this.readStream(response.body, emit, controller.signal, resetIdleTimer);
+      if (responsesApi) await this.readResponsesStream(response.body, emit, signal, deadline.resetIdle, Boolean(req.modelResolution?.serviceTier));
+      else await this.readStream(response.body, emit, signal, deadline.resetIdle);
       succeeded = true;
     } catch (err) {
-      if (timeoutError !== undefined) throw timeoutError;
+      if (deadline.timeoutError !== undefined) throw deadline.timeoutError;
       throw err;
     } finally {
-      if (idleTimer !== undefined) clearTimeout(idleTimer);
-      clearTimeout(maxDurationTimer);
-      req.signal?.removeEventListener("abort", onAbort);
+      deadline.dispose();
       const responseBody = response?.body;
       if (!succeeded && responseBody !== undefined && responseBody !== null && !responseBody.locked) {
         await responseBody.cancel().catch(() => undefined);
       }
     }
   }
-}
-
-/**
- * Registra o adapter OpenAI no registry default do roteador como "openai"
- * (contrato `ProviderRegistry.register` de T5). Retorna a instância criada.
- * Chamado no boot (T10) e pelos testes.
- */
-export function registerOpenAiAdapter(opts: OpenAiAdapterOptions = {}): OpenAiAdapter {
-  const adapter = new OpenAiAdapter(opts);
-  defaultRegistry.register(adapter);
-  return adapter;
 }

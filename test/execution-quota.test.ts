@@ -158,6 +158,34 @@ describe("workspace inventory and quota", () => {
     await observer.close();
   });
 
+  it.skipIf(process.platform !== "win32")("conta uma árvore uma vez só após renomear apenas a caixa da pasta", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-quota-observer-case-"));
+    roots.push(root);
+    await mkdir(join(root, "Projects", "MyApp"), { recursive: true });
+    await writeFile(join(root, "Projects", "MyApp", "a.txt"), "x".repeat(100));
+    let emit!: (event: string, filename: string | Buffer | null) => void;
+    let snapshot: { bytes: number; files: number } | undefined;
+    const observer = new WorkspaceQuotaObserver({
+      root,
+      reconciliationIntervalMs: 3_600_000,
+      onSnapshot: (usage) => { snapshot = { bytes: usage.bytes, files: usage.files }; },
+      watch: (_root, _options, listener) => {
+        emit = listener;
+        return { on() { return this; }, close: vi.fn() } as unknown as ReturnType<WorkspaceWatch>;
+      },
+    });
+    await observer.start();
+    expect(snapshot).toEqual({ bytes: 100, files: 1 });
+
+    await rename(join(root, "Projects", "MyApp"), join(root, "Projects", "myapp"));
+    emit("rename", "Projects\\MyApp");
+    emit("rename", "Projects\\myapp");
+    await observer.drain();
+
+    expect(snapshot).toEqual({ bytes: 100, files: 1 });
+    await observer.close();
+  });
+
   it("falha fechado quando o watcher perde autoridade", async () => {
     const root = await mkdtemp(join(tmpdir(), "openbot-quota-observer-error-"));
     roots.push(root);
@@ -252,6 +280,28 @@ describe("workspace inventory and quota", () => {
       expect(quota.metrics().activeObservers).toBe(0);
       await expect(quota.assertWithinQuota()).rejects.toBeInstanceOf(WorkspaceQuotaError);
     } finally { await one.close().catch(() => undefined); await two.close().catch(() => undefined); }
+  });
+
+  it("reconciles only the written path after a structured write while observing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openbot-quota-touch-"));
+    roots.push(root);
+    await writeFile(join(root, "existing.txt"), "12");
+    const quota = new WorkspaceQuota(await WorkspaceSandbox.create(root), { maxBytes: 100, maxFiles: 10, maxEntries: 20 });
+    const watch = vi.fn<WorkspaceWatch>(() => ({ on() { return this; }, close() {} }));
+    const observation = await quota.observeProcesses(vi.fn(), watch);
+    try {
+      const scansBefore = quota.metrics().scans;
+      const target = join(root, "written.txt");
+      const reservation = await quota.reserve(target, 4);
+      await writeFile(target, "1234");
+      reservation.commit();
+      await observation.drain();
+      // 2 + 4 bytes are counted without a rescan: 95 more would exceed 100.
+      await expect(quota.reserve(join(root, "big.txt"), 95)).rejects.toBeInstanceOf(WorkspaceQuotaError);
+      const fits = await quota.reserve(join(root, "fits.txt"), 94);
+      fits.cancel();
+      expect(quota.metrics().scans).toBe(scansBefore);
+    } finally { await observation.close(); }
   });
 
   it("waits for the retiring observer final reconciliation before starting a new authority", async () => {

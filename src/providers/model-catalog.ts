@@ -110,6 +110,7 @@ function cleanModel(value: DiscoveredModel): DiscoveredModel {
 
 export class ModelCatalogService {
   private readonly states = new Map<CatalogProvider, ProviderState>();
+  private readonly modelCache = new Map<CatalogProvider, { saved: unknown; connected: boolean | undefined; models: readonly CatalogModel[] }>();
   private readonly now: () => number;
   private closed = false;
 
@@ -190,13 +191,33 @@ export class ModelCatalogService {
     });
   }
 
-  peek(provider: CatalogProvider): ProviderModelCatalog {
+  /** The saved remote catalog when it belongs to the current connection. */
+  private savedFor(provider: CatalogProvider) {
     const state = this.states.get(provider)!;
-    const saved = state.connection !== undefined && state.saved?.connection === state.connection ? state.saved : undefined;
+    return state.connection !== undefined && state.saved?.connection === state.connection ? state.saved : undefined;
+  }
+
+  /**
+   * Resolved models of one provider. Internal and never handed out: callers get
+   * clones (peek/resolve/find). Recomputed only when the saved catalog or the
+   * connection state changes — resolve() runs on every send.
+   */
+  private models(provider: CatalogProvider): readonly CatalogModel[] {
+    const state = this.states.get(provider)!;
+    const saved = this.savedFor(provider);
+    const cached = this.modelCache.get(provider);
+    if (cached !== undefined && cached.saved === saved && cached.connected === state.connected) return cached.models;
+    const models = this.computeModels(provider, saved);
+    this.modelCache.set(provider, { saved, connected: state.connected, models });
+    return models;
+  }
+
+  private computeModels(provider: CatalogProvider, saved: ReturnType<ModelCatalogService["savedFor"]>): CatalogModel[] {
+    const state = this.states.get(provider)!;
     const discovered = new Map(saved?.models.map(m => [m.id, m]));
     const local = new Map(this.local(provider).map(m => [m.id, m]));
     const ids = new Set([...discovered.keys(), ...local.keys()]);
-    const models = [...ids].map((id): CatalogModel => {
+    return [...ids].map((id): CatalogModel => {
       const known = local.get(id);
       const remote = discovered.get(id);
       const removed = saved !== undefined && remote === undefined;
@@ -236,6 +257,12 @@ export class ModelCatalogService {
         ...(remote?.defaultReasoningEffort ? { defaultReasoningEffort: remote.defaultReasoningEffort } : {}),
       };
     });
+  }
+
+  peek(provider: CatalogProvider): ProviderModelCatalog {
+    const state = this.states.get(provider)!;
+    const saved = this.savedFor(provider);
+    const models = [...this.models(provider)];
     const fresh = saved !== undefined && this.now() - saved.updatedAt < 30_000 && !state.error && state.source === "remote";
     return structuredClone({
       provider, state: saved ? fresh ? saved.models.length ? "fresh" : "empty" : "stale" : "unavailable",
@@ -299,13 +326,26 @@ export class ModelCatalogService {
   }
 
   find(model: string, provider?: string): ModelCatalogEntry | undefined {
-    return this.available().find(m => m.id === model && (provider === undefined || m.provider === provider));
+    for (const candidate of CATALOG_PROVIDERS) {
+      if (provider !== undefined && candidate !== provider) continue;
+      const found = this.models(candidate).find(m => m.selectable && m.id === model);
+      if (found === undefined) continue;
+      const { selectable: _selectable, availability: _availability, reason: _reason, aliases: _aliases,
+        supportedReasoningEfforts: _efforts, defaultReasoningEffort: _defaultEffort, ...entry } = found;
+      return structuredClone(entry);
+    }
+    return undefined;
+  }
+
+  /** True when the saved remote catalog already confirms the tier for this model (no discovery needed). */
+  hasServiceTier(provider: CatalogProvider, model: string, tier: ServiceTier): boolean {
+    return this.savedFor(provider)?.models.find(m => m.id === model)?.serviceTiers?.includes(tier) === true;
   }
 
   resolve(provider: string, model: string, effort?: ReasoningEffort, serviceTier?: ServiceTier): ModelResolution {
     if (!isCatalogProvider(provider)) throw new Error("Provedor fora do catálogo gerenciado.");
     const state = this.states.get(provider)!;
-    let entry = this.peek(provider).models.find(m => m.id === model);
+    let entry: CatalogModel | undefined = this.models(provider).find(m => m.id === model);
     if (entry === undefined && provider === "openai-compat" && state.saved === undefined) {
       // Endpoint nunca consultado: um id de modelo custom usa os limites
       // conservadores da entrada genérica (comportamento anterior à

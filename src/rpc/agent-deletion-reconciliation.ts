@@ -12,6 +12,41 @@ export interface AgentDeletionJournalStore {
   clearAgents?(agentIds: readonly string[]): void;
 }
 
+/** Agent-scoped persistence outside the transcript store, purged once a deletion commits. */
+export interface AgentScopedPersistence {
+  asyncTaskStore?: Pick<AsyncTaskStore, "purgeAgentTasks">;
+  a2aStore?: Pick<A2AStore, "purgeAgent">;
+  reactionStore?: Pick<ReactionStore, "purgeAgent">;
+  attachmentStaging?: Pick<AttachmentStagingStore, "purgeAgent">;
+  keystore?: Pick<Keystore, "purgeScope">;
+  browserLifecycle?: { purgeAgent(agentId: string): Promise<void> };
+}
+
+/**
+ * Purges every agent-scoped surface of one deleted agent. Each surface is
+ * attempted even when an earlier one fails; the failures are returned so the
+ * caller decides whether the deletion journal can be completed. Shared by the
+ * live deletion and the startup reconciliation, so both purge the same set.
+ */
+export async function purgeAgentScopedPersistence(agentId: string, surfaces: AgentScopedPersistence): Promise<unknown[]> {
+  const failures: unknown[] = [];
+  const attempt = async (purge: () => unknown): Promise<void> => {
+    try {
+      await purge();
+    } catch (error) {
+      failures.push(error);
+    }
+  };
+  await attempt(() => surfaces.asyncTaskStore?.purgeAgentTasks(agentId));
+  // Cancels pending traffic, then deletes the agent's messages, usage, incarnations and fence.
+  await attempt(() => surfaces.a2aStore?.purgeAgent(agentId));
+  await attempt(() => surfaces.reactionStore?.purgeAgent(agentId));
+  await attempt(() => surfaces.attachmentStaging?.purgeAgent(agentId));
+  await attempt(() => surfaces.keystore?.purgeScope(agentId));
+  await attempt(() => surfaces.browserLifecycle?.purgeAgent(agentId));
+  return failures;
+}
+
 export interface AgentDeletionReconciliationResult {
   rolledBack: string[];
   completed: string[];
@@ -45,6 +80,13 @@ export async function reconcileAgentDeletions(options: {
     .filter((agentId) => !roster.has(agentId.toLowerCase()));
 
   if (rolledBack.length > 0) {
+    // The deletion began (and wrote its durable fences) but the roster kept
+    // the agent: lift those fences too, or the agent stays blocked for A2A
+    // and async tasks forever.
+    for (const agentId of rolledBack) {
+      options.asyncTaskStore?.clearAgentFence(agentId);
+      options.a2aStore?.clearAgentFence(agentId);
+    }
     options.store.completeAgentDeletion(rolledBack);
     result.rolledBack.push(...rolledBack);
   }
@@ -62,13 +104,10 @@ export async function reconcileAgentDeletions(options: {
   }
 
   for (const agentId of committed) {
-    options.asyncTaskStore?.purgeAgentTasks(agentId);
-    options.a2aStore?.retireAgent(agentId);
-    options.a2aStore?.clearAgentFence(agentId);
-    options.reactionStore?.purgeAgent(agentId);
-    await options.attachmentStaging?.purgeAgent(agentId);
-    await options.keystore?.purgeScope(agentId);
-    if (browserLifecycle !== undefined) await browserLifecycle.purgeAgent(agentId);
+    const failures = await purgeAgentScopedPersistence(agentId, options);
+    if (failures.length > 0) {
+      throw failures.length === 1 ? failures[0] : new AggregateError(failures, "agent deletion reconciliation failed");
+    }
   }
   if (browserPurgeUnavailable) return result;
   options.store.completeAgentDeletion(committed);

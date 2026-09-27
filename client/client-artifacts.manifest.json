@@ -13,7 +13,7 @@
     "main": {
       "path": "client/extracted/dist/electron-main/main.cjs",
       "version": "0.16.0",
-      "sha256": "f9af158d1525c1f0cf42ac0266de27b023ee80c682c50e1bd4ec5b409f50b71a",
+      "sha256": "aa8f91688c538450ac7001e88c6319dc8d17ab92cea60adaf768051071edacb2",
       "sourceMap": {
         "path": "client/extracted/dist/electron-main/main.cjs.map",
         "status": "removed",

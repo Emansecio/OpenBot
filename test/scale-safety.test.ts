@@ -121,22 +121,30 @@ describe("scale safety", () => {
     expect(config.snapshot().agents).toEqual([]);
   });
 
-  it("SQLite limpa lote atomicamente e reconstrói FTS uma vez", () => {
+  it("SQLite limpa lote atomicamente e mantém o FTS pelos triggers, sem reconstrução total", () => {
     const store = new SqliteTranscriptStore({ path: ":memory:" });
     try {
-      for (const agentId of ["agent-a", "agent-b"]) {
+      for (const agentId of ["agent-a", "agent-b", "agent-c"]) {
         const conversation = store.conversationStore.ensureDefault(agentId);
-        store.append(agentId, [{ kind: "notice", id: `notice:${agentId}`, text: agentId }], conversation.id);
+        store.append(agentId, [
+          { kind: "notice", id: `notice:${agentId}`, text: agentId },
+          { kind: "message", id: `message:${agentId}`, role: "user", content: `busca ${agentId}`, timestampMs: 1 },
+        ], conversation.id);
       }
+      const db = store.databaseForSharedStores();
+      const indexed = (agentId: string) => (db.prepare("SELECT COUNT(*) AS count FROM history_fts WHERE agent_id = ?").get(agentId) as { count: number }).count;
+      expect(indexed("agent-a")).toBe(1);
       const rebuild = vi.spyOn(store.memoryStore, "rebuildFts");
 
       expect(() => store.clearAgents(["agent-a", ""])).toThrow();
-      expect(store.getEntries("agent-a", store.conversationStore.getActive("agent-a")!.id)).toHaveLength(1);
-      expect(rebuild).not.toHaveBeenCalled();
+      expect(store.getEntries("agent-a", store.conversationStore.getActive("agent-a")!.id)).toHaveLength(2);
 
       store.clearAgents(["agent-a", "agent-b", "agent-a"]);
 
-      expect(rebuild).toHaveBeenCalledTimes(1);
+      expect(rebuild).not.toHaveBeenCalled();
+      expect(indexed("agent-a")).toBe(0);
+      expect(indexed("agent-b")).toBe(0);
+      expect(indexed("agent-c")).toBe(1);
       expect(store.conversationStore.getActive("agent-a")).toBeNull();
       expect(store.conversationStore.getActive("agent-b")).toBeNull();
     } finally {

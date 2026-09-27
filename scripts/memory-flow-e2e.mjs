@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { resolveElectronExecutable } from "./electron-executable.mjs";
-import { cleanE2eEnvironment, connectCdp, startE2eWatchdog } from "./e2e-runtime.mjs";
+import { cleanE2eEnvironment, connectCdp, getFreePort, sleep, startE2eWatchdog } from "./e2e-runtime.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(process.env.OPENBOT_ROOT || fileURLToPath(new URL("..", import.meta.url)));
@@ -38,23 +38,6 @@ const [
   import("../dist/keystore/index.js"),
   import("../dist/keystore/backend.js"),
 ]);
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function getFreePort() {
-  const server = createServer();
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  const port = typeof address === "object" && address ? address.port : 0;
-  await new Promise((resolve) => server.close(resolve));
-  if (!port) throw new Error("Could not allocate a free port");
-  return port;
-}
 
 async function waitFor(read, predicate, timeoutMs, label) {
   const startedAt = Date.now();

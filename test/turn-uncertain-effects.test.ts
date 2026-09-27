@@ -207,3 +207,69 @@ describe("backend-provided recovery actions", () => {
     });
   });
 });
+
+describe("failure recovery reads only the conversation suffix it needs", () => {
+  const user = (id: string, turnId: string, clientNonce: string, timestampMs: number): TranscriptEntry => ({
+    kind: "message", id, role: "user", content: `pedido ${id}`, timestampMs, streaming: false, clientNonce, turnId,
+    provider: "xai", model: "grok-4.6", fromUser: { name: "Fixture", authId: "local" } });
+  const assistant = (id: string, turnId: string, timestampMs: number): TranscriptEntry => ({
+    kind: "message", id, role: "assistant", content: `resposta ${id}`, timestampMs, streaming: false, turnId, provider: "xai", model: "grok-4.6" });
+  const failure = (id: string, turnId: string, clientNonce: string, retryOfClientNonce?: string): TranscriptEntry => ({
+    kind: "notice", id, type: "provider-error", text: "Falha", level: "error", retryable: true, turnId, clientNonce,
+    ...(retryOfClientNonce === undefined ? {} : { retryOfClientNonce }), provider: "xai", model: "grok-4.6" });
+  // An old, superseded failure with its own effects, followed by unrelated history.
+  const history: TranscriptEntry[] = [
+    user("old-user", "turn:old", "nonce-old", 1),
+    { kind: "tool-call", id: "old-tool", name: "file.move", summary: "fixture", status: "completed", localToolCallId: "turn:old\0call", result: { ok: true } },
+    failure("old-failure", "turn:old", "nonce-old"),
+    ...Array.from({ length: 40 }, (_, index) => [user(`u${index}`, `turn:${index}`, `n${index}`, 10 + index), assistant(`a${index}`, `turn:${index}`, 10 + index)]).flat(),
+  ];
+  const scenarios: Array<[string, TranscriptEntry[], number | undefined]> = [
+    ["retry", [user("user", "turn", "nonce", 100), failure("failure", "turn", "nonce")], 2],
+    ["inspect", [user("user", "turn", "nonce", 100),
+      { kind: "tool-call", id: "tool", name: "process.run", summary: "fixture", status: "failed", localToolCallId: "turn\0call", result: { ok: false, code: "timed_out", message: "x" } },
+      failure("failure", "turn", "nonce")], 3],
+    ["retry chain", [user("user", "turn", "nonce", 100), failure("failure-1", "turn", "nonce"),
+      { kind: "notice", id: "retry-attempt:turn:retry", type: "retry-attempt", text: "Nova tentativa iniciada.", level: "info", turnId: "turn:retry", clientNonce: "retry:turn", retryOfClientNonce: "nonce", provider: "xai", model: "grok-4.6" },
+      { kind: "tool-call", id: "tool-2", name: "file.read", summary: "fixture", status: "completed", localToolCallId: "turn:retry\0call", result: { ok: true } },
+      failure("failure-2", "turn:retry", "retry:turn", "nonce")], 5],
+    ["advanced", [user("user", "turn", "nonce", 100), failure("failure", "turn", "nonce"), assistant("later", "turn:later", 101)], 3],
+    ["missing message", [failure("failure", "turn:orphan", "nonce-orphan")], undefined],
+  ];
+
+  it.each(scenarios)("%s: same recovery as a full read", async (_name, tail, windowLength) => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-recovery-window-"));
+    const store = new SqliteTranscriptStore({ path: join(root, "store.db") });
+    try {
+      const conversationId = store.conversationStore.ensureDefault("a").id;
+      store.append("a", [...history, ...tail], conversationId);
+      const window = store.getRetryableFailureWindow("a", conversationId);
+      expect(window?.length).toBe(windowLength);
+      if (window !== undefined) expect(window).toEqual(store.getEntries("a", conversationId).slice(-window.length));
+      const runner = createTurnRunner({ store, registry: createProviderRegistry() });
+      const windowed = runner.getPromptRecovery("a", conversationId);
+      Object.defineProperty(store, "getRetryableFailureWindow", { value: undefined, configurable: true });
+      expect(windowed).toEqual(runner.getPromptRecovery("a", conversationId));
+      expect(windowed.failure).not.toBeNull();
+    } finally {
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns an empty window without a retryable failure and defers to a full read during a live stream", () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-recovery-window-"));
+    const store = new SqliteTranscriptStore({ path: join(root, "store.db") });
+    try {
+      const conversationId = store.conversationStore.ensureDefault("a").id;
+      store.append("a", [user("user", "turn", "nonce", 1), assistant("reply", "turn", 2)], conversationId);
+      expect(store.getRetryableFailureWindow("a", conversationId)).toEqual([]);
+      store.append("a", [failure("failure", "turn", "nonce")], conversationId);
+      store.setLiveEntry("a", assistant("live", "turn:live", 3), conversationId);
+      expect(store.getRetryableFailureWindow("a", conversationId)).toBeUndefined();
+    } finally {
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

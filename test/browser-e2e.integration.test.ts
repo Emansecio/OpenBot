@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createServer, request as nodeHttpRequest, type IncomingMessage, type RequestOptions, type ServerResponse } from "node:http";
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -34,7 +35,6 @@ describe("browser e2e gate", () => {
     const configPath = join(root, "config.json");
     const config = new ConfigStore({ configPath });
     config.update({ agents: [{ id: "workspace-agent", name: "Workspace Agent", avatarId: "workspace-agent" }] });
-    config.close();
     const userProfile = join(root, "profile");
     await mkdir(join(userProfile, "Documents"), { recursive: true });
     const fixture = createServer(serveFixture);
@@ -199,7 +199,7 @@ describe("browser e2e gate", () => {
 
     const semanticSnapshot = await manager.snapshot(first);
     const button = semanticSnapshot.snapshot?.elements?.find((element) => element.name === "Click me");
-    expect(button).toMatchObject({ id: expect.stringMatching(/^ob-el-/), role: "button" });
+    expect(button, JSON.stringify(semanticSnapshot.snapshot?.elements)).toMatchObject({ id: expect.stringMatching(/^ob-el-/), role: "button" });
     await expect(manager.execute(first, { command: "click_element", elementId: button!.id })).resolves.toMatchObject({ command: "click_element" });
     await waitFor(async () => {
       expect((await manager.snapshot(first)).snapshot?.text).toContain("Clicked");
@@ -214,6 +214,27 @@ describe("browser e2e gate", () => {
       expect(snapshot.snapshot?.text).toContain("Clicked");
     });
 
+    // ENTER must submit a form, which needs the character event too.
+    const formSnapshot = await manager.snapshot(first);
+    const formField = formSnapshot.snapshot?.elements?.find((element) => element.name === "form field");
+    expect(formField, JSON.stringify(formSnapshot.snapshot?.elements)).toBeDefined();
+    await manager.execute(first, { command: "click_element", elementId: formField!.id });
+    await manager.execute(first, { command: "press_key", key: "ENTER" });
+    await waitFor(async () => {
+      expect((await manager.snapshot(first)).snapshot?.text).toContain("Submitted");
+    });
+
+    // An agent click cannot make the page write the user's clipboard.
+    const copySnapshot = await manager.snapshot(first);
+    const copyButton = copySnapshot.snapshot?.elements?.find((element) => element.name === "Copy code");
+    expect(copyButton, JSON.stringify(copySnapshot.snapshot?.elements)).toBeDefined();
+    await manager.execute(first, { command: "click_element", elementId: copyButton!.id });
+    await waitFor(async () => {
+      expect((await manager.snapshot(first)).snapshot?.text).toContain("Copy attempted");
+    });
+    expect((await manager.snapshot(first)).snapshot?.text).not.toContain("CopyListener");
+    expect(readSystemClipboard()).not.toContain(CLIPBOARD_MARKER);
+
     await expect(manager.upload(first, "#upload", "upload.txt")).resolves.toMatchObject({
       command: "upload",
       upload: { fileName: "upload.txt", bytes: 19 },
@@ -227,7 +248,8 @@ describe("browser e2e gate", () => {
     expect(fullPageShot.screenshot?.height).toBeGreaterThan(viewportShot.screenshot!.height);
 
     await expect(manager.click(first, 120, 185)).resolves.toMatchObject({ command: "click" });
-    const downloaded = await downloadSeen;
+    const downloaded = await within(downloadSeen, 20_000, () => `no download event; host stderr: ${hostStderr}`)
+      .catch(async (error: unknown) => { throw new Error(`${String(error)}; elements: ${JSON.stringify((await manager.snapshot(first)).snapshot?.elements)}`); });
     expect(downloaded.agentId).toBe("agent-a");
     expect(downloaded.state).toBe("completed");
     expect(isAbsolute(downloaded.path)).toBe(true);
@@ -244,6 +266,8 @@ describe("browser e2e gate", () => {
     });
 
     await expect(manager.handoff(first)).resolves.toMatchObject({ command: "handoff", visible: true });
+    // While the user controls the window, the agent is refused with a clear code.
+    await expect(manager.snapshot(first)).rejects.toMatchObject({ code: "BROWSER_HANDOFF_ACTIVE" });
 
     await expect(manager.open(second, `${baseUrl}/app`)).resolves.toMatchObject({ command: "open" });
     const isolated = await manager.snapshot(second);
@@ -285,6 +309,9 @@ function pageHtml(): string {
     "#mirror { position: absolute; left: 20px; top: 130px; width: 400px; font-size: 20px; }",
     "#download { position: absolute; left: 20px; top: 170px; font-size: 20px; }",
     "#upload { position: absolute; left: 20px; top: 220px; }",
+    "#form { position: absolute; left: 400px; top: 80px; }",
+    "#copy { position: absolute; left: 600px; top: 20px; }",
+    "#clip { position: absolute; left: 600px; top: 220px; width: 200px; height: 40px; }",
     "#spacer { position: absolute; left: 0; top: 320px; width: 100%; height: 1600px; background: linear-gradient(#fff8e1, #ffe0b2); }",
     "</style>",
     "</head>",
@@ -295,6 +322,9 @@ function pageHtml(): string {
     "<a id=\"download\" href=\"/download/report.txt\">Download report</a>",
     "<a style=\"position:absolute;left:400px;top:170px\" href=\"/download/report.txt\" download=\"attribute.txt\" onclick=\"document.getElementById('mirror').textContent='Attribute clicked'\">Download attribute</a>",
     "<input id=\"upload\" type=\"file\" />",
+    "<form id=\"form\"><input id=\"field\" aria-label=\"form field\" /></form>",
+    "<button id=\"copy\">Copy code</button>",
+    `<textarea id="clip" aria-label="clip source">${CLIPBOARD_MARKER}-selection</textarea>`,
     "<div id=\"spacer\">Tall page for full-page screenshots</div>",
     "<script>",
     "const input = document.getElementById('text');",
@@ -306,6 +336,20 @@ function pageHtml(): string {
     "sync(saved);",
     "input.focus();",
     "input.addEventListener('input', () => sync(input.value));",
+    "document.getElementById('form').addEventListener('submit', (event) => {",
+    "  event.preventDefault();",
+    "  mirror.textContent = mirror.textContent + ' Submitted';",
+    "});",
+    "document.addEventListener('copy', (event) => {",
+    `  event.clipboardData.setData('text/plain', '${CLIPBOARD_MARKER}');`,
+    "  event.preventDefault();",
+    "  mirror.textContent = mirror.textContent + ' CopyListener';",
+    "});",
+    "document.getElementById('copy').addEventListener('click', () => {",
+    "  document.getElementById('clip').select();",
+    "  document.execCommand('copy');",
+    "  mirror.textContent = mirror.textContent + ' Copy attempted';",
+    "});",
     "document.getElementById('button').addEventListener('click', () => {",
     "  mirror.textContent = mirror.textContent + ' Clicked';",
     "});",
@@ -313,6 +357,17 @@ function pageHtml(): string {
     "</body>",
     "</html>",
   ].join("");
+}
+
+const CLIPBOARD_MARKER = "openbot-e2e-clipboard-marker";
+
+/** Read-only check of the Windows clipboard; the content is only compared. */
+function readSystemClipboard(): string {
+  return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard -Raw"], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 15_000,
+  });
 }
 
 function secondPageHtml(): string {
@@ -368,6 +423,20 @@ async function closeServer(server: ReturnType<typeof createServer>): Promise<voi
       else resolvePromise();
     });
   });
+}
+
+async function within<T>(promise: Promise<T>, timeoutMs: number, explain: () => string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(explain())), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function waitFor(check: () => Promise<void>, timeoutMs = 10_000, intervalMs = 200): Promise<void> {

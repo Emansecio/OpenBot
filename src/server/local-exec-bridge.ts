@@ -36,15 +36,8 @@ export function createLocalExecBridge(broker: LocalExecutionBroker): GatewayBrid
     } catch (error) {
       throw new RpcError(400, "local-exec: " + (error instanceof Error ? error.message : "request is invalid"));
     }
-    const conversationId = body.conversationId === undefined
-      ? undefined
-      : requiredText(body, "conversationId", 256);
-    return broker.execute(
-      agentId,
-      requestId,
-      request,
-      undefined,
-      conversationId === undefined ? undefined : { conversationId },
-    );
+    // Still validated for older clients; approvals that needed it no longer exist.
+    if (body.conversationId !== undefined) requiredText(body, "conversationId", 256);
+    return broker.execute(agentId, requestId, request);
   };
 }

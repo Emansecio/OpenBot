@@ -61,7 +61,6 @@ function runtimeHarness() {
     agentIds: () => ["agent-b", "agent-c"],
     isUserLaneBusy: () => userBusy,
     isUserLanePending: () => userPending,
-    enqueueBackground: (_agentId, _priority, task) => { void task(); },
     consume: (context) => consume(context),
     pollIntervalMs: 1,
   };
@@ -314,5 +313,77 @@ describe("P2.1 A2A runtime", () => {
     await consumed.promise;
     expect(h.store.getMessage("restart-scan")).toMatchObject({ status: "acked" });
     await restarted.stop();
+  });
+
+  it("keeps delivering after a failing pass instead of stopping the loop", async () => {
+    const h = runtimeHarness();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const hasActive = h.store.hasActiveMessages.bind(h.store);
+    let failures = 1;
+    h.store.hasActiveMessages = () => {
+      if (failures > 0) { failures -= 1; throw new Error("transient read failure"); }
+      return hasActive();
+    };
+    const runtime = new A2ARuntime(h.options);
+    runtime.start();
+    h.store.send(envelope("after-failure"));
+    await waitFor(() => h.store.getMessage("after-failure")?.status === "acked");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("transient read failure"));
+    await runtime.stop();
+  });
+
+  it("does no write transaction and no per-agent claim while idle", async () => {
+    const h = runtimeHarness();
+    const recover = vi.spyOn(h.store, "recoverExpired");
+    const claim = vi.spyOn(h.store, "claimNext");
+    const runtime = new A2ARuntime(h.options);
+    runtime.start();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(recover).not.toHaveBeenCalled();
+    expect(claim).not.toHaveBeenCalled();
+    h.store.send(envelope("wakes-work"));
+    runtime.wake();
+    await waitFor(() => h.store.getMessage("wakes-work")?.status === "acked");
+    // Recovery runs once per pass, not once more inside every claim.
+    expect(claim.mock.calls.every(([, options]) => options.recover === false)).toBe(true);
+    await runtime.stop();
+  });
+
+  it("stops waiting for the recipient turn when the delivery is aborted", async () => {
+    let releaseFlush: (() => void) | undefined;
+    const runner = {
+      sendAgentPrompt: async () => ({ accepted: true }),
+      flush: () => new Promise<void>((resolve) => { releaseFlush = resolve; }),
+      promptOutcome: () => "success" as const,
+    };
+    const controller = new AbortController();
+    const h = runtimeHarness();
+    h.store.send(envelope("aborted-wait"));
+    const pending = consumeA2ATurn(runner as never, h.store.getMessage("aborted-wait")!, controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toThrow(/aborted/);
+    releaseFlush?.();
+  });
+
+  it("purges every row of a deleted agent and prunes only finished history", () => {
+    const h = runtimeHarness();
+    h.store.send(envelope("to-b"));
+    h.store.send(envelope("to-c", "normal", "agent-c"));
+    const claimed = h.store.claimNext("agent-c", { ownerId: "test", leaseDurationMs: 10_000 })!;
+    h.store.ack("to-c", { ownerId: "test", expectedVersion: claimed.lease.version, status: "acked" });
+    h.store.fenceAgent("agent-b");
+
+    h.store.purgeAgent("agent-b");
+    expect(h.store.getMessage("to-b")).toBeUndefined();
+    expect(h.store.getMessage("to-c")).toMatchObject({ status: "acked" });
+    expect(h.store.isAgentFenced("agent-b")).toBe(false);
+    expect(h.store.listForRecipient("agent-b")).toEqual([]);
+
+    h.store.send(envelope("still-queued", "normal", "agent-c"));
+    // Everything is older than the cutoff, but queued traffic is never pruned.
+    expect(h.store.pruneHistory(10_000)).toBe(1);
+    expect(h.store.getMessage("to-c")).toBeUndefined();
+    expect(h.store.getMessage("still-queued")).toMatchObject({ status: "queued" });
+    expect(h.store.hasActiveMessages()).toBe(true);
   });
 });

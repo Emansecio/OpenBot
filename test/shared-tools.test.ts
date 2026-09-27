@@ -7,6 +7,8 @@ import type { SkillCatalog } from "../src/skills/catalog.js";
 import type { McpAgentPolicy } from "../src/mcp/contracts.js";
 import { McpAbortedError, McpPolicyError, McpResultLimitError, McpTimeoutError } from "../src/mcp/contracts.js";
 import { MAX_PROVIDER_TOOL_SCHEMA_BYTES, SEARCH_MCP_TOOLS_NAME, CALL_MCP_TOOL_NAME, SharedTools, createSharedTools, type SharedMcpManager } from "../src/integrations/shared-tools.js";
+import { McpManager } from "../src/mcp/manager.js";
+import { McpOperationalError, McpSecurityError } from "../src/mcp/security.js";
 
 function call(name: string, args: unknown): ProviderToolCall {
   return { id: `${name}-1`, type: "function", function: { name, arguments: JSON.stringify(args) } };
@@ -338,6 +340,66 @@ describe("SharedTools", () => {
     expect(shared.status("deleted-bot").mcp.state).toBe("disabled");
   });
 
+  it("warms a slow cold MCP connection across turns instead of restarting it every turn", async () => {
+    let connects = 0;
+    let aborted = 0;
+    const manager = new McpManager({
+      servers: [{ id: "browser", transport: "http", url: "http://127.0.0.1:8787/mcp" }],
+      connector: async (_server, context) => {
+        connects += 1;
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, 150);
+          context.signal?.addEventListener("abort", () => { clearTimeout(timer); aborted += 1; reject(new Error("aborted")); }, { once: true });
+        });
+        return {
+          async listTools() { return { tools: [{ name: "open", inputSchema: { type: "object" as const } }] }; },
+          async callTool() { return { content: [] }; },
+          async close() {},
+        };
+      },
+    });
+    const shared = createSharedTools({
+      catalog: catalog(),
+      mcpManager: manager,
+      resolveAgentSkillPolicy: () => ({ enabled: true }),
+      resolveAgentMcpPolicy: () => ({ enabled: true, serverAllowlist: ["browser"] }),
+      mcpTurnTimeoutMs: 20,
+    });
+    try {
+      for (let turn = 0; turn < 3; turn += 1) await shared.providerTools("bot", []);
+      await vi.waitFor(() => expect(shared.status("bot").mcp).toMatchObject({ state: "ready", toolCount: 1 }));
+      expect({ connects, aborted }).toEqual({ connects: 1, aborted: 0 });
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it("keeps a failed discovery visible to the next turn until one succeeds", async () => {
+    let attempt = 0;
+    let release!: (tools: ProviderTool[]) => void;
+    const manager = fakeMcp({
+      async getProviderTools() {
+        attempt += 1;
+        if (attempt === 1) throw new Error("unreachable");
+        return new Promise<ProviderTool[]>((resolve) => { release = resolve; });
+      },
+    });
+    const shared = createSharedTools({
+      catalog: catalog(),
+      mcpManager: manager,
+      resolveAgentSkillPolicy: () => ({ enabled: true }),
+      resolveAgentMcpPolicy: () => ({ enabled: true, serverAllowlist: ["browser"] }),
+      mcpTurnTimeoutMs: 10,
+    });
+    await shared.providerTools("bot", []);
+    expect(shared.status("bot").mcp.state).toBe("error");
+    // The next discovery is still running when the turn starts: the notice stays.
+    await shared.providerTools("bot", []);
+    expect(shared.status("bot").mcp.state).toBe("error");
+    release([mcpTool]);
+    await vi.waitFor(() => expect(shared.status("bot").mcp).toMatchObject({ state: "ready", toolCount: 1 }));
+  });
+
   it("mantém a descoberta MCP independente do cancelamento do turno", async () => {
     let received: AbortSignal | undefined;
     const manager = fakeMcp({
@@ -444,6 +506,9 @@ describe("SharedTools", () => {
       { error: new McpTimeoutError(), code: "timed_out" },
       { error: new McpAbortedError(), code: "aborted" },
       { error: new McpResultLimitError(), code: "output_limit" },
+      { error: new McpSecurityError("command is not allowlisted"), code: "policy" },
+      // DNS, keystore or snapshot failures fail closed but are not denials.
+      { error: new McpOperationalError("endpoint DNS resolution failed"), code: "unavailable" },
       { error: new Error("socket reset"), code: "unavailable" },
     ];
     for (const { error, code } of cases) {

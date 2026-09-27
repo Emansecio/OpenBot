@@ -51,7 +51,7 @@ import type { AsyncTaskAuthorityResolver } from "./tasks.js";
 import type { AsyncTaskRuntime } from "../tasks/runtime.js";
 import type { AsyncTaskStore } from "../tasks/store.js";
 import type { McpManager } from "../mcp/manager.js";
-import type { ConversationPage } from "../conversations/store.js";
+import { MAX_CONVERSATION_TITLE_CHARS, type ConversationPage } from "../conversations/store.js";
 import type { HistorySearchResult, Memory, MemoryMode, MemoryStore } from "../memory/types.js";
 import { USER_PROFILE_AGENT_ID } from "../memory/types.js";
 import { registerA2AHandlers } from "./a2a.js";
@@ -59,6 +59,7 @@ import type { A2AStore } from "../a2a/store.js";
 import type { A2ARuntime } from "../a2a/runtime.js";
 import { defaultRegistry } from "../providers/router.js";
 import { AgentLifecycleFence, rpcAgentIds, waitForDeletionDrain } from "./agent-lifecycle.js";
+import { purgeAgentScopedPersistence } from "./agent-deletion-reconciliation.js";
 
 export {
   reconcileRosterHomes,
@@ -200,6 +201,22 @@ function mapConversationError(method: string, error: unknown): never {
   throw new RpcError(status, `${method}: ${message}`);
 }
 
+/**
+ * Store rejections of memory requests become client errors: stale revisions
+ * and protected targets conflict, policy and validation failures are bad
+ * requests, and a missing memory is not found. Anything else stays a 500.
+ */
+function mapMemoryError(method: string, error: unknown): never {
+  if (error instanceof RpcError) throw error;
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  if (code === "revision_conflict" || code === "protected_target") throw new RpcError(409, `${method}: ${message}`);
+  if (code === "policy" || code === "invalid_authority") throw new RpcError(400, `${method}: ${message}`);
+  if (/não encontrad/iu.test(message)) throw new RpcError(404, `${method}: ${message}`);
+  if (/inválid|excede|limite|muito longa|já existe|aceita apenas|não pode/iu.test(message)) throw new RpcError(400, `${method}: ${message}`);
+  throw error;
+}
+
 function registerConversationHandlers(
   gateway: Gateway,
   store: ConversationStoreLike,
@@ -212,7 +229,7 @@ function registerConversationHandlers(
     runner.setPublish(ctx.publish);
   };
   const assertAgent = (agentId: string, method: string): void => {
-    if (config && !config.snapshot().agents.some((agent) => agent.id === agentId)) {
+    if (config && !config.hasAgent(agentId)) {
       throw new RpcError(404, `${method}: agente não encontrado`);
     }
   };
@@ -311,6 +328,7 @@ function registerConversationHandlers(
     const conversationId = requiredConversationId(body, method);
     const record = conversationRecord(body, method);
     if (typeof record.title !== "string" || record.title.trim().length === 0) throw new RpcError(400, `${method}: title inválido`);
+    if ([...record.title.trim()].length > MAX_CONVERSATION_TITLE_CHARS) throw new RpcError(400, `${method}: title excede ${MAX_CONVERSATION_TITLE_CHARS} caracteres`);
     assertAgent(agentId, method);
     guardIdle(agentId, method);
     try {
@@ -375,7 +393,7 @@ function registerMemoryHandlers(gateway: Gateway, store: TranscriptStore, config
   const memoryStore = memoryStoreFrom(store);
   if (memoryStore === undefined) return;
   const assertMemoryAgent = (agentId: string, method: string): void => {
-    if (config && !config.snapshot().agents.some((agent) => agent.id === agentId)) {
+    if (config && !config.hasAgent(agentId)) {
       throw new RpcError(404, `${method}: agente não encontrado`);
     }
   };
@@ -498,12 +516,18 @@ function registerMemoryHandlers(gateway: Gateway, store: TranscriptStore, config
     if (record.query !== undefined && (typeof record.query !== "string" || Buffer.byteLength(record.query, "utf8") > 512)) {
       throw new RpcError(400, `${method}: query inválida`);
     }
-    const page = memoryStore.listMemoriesPage(memoryTargetAgentId(body, method), {
-      limit: limit as number,
-      includeInactive: record.includeInactive === true,
-      ...(typeof record.cursor === "string" ? { cursor: record.cursor } : {}),
-      ...(typeof record.query === "string" ? { query: record.query } : {}),
-    });
+    const target = memoryTargetAgentId(body, method);
+    let page: ReturnType<typeof memoryStore.listMemoriesPage>;
+    try {
+      page = memoryStore.listMemoriesPage(target, {
+        limit: limit as number,
+        includeInactive: record.includeInactive === true,
+        ...(typeof record.cursor === "string" ? { cursor: record.cursor } : {}),
+        ...(typeof record.query === "string" ? { query: record.query } : {}),
+      });
+    } catch (error) {
+      return mapMemoryError(method, error);
+    }
     return {
       items: page.items.map(memoryUiItem),
       ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }),
@@ -527,27 +551,37 @@ function registerMemoryHandlers(gateway: Gateway, store: TranscriptStore, config
     if (record.importance !== undefined && (!Number.isInteger(record.importance) || (record.importance as number) < 0 || (record.importance as number) > 100)) {
       throw new RpcError(400, `${method}: importance inválida`);
     }
-    return memoryUiItem(memoryStore.upsertMemory(target, {
-      id: current.id,
-      kind: current.kind,
-      canonicalKey: current.canonicalKey,
-      text: typeof record.text === "string" ? record.text.trim() : current.text,
-      valueJson: current.valueJson,
-      trust: "user",
-      pinned: typeof record.pinned === "boolean" ? record.pinned : current.pinned,
-      importance: typeof record.importance === "number" ? record.importance : current.importance,
-      confidence: current.confidence,
-      sourceConversationId: current.sourceConversationId,
-      sourceEntryIds: current.sourceEntryIds,
-      validFromMs: current.validFromMs,
-      validToMs: current.validToMs,
-      expiresAtMs: current.expiresAtMs,
-    }, { kind: "user", expectedRevision: current.revision }));
+    try {
+      return memoryUiItem(memoryStore.upsertMemory(target, {
+        id: current.id,
+        kind: current.kind,
+        canonicalKey: current.canonicalKey,
+        text: typeof record.text === "string" ? record.text.trim() : current.text,
+        valueJson: current.valueJson,
+        trust: "user",
+        pinned: typeof record.pinned === "boolean" ? record.pinned : current.pinned,
+        importance: typeof record.importance === "number" ? record.importance : current.importance,
+        confidence: current.confidence,
+        sourceConversationId: current.sourceConversationId,
+        sourceEntryIds: current.sourceEntryIds,
+        validFromMs: current.validFromMs,
+        validToMs: current.validToMs,
+        expiresAtMs: current.expiresAtMs,
+      }, { kind: "user", expectedRevision: current.revision }));
+    } catch (error) {
+      return mapMemoryError(method, error);
+    }
   });
 
   gateway.registerHandler("deleteMemory", (body) => {
     const method = "deleteMemory";
-    return memoryUiItem(memoryStore.forgetMemory(memoryTargetAgentId(body, method), requireMemoryId(body, method), { kind: "user" }, "user-delete"));
+    const target = memoryTargetAgentId(body, method);
+    const memoryId = requireMemoryId(body, method);
+    try {
+      return memoryUiItem(memoryStore.forgetMemory(target, memoryId, { kind: "user" }, "user-delete"));
+    } catch (error) {
+      return mapMemoryError(method, error);
+    }
   });
 
   gateway.registerHandler("getMemoryStatus", (body) => {
@@ -595,6 +629,7 @@ function registerMemoryHandlers(gateway: Gateway, store: TranscriptStore, config
     const record = conversationRecord(body, method);
     const query = typeof record.query === "string" ? record.query.trim() : "";
     if (query.length === 0) throw new RpcError(400, `${method}: query é obrigatória`);
+    if (Buffer.byteLength(query, "utf8") > 512) throw new RpcError(400, `${method}: query inválida`);
     const limit = record.limit === undefined ? 10 : record.limit;
     if (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > 20) {
       throw new RpcError(400, `${method}: limit inválido`);
@@ -652,7 +687,7 @@ export function registerRpcHandlers(
 ): { runner: ReturnType<typeof registerSendPromptHandler>; store: TranscriptStore } {
   const store = opts.store ?? createMemoryTranscriptStore();
   const activity = opts.activity ?? new AgentActivityStore();
-  for (const agent of opts.config?.snapshot().agents ?? []) {
+  for (const agent of opts.config?.view().agents ?? []) {
     const latest = store.getLatestAssistant(agent.id);
     if (latest?.content.trim()) {
       activity.patch(agent.id, {
@@ -666,10 +701,10 @@ export function registerRpcHandlers(
   const kickstartReadiness = opts.resolveKickstartReadiness ?? (async (agentId, inference) => {
     const registry = opts.registry ?? defaultRegistry;
     if (registry.get(inference.provider) === undefined) throw new Error("provider não registrado");
-    const agent = opts.config?.snapshot().agents.find((entry) => entry.id === agentId);
+    const agent = opts.config?.view().agents.find((entry) => entry.id === agentId);
     if (agent === undefined) throw new Error("agente não encontrado");
     if (opts.homes === undefined) throw new Error("home readiness indisponível");
-    await opts.homes.inventory(agentId);
+    await opts.homes.assertReady(agentId);
     if (opts.runtimeManager === undefined) throw new Error("runtime readiness indisponível");
     const runtime = await opts.runtimeManager.status(agentId, agent.runtimeMode ?? "developer");
     if (!["lite-ready", "ready", "busy"].includes(runtime.state)) throw new Error(`runtime não está pronto (${runtime.state})`);
@@ -717,6 +752,10 @@ export function registerRpcHandlers(
   const releaseDeletion = (agentIds: readonly string[]): void => {
     runner.releaseAgentFence(agentIds);
     for (const agentId of agentIds) {
+      // Only after the drain settled: its runtime stop tombstones the agent on
+      // completion, and a fence released earlier would let that late stop
+      // lock out an agent whose deletion was rolled back.
+      (opts.runtimeManager as { releaseAgentFence?(agentId: string): void } | undefined)?.releaseAgentFence?.(agentId);
       deletionAsyncFences.get(agentId)?.();
       deletionAsyncFences.delete(agentId);
       deletionBrokerFences.get(agentId)?.();
@@ -725,7 +764,7 @@ export function registerRpcHandlers(
       opts.asyncTaskStore?.clearAgentFence(agentId);
       opts.a2aStore?.clearAgentFence(agentId);
     }
-    const roster = new Set(opts.config!.snapshot().agents.map((agent) => agent.id.toLowerCase()));
+    const roster = new Set(opts.config!.view().agents.map((agent) => agent.id.toLowerCase()));
     const rolledBack = agentIds.filter((agentId) => roster.has(agentId.toLowerCase()));
     if (rolledBack.length > 0) deletionJournal.completeAgentDeletion?.(rolledBack);
     lifecycleFence.endDeletion(agentIds);
@@ -749,7 +788,11 @@ export function registerRpcHandlers(
     keystore: opts.keystore,
   });
   let activateAgent: ((agentId: string) => void) | undefined;
+  // Roster RPCs accept the legacy `{ id }` alias for the agent; elsewhere
+  // `id` names other things (servers, conversations, tasks).
+  const agentIdAliasMethods = new Set<string>();
   if (opts.config) {
+    const methodsBeforeRoster = new Set(gateway.listHandlers().keys());
     const roster = registerRosterHandlers(
       gateway,
       opts.config,
@@ -830,29 +873,8 @@ export function registerRpcHandlers(
         } catch (error) {
           cleanupFailures.push(error);
         }
-        for (const agentId of agentIds) {
-          for (const cleanup of [
-            () => opts.asyncTaskStore?.purgeAgentTasks(agentId),
-            () => opts.a2aStore?.retireAgent(agentId),
-            () => opts.a2aStore?.clearAgentFence(agentId),
-            () => opts.reactionStore?.purgeAgent(agentId),
-          ]) {
-            try {
-              cleanup();
-            } catch (error) {
-              cleanupFailures.push(error);
-            }
-          }
-        }
-        const settleCleanup = async (operations: readonly Promise<unknown>[]): Promise<void> => {
-          const results = await Promise.allSettled(operations);
-          for (const result of results) {
-            if (result.status === "rejected") cleanupFailures.push(result.reason);
-          }
-        };
-        await settleCleanup(agentIds.map((agentId) => Promise.resolve().then(() => opts.attachmentStaging?.purgeAgent(agentId))));
-        await settleCleanup(agentIds.map((agentId) => Promise.resolve().then(() => opts.keystore?.purgeScope(agentId))));
-        await settleCleanup(agentIds.map((agentId) => Promise.resolve().then(() => opts.browserLifecycle?.purgeAgent(agentId))));
+        const purged = await Promise.all(agentIds.map((agentId) => purgeAgentScopedPersistence(agentId, opts)));
+        cleanupFailures.push(...purged.flat());
         if (cleanupFailures.length > 0) {
           throw cleanupFailures.length === 1
             ? cleanupFailures[0]
@@ -870,11 +892,16 @@ export function registerRpcHandlers(
       opts.onAgentWorkspaceConfigChanged,
     );
     activateAgent = roster.activateAgent;
+    for (const method of gateway.listHandlers().keys()) {
+      // Reads keep answering during a deletion as before; the alias must not
+      // let a mutation (update, home import/restore, duplicate...) slip in.
+      if (!methodsBeforeRoster.has(method) && !/^(get|list|count|search|is)[A-Z]/u.test(method)) agentIdAliasMethods.add(method);
+    }
   }
   registerTranscriptHandlers(gateway, store, runner, activateAgent);
   if (opts.a2aStore) registerA2AHandlers(gateway, {
     store: opts.a2aStore,
-    activeAgents: opts.config ? () => opts.config!.snapshot().agents.map((agent) => agent.id) : undefined,
+    activeAgents: opts.config ? () => opts.config!.agentIds() : undefined,
     wake: () => opts.a2aRuntime?.wake(),
   });
   if (opts.asyncTaskStore && opts.config) {
@@ -886,7 +913,7 @@ export function registerRpcHandlers(
     });
   }
   if (opts.keystore && "getInteractionDecision" in store) {
-    registerInteractionHandlers(gateway, store as never, opts.keystore, opts.executionBroker);
+    registerInteractionHandlers(gateway, store as never, opts.keystore);
   }
   const memoryForP23 = memoryStoreFrom(store);
   registerP23Handlers(gateway, {
@@ -908,7 +935,7 @@ export function registerRpcHandlers(
   for (const [method, handler] of [...gateway.listHandlers()]) {
     if (method === "deleteAgents") continue;
     gateway.registerHandler(method, (body, context) => {
-      const agentIds = rpcAgentIds(method, body);
+      const agentIds = rpcAgentIds(method, body, agentIdAliasMethods.has(method));
       const invoke = () => handler(body, context);
       return method === "createAgent"
         ? lifecycleFence.runWhenAvailable(agentIds, invoke)

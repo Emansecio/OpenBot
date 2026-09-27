@@ -1,4 +1,4 @@
-import { lstat, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -9,19 +9,31 @@ import { DEFAULT_WORKSPACE_QUOTA } from "../src/execution/quota.js";
 import { TempRoots } from "./helpers/temp-roots.js";
 
 const tempRoots = new TempRoots();
-const temp = async () => {
-  const root = await tempRoots.makeAsync("openbot-home-lifecycle-");
-  return root;
-};
+const temp = () => tempRoots.makeAsync("openbot-home-lifecycle-");
 
 afterEach(async () => {
   await tempRoots.cleanup();
 });
 
-
 describe("AgentHomeStore lifecycle", () => {
   it("mantém o inventário alinhado ao teto de entradas permitido pela quota", () => {
     expect(DEFAULT_HOME_INVENTORY_MAX_ENTRIES).toBe(DEFAULT_WORKSPACE_QUOTA.maxEntries);
+  });
+
+  it("descarta no boot só staging órfão antigo e preserva o recente e arquivos soltos", async () => {
+    const root = await temp();
+    const first = await AgentHomeStore.create(root);
+    const stale = join(first.stagingRoot, "create-crashed-00000000");
+    const recent = join(first.stagingRoot, "create-inflight-11111111");
+    await mkdir(join(stale, "Documents"), { recursive: true });
+    await writeFile(join(stale, "Documents", "partial.txt"), "partial");
+    await mkdir(recent);
+    await writeFile(join(first.stagingRoot, "note.txt"), "not a stage");
+    const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+    await utimes(stale, twoDaysAgo, twoDaysAgo);
+
+    const second = await AgentHomeStore.create(root);
+    expect((await readdir(second.stagingRoot)).sort()).toEqual(["create-inflight-11111111", "note.txt"]);
   });
 
   it("lists quarantine and restores without overwriting an active home", async () => {
@@ -38,6 +50,27 @@ describe("AgentHomeStore lifecycle", () => {
     expect(await readFile(join(restored.root, "Documents", "keep.txt"), "utf8")).toBe("recover-me");
     expect(await readdir(store.quarantineRoot)).toEqual([]);
     await expect(store.restore("recoverable")).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("exclui, restaura, repara e purga uma home com junction sem seguir o link", async () => {
+    const root = await temp();
+    const outside = await temp();
+    await writeFile(join(outside, "external.txt"), "keep-outside");
+    const store = await AgentHomeStore.create(root);
+    const home = await store.ensure("linked");
+    await mkdir(join(home.root, "Projects", "app"), { recursive: true });
+    await symlink(outside, join(home.root, "Projects", "app", "node_modules"), "junction");
+
+    const repaired = await store.repair("linked");
+    expect(repaired.inventory.entries.some((entry) => entry.path.includes("node_modules"))).toBe(false);
+    expect(repaired.inventory.complete).toBe(false);
+    const quarantineId = await store.remove("linked");
+    expect(quarantineId).toEqual(expect.any(String));
+    const restored = await store.restore("linked", quarantineId);
+    expect((await lstat(join(restored.root, "Projects", "app", "node_modules"))).isSymbolicLink()).toBe(true);
+    await store.remove("linked");
+    await store.purgeDeletedAgentData("linked");
+    expect(await readFile(join(outside, "external.txt"), "utf8")).toBe("keep-outside");
   });
 
   it("restaura ids de agente com capitalização equivalente", async () => {
@@ -130,7 +163,7 @@ describe("AgentHomeStore lifecycle", () => {
     expect(home.acl).toMatchObject({ status: "failed" });
   });
 
-  it("applies ACL to the workspace root and lifecycle directories", async () => {
+  it("applies ACL to the workspace root once, covering the lifecycle directories inside it", async () => {
     const root = await temp();
     const calls: string[] = [];
     const acl: HomeAclAdapter = {
@@ -147,11 +180,12 @@ describe("AgentHomeStore lifecycle", () => {
     await store.ensure("acl-agent");
     expect(calls).toHaveLength(afterCreate + 1);
 
-    expect(calls).toEqual(expect.arrayContaining([
-      `create:${store.root}`,
-      `create:${store.quarantineRoot}`,
-      `create:${store.stagingRoot}`,
-    ]));
+    expect(calls).toEqual(expect.arrayContaining([`create:${store.root}`]));
+    expect(calls).not.toContain(`create:${store.quarantineRoot}`);
+    expect(calls).not.toContain(`create:${store.stagingRoot}`);
+    for (const lifecycleRoot of [store.quarantineRoot, store.stagingRoot]) {
+      expect(lifecycleRoot.startsWith(`${store.root}\\`)).toBe(true);
+    }
   });
 
   it("falha fechado no Windows quando o ACL não pode ser verificado", async () => {
@@ -249,5 +283,24 @@ describe("AgentHomeStore lifecycle", () => {
     // inventory/list operations.
     await expect(readFile(join(store.quarantineRoot, quarantine!, "Desktop", "Bem-vindo.md"), "utf8")).resolves.toContain("Computador");
     expect(home.root).not.toBe(join(store.quarantineRoot, quarantine!));
+  });
+
+  it("restaura e purga um bot mesmo com a quarentena danificada de outro bot", async () => {
+    const store = await AgentHomeStore.create(await temp());
+    await store.ensure("damaged-other");
+    await store.remove("damaged-other");
+    const damaged = (await readdir(store.quarantineRoot))[0]!;
+    await writeFile(join(store.quarantineRoot, damaged, ".openbot", "quarantine.json"), "not-json");
+    const home = await store.ensure("healthy");
+    await writeFile(join(home.root, "Documents", "keep.txt"), "keep");
+    await store.remove("healthy");
+
+    const restored = await store.restore("healthy");
+    expect(await readFile(join(restored.root, "Documents", "keep.txt"), "utf8")).toBe("keep");
+    await store.remove("healthy");
+    await expect(store.purgeDeletedAgentData("healthy")).resolves.toMatchObject({ quarantinesRemoved: 1 });
+    // The damaged entry stays on disk and the full listing still reports it.
+    expect(await readdir(store.quarantineRoot)).toEqual([damaged]);
+    await expect(store.listQuarantine()).rejects.toMatchObject({ code: "integrity_error" });
   });
 });

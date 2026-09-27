@@ -25,7 +25,7 @@ describe("broker lifecycle fences", () => {
         };
       },
     };
-    const broker = new LocalExecutionBroker(backend, () => "always");
+    const broker = new LocalExecutionBroker(backend);
     const one: ExecutionRequest = { operation: "file.write", path: "one.txt", content: "x", encoding: "utf8" };
     const two: ExecutionRequest = { operation: "file.write", path: "two.txt", content: "x", encoding: "utf8" };
     try {
@@ -49,19 +49,15 @@ describe("broker lifecycle fences", () => {
     }
   });
 
-  it("refcounts fences, revokes approvals and isolates other agents", async () => {
+  it("refcounts fences and isolates other agents", async () => {
     const backend = { execute: vi.fn(async () => success()) };
-    const broker = new LocalExecutionBroker(backend, () => "always");
+    const broker = new LocalExecutionBroker(backend);
     await broker.execute("a", "cached", request);
-    const approval = broker.execute("a", "approval", request, undefined, { permission: "ask" });
     const releaseOne = broker.fenceAgent("a");
     const releaseTwo = broker.fenceAgent("a");
     try {
-      await expect(approval).resolves.toMatchObject({ ok: false, code: "permission_denied" });
-      expect(broker.resolve("approval", "allow", "a")).toBe(false);
       await expect(broker.execute("a", "cached", request)).resolves.toMatchObject({ ok: false, code: "permission_denied" });
-      await expect(broker.execute("a", "new", request, undefined, { permission: "ask" })).resolves.toMatchObject({ ok: false });
-      expect(broker.pendingCount).toBe(0);
+      await expect(broker.execute("a", "new", request)).resolves.toMatchObject({ ok: false });
       await expect(broker.execute("b", "other", request)).resolves.toMatchObject({ ok: true });
       releaseOne();
       releaseOne();
@@ -83,7 +79,7 @@ describe("broker lifecycle fences", () => {
       effects += 1;
       return success();
     }) };
-    const broker = new LocalExecutionBroker(backend, () => "always");
+    const broker = new LocalExecutionBroker(backend);
     const first = broker.execute("a", "same", request);
     const duplicate = broker.execute("a", "same", request);
     const signal = await started.promise;
@@ -107,7 +103,7 @@ describe("broker lifecycle fences", () => {
     const resolution = deferred<ExecutionBackend>();
     const entered = deferred();
     const backend = { execute: vi.fn(async () => success()) };
-    const broker = new LocalExecutionBroker(() => { entered.resolve(); return resolution.promise; }, () => "always");
+    const broker = new LocalExecutionBroker(() => { entered.resolve(); return resolution.promise; });
     const execution = broker.execute("a", "resolving", request);
     await entered.promise;
     const release = broker.fenceAgent("a");
@@ -126,7 +122,7 @@ describe("broker lifecycle fences", () => {
   it("fails closed on timeout until a subsequent fenced drain succeeds", async () => {
     const gate = deferred();
     const started = deferred();
-    const broker = new LocalExecutionBroker({ execute: async () => { started.resolve(); await gate.promise; return success(); } }, () => "always");
+    const broker = new LocalExecutionBroker({ execute: async () => { started.resolve(); await gate.promise; return success(); } });
     const execution = broker.execute("a", "slow", request);
     await started.promise;
     const release = broker.fenceAgent("a");
@@ -143,17 +139,18 @@ describe("broker lifecycle fences", () => {
     } finally { gate.resolve(); await execution; release(); broker.close(); }
   });
 
-  it("tracks policy and audit awaits and does not publish a late approval", async () => {
+  it("tracks a pending decision audit and does not run the backend after the fence", async () => {
     const gate = deferred();
     const entered = deferred();
     const audit: BrokerAuditEntry[] = [];
-    const approvals = vi.fn();
     const backend = { execute: vi.fn(async () => success()) };
-    const broker = new LocalExecutionBroker(backend, () => "always", approvals, 1_000, {
-      decidePolicy: async () => { entered.resolve(); await gate.promise; return { effect: "ask" }; },
-      audit: (entry) => { audit.push(entry); },
+    const broker = new LocalExecutionBroker(backend, {
+      audit: async (entry) => {
+        audit.push(entry);
+        if (entry.kind === "decision") { entered.resolve(); await gate.promise; }
+      },
     });
-    const execution = broker.execute("a", "policy", request);
+    const execution = broker.execute("a", "decision", request);
     await entered.promise;
     const release = broker.fenceAgent("a");
     const drain = broker.drainAgent("a");
@@ -161,23 +158,19 @@ describe("broker lifecycle fences", () => {
       gate.resolve();
       await drain;
       await expect(execution).resolves.toMatchObject({ ok: false, code: "aborted" });
-      expect(approvals).not.toHaveBeenCalled();
       expect(backend.execute).not.toHaveBeenCalled();
       expect(audit.map((entry) => entry.kind)).toEqual(["decision", "outcome"]);
     } finally { gate.resolve(); await Promise.all([execution, drain]); release(); broker.close(); }
   });
 
-  it("waits for an approval outcome audit even when the approval promise has settled", async () => {
+  it("waits for a pending outcome audit before the drain completes", async () => {
     const gate = deferred();
     const entered = deferred();
-    const broker = new LocalExecutionBroker({ execute: async () => success() }, () => "ask", undefined, 1_000, {
+    const broker = new LocalExecutionBroker({ execute: async () => success() }, {
       audit: async (entry) => { if (entry.kind === "outcome") { entered.resolve(); await gate.promise; } },
     });
     const execution = broker.execute("a", "audit", request);
-    await vi.waitFor(() => expect(broker.pendingCount).toBe(1));
-    broker.resolve("audit", "deny", "a");
     await entered.promise;
-    await execution;
     const release = broker.fenceAgent("a");
     let drained = false;
     const drain = broker.drainAgent("a").then(() => { drained = true; });
@@ -186,11 +179,11 @@ describe("broker lifecycle fences", () => {
       expect(drained).toBe(false);
       gate.resolve();
       await drain;
-    } finally { gate.resolve(); await drain; release(); broker.close(); }
+    } finally { gate.resolve(); await drain; await execution; release(); broker.close(); }
   });
 
   it("requires a held fence and a positive drain deadline", async () => {
-    const broker = new LocalExecutionBroker({ execute: async () => success() }, () => "always");
+    const broker = new LocalExecutionBroker({ execute: async () => success() });
     await expect(broker.drainAgent("a")).rejects.toThrow(/fenced/);
     const release = broker.fenceAgent("a");
     try { await expect(broker.drainAgent("a", 0)).rejects.toThrow(/positive/); }

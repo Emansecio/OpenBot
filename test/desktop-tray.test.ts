@@ -118,6 +118,11 @@ describe("desktop close-to-tray", () => {
     trays[0]!.emit("double-click");
     expect(window.minimized).toBe(false);
     expect(window.visible).toBe(true);
+    // A single click on the tray icon is enough to bring the window back.
+    window.close();
+    expect(window.visible).toBe(false);
+    trays[0]!.emit("click");
+    expect(window.visible).toBe(true);
   });
 
   it("reopens on another launch or activation and ignores auxiliary windows", () => {

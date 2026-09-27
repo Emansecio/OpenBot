@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, opendir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, win32 as win32Path } from "node:path";
 import { promisify } from "node:util";
+
+import { systemToolPath } from "../shared/windows-tools.js";
 
 /**
  * ACL integration is deliberately injectable. The home lifecycle must not
@@ -62,7 +64,7 @@ export interface WindowsHomeAclAdapterOptions {
   commandTimeoutMs?: number;
 }
 
-const ICACLS = "icacls.exe";
+const ICACLS = systemToolPath("icacls.exe");
 const FULL_CONTROL = "(OI)(CI)F";
 const DIRECT_FULL_CONTROL = "F";
 const SYSTEM = "*S-1-5-18";
@@ -76,10 +78,35 @@ const SDDL_SYSTEM = new Set(["SY", "S-1-5-18"]);
 const SDDL_ADMINISTRATORS = new Set(["BA", "S-1-5-32-544"]);
 const FULL_CONTROL_MASKS = new Set(["F", "FA", "GA", "0X1F01FF"]);
 const ALLOWED_INHERITANCE_FLAGS = new Set(["", "OICI"]);
-const WHOAMI = "whoami.exe";
+const WHOAMI = systemToolPath("whoami.exe");
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * `icacls /T` follows directory junctions and symbolic links (even with /L),
+ * so a link inside a home would carry reset/grant/inheritance changes to its
+ * target outside the home. A tree with links is configured at its root only:
+ * Windows then propagates the inheritable entries to descendants without
+ * crossing reparse points. Unreadable trees take the same conservative path.
+ */
+async function recursionFor(root: string): Promise<readonly string[]> {
+  const pending = [root];
+  let current = root;
+  try {
+    while (pending.length > 0) {
+      current = pending.pop()!;
+      for await (const entry of await opendir(current)) {
+        if (entry.isSymbolicLink()) return [];
+        if (entry.isDirectory()) pending.push(join(current, entry.name));
+      }
+    }
+    return ["/T"];
+  } catch (error) {
+    // A missing root has nothing to traverse; icacls reports it itself.
+    return current === root && (error as NodeJS.ErrnoException).code === "ENOENT" ? ["/T"] : [];
+  }
+}
 
 function text(value: unknown): string {
   return typeof value === "string" ? value : "";
@@ -214,11 +241,12 @@ export class WindowsHomeAclAdapter implements HomeAclAdapter {
   private async readPolicyDescriptors(
     target: string,
     options: HomeAclCommandOptions,
+    recursion: readonly string[],
   ): Promise<{ descriptors: string[]; temporaryRoot: string }> {
     const temporaryRoot = await mkdtemp(join(tmpdir(), "openbot-acl-inspect-"));
     const aclFile = join(temporaryRoot, "tree.acl");
     try {
-      const saved = await this.runCommand(ICACLS, [target, "/save", aclFile, "/T", "/Q"], options);
+      const saved = await this.runCommand(ICACLS, [target, "/save", aclFile, ...recursion, "/Q"], options);
       if (commandFailed(saved)) {
         throw new Error("icacls ACL save failed with exit " + saved.exitCode + (summarize(saved) ? ": " + summarize(saved) : "."));
       }
@@ -238,10 +266,17 @@ export class WindowsHomeAclAdapter implements HomeAclAdapter {
           throw new Error("icacls ACL descriptor could not be read: " + (error instanceof Error ? error.message : "ACL file unavailable"));
         }
       }
-      const descriptors = contents
-        .split(/\r?\n/gu)
+      // icacls appends the SACL (e.g. a mandatory integrity label, `S:(ML;...)`)
+      // after the DACL on the same line; the policy concerns the DACL only.
+      const lines = contents.split(/\r?\n/gu)
         .map((line) => line.trim())
-        .filter((line) => SDDL_LINE.test(line));
+        .map((line) => /^D:/iu.test(line) ? line.replace(/S:[A-Z]*(?:\([^()]*\))*$/iu, "") : line);
+      // A null DACL (`D:NO_ACCESS_CONTROL`) or an unparsable entry must not
+      // silently drop out of the policy check.
+      if (lines.some((line) => /^[DOGS]:/iu.test(line) && !SDDL_LINE.test(line))) {
+        throw new Error("icacls ACL descriptor is invalid.");
+      }
+      const descriptors = lines.filter((line) => SDDL_LINE.test(line));
       if (descriptors.length === 0) throw new Error("icacls ACL descriptor is empty or invalid.");
       return { descriptors, temporaryRoot };
     } catch (error) {
@@ -254,8 +289,9 @@ export class WindowsHomeAclAdapter implements HomeAclAdapter {
     target: string,
     principal: string,
     options: HomeAclCommandOptions,
+    recursion: readonly string[],
   ): Promise<string | undefined> {
-    const { descriptors, temporaryRoot } = await this.readPolicyDescriptors(target, options);
+    const { descriptors, temporaryRoot } = await this.readPolicyDescriptors(target, options, recursion);
     try {
       const normalizedPrincipal = normalizePrincipal(principal);
       let currentSid: string | undefined;
@@ -327,9 +363,10 @@ export class WindowsHomeAclAdapter implements HomeAclAdapter {
     }
 
     const options: HomeAclCommandOptions = { shell: false, windowsHide: true, timeoutMs: this.commandTimeoutMs };
+    const recursion = await recursionFor(target);
     let verification: HomeAclCommandResult;
     try {
-      verification = await this.runCommand(ICACLS, [target, "/verify", "/T", "/Q"], options);
+      verification = await this.runCommand(ICACLS, [target, "/verify", ...recursion, "/Q"], options);
     } catch (error) {
       return {
         status: "failed",
@@ -345,7 +382,7 @@ export class WindowsHomeAclAdapter implements HomeAclAdapter {
       };
     }
     try {
-      const policyError = await this.verifyPolicy(target, principal, options);
+      const policyError = await this.verifyPolicy(target, principal, options, recursion);
       if (policyError !== undefined) {
         return { status: "failed", platform: this.platform, message: policyError };
       }
@@ -385,8 +422,9 @@ export class WindowsHomeAclAdapter implements HomeAclAdapter {
     }
 
     const options: HomeAclCommandOptions = { shell: false, windowsHide: true, timeoutMs: this.commandTimeoutMs };
+    const recursion = await recursionFor(target);
     const commands: readonly (readonly string[])[] = [
-      [target, "/reset", "/T", "/Q"],
+      [target, "/reset", ...recursion, "/Q"],
       [
         target,
         "/grant:r",
@@ -396,13 +434,13 @@ export class WindowsHomeAclAdapter implements HomeAclAdapter {
         `${SYSTEM}:${DIRECT_FULL_CONTROL}`,
         `${ADMINISTRATORS}:${FULL_CONTROL}`,
         `${ADMINISTRATORS}:${DIRECT_FULL_CONTROL}`,
-        "/T",
+        ...recursion,
         "/Q",
       ],
       // Grant explicit access before removing inheritance. If inheritance is
       // removed from the root first, icacls can lose traversal rights before
       // it reaches descendants and leave the tree half-configured.
-      [target, "/inheritance:r", "/T", "/Q"],
+      [target, "/inheritance:r", ...recursion, "/Q"],
     ];
 
     for (const [index, args] of commands.entries()) {
@@ -427,7 +465,7 @@ export class WindowsHomeAclAdapter implements HomeAclAdapter {
 
     let verification: HomeAclCommandResult;
     try {
-      verification = await this.runCommand(ICACLS, [target, "/verify", "/T", "/Q"], options);
+      verification = await this.runCommand(ICACLS, [target, "/verify", ...recursion, "/Q"], options);
     } catch (error) {
       return {
         status: "failed",
@@ -444,7 +482,7 @@ export class WindowsHomeAclAdapter implements HomeAclAdapter {
     }
 
     try {
-      const policyError = await this.verifyPolicy(target, principal, options);
+      const policyError = await this.verifyPolicy(target, principal, options, recursion);
       if (policyError !== undefined) {
         return { status: "failed", platform: this.platform, message: policyError };
       }

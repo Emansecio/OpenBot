@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -309,5 +309,28 @@ describe("SkillDispatcher", () => {
       result: { ok: false, operation: "skills.save", code: "policy" },
     });
     expect(existsSync(skillPath)).toBe(false);
+  });
+
+  it("save_skill refuses to write when the authoring root was swapped for a junction after startup", async () => {
+    const authoring = root();
+    const instance = createSkillDispatcher({
+      catalog: new SkillCatalog({ roots: [{ path: authoring, source: OPENBOT_SKILL_ROOT_SOURCE }] }),
+    });
+    const elsewhere = root();
+    renameSync(authoring, `${authoring}.orig`);
+    roots.push(`${authoring}.orig`);
+    symlinkSync(elsewhere, authoring, "junction");
+
+    const saved = handled(await instance.execute({
+      agentId: "bot-a",
+      call: call("save_skill", {
+        id: "redirected",
+        name: "Redirected",
+        description: "Should never be written through a swapped root.",
+        body: "body\n",
+      }),
+    }));
+    expect(saved).toMatchObject({ ok: false, result: { code: "policy" } });
+    expect(readdirSync(elsewhere)).toEqual([]);
   });
 });

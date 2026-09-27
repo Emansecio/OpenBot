@@ -2,16 +2,13 @@
  * T4 — Keystore de providers (plano §3 T4; spec §3.3; mapa-funcoes §3.7).
  *
  * Persistência de segredos do usuário em `%APPDATA%\OpenBot\sand-secrets.json`
- * com criptografia (safeStorage/DPAPI no Windows; fallback em memória em Node
- * puro). Namespace `scoped:v1:provider:<name>:apiKey` — NENHUMA chave fica em
- * claro no disco.
+ * com criptografia (DPAPI CurrentUser no Windows). Namespace
+ * `scoped:v1:provider:<name>:apiKey` — NENHUMA chave fica em claro no disco.
  *
  * Regras (spec §3.3 / mapa-funcoes §3.7):
  *   - escrever → cifra com o backend de escrita ANTES de serializar;
- *   - ler      → decifra com o backend indicado pela tag do registro
- *     (`electron-safe-storage` = DPAPI/legado, `memory` = sessão atual);
- *   - sem keyring → fallback em memória (nunca grava plaintext novo);
- *     registros legados DPAPI continuam legíveis (somente leitura).
+ *   - ler      → decifra com o backend indicado pela tag do registro;
+ *   - backend `memory` → nada é gravado; os segredos vivem só no processo.
  *
  * Integração ao gateway (plano §3 T4):
  *   - `registerKeystoreHandlers(gateway)` pluga:
@@ -27,7 +24,8 @@ import path from "node:path";
 import os from "node:os";
 
 import type { BoxSecretsStatus } from "../shared/contracts.js";
-import { renameWithRetry, writeFileExclusiveSync } from "../shared/fs-atomic.js";
+import { renameWithRetry, writeFileAtomic, writeFileExclusiveSync } from "../shared/fs-atomic.js";
+import { withFileLock } from "../shared/file-lock.js";
 import type { Gateway, RpcHandler } from "../server/gateway.js";
 import { RpcError } from "../server/gateway.js";
 import {
@@ -42,7 +40,6 @@ import {
   providerApiKeyKey,
   resolveLegacyReadBackend,
   resolveWriteBackend,
-  hasElectronSafeStorage,
 } from "./backend.js";
 import { DPAPI_CURRENT_USER_BACKEND, dpapiCurrentUserBackend } from "./dpapi.js";
 
@@ -71,6 +68,9 @@ export type SecretsFileShape = Record<string, EncryptedEntry>;
 export const SECRETS_FILE_VERSION = 2;
 export const DEFAULT_KEYSTORE_SCOPE = "openbot-default";
 const SCOPE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/u;
+const PROVIDER_KEY_PREFIX = "scoped:v1:provider:";
+const PROVIDER_KEY_SUFFIX = ":apiKey";
+const LOCK_OPTIONS = { label: "keystore", timeoutMs: 5_000 } as const;
 
 export interface ScopedSecretsFile {
   version: typeof SECRETS_FILE_VERSION;
@@ -86,66 +86,55 @@ export function normalizeKeystoreScope(agentId?: string): string {
   return agentId;
 }
 
-/** Aceita v2 explícito ou legado plano (v1) → escopo padrão. */
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function validEntries(entries: Record<string, unknown>): SecretsFileShape {
+  const valid: SecretsFileShape = {};
+  for (const [key, value] of Object.entries(entries)) {
+    if (isPlainObject(value) && typeof value.backend === "string" && typeof value.data === "string") {
+      valid[key] = { backend: value.backend, data: value.data };
+    }
+  }
+  return valid;
+}
+
+/**
+ * Aceita v2 explícito ou legado plano (v1, sem campo `version`) → escopo
+ * padrão. Uma versão desconhecida é recusada: lê-la como v1 produziria um
+ * arquivo vazio que o próximo write gravaria por cima dos segredos.
+ */
 function toScopedShape(parsed: unknown, file: string): ScopedSecretsFile {
   if (!isPlainObject(parsed)) {
     throw new Error(`keystore: ${file} não é um objeto JSON válido`);
   }
-  if (parsed.version === SECRETS_FILE_VERSION && isPlainObject(parsed.scopes)) {
+  if (Object.prototype.hasOwnProperty.call(parsed, "version")) {
+    if (parsed.version !== SECRETS_FILE_VERSION) {
+      throw new Error(`keystore: ${file} usa uma versão não suportada: ${String(parsed.version)}`);
+    }
+    if (!isPlainObject(parsed.scopes)) throw new Error(`keystore: ${file} não tem escopos válidos`);
     const scopes: Record<string, SecretsFileShape> = {};
     for (const [scope, entries] of Object.entries(parsed.scopes)) {
-      if (!isPlainObject(entries)) continue;
-      const valid: SecretsFileShape = {};
-      for (const [key, value] of Object.entries(entries)) {
-        if (isPlainObject(value) && typeof value.backend === "string" && typeof value.data === "string") {
-          valid[key] = { backend: value.backend, data: value.data };
-        }
-      }
-      scopes[scope] = valid;
+      if (isPlainObject(entries)) scopes[scope] = validEntries(entries);
     }
     return { version: SECRETS_FILE_VERSION, scopes };
   }
   // Legado v1: todas as chaves pertencem ao escopo padrão.
-  const legacy: SecretsFileShape = {};
-  for (const [key, value] of Object.entries(parsed)) {
-    if (isPlainObject(value) && typeof value.backend === "string" && typeof value.data === "string") {
-      legacy[key] = { backend: value.backend, data: value.data };
-    }
+  return { version: SECRETS_FILE_VERSION, scopes: { [DEFAULT_KEYSTORE_SCOPE]: validEntries(parsed) } };
+}
+
+function parseSecretsText(raw: string, file: string): ScopedSecretsFile {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`keystore: ${file} não é um objeto JSON válido`, { cause: error });
   }
-  return { version: SECRETS_FILE_VERSION, scopes: { [DEFAULT_KEYSTORE_SCOPE]: legacy } };
+  return toScopedShape(parsed, file);
 }
 
-export interface KeystoreOptions {
-  /** Diretório dos dados; default: `%APPDATA%\OpenBot\` (injetável p/ testes). */
-  dir?: string;
-  /** Backend de escrita injetado (testes); default: resolver do runtime. */
-  writeBackend?: CryptoBackend;
-  /** Backend de leitura de registros DPAPI legados; default: resolver. */
-  legacyReadBackend?: CryptoBackend;
-  /** Intervalo do poll de `waitForEncryptedStorage` (ms; default 200). */
-  pollIntervalMs?: number;
-  /** Timeout do poll (ms; default 5000). */
-  pollTimeoutMs?: number;
-}
-
-/** Resultado de `setBoxSecrets` no gateway (espelho do retorno dos IPC de secrets). */
-export interface SetBoxSecretsResult {
-  synced: boolean;
-  /** Providers cuja chave foi escrita/atualizada. */
-  upserted: string[];
-  /** Providers cuja chave foi removida. */
-  deleted: string[];
-}
-
-/** Estado interno de um registro mantido em memória (decifrado). */
-interface SecretRecord {
-  provider: string;
-  value: string;
-}
-
-function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
+const emptySecrets = (): ScopedSecretsFile => ({ version: SECRETS_FILE_VERSION, scopes: {} });
 
 /** Lê o arquivo de secrets (ausente → vazio). Lança em JSON inválido. */
 async function readSecretsFile(file: string): Promise<ScopedSecretsFile> {
@@ -153,37 +142,36 @@ async function readSecretsFile(file: string): Promise<ScopedSecretsFile> {
   try {
     raw = await fsp.readFile(file, "utf8");
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return { version: SECRETS_FILE_VERSION, scopes: {} };
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return emptySecrets();
     throw err;
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error(`keystore: ${file} não é um objeto JSON válido`);
-  }
-  return toScopedShape(parsed, file);
+  return parseSecretsText(raw, file);
 }
 
-/** Grava o arquivo de secrets escopado de forma atômica (tmp único + fsync + rename). */
-export async function writeScopedSecretsFile(file: string, shape: ScopedSecretsFile): Promise<void> {
-  await fsp.mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-  let handle: Awaited<ReturnType<typeof fsp.open>> | undefined;
-  let renamed = false;
+/** Variante síncrona, usada pela hidratação da cache de redaction no boot. */
+function readSecretsFileSync(file: string): ScopedSecretsFile {
+  let raw: string;
   try {
-    handle = await fsp.open(tmp, "w", 0o600);
-    await handle.writeFile(JSON.stringify(shape, null, 2) + "\n", "utf8");
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await renameWithRetry(tmp, file);
-    renamed = true;
-  } finally {
-    await handle?.close().catch(() => undefined);
-    if (!renamed) await fsp.unlink(tmp).catch(() => undefined);
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return emptySecrets();
+    throw err;
   }
+  return parseSecretsText(raw, file);
+}
+
+const serializeSecrets = (shape: ScopedSecretsFile): string => JSON.stringify(shape, null, 2) + "\n";
+
+/** Grava o arquivo de secrets escopado de forma atômica e durável. */
+export async function writeScopedSecretsFile(file: string, shape: ScopedSecretsFile): Promise<void> {
+  await writeFileAtomic(file, serializeSecrets(shape));
+}
+
+/** Provider name encoded in a `scoped:v1:provider:<name>:apiKey` key, if valid. */
+function providerFromKey(key: string): string | null {
+  if (!key.startsWith(PROVIDER_KEY_PREFIX) || !key.endsWith(PROVIDER_KEY_SUFFIX)) return null;
+  const name = key.slice(PROVIDER_KEY_PREFIX.length, -PROVIDER_KEY_SUFFIX.length);
+  return isProviderNameValid(name) ? name : null;
 }
 
 export interface LocalFileMigrationOptions {
@@ -193,25 +181,6 @@ export interface LocalFileMigrationOptions {
   beforeRename?: () => void | Promise<void>;
 }
 
-async function writeDurableBytes(file: string, bytes: Buffer): Promise<void> {
-  const tmp = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-  let handle: Awaited<ReturnType<typeof fsp.open>> | undefined;
-  let renamed = false;
-  try {
-    await fsp.mkdir(path.dirname(file), { recursive: true });
-    handle = await fsp.open(tmp, "w", 0o600);
-    await handle.write(bytes);
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await renameWithRetry(tmp, file);
-    renamed = true;
-  } finally {
-    await handle?.close().catch(() => undefined);
-    if (!renamed) await fsp.unlink(tmp).catch(() => undefined);
-  }
-}
-
 /** Migra registros local-file para DPAPI sem retirar a chave antiga antes da verificação. */
 export async function migrateLocalFileToDpapi(options: LocalFileMigrationOptions): Promise<boolean> {
   const file = defaultSecretsFile(options.dir);
@@ -219,10 +188,10 @@ export async function migrateLocalFileToDpapi(options: LocalFileMigrationOptions
   if (!fs.existsSync(file) || !fs.existsSync(keyFile)) return false;
   const originalBytes = await fsp.readFile(file);
   const current = await readSecretsFile(file);
-  const localEntries = Object.values(current.scopes).flatMap((entries) =>
-    Object.values(entries).filter((entry) => entry.backend === "local-file"),
+  const hasLocalEntries = Object.values(current.scopes).some((entries) =>
+    Object.values(entries).some((entry) => entry.backend === "local-file"),
   );
-  if (localEntries.length === 0) return false;
+  if (!hasLocalEntries) return false;
 
   const oldKey = readMasterKey(keyFile);
   const legacy = localFileBackend(oldKey);
@@ -233,8 +202,8 @@ export async function migrateLocalFileToDpapi(options: LocalFileMigrationOptions
   let completed = false;
   try {
     // Preserve the exact AES file before any promotion. This copy is itself
-    // durable and is the rollback source if verification or key archival REDs.
-    await writeDurableBytes(backup, originalBytes);
+    // durable and is the rollback source if verification or key archival fails.
+    await writeFileAtomic(backup, originalBytes);
     for (const [scope, entries] of Object.entries(current.scopes)) {
       const targetEntries = next.scopes[scope]!;
       for (const [key, entry] of Object.entries(entries)) {
@@ -246,35 +215,16 @@ export async function migrateLocalFileToDpapi(options: LocalFileMigrationOptions
         } finally {
           payload.fill(0);
         }
-        try {
-          const encrypted = options.dpapiBackend.encrypt(plain);
-          targetEntries[key] = { backend: options.dpapiBackend.name, data: entryToBase64(encrypted) };
-          encrypted.fill(0);
-        } finally {
-          const clear = Buffer.from(plain, "utf8");
-          clear.fill(0);
-        }
+        const encrypted = options.dpapiBackend.encrypt(plain);
+        targetEntries[key] = { backend: options.dpapiBackend.name, data: entryToBase64(encrypted) };
+        encrypted.fill(0);
       }
     }
 
-    const tmp = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.migration.tmp`;
-    let handle: Awaited<ReturnType<typeof fsp.open>> | undefined;
-    let renamed = false;
-    try {
-      await fsp.mkdir(path.dirname(file), { recursive: true });
-      handle = await fsp.open(tmp, "w", 0o600);
-      await handle.writeFile(JSON.stringify(next, null, 2) + "\n", "utf8");
-      await handle.sync();
-      await handle.close();
-      handle = undefined;
-      await options.beforeRename?.();
-      await renameWithRetry(tmp, file);
-      renamed = true;
-      promoted = true;
-    } finally {
-      await handle?.close().catch(() => undefined);
-      if (!renamed) await fsp.unlink(tmp).catch(() => undefined);
-    }
+    await writeFileAtomic(file, serializeSecrets(next), 0o600, {
+      beforeRename: options.beforeRename,
+    });
+    promoted = true;
 
     // Verifica o arquivo já renomeado antes de tocar na chave legada.
     const verified = await readSecretsFile(file);
@@ -292,7 +242,7 @@ export async function migrateLocalFileToDpapi(options: LocalFileMigrationOptions
   } catch (error) {
     if (promoted) {
       try {
-        await writeDurableBytes(file, originalBytes);
+        await writeFileAtomic(file, originalBytes);
         rolledBack = true;
       } catch (rollbackError) {
         throw new Error(
@@ -306,114 +256,6 @@ export async function migrateLocalFileToDpapi(options: LocalFileMigrationOptions
   } finally {
     oldKey.fill(0);
     if (completed || rolledBack || !promoted) await fsp.unlink(backup).catch(() => undefined);
-  }
-}
-
-/** Legado (v1): grava um shape plano de forma atômica (tmp único + fsync + rename). */
-export async function writeSecretsFile(file: string, shape: SecretsFileShape): Promise<void> {
-  await fsp.mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-  let handle: Awaited<ReturnType<typeof fsp.open>> | undefined;
-  let renamed = false;
-  try {
-    handle = await fsp.open(tmp, "w", 0o600);
-    await handle.writeFile(JSON.stringify(shape, null, 2) + "\n", "utf8");
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await renameWithRetry(tmp, file);
-    renamed = true;
-  } finally {
-    await handle?.close().catch(() => undefined);
-    if (!renamed) await fsp.unlink(tmp).catch(() => undefined);
-  }
-}
-
-interface FileLockRecord {
-  pid: number;
-  token: string;
-}
-
-const FILE_LOCK_RETRY_MS = 10;
-const FILE_LOCK_TIMEOUT_MS = 5_000;
-
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
-}
-
-async function readFileLock(file: string): Promise<FileLockRecord | null> {
-  try {
-    const value: unknown = JSON.parse(await fsp.readFile(file, "utf8"));
-    if (!isPlainObject(value) || typeof value.pid !== "number" || typeof value.token !== "string") return null;
-    return { pid: value.pid, token: value.token };
-  } catch {
-    return null;
-  }
-}
-
-async function releaseFileLock(file: string, token: string): Promise<void> {
-  const owner = await readFileLock(file);
-  if (owner?.token !== token) return;
-  await fsp.unlink(file).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== "ENOENT") throw error;
-  });
-}
-
-async function withFileLock<T>(target: string, task: () => Promise<T>): Promise<T> {
-  const file = `${target}.lock`;
-  const token = randomBytes(16).toString("hex");
-  const deadline = Date.now() + FILE_LOCK_TIMEOUT_MS;
-  await fsp.mkdir(path.dirname(file), { recursive: true });
-
-  while (true) {
-    try {
-      const handle = await fsp.open(file, "wx", 0o600);
-      try {
-        await handle.writeFile(JSON.stringify({ pid: process.pid, token }), "utf8");
-        await handle.sync();
-      } catch (error) {
-        await handle.close().catch(() => undefined);
-        await fsp.unlink(file).catch(() => undefined);
-        throw error;
-      }
-      await handle.close();
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const owner = await readFileLock(file);
-      if (owner !== null && !isProcessAlive(owner.pid)) {
-        await releaseFileLock(file, owner.token);
-        continue;
-      }
-      if (owner === null) {
-        try {
-          const stat = await fsp.stat(file);
-          if (Date.now() - stat.mtimeMs >= FILE_LOCK_TIMEOUT_MS) {
-            await fsp.unlink(file);
-            continue;
-          }
-        } catch (statError) {
-          if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
-          continue;
-        }
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(`keystore: timeout aguardando lock de ${target}`, { cause: error });
-      }
-      await new Promise((resolve) => setTimeout(resolve, FILE_LOCK_RETRY_MS));
-    }
-  }
-
-  try {
-    return await task();
-  } finally {
-    await releaseFileLock(file, token);
   }
 }
 
@@ -455,24 +297,45 @@ function loadOrCreateMasterKey(dir: string): Buffer {
   }
 }
 
-/** Lê o arquivo de forma SÍNCRONA (usado pela detecção de disponibilidade). */
-function readSecretsFileSync(file: string): ScopedSecretsFile {
-  let raw: string;
+export interface KeystoreOptions {
+  /** Diretório dos dados; default: `%APPDATA%\OpenBot\` (injetável p/ testes). */
+  dir?: string;
+  /** Backend de escrita injetado (testes); default: {@link selectWriteBackend}. */
+  writeBackend?: CryptoBackend;
+  /** Backend de leitura dos registros `electron-safe-storage`; default: DPAPI legado. */
+  legacyReadBackend?: CryptoBackend;
+}
+
+/**
+ * Escolhe o backend de escrita padrão:
+ *   - `OPENBOT_KEYSTORE_MEMORY=1` → memória (nada em disco);
+ *   - `OPENBOT_KEYSTORE_BACKEND=local-file` → AES com `.master.key`;
+ *   - Windows → DPAPI CurrentUser; outras plataformas → AES com `.master.key`.
+ */
+function selectWriteBackend(dir: string): CryptoBackend {
+  if (process.env.OPENBOT_KEYSTORE_MEMORY === "1") return memoryBackend();
+  if (process.env.OPENBOT_KEYSTORE_BACKEND === "local-file") return localFileBackend(loadOrCreateMasterKey(dir));
   try {
-    raw = fs.readFileSync(file, "utf8");
+    return resolveWriteBackend();
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return { version: SECRETS_FILE_VERSION, scopes: {} };
-    throw err;
+    if (!(err instanceof KeyringUnavailableError)) throw err;
+    return localFileBackend(loadOrCreateMasterKey(dir));
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error(`keystore: ${file} não é um objeto JSON válido`);
-  }
-  if (!isPlainObject(parsed)) return { version: SECRETS_FILE_VERSION, scopes: {} };
-  return toScopedShape(parsed, file);
+}
+
+/** Resultado de `setBoxSecrets` no gateway (espelho do retorno dos IPC de secrets). */
+export interface SetBoxSecretsResult {
+  synced: boolean;
+  /** Providers cuja chave foi escrita/atualizada. */
+  upserted: string[];
+  /** Providers cuja chave foi removida. */
+  deleted: string[];
+}
+
+/** Estado interno de um registro mantido em memória (decifrado). */
+interface SecretRecord {
+  provider: string;
+  value: string;
 }
 
 export class Keystore {
@@ -480,54 +343,31 @@ export class Keystore {
   private readonly file: string;
   private readonly writeBackend: CryptoBackend;
   private readonly legacyReadBackend: CryptoBackend;
-  private readonly pollIntervalMs: number;
-  private readonly pollTimeoutMs: number;
   private readonly memory = new Map<string, SecretRecord>();
-  private onDiskCache: ScopedSecretsFile | null = null;
+  /** Source of truth for the `memory` backend, which never touches the file. */
+  private memoryShape: ScopedSecretsFile | null = null;
+  private localFileReader: CryptoBackend | undefined;
   private writeChain: Promise<void> = Promise.resolve();
   private migrationPromise: Promise<void> | null = null;
 
   constructor(opts: KeystoreOptions = {}) {
+    // Guard: a test that forgot `dir` must never touch the real profile.
     const runningTest = process.env.NODE_ENV === "test" || process.env.VITEST === "true";
     if (runningTest && opts.dir === undefined && !process.env.OPENBOT_DATA_ROOT?.trim()) {
       throw new Error("keystore: em ambiente de teste, informe opts.dir ou OPENBOT_DATA_ROOT");
     }
-    const dir = opts.dir ?? defaultKeystoreDir();
-    this.dir = dir;
-    this.file = defaultSecretsFile(dir);
-    let writeBackend: CryptoBackend;
-    try {
-      if (opts.writeBackend === undefined && process.env.VITEST === "true" && process.env.OPENBOT_KEYSTORE_MEMORY !== "1" && !hasElectronSafeStorage()) {
-        // Compatibilidade das fixtures legadas: a seleção fail-closed é exercitada
-        // pelo backend DPAPI diretamente; fixtures local-file ainda cobrem AES.
-        writeBackend = localFileBackend(loadOrCreateMasterKey(dir));
-      } else if (opts.writeBackend === undefined && process.env.OPENBOT_KEYSTORE_MEMORY === "1" && !hasElectronSafeStorage()) {
-        writeBackend = memoryBackend();
-      } else {
-        writeBackend = opts.writeBackend ?? resolveWriteBackend();
-      }
-    } catch (err) {
-      if (err instanceof KeyringUnavailableError) {
-        if (process.platform === "win32" && process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") throw err;
-        writeBackend = process.env.OPENBOT_KEYSTORE_MEMORY === "1"
-          ? memoryBackend()
-          : localFileBackend(loadOrCreateMasterKey(dir));
-      } else {
-        throw err;
-      }
-    }
-    this.writeBackend = writeBackend;
+    this.dir = opts.dir ?? defaultKeystoreDir();
+    this.file = defaultSecretsFile(this.dir);
+    this.writeBackend = opts.writeBackend ?? selectWriteBackend(this.dir);
     this.legacyReadBackend = opts.legacyReadBackend ?? this.buildLegacyReadBackend();
-    this.pollIntervalMs = opts.pollIntervalMs ?? 200;
-    this.pollTimeoutMs = opts.pollTimeoutMs ?? 5000;
   }
 
   private buildLegacyReadBackend(): CryptoBackend {
     try {
       return resolveLegacyReadBackend();
     } catch {
-      // Sem safeStorage: registros DPAPI legados ficam ilegíveis nesta sessão
-      // (apenas em memória). Nunca lançamos no construtor por causa disto.
+      // Sem DPAPI (outra plataforma ou addon ausente): registros legados ficam
+      // indecifráveis e o reveal falha com erro claro. Nunca lançamos aqui.
       return memoryBackend();
     }
   }
@@ -542,12 +382,6 @@ export class Keystore {
     return this.writeBackend.name !== "memory";
   }
 
-  private enqueueWrite<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.writeChain.then(task, task);
-    this.writeChain = run.then(() => undefined, () => undefined);
-    return run;
-  }
-
   /** Diretório de dados (útil para testes de scan do arquivo). */
   getDir(): string {
     return this.dir;
@@ -558,57 +392,64 @@ export class Keystore {
     return this.file;
   }
 
-  // ── leitura do disco ────────────────────────────────────────────────────
+  /**
+   * Migrates records written by the pre-DPAPI `local-file` backend. The
+   * bootstrap calls it so profiles that never write a secret also retire the
+   * `.master.key`; writes call it too. A failure is not cached: the next call
+   * retries.
+   */
+  migrateLegacySecrets(): Promise<void> {
+    if (this.writeBackend.name !== DPAPI_CURRENT_USER_BACKEND) return Promise.resolve();
+    if (this.migrationPromise === null) {
+      const running = withFileLock(this.file, () => migrateLocalFileToDpapi({ dir: this.dir, dpapiBackend: this.writeBackend }), LOCK_OPTIONS)
+        .then(() => undefined);
+      this.migrationPromise = running;
+      running.catch(() => {
+        if (this.migrationPromise === running) this.migrationPromise = null;
+      });
+    }
+    return this.migrationPromise;
+  }
+
+  private enqueueWrite<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.writeChain.then(task, task);
+    this.writeChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /** Serializes a write in-process and, for persistent backends, across processes. */
+  private write<T>(task: () => Promise<T>): Promise<T> {
+    if (!this.isPersistent()) return this.enqueueWrite(task);
+    return this.enqueueWrite(async () => {
+      await this.migrateLegacySecrets();
+      return withFileLock(this.file, task, LOCK_OPTIONS);
+    });
+  }
 
   /** Chave de memória escopada: um bot nunca enxerga o cache de outro. */
   private memoryKey(scope: string, key: string): string {
     return `${scope}\u0000${key}`;
   }
 
-  /** Lê o arquivo do disco (cacheado por operação de escrita), já em formato v2. */
+  /** Current secrets, already in the v2 shape; the caller owns the result. */
   private async readFile(): Promise<ScopedSecretsFile> {
-    if (this.writeBackend.name === "memory" && this.onDiskCache !== null) return structuredClone(this.onDiskCache);
-    const shape = await readSecretsFile(this.file);
-    this.onDiskCache = structuredClone(shape);
-    return shape;
+    if (!this.isPersistent()) return structuredClone(this.memoryShape ?? await readSecretsFile(this.file));
+    return readSecretsFile(this.file);
   }
 
   private async saveFile(shape: ScopedSecretsFile): Promise<void> {
-    // Se o backend for memória, NUNCA tocamos no arquivo (sem plaintext novo).
-    if (this.writeBackend.name === "memory") {
-      this.onDiskCache = shape;
+    // Backend de memória NUNCA toca no arquivo (sem plaintext novo).
+    if (!this.isPersistent()) {
+      this.memoryShape = shape;
       return;
     }
     await writeScopedSecretsFile(this.file, shape);
-    this.onDiskCache = shape;
-  }
-
-  private async ensureMigration(): Promise<void> {
-    if (this.writeBackend.name !== DPAPI_CURRENT_USER_BACKEND) return;
-    if (this.migrationPromise === null) {
-      this.migrationPromise = migrateLocalFileToDpapi({ dir: this.dir, dpapiBackend: this.writeBackend }).then(() => undefined);
-    }
-    await this.migrationPromise;
-  }
-
-  /** Remove o arquivo do disco (modo memória: limpar resíduos de sessão anterior). */
-  async removeFile(): Promise<void> {
-    return this.enqueueWrite(() => withFileLock(this.file, async () => {
-      this.onDiskCache = { version: SECRETS_FILE_VERSION, scopes: {} };
-      try {
-        await fsp.unlink(this.file);
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code !== "ENOENT") throw err;
-      }
-    }));
   }
 
   /** Removes all encrypted and process-memory secrets owned by one agent. */
   async purgeScope(agentId: string): Promise<boolean> {
     const scope = normalizeKeystoreScope(agentId);
-    const write = async (): Promise<boolean> => {
-      await this.ensureMigration();
+    return this.write(async () => {
       const current = await this.readFile();
       const existed = Object.prototype.hasOwnProperty.call(current.scopes, scope);
       if (existed) {
@@ -621,8 +462,7 @@ export class Keystore {
         if (key.startsWith(prefix)) this.memory.delete(key);
       }
       return existed;
-    };
-    return this.enqueueWrite(() => this.writeBackend.name === "memory" ? write() : withFileLock(this.file, write));
+    });
   }
 
   // ── API por provider (plano §3 T4; escopo por bot — melhoria 5) ────────
@@ -634,8 +474,7 @@ export class Keystore {
     agentId?: string,
   ): Promise<Pick<SetBoxSecretsResult, "upserted" | "deleted">> {
     const scope = normalizeKeystoreScope(agentId);
-    const write = async (): Promise<Pick<SetBoxSecretsResult, "upserted" | "deleted">> => {
-      await this.ensureMigration();
+    return this.write(async () => {
       const current = await this.readFile();
       const scopeEntries: SecretsFileShape = { ...(current.scopes[scope] ?? {}) };
       const next: ScopedSecretsFile = { ...current, scopes: { ...current.scopes, [scope]: scopeEntries } };
@@ -667,9 +506,7 @@ export class Keystore {
       }
       for (const provider of deleteProviders) this.memory.delete(this.memoryKey(scope, providerApiKeyKey(provider)));
       return { upserted, deleted };
-    };
-
-    return this.enqueueWrite(() => this.writeBackend.name === "memory" ? write() : withFileLock(this.file, write));
+    });
   }
 
   /**
@@ -688,89 +525,95 @@ export class Keystore {
       throw new RpcError(400, "keystore: apiKey muito longa (máx 8192)");
     }
     const key = providerApiKeyKey(provider);
-    const write = async () => {
-      await this.ensureMigration();
+    return this.write(async () => {
       const ciphertext = this.writeBackend.encrypt(apiKey);
       const current = await this.readFile();
       const scopeEntries: SecretsFileShape = { ...(current.scopes[scope] ?? {}) };
       scopeEntries[key] = { backend: this.writeBackend.name, data: entryToBase64(ciphertext) };
       await this.saveFile({ ...current, scopes: { ...current.scopes, [scope]: scopeEntries } });
       this.memory.set(this.memoryKey(scope, key), { provider, value: apiKey });
-    };
-    return this.enqueueWrite(() => this.writeBackend.name === "memory" ? write() : withFileLock(this.file, write));
+    });
   }
 
   /**
    * Revela a chave de API de um provider no escopo do bot (null se ausente).
-   * Decifra com o backend indicado pela tag do registro (DPAPI legado/memória).
+   * Decifra com o backend indicado pela tag do registro.
    */
   async reveal(provider: string, agentId?: string): Promise<string | null> {
     const scope = normalizeKeystoreScope(agentId);
     const key = providerApiKeyKey(provider);
     const mem = this.memory.get(this.memoryKey(scope, key));
     if (mem !== undefined) return mem.value;
-    const shape = await this.readFile();
+    return this.revealFrom(await this.readFile(), scope, key, provider);
+  }
+
+  /** Decrypts one entry of an already-read shape and caches the plaintext for redaction. */
+  private revealFrom(shape: ScopedSecretsFile, scope: string, key: string, provider: string): string | null {
     const entry = shape.scopes[scope]?.[key];
     if (!entry) return null;
     try {
-      const payload = entryFromBase64(entry.data);
-      const backend = this.backendFor(entry.backend);
-      const value = backend.decrypt(payload);
+      const value = this.backendFor(entry.backend).decrypt(entryFromBase64(entry.data));
       // Keep a process-local cache for the redaction boundary. The plaintext
       // is never persisted or logged; this only lets task scanners see the
       // same secret that the adapter just resolved.
       this.memory.set(this.memoryKey(scope, key), { provider, value });
       return value;
     } catch (err) {
-      // Registro indecifrável (safeStorage de outra máquina/sessão) → ausente.
+      // Registro indecifrável (DPAPI de outra máquina/usuário) → erro claro.
       const message = err instanceof Error ? err.message : String(err);
       throw new RpcError(500, `keystore: falha ao decifrar "${provider}": ${message}`);
     }
   }
 
-  /** Remove a chave de API de um provider no escopo do bot. */
+  /**
+   * Remove a chave de API de um provider no escopo do bot. A remoção vale
+   * também para o arquivo com o backend de memória: apagar retira um registro
+   * cifrado e nunca grava um novo.
+   */
   async delete(provider: string, agentId?: string): Promise<boolean> {
     const scope = normalizeKeystoreScope(agentId);
     const key = providerApiKeyKey(provider);
-    return this.enqueueWrite(() => withFileLock(this.file, async () => {
-      await this.ensureMigration();
-      const hadMemory = this.memory.delete(this.memoryKey(scope, key));
-      const disk = await readSecretsFile(this.file);
-      const scopeEntries = disk.scopes[scope];
-      const hadDisk = scopeEntries !== undefined && key in scopeEntries;
-      if (hadDisk) {
-        const nextEntries = { ...scopeEntries };
-        delete nextEntries[key];
-        await writeScopedSecretsFile(this.file, { ...disk, scopes: { ...disk.scopes, [scope]: nextEntries } });
-      }
-      if (this.onDiskCache && key in (this.onDiskCache.scopes[scope] ?? {})) {
-        const cachedScope = { ...(this.onDiskCache.scopes[scope] ?? {}) };
-        delete cachedScope[key];
-        this.onDiskCache = { ...this.onDiskCache, scopes: { ...this.onDiskCache.scopes, [scope]: cachedScope } };
-      }
-      return hadMemory || hadDisk;
-    }));
+    const withoutKey = (shape: ScopedSecretsFile): ScopedSecretsFile | null => {
+      const entries = shape.scopes[scope];
+      if (entries === undefined || !(key in entries)) return null;
+      const nextEntries = { ...entries };
+      delete nextEntries[key];
+      return { ...shape, scopes: { ...shape.scopes, [scope]: nextEntries } };
+    };
+    return this.enqueueWrite(async () => {
+      if (this.isPersistent()) await this.migrateLegacySecrets();
+      return withFileLock(this.file, async () => {
+        const hadMemory = this.memory.delete(this.memoryKey(scope, key));
+        const onDisk = withoutKey(await readSecretsFile(this.file));
+        if (onDisk !== null) await writeScopedSecretsFile(this.file, onDisk);
+        const inMemory = this.memoryShape === null ? null : withoutKey(this.memoryShape);
+        if (inMemory !== null) this.memoryShape = inMemory;
+        return hadMemory || onDisk !== null || inMemory !== null;
+      }, LOCK_OPTIONS);
+    });
   }
 
-  /** Lista os providers com chave gravada NO ESCOPO do bot — só nomes. */
+  /** Lista os providers com chave utilizável NO ESCOPO do bot — só nomes. */
   async list(agentId?: string): Promise<string[]> {
     const scope = normalizeKeystoreScope(agentId);
-    const providers = new Set<string>();
     const shape = await this.readFile();
-    const prefix = "scoped:v1:provider:";
+    const providers = new Set<string>();
     for (const key of Object.keys(shape.scopes[scope] ?? {})) {
-      if (key.startsWith(prefix)) {
-        const rest = key.slice(prefix.length);
-        const name = rest.endsWith(":apiKey") ? rest.slice(0, -":apiKey".length) : null;
-        if (name && isProviderNameValid(name)) providers.add(name);
-      }
+      const name = providerFromKey(key);
+      if (name !== null) providers.add(name);
     }
     for (const [memoryKey, record] of this.memory.entries()) {
       if (memoryKey.startsWith(`${scope}\u0000`)) providers.add(record.provider);
     }
     const usable: string[] = [];
     for (const provider of providers) {
-      try { if (await this.reveal(provider, scope) !== null) usable.push(provider); } catch { /* corrupt entries are not advertised */ }
+      const key = providerApiKeyKey(provider);
+      try {
+        const value = this.memory.get(this.memoryKey(scope, key))?.value ?? this.revealFrom(shape, scope, key, provider);
+        if (value !== null) usable.push(provider);
+      } catch {
+        // Corrupt entries are not advertised.
+      }
     }
     return usable.sort();
   }
@@ -794,10 +637,8 @@ export class Keystore {
     const shape = readSecretsFileSync(this.file);
     for (const [scope, entries] of Object.entries(shape.scopes)) {
       for (const [key, entry] of Object.entries(entries)) {
-        const prefix = "scoped:v1:provider:";
-        if (!key.startsWith(prefix) || !key.endsWith(":apiKey")) continue;
-        const provider = key.slice(prefix.length, -":apiKey".length);
-        if (!isProviderNameValid(provider)) continue;
+        const provider = providerFromKey(key);
+        if (provider === null) continue;
         try {
           const value = this.backendFor(entry.backend).decrypt(entryFromBase64(entry.data));
           this.memory.set(this.memoryKey(scope, key), { provider, value });
@@ -809,33 +650,6 @@ export class Keystore {
     }
   }
 
-  // ── disponibilidade / aguardar keyring (spec §3.3) ─────────────────────
-
-  /**
-   * Polling do keyring (espelho de `waitForEncryptedStorage` do original):
-   * aguarda até o safeStorage (DPAPI) estar disponível para escrita.
-   * Em Node puro sem keyring → resolve `false` (fallback em memória).
-   */
-  async waitForEncryptedStorage(timeoutMs?: number): Promise<boolean> {
-    const deadline = Date.now() + (timeoutMs ?? this.pollTimeoutMs);
-    for (;;) {
-      if (this.writeBackend.name !== "memory") return true;
-      // Sem keyring de escrita: se existe um arquivo com registros DPAPI,
-      // reporta "aguardando keyring" (a leitura usa o backend legado).
-      const hasLegacy = await this.hasLegacyRecords();
-      if (!hasLegacy) return false;
-      if (Date.now() >= deadline) return false;
-      await new Promise((r) => setTimeout(r, this.pollIntervalMs));
-    }
-  }
-
-  private async hasLegacyRecords(): Promise<boolean> {
-    const shape = await this.readFile();
-    return Object.values(shape.scopes).some((entries) =>
-      Object.values(entries).some((e) => e.backend === "electron-safe-storage")
-    );
-  }
-
   // ── helpers internos ───────────────────────────────────────────────────
 
   private backendFor(backendName: string): CryptoBackend {
@@ -843,7 +657,8 @@ export class Keystore {
     if (backendName === DPAPI_CURRENT_USER_BACKEND) return dpapiCurrentUserBackend();
     if (backendName === "electron-safe-storage") return this.legacyReadBackend;
     if (backendName === "local-file") {
-      return localFileBackend(readMasterKey(masterKeyPath(this.dir)));
+      this.localFileReader ??= localFileBackend(readMasterKey(masterKeyPath(this.dir)));
+      return this.localFileReader;
     }
     if (backendName === "memory") return memoryBackend();
     throw new RpcError(500, `keystore: backend desconhecido "${backendName}"`);
@@ -945,15 +760,4 @@ export function registerKeystoreHandlers(
 /** Factory ergonômica (bootstrap/tests). */
 export function createKeystore(opts: KeystoreOptions = {}): Keystore {
   return new Keystore(opts);
-}
-
-/** True se um arquivo de secrets com registros criptografados já existe. */
-export function hasSecretsFile(dir?: string): boolean {
-  const file = defaultSecretsFile(dir ?? defaultKeystoreDir());
-  try {
-    const shape = readSecretsFileSync(file);
-    return Object.values(shape.scopes).some((entries) => Object.keys(entries).length > 0);
-  } catch {
-    return false;
-  }
 }

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -308,6 +308,54 @@ class TeardownRaceBrowserHost implements BrowserHostProcess {
   }
 }
 
+/** Answers each frame through `respond`; undefined leaves the request pending. */
+class ScriptedBrowserHost implements BrowserHostProcess {
+  readonly stdout = new PassThrough();
+  readonly requests: Array<Record<string, unknown>> = [];
+  readonly stdin = new Writable({
+    write: (chunk, _encoding, callback) => {
+      const request = JSON.parse(chunk.toString()) as Record<string, unknown>;
+      this.requests.push(request);
+      const reply = this.respond(request, this);
+      if (reply !== undefined) queueMicrotask(() => this.stdout.write(encodeBrowserFrame({ protocolVersion: 1, kind: "response", id: request.id, ...reply })));
+      callback();
+    },
+    final: (callback) => {
+      this.exit();
+      callback();
+    },
+  });
+  private readonly exitListeners: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
+  private exited = false;
+
+  constructor(private readonly respond: (request: Record<string, unknown>, host: ScriptedBrowserHost) => Record<string, unknown> | undefined) {
+    queueMicrotask(() => this.stdout.write(encodeBrowserFrame({ protocolVersion: 1, kind: "ready", hostVersion: "test" })));
+  }
+
+  static ok(request: Record<string, unknown>): Record<string, unknown> {
+    const command = request.command as Record<string, unknown>;
+    return { ok: true, result: { command: command.command, tabId: request.tabId, visible: command.command === "close" ? false : undefined } };
+  }
+
+  commands(): unknown[] {
+    return this.requests.map((request) => (request.command as Record<string, unknown>).command);
+  }
+
+  kill(): void {
+    this.exit();
+  }
+
+  exit(): void {
+    if (this.exited) return;
+    this.exited = true;
+    for (const listener of this.exitListeners) listener(1, null);
+  }
+
+  onExit(listener: (code: number | null, signal: NodeJS.Signals | null) => void): void {
+    this.exitListeners.push(listener);
+  }
+}
+
 class LateExitBrowserHost extends TeardownRaceBrowserHost {
   override kill(): void {
     this.killed = true;
@@ -382,7 +430,9 @@ describe("BrowserSessionManager", () => {
     await manager.open(lease, "https://example.com/");
     await manager.navigate(nextLease, "https://example.com/next");
     expect(launches).toBe(1);
-    expect(electronPath.replaceAll("\\", "/")).toMatch(/\/node_modules\/electron\/cli\.js$/u);
+    // The Electron binary itself, never node + electron/cli.js: killing that
+    // wrapper on Windows left electron.exe running.
+    expect(electronPath.replaceAll("\\", "/")).toMatch(/\/node_modules\/electron\/dist\/electron\.exe$/u);
     expect(hosts[0]?.requests).toHaveLength(2);
     expect(authToken).toMatch(/^[a-f0-9]{64}$/u);
     expect(hosts[0]?.requests.map((request) => request.token)).toEqual([authToken, authToken]);
@@ -571,19 +621,23 @@ describe("BrowserSessionManager", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("purges Chromium cache after the last lease stops the host and keeps cookies", async () => {
+  it("trims only oversized Chromium caches after the last lease stops the host and keeps cookies", async () => {
     const root = join(tmpdir(), `openbot-browser-cache-${Date.now()}`);
     mkdirSync(join(root, "workspaces", "agent-a", "Downloads"), { recursive: true });
     const partitionRoot = join(root, "profiles", "Partitions", `openbot-agent-${hashAgentId("agent-a")}`);
-    mkdirSync(join(partitionRoot, "Cache"), { recursive: true });
-    writeFileSync(join(partitionRoot, "Cache", "data"), "cached");
+    const warmRoot = join(root, "profiles", "Partitions", `openbot-agent-${hashAgentId("agent-b")}`);
+    mkdirSync(join(partitionRoot, "Cache", "Cache_Data"), { recursive: true });
+    writeFileSync(join(partitionRoot, "Cache", "Cache_Data", "data"), "x".repeat(40));
     writeFileSync(join(partitionRoot, "Cookies"), "keep");
     mkdirSync(join(partitionRoot, "Service Worker", "CacheStorage"), { recursive: true });
-    writeFileSync(join(partitionRoot, "Service Worker", "CacheStorage", "offline-data"), "keep");
+    writeFileSync(join(partitionRoot, "Service Worker", "CacheStorage", "offline-data"), "x".repeat(400));
+    mkdirSync(join(warmRoot, "Code Cache"), { recursive: true });
+    writeFileSync(join(warmRoot, "Code Cache", "data"), "small");
     const manager = new BrowserSessionManager({
       downloadsRoot: join(root, "workspaces"),
       userDataRoot: join(root, "profiles"),
       resolveDownloadRoot: () => join(root, "workspaces", "agent-a", "Downloads"),
+      maxPartitionCacheBytes: 32,
       launchHost: () => new FakeBrowserHost(),
     });
     managers.push(manager);
@@ -594,6 +648,7 @@ describe("BrowserSessionManager", () => {
     expect(existsSync(join(partitionRoot, "Cache"))).toBe(false);
     expect(existsSync(join(partitionRoot, "Cookies"))).toBe(true);
     expect(existsSync(join(partitionRoot, "Service Worker", "CacheStorage", "offline-data"))).toBe(true);
+    expect(existsSync(join(warmRoot, "Code Cache", "data"))).toBe(true);
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -618,12 +673,17 @@ describe("BrowserSessionManager", () => {
     expect(host.requests[1]?.command).toMatchObject({ targetId: host.requests[0]?.id });
   });
 
-  it("cancela close em andamento usando o mesmo AbortSignal", async () => {
-    const host = new TimeoutCloseHost();
+  it("conclui o close mesmo quando o AbortSignal do chamador aborta", async () => {
+    let releaseClose!: () => void;
+    const host = new ScriptedBrowserHost((request, self) => {
+      if ((request.command as Record<string, unknown>).command !== "close") return ScriptedBrowserHost.ok(request);
+      releaseClose = () => self.stdout.write(encodeBrowserFrame({ protocolVersion: 1, kind: "response", id: request.id, ...ScriptedBrowserHost.ok(request) }));
+      return undefined;
+    });
     const manager = new BrowserSessionManager({
       downloadsRoot: "C:\\Temp\\OpenBot\\downloads",
       launchHost: () => host,
-      commandTimeoutMs: 50,
+      commandTimeoutMs: 5_000,
     });
     managers.push(manager);
     const closing = await manager.acquire("agent-a");
@@ -631,13 +691,197 @@ describe("BrowserSessionManager", () => {
     await manager.open(closing, "https://example.com/");
     const controller = new AbortController();
     const pending = manager.execute(closing, { command: "close" }, controller.signal);
-    await vi.waitFor(() => expect(host.requests.some((request) =>
-      (request.command as Record<string, unknown>).command === "close")).toBe(true));
+    await vi.waitFor(() => expect(host.commands()).toContain("close"));
 
     controller.abort();
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    expect(host.commands()).not.toContain("cancel");
+    releaseClose();
 
-    await expect(pending).rejects.toMatchObject({ code: "BROWSER_COMMAND_ABORTED" } satisfies Partial<BrowserHostError>);
+    await expect(pending).resolves.toMatchObject({ command: "close", visible: false });
     expect(manager.hasLease(closing)).toBe(false);
+  });
+
+  it("renova a lease a cada uso e não a expira durante o handoff", async () => {
+    let now = 10_000;
+    const host = new FakeBrowserHost();
+    const manager = new BrowserSessionManager({
+      downloadsRoot: "C:\\Temp\\OpenBot\\downloads",
+      leaseTtlMs: 1_000,
+      now: () => now,
+      launchHost: () => host,
+    });
+    managers.push(manager);
+    const lease = await manager.acquire("agent-a");
+    await manager.open(lease, "https://example.com/");
+    now += 800;
+    await expect(manager.snapshot(lease)).resolves.toMatchObject({ command: "snapshot" });
+    now += 800;
+    await expect(manager.snapshot(lease)).resolves.toMatchObject({ command: "snapshot" });
+
+    host.stdout.write(encodeBrowserFrame({ protocolVersion: 1, kind: "event", event: "handoff", tabId: lease.tabId, active: true }));
+    await vi.waitFor(() => expect(manager.hasLease(lease)).toBe(true));
+    now += 60_000;
+    await expect(manager.snapshot(lease)).resolves.toMatchObject({ command: "snapshot" });
+    host.stdout.write(encodeBrowserFrame({ protocolVersion: 1, kind: "event", event: "handoff", tabId: lease.tabId, active: false }));
+    await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    now += 999;
+    await expect(manager.snapshot(lease)).resolves.toMatchObject({ command: "snapshot" });
+    now += 1_001;
+    await expect(manager.snapshot(lease)).rejects.toMatchObject({ code: "BROWSER_LEASE_EXPIRED" });
+  });
+
+  it("libera a lease quando o host não tem mais a aba", async () => {
+    const host = new ScriptedBrowserHost((request) => (request.command as Record<string, unknown>).command === "snapshot"
+      ? { ok: false, error: { code: "BROWSER_TAB_NOT_FOUND", message: "browser tab is not open; call browser.open first" } }
+      : ScriptedBrowserHost.ok(request));
+    const manager = new BrowserSessionManager({ downloadsRoot: "C:\\Temp\\OpenBot\\downloads", launchHost: () => host });
+    managers.push(manager);
+    const lease = await manager.acquire("agent-a");
+    await expect(manager.snapshot(lease)).rejects.toMatchObject({ code: "BROWSER_TAB_NOT_FOUND" });
+    expect(manager.hasLease(lease)).toBe(false);
+    expect(manager.activeLeaseCount).toBe(0);
+    await vi.waitFor(() => expect(manager.hostRunning).toBe(false));
+  });
+
+  it("repete pelo sweep o close que falhou num host compartilhado", async () => {
+    vi.useFakeTimers();
+    let failClose = true;
+    const host = new ScriptedBrowserHost((request) => (request.command as Record<string, unknown>).command === "close" && failClose
+      ? { ok: false, error: { code: "BROWSER_COMMAND_FAILED", message: "close failed" } }
+      : ScriptedBrowserHost.ok(request));
+    const manager = new BrowserSessionManager({ downloadsRoot: "C:\\Temp\\OpenBot\\downloads", launchHost: () => host });
+    managers.push(manager);
+    const closing = await manager.acquire("agent-a");
+    await manager.acquire("agent-b");
+    await manager.open(closing, "https://example.com/");
+    await expect(manager.release(closing)).rejects.toThrow("close failed");
+    expect(manager.activeLeaseCount).toBe(2);
+
+    failClose = false;
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(host.commands().filter((command) => command === "close")).toHaveLength(2);
+    expect(manager.activeLeaseCount).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it("trata a saída do host durante o close como limpeza concluída", async () => {
+    const host = new ScriptedBrowserHost((request, self) => {
+      if ((request.command as Record<string, unknown>).command !== "close") return ScriptedBrowserHost.ok(request);
+      queueMicrotask(() => self.exit());
+      return undefined;
+    });
+    const manager = new BrowserSessionManager({ downloadsRoot: "C:\\Temp\\OpenBot\\downloads", launchHost: () => host });
+    managers.push(manager);
+    const closing = await manager.acquire("agent-a");
+    const other = await manager.acquire("agent-b");
+    await manager.open(closing, "https://example.com/");
+    await manager.open(other, "https://example.com/");
+    await expect(manager.teardownAgent("agent-a")).resolves.toBeUndefined();
+    expect(manager.hasLease(closing)).toBe(false);
+  });
+
+  it("apaga a partição purgada com host compartilhado só depois que o host para", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-browser-purge-"));
+    const partitionRoot = join(root, "profiles", "Partitions", `openbot-agent-${hashAgentId("agent-a")}`);
+    mkdirSync(partitionRoot, { recursive: true });
+    writeFileSync(join(partitionRoot, "Cookies"), "purge-me");
+    const host = new ScriptedBrowserHost((request) => ScriptedBrowserHost.ok(request));
+    const manager = new BrowserSessionManager({
+      downloadsRoot: join(root, "workspaces"),
+      userDataRoot: join(root, "profiles"),
+      launchHost: () => host,
+    });
+    managers.push(manager);
+    try {
+      const purged = await manager.acquire("agent-a");
+      const survivor = await manager.acquire("agent-b");
+      await manager.open(purged, "https://example.com/");
+      await manager.open(survivor, "https://example.com/");
+
+      await manager.purgeAgent("agent-a");
+      expect(host.commands()).toContain("reset");
+      // The shared host still has the folder open; it is not touched yet.
+      expect(existsSync(partitionRoot)).toBe(true);
+
+      await manager.release(survivor);
+      await vi.waitFor(() => expect(manager.hostRunning).toBe(false));
+      await vi.waitFor(() => expect(existsSync(partitionRoot)).toBe(false));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("encerra o host quando um frame inválido chega depois do ready", async () => {
+    const host = new ScriptedBrowserHost((request, self) => {
+      if ((request.command as Record<string, unknown>).command === "snapshot") {
+        queueMicrotask(() => self.stdout.write("{not json\n"));
+        return undefined;
+      }
+      return ScriptedBrowserHost.ok(request);
+    });
+    const manager = new BrowserSessionManager({
+      downloadsRoot: "C:\\Temp\\OpenBot\\downloads",
+      launchHost: () => host,
+      commandTimeoutMs: 60_000,
+    });
+    managers.push(manager);
+    const lease = await manager.acquire("agent-a");
+    const started = Date.now();
+    await expect(manager.snapshot(lease)).rejects.toMatchObject({ code: "BROWSER_HOST_EXITED" });
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  it("só exige o Electron no primeiro comando, sem impedir o boot do gateway", async () => {
+    vi.stubEnv("OPENBOT_BROWSER_ELECTRON_PATH", "C:\\OpenBot-Test\\missing\\electron.exe");
+    const manager = new BrowserSessionManager({ downloadsRoot: "C:\\Temp\\OpenBot\\downloads" });
+    managers.push(manager);
+    const lease = await manager.acquire("agent-a");
+    await expect(manager.open(lease, "https://example.com/")).rejects.toMatchObject({ code: "BROWSER_ELECTRON_PATH_INVALID" });
+  });
+
+  it("relata a saída precoce do host sem esperar o timeout do pipe", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-browser-early-exit-"));
+    // Plain Node cannot load the Electron APIs, so the host exits at startup.
+    const manager = new BrowserSessionManager({
+      downloadsRoot: join(root, "workspaces"),
+      userDataRoot: join(root, "profiles"),
+      electronPath: process.execPath,
+      egressProxyOptions: { resolve: async () => [] },
+    });
+    managers.push(manager);
+    try {
+      const lease = await manager.acquire("agent-a");
+      const started = Date.now();
+      await expect(manager.open(lease, "https://example.com/")).rejects.toMatchObject({ code: "BROWSER_HOST_LAUNCH_FAILED" });
+      expect(Date.now() - started).toBeLessThan(10_000);
+    } finally {
+      await manager.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("relata falha de lançamento sem erro não tratado quando o executável não inicia", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openbot-browser-launch-"));
+    const notExecutable = join(root, "electron.exe");
+    writeFileSync(notExecutable, "not a program");
+    const manager = new BrowserSessionManager({
+      downloadsRoot: join(root, "workspaces"),
+      userDataRoot: join(root, "profiles"),
+      electronPath: notExecutable,
+      egressProxyOptions: { resolve: async () => [] },
+    });
+    managers.push(manager);
+    try {
+      const lease = await manager.acquire("agent-a");
+      const started = Date.now();
+      await expect(manager.open(lease, "https://example.com/")).rejects.toMatchObject({ code: "BROWSER_HOST_LAUNCH_FAILED" });
+      expect(Date.now() - started).toBeLessThan(10_000);
+    } finally {
+      await manager.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("does not acquire a new lease through a host pipe while the last host tears down", async () => {

@@ -6,8 +6,8 @@ import type {
 import type { Gateway, RpcHandler } from "../server/gateway.js";
 import { RpcError } from "../server/gateway.js";
 
-/** A per-agent policy can only narrow catalog permissions, never widen them. */
-export interface SkillAgentPolicy {
+/** A per-agent override can only narrow catalog invocation permissions, never widen them. */
+export interface SkillInvocationOverride {
   enabled?: boolean;
   modelInvocable?: boolean;
   userInvocable?: boolean;
@@ -18,7 +18,7 @@ export type ResolveSkillPolicy = (
   agentId: string,
   skillId: string,
   summary: SkillSummary,
-) => SkillAgentPolicy | boolean | undefined;
+) => SkillInvocationOverride | boolean | undefined;
 
 export interface SkillRpcOptions {
   /** Shared, already-rooted catalog. Chat input never supplies filesystem paths. */
@@ -94,7 +94,7 @@ function effectivePolicy(
   resolveSkillPolicy?: ResolveSkillPolicy,
 ): EffectiveSkillPolicy {
   const current = basePolicy(catalog.invocationPolicy(summary.id));
-  let override: SkillAgentPolicy | boolean | undefined;
+  let override: SkillInvocationOverride | boolean | undefined;
   try {
     override = resolveSkillPolicy?.(agentId, summary.id, summary);
   } catch {

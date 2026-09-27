@@ -1,7 +1,7 @@
 import { cpSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import type {
   RuntimeBoot,
@@ -17,8 +17,6 @@ import {
   FileRuntimeLeaseJournal,
   type RuntimeResourceReconciler,
 } from "../src/execution/runtime/recovery.js";
-import { WslProcessBackend } from "../src/execution/runtime/wsl/process-backend.js";
-import type { WslCommandRunner } from "../src/execution/runtime/wsl/provisioner.js";
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
 import { createProviderRegistry } from "../src/providers/router.js";
 import { createFakeAdapter } from "./mocks/fake-provider-adapter.js";
@@ -26,12 +24,7 @@ import { TempRoots } from "./helpers/temp-roots.js";
 
 const temp = new TempRoots();
 
-beforeEach(() => {
-  vi.stubEnv("OPENBOT_RUNTIME_DRIVER", "wsl");
-});
-
 afterEach(async () => {
-  vi.unstubAllEnvs();
   await temp.cleanup();
 });
 
@@ -63,59 +56,12 @@ class FakeDriver implements RuntimeDriver {
   }
 }
 
-class FakeWslCommandRunner implements WslCommandRunner {
-  readonly calls: string[][] = [];
-  proofExitCode = 0;
-  startError: unknown;
-  private bootNumber = 0;
-
-  async run(args: readonly string[]): Promise<{ exitCode: number; stdout: Buffer; stderr: Buffer }> {
-    this.calls.push([...args]);
-    if (args.includes("start")) {
-      if (this.startError !== undefined) throw this.startError;
-      this.bootNumber += 1;
-      return {
-        exitCode: 0,
-        stdout: Buffer.from(JSON.stringify({
-          runtimeBootId: `guest-boot-${this.bootNumber}`,
-          runtimeVersion: "test",
-          imageDigest: `sha256:${"a".repeat(64)}`,
-        })),
-        stderr: Buffer.alloc(0),
-      };
-    }
-    if (args.includes("health")) {
-      return { exitCode: 0, stdout: Buffer.from(JSON.stringify({ ok: true })), stderr: Buffer.alloc(0) };
-    }
-    if (args.includes("test")) {
-      return { exitCode: this.proofExitCode, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
-    }
-    throw new Error(`unexpected WSL command: ${args.join(" ")}`);
-  }
-}
-
 const staleRecord = {
   leaseId: "lease-stale",
   agentId: "agent-a",
   runtimeBootId: "boot-old",
   sandboxId: "sandbox-stale",
   temporaryId: "tmp-stale",
-};
-
-const wslStaleRecord = {
-  leaseId: "lease-wsl-stale",
-  agentId: "agent-a",
-  runtimeBootId: "boot-old",
-  sandboxId: "sandbox-lease-wsl-stale",
-  temporaryId: "tmp-lease-wsl-stale",
-};
-
-const wslPendingRecord = {
-  leaseId: "lease-wsl-pending",
-  agentId: "agent-a",
-  runtimeBootId: "boot-old",
-  temporaryId: "tmp-lease-wsl-pending",
-  pending: true as const,
 };
 
 function isolatedOptions(root: string) {
@@ -139,161 +85,6 @@ async function post(handle: ServerHandle, method: string, body: unknown) {
 }
 
 describe("runtime recovery integration", () => {
-  it("injeta o reconciliador WSL quando esse runtime de teste é selecionado", async () => {
-    const root = temp.make("openbot-runtime-default-recovery-");
-    const stateRoot = join(root, "runtime", "state");
-    const journal = new FileRuntimeLeaseJournal(stateRoot);
-    await journal.put(wslStaleRecord);
-    const runner = new FakeWslCommandRunner();
-
-    const handle = await startServer(0, {
-      ...isolatedOptions(root),
-      runtimeRoot: join(root, "runtime"),
-      runtimeJournal: journal,
-      runtimeCommandRunner: runner,
-    });
-    try {
-      expect(handle.server.listening).toBe(true);
-      expect(runner.calls.some((args) => args.includes("start"))).toBe(true);
-      const proofCalls = runner.calls.filter((args) => args.includes("test"));
-      expect(proofCalls).toHaveLength(2);
-      expect(proofCalls.some((args) => args.includes(`/run/openbot/sandboxes/${wslStaleRecord.leaseId}`))).toBe(true);
-      expect(proofCalls.some((args) => args.includes(`/sys/fs/cgroup/openbot/${wslStaleRecord.runtimeBootId}/${wslStaleRecord.leaseId}`))).toBe(true);
-      expect(runner.calls.flat()).not.toContain("/bin/sh");
-      await expect(journal.list()).resolves.toEqual([]);
-    } finally {
-      await stopServer(handle);
-    }
-  });
-
-  it("abre o gateway e compensa pending sem sandboxId pelo leaseId persistido", async () => {
-    const root = temp.make("openbot-runtime-pending-recovery-");
-    const journal = new FileRuntimeLeaseJournal(join(root, "runtime", "state"));
-    await journal.put(wslPendingRecord);
-    const runner = new FakeWslCommandRunner();
-
-    const handle = await startServer(0, {
-      ...isolatedOptions(root),
-      runtimeRoot: join(root, "runtime"),
-      runtimeJournal: journal,
-      runtimeCommandRunner: runner,
-    });
-    try {
-      expect(handle.server.listening).toBe(true);
-      expect(runner.calls.some((args) => args.includes(`/run/openbot/sandboxes/${wslPendingRecord.leaseId}`))).toBe(true);
-      await expect(journal.list()).resolves.toEqual([]);
-    } finally {
-      await stopServer(handle);
-    }
-  });
-
-  it("mantém gateway e chat ativos, mas fecha Developer quando a prova guest não passa", async () => {
-    const root = temp.make("openbot-runtime-default-recovery-red-");
-    const journal = new FileRuntimeLeaseJournal(join(root, "runtime", "state"));
-    await journal.put(wslStaleRecord);
-    const runner = new FakeWslCommandRunner();
-    runner.proofExitCode = 1;
-    const registry = createProviderRegistry();
-    registry.register(createFakeAdapter("xai", { deltas: ["ok"] }));
-
-    const handle = await startServer(0, {
-      ...isolatedOptions(root),
-      runtimeRoot: join(root, "runtime"),
-      runtimeJournal: journal,
-      runtimeCommandRunner: runner,
-      registry,
-    });
-    try {
-      expect(handle.server.listening).toBe(true);
-      await expect(journal.list()).resolves.toEqual([wslStaleRecord]);
-      expect((await post(handle, "createAgent", { id: "agent-a", name: "Agent A", runtimeMode: "developer" })).status).toBe(200);
-
-      const status = await post(handle, "getLocalRuntimeStatus", { agentId: "agent-a" });
-      expect(status.json.value).toMatchObject({
-        agentId: "agent-a",
-        mode: "developer",
-        state: "repair-required",
-        lastError: { code: "runtime_unhealthy", message: "Runtime recovery requires repair." },
-      });
-
-      expect((await post(handle, "sendPrompt", { agentId: "agent-a", prompt: "chat sem tools", clientNonce: "recovery:chat" })).status).toBe(200);
-      await handle.runner.flush("agent-a");
-
-      const processBackend = new WslProcessBackend({
-        agentId: "agent-a",
-        manager: handle.runtimeManager,
-        runner: { run: async () => { throw new Error("process runner must not start"); } },
-      });
-      await expect(handle.runtimeManager.acquire("agent-a", { kind: "process.run", networkProfile: "none" }))
-        .rejects.toMatchObject({ code: "runtime_unhealthy", message: "Runtime recovery requires repair." });
-      await expect(processBackend.execute({
-        operation: "process.run",
-        executable: "node",
-        argv: ["--version"],
-        cwd: ".",
-        timeoutMs: 1_000,
-        networkProfile: "none",
-      })).resolves.toMatchObject({ ok: false, operation: "process.run", code: "runtime_unhealthy" });
-      expect(runner.calls.filter((args) => args.includes("start"))).toHaveLength(1);
-    } finally {
-      await stopServer(handle);
-    }
-  });
-
-  it("mantém gateway ativo quando a infraestrutura WSL não pode provar o teardown", async () => {
-    const root = temp.make("openbot-runtime-default-recovery-infra-red-");
-    const journal = new FileRuntimeLeaseJournal(join(root, "runtime", "state"));
-    await journal.put(wslStaleRecord);
-    const runner = new FakeWslCommandRunner();
-    runner.startError = Object.assign(new Error("wsl.exe not found"), { code: "ENOENT" });
-
-    const handle = await startServer(0, {
-      ...isolatedOptions(root),
-      runtimeRoot: join(root, "runtime"),
-      runtimeJournal: journal,
-      runtimeCommandRunner: runner,
-    });
-    try {
-      expect(handle.server.listening).toBe(true);
-      // ENOENT from the WSL host is not treated as an already-absent guest
-      // resource; the identity remains for a later repair attempt.
-      await expect(journal.list()).resolves.toEqual([wslStaleRecord]);
-    } finally {
-      await stopServer(handle);
-    }
-  });
-
-  it("recupera o lease órfão novamente após restart do bootstrap", async () => {
-    const root = temp.make("openbot-runtime-default-restart-");
-    const journal = new FileRuntimeLeaseJournal(join(root, "runtime", "state"));
-    const runner = new FakeWslCommandRunner();
-    await journal.put(wslStaleRecord);
-
-    const first = await startServer(0, {
-      ...isolatedOptions(root),
-      runtimeRoot: join(root, "runtime"),
-      runtimeJournal: journal,
-      runtimeCommandRunner: runner,
-    });
-    await stopServer(first);
-    await journal.put(wslStaleRecord);
-
-    const second = await startServer(0, {
-      ...isolatedOptions(root),
-      runtimeRoot: join(root, "runtime"),
-      runtimeJournal: journal,
-      runtimeCommandRunner: runner,
-    });
-    try {
-      expect(runner.calls.filter((args) => args.includes("start"))).toHaveLength(2);
-      expect(runner.calls.filter((args) => args.includes("test"))).toHaveLength(4);
-      expect(runner.calls.flat()).not.toContain("/bin/sh");
-      await expect(journal.list()).resolves.toEqual([]);
-    } finally {
-      await stopServer(second);
-    }
-  });
-
   it("reconcilia o journal antes do listen e não inicia WSL nem toca workspace", async () => {
     const root = temp.make("openbot-runtime-recovery-");
     const stateRoot = join(root, "runtime", "state");

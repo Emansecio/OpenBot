@@ -10,7 +10,8 @@
  *   - chave via keystore: reveal por namespace `scoped:v1:provider:openai:apiKey`
  *     (e por nome custom — base para xAI/OpenAI-compat);
  *   - helpers (reuso T7/T8): buildChatBody (stream:true + tools + system
- *     inline), OpenAiToolCallAccumulator, parseOpenAiSseChunk (fixtures),
+ *     inline), OpenAiToolCallAccumulator, readSseFrames + the Chat Completions
+ *     stream handler (fixtures, EOF without the blank line),
  *     normalizeOpenAiError, extractOpenAiErrorMessage;
  *   - erros: 401 → auth, 429 → rate-limit, 500 → server, 400 → validation
  *     (transiente vs permanente, spec §3.1);
@@ -27,8 +28,6 @@ import path from "node:path";
 import {
   OpenAiAdapter,
   OPENAI_API_BASE_URL,
-  openAiApiKeyKey,
-  registerOpenAiAdapter,
 } from "../src/providers/openai.js";
 import {
   ApiError,
@@ -36,8 +35,10 @@ import {
   OpenAiToolCallAccumulator,
   buildChatBody,
   extractOpenAiErrorMessage,
+  createChatCompletionsStreamHandler,
   normalizeOpenAiError,
-  parseOpenAiSseChunk,
+  providerHttpError,
+  readSseFrames,
   splitSseLines,
 } from "../src/providers/openai-helpers.js";
 import { defaultRegistry, streamChat } from "../src/providers/router.js";
@@ -46,6 +47,7 @@ import type { ModelResolution } from "../src/providers/model-catalog.js";
 import { XaiAdapter } from "../src/providers/xai.js";
 import { OpenAiCompatAdapter } from "../src/providers/openai-compat.js";
 import { createKeystore } from "../src/keystore/index.js";
+import { providerApiKeyKey } from "../src/keystore/backend.js";
 import type { KeystoreOptions } from "../src/keystore/index.js";
 
 import {
@@ -188,53 +190,103 @@ describe("T6 openai-helpers — OpenAiToolCallAccumulator (normalização de too
   });
 });
 
-describe("T6 openai-helpers — parseOpenAiSseChunk (parser de SSE da OpenAI)", () => {
-  it("parseia frames data: com [DONE] como fim e ignora heartbeat/comentários", () => {
+/** A ReadableStream that delivers the given text in the given chunk sizes. */
+function sseBody(text: string, chunkSize = text.length): ReadableStream<Uint8Array> {
+  const bytes = new TextEncoder().encode(text);
+  let offset = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (offset >= bytes.length) { controller.close(); return; }
+      controller.enqueue(bytes.subarray(offset, offset + chunkSize));
+      offset += chunkSize;
+    },
+  });
+}
+
+async function readChatStream(text: string, chunkSize?: number): Promise<{ events: ProviderStreamEvent[]; terminated: boolean }> {
+  const events: ProviderStreamEvent[] = [];
+  const handler = createChatCompletionsStreamHandler("openai", (event) => events.push(event));
+  const terminated = await readSseFrames(sseBody(text, chunkSize), new AbortController().signal, () => undefined, "openai", (frame) => handler.dispatchFrame(frame));
+  if (terminated) handler.finish();
+  return { events, terminated };
+}
+
+describe("T6 openai-helpers — SSE reader and Chat Completions handler (production path)", () => {
+  it("reads data: frames, ignores heartbeats/comments and stops at [DONE]", async () => {
     const sse = [
       ": ping",
       "event: message",
       'data: {"id":"1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"oi"},"finish_reason":null}]}',
       "",
-      'data: {"id":"1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null}]}',
+      'data: {"id":"1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":"stop"}]}',
       "",
       "data: [DONE]",
       "",
+      "",
     ].join("\n");
-    const frames = parseOpenAiSseChunk(sse);
-    expect(frames).toHaveLength(3);
-    const content = (frames[0]?.data as { choices: { delta: { content: string } }[] }).choices[0]?.delta.content;
-    expect(content).toBe("oi");
-    expect(frames[2]).toEqual({ data: null });
+    const { events, terminated } = await readChatStream(sse, 7);
+    expect(terminated).toBe(true);
+    expect(events).toEqual([{ type: "delta", delta: "oi" }, { type: "delta", delta: "!" }]);
   });
 
   it("splitSseLines normaliza \\r\\n e linhas vazias", () => {
     expect(splitSseLines("data: a\r\ndata: b\r\n")).toEqual(["data: a", "data: b"]);
   });
 
-  it("JSON inválido em data: é descartado (stream continua)", () => {
-    const frames = parseOpenAiSseChunk("data: {json incompleto}\n\ndata: [DONE]\n\n");
-    expect(frames).toHaveLength(1);
-    expect(frames[0]).toEqual({ data: null });
+  it("rejects an invalid JSON data: frame instead of silently dropping it", async () => {
+    await expect(readChatStream("data: {json incompleto}\n\ndata: [DONE]\n\n")).rejects.toMatchObject({ status: 502, message: "openai: frame SSE inválido" });
   });
 
-  it("fixture de contrato: SSE de tool_calls → texto acumulado + tool call normalizada", () => {
-    const fixture = openAiSseToolCallsFixture;
-    const frames = parseOpenAiSseChunk(fixture.sse);
-
-    // Delimitador de frame é a linha vazia — o parser trata cada data: como frame.
-    const contentFrames = frames
-      .map((f) => (f?.data as { choices: { delta: { content?: string } }[] } | null)?.choices[0]?.delta.content)
-      .filter((c): c is string => typeof c === "string");
-    expect(contentFrames.join("")).toBe(fixture.expectedText);
-
-    const acc = new OpenAiToolCallAccumulator();
-    for (const frame of frames) {
-      if (frame === null || frame.data === null) continue;
-      const choices = (frame.data as { choices: { delta: { tool_calls?: MockToolCallChunk[] } }[] }).choices;
-      const toolCalls = choices[0]?.delta.tool_calls;
-      if (toolCalls) for (const chunk of toolCalls) acc.add(chunk);
+  it("still sees [DONE] when the server closes without the final blank line", async () => {
+    const sse = 'data: {"choices":[{"index":0,"delta":{"content":"fim"},"finish_reason":"stop"}]}\r\n\r\ndata: [DONE]\r\n';
+    for (const chunkSize of [1, 5, sse.length]) {
+      const { events, terminated } = await readChatStream(sse, chunkSize);
+      expect(terminated, `chunk size ${chunkSize}`).toBe(true);
+      expect(events).toEqual([{ type: "delta", delta: "fim" }]);
     }
-    expect(acc.calls()[0]).toEqual(fixture.expectedToolCall);
+  });
+
+  it("reports a stream that ends without [DONE]", async () => {
+    const { terminated } = await readChatStream('data: {"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}\n\n');
+    expect(terminated).toBe(false);
+  });
+
+  it("fixture de contrato: SSE de tool_calls → texto acumulado + tool call normalizada", async () => {
+    const fixture = openAiSseToolCallsFixture;
+    const { events, terminated } = await readChatStream(fixture.sse, 11);
+    expect(terminated).toBe(true);
+    const text = events.flatMap((event) => event.type === "delta" ? [event.delta] : []).join("");
+    expect(text).toBe(fixture.expectedText);
+    const calls = events.flatMap((event) => event.type === "tool-call" ? [event.call] : []);
+    expect(calls[0]).toEqual(fixture.expectedToolCall);
+  });
+});
+
+describe("T6 OpenAI 401 handling", () => {
+  it("keeps the 401 when recording the rejected credential fails", async () => {
+    const adapter = new OpenAiAdapter({
+      baseUrl: "http://127.0.0.1:9/v1",
+      apiKey: "sk-rejected",
+      fetchImpl: (async () => Response.json({ error: { message: "invalid api key" } }, { status: 401 })) as typeof fetch,
+      onCredentialRejected: async () => { throw new Error("keystore write failed"); },
+    });
+    await expect(adapter.streamChat(baseRequest(), () => undefined)).rejects.toMatchObject({
+      status: 401, message: expect.stringContaining("invalid api key"),
+    });
+  });
+});
+
+describe("T6 openai-helpers — providerHttpError", () => {
+  it("keeps the provider's message, the parsed body and Retry-After", async () => {
+    const response = new Response(JSON.stringify({ error: { message: "context_length_exceeded: too many tokens" } }), {
+      status: 429, headers: { "retry-after": "3" },
+    });
+    const error = await providerHttpError("opencode-go", response, new AbortController().signal);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.status).toBe(429);
+    expect(error.message).toBe("opencode-go: HTTP 429 — context_length_exceeded: too many tokens");
+    expect(error.retryAfterMs).toBe(3_000);
+    expect(error.body).toEqual({ error: { message: "context_length_exceeded: too many tokens" } });
   });
 });
 
@@ -417,7 +469,7 @@ describe("T6 adapter OpenAI — chave via keystore (namespace scoped:v1:provider
     expect(out.error).toBeUndefined();
     expect(out.message?.content).toBe("ok");
     // Namespace do contrato T4.
-    expect(openAiApiKeyKey()).toBe("scoped:v1:provider:openai:apiKey");
+    expect(providerApiKeyKey("openai")).toBe("scoped:v1:provider:openai:apiKey");
   });
 
   it("chave ausente na keystore → error auth (permanente, não retryable)", async () => {
@@ -553,9 +605,10 @@ describe("T6 adapter OpenAI — abort encerra o stream", () => {
 });
 
 describe("T6 registro — adapter OpenAI como 'openai' no registry do roteador", () => {
-  it("registerOpenAiAdapter registra com nome 'openai' e streamChat resolve", async () => {
+  it("o adapter se registra com nome 'openai' e streamChat resolve", async () => {
     const mock = await bootMock({ script: { deltas: ["registrado"] } });
-    const adapter = registerOpenAiAdapter({ baseUrl: mock.baseUrl, apiKey: "sk-test" });
+    const adapter = new OpenAiAdapter({ baseUrl: mock.baseUrl, apiKey: "sk-test" });
+    defaultRegistry.register(adapter);
 
     expect(adapter.name).toBe("openai");
     expect(defaultRegistry.has("openai")).toBe(true);

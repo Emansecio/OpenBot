@@ -66,6 +66,9 @@ const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const SOURCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/u;
 
+/** The catalog checks the disk for changes at most this often before being used. */
+const SKILL_FRESHNESS_CHECK_INTERVAL_MS = 2_000;
+
 interface ValidatedRoot {
   readonly config: SkillRoot;
   readonly absolutePath: string;
@@ -141,11 +144,6 @@ function pathComponents(absolutePath: string): string[] {
   return components;
 }
 
-function isReparsePoint(stats: Stats): boolean {
-  const candidate = stats as Stats & { isReparsePoint?: () => boolean };
-  return typeof candidate.isReparsePoint === "function" && candidate.isReparsePoint();
-}
-
 function sameFileSnapshot(left: Stats, right: Stats): boolean {
   // dev/ino are the stable descriptor identity on POSIX and are populated by
   // current Node Windows builds. Keep the remaining fields as a conservative
@@ -172,43 +170,84 @@ function sameSnapshot(left: FileSnapshot, right: FileSnapshot): boolean {
     left.ctimeMs === right.ctimeMs;
 }
 
+/** A Windows 8.3 short alias such as THIAGO~1 or PROGRA~2.TXT. */
+const SHORT_NAME_ALIAS = /^[^.~\s\\/]{1,6}~\d{1,6}(\.[^.\s\\/]{1,3})?$/u;
+
 /**
- * Checks every existing component. Comparing realpath with the lexical path
- * catches Windows junctions/reparse points as well as POSIX symlinks; lstat is
- * retained so a direct symlink is rejected even when realpath is unavailable.
+ * The real path a component must resolve to when it is not a link: its
+ * parent's real path plus its own name. An 8.3 alias may resolve to its long
+ * name in the same directory, and only when both name the same file, which
+ * the caller confirms by identity.
+ */
+function expectedRealPath(component: string, parentRealPath: string, realPath: string): { path: string; alias: boolean } {
+  if (parentRealPath === "") return { path: component, alias: false };
+  const name = parsePath(component).base;
+  const alias = isWindows() && SHORT_NAME_ALIAS.test(name) && !samePath(parsePath(realPath).base, name);
+  return { path: join(parentRealPath, alias ? parsePath(realPath).base : name), alias };
+}
+
+function sameFileIdentity(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+const LINK_COMPONENT_MESSAGE = "skill path contains a symlink, junction, or reparse point";
+
+/**
+ * Checks every existing component. Comparing each realpath with its parent's
+ * realpath plus the component name catches Windows junctions/reparse points
+ * as well as POSIX symlinks; lstat is retained so a direct symlink is rejected
+ * even when realpath is unavailable. Returns the canonical real path.
  */
 function assertNoLinkComponents(absolutePath: string): string {
   let lastRealPath = "";
   for (const component of pathComponents(absolutePath)) {
     let stats: Stats;
+    let realPath: string;
     try {
       stats = lstatSync(component);
-      lastRealPath = realpathSync.native(component);
+      realPath = realpathSync.native(component);
     } catch {
       throw new InvalidSkillError("skill path is unavailable");
     }
-    if (stats.isSymbolicLink() || isReparsePoint(stats) || !samePath(lastRealPath, component)) {
-      throw new InvalidSkillError("skill path contains a symlink, junction, or reparse point");
+    const expected = expectedRealPath(component, lastRealPath, realPath);
+    if (stats.isSymbolicLink() || !samePath(realPath, expected.path)) throw new InvalidSkillError(LINK_COMPONENT_MESSAGE);
+    if (expected.alias) {
+      let resolved: Stats;
+      try { resolved = lstatSync(realPath); } catch { throw new InvalidSkillError("skill path is unavailable"); }
+      if (!sameFileIdentity(stats, resolved)) throw new InvalidSkillError(LINK_COMPONENT_MESSAGE);
     }
+    lastRealPath = realPath;
   }
   return lastRealPath;
 }
 
-async function assertNoLinkComponentsAsync(absolutePath: string): Promise<string> {
+/** Same check as assertNoLinkComponents with async filesystem calls only. */
+export async function assertNoLinkComponentsAsync(absolutePath: string): Promise<string> {
   let lastRealPath = "";
   for (const component of pathComponents(absolutePath)) {
     let stats: Stats;
+    let realPath: string;
     try {
       stats = await lstatAsync(component);
-      lastRealPath = await realpathAsync(component);
+      realPath = await realpathAsync(component);
     } catch {
       throw new InvalidSkillError("skill path is unavailable");
     }
-    if (stats.isSymbolicLink() || isReparsePoint(stats) || !samePath(lastRealPath, component)) {
-      throw new InvalidSkillError("skill path contains a symlink, junction, or reparse point");
+    const expected = expectedRealPath(component, lastRealPath, realPath);
+    if (stats.isSymbolicLink() || !samePath(realPath, expected.path)) throw new InvalidSkillError(LINK_COMPONENT_MESSAGE);
+    if (expected.alias) {
+      let resolved: Stats;
+      try { resolved = await lstatAsync(realPath); } catch { throw new InvalidSkillError("skill path is unavailable"); }
+      if (!sameFileIdentity(stats, resolved)) throw new InvalidSkillError(LINK_COMPONENT_MESSAGE);
     }
+    lastRealPath = realPath;
   }
   return lastRealPath;
+}
+
+/** Whether a canonical path lies inside a canonical root (both from assertNoLinkComponents*). */
+export function skillPathContainedBy(rootRealPath: string, candidateRealPath: string): boolean {
+  return containedBy(rootRealPath, candidateRealPath);
 }
 
 function normalizeId(value: string): string | undefined {
@@ -496,14 +535,19 @@ function parseSkillText(text: string, id: string, limits: SkillCatalogLimits, by
   };
 }
 
+/**
+ * Parses bytes read through a validated descriptor. `after` is the path
+ * revalidated once the read finished (sync or async by the caller); it must
+ * still be the same file inside the root.
+ */
 function finishValidatedSkill(
   bytes: Buffer,
   id: string,
   limits: SkillCatalogLimits,
   finalSnapshot: ReturnType<typeof fileSnapshot>,
   before: string,
+  after: string,
   root: ValidatedRoot,
-  filePath: string,
 ): CachedSkill {
   if (bytes.byteLength > limits.maxSkillBytes) throw new InvalidSkillError("skill exceeds its byte limit");
   let text: string;
@@ -512,7 +556,6 @@ function finishValidatedSkill(
   } catch {
     throw new InvalidSkillError("skill is not valid UTF-8");
   }
-  const after = assertNoLinkComponents(filePath);
   if (!samePath(before, after) || !containedBy(root.realPath, after)) throw new InvalidSkillError("skill path changed during read");
   return {
     parsed: parseSkillText(text, id, limits, bytes.byteLength),
@@ -530,7 +573,7 @@ function readValidatedSkill(
   const before = assertNoLinkComponents(filePath);
   if (!containedBy(root.realPath, before)) throw new InvalidSkillError("skill path escapes its root");
   const pathStats = lstatSync(filePath);
-  if (pathStats.isSymbolicLink() || isReparsePoint(pathStats) || !pathStats.isFile()) {
+  if (pathStats.isSymbolicLink() || !pathStats.isFile()) {
     throw new InvalidSkillError("SKILL.md is not a regular file");
   }
   if (pathStats.size > limits.maxSkillBytes) throw new InvalidSkillError("skill exceeds its byte limit");
@@ -577,7 +620,7 @@ function readValidatedSkill(
   } catch {
     throw new InvalidSkillError("skill descriptor cannot be closed");
   }
-  return finishValidatedSkill(bytes, id, limits, finalSnapshot, before, root, filePath);
+  return finishValidatedSkill(bytes, id, limits, finalSnapshot, before, assertNoLinkComponents(filePath), root);
 }
 
 async function readValidatedSkillAsync(
@@ -587,10 +630,10 @@ async function readValidatedSkillAsync(
   limits: SkillCatalogLimits,
   cached?: CachedSkill,
 ): Promise<CachedSkill> {
-  const before = assertNoLinkComponents(filePath);
+  const before = await assertNoLinkComponentsAsync(filePath);
   if (!containedBy(root.realPath, before)) throw new InvalidSkillError("skill path escapes its root");
   const pathStats = await lstatAsync(filePath);
-  if (pathStats.isSymbolicLink() || isReparsePoint(pathStats) || !pathStats.isFile()) {
+  if (pathStats.isSymbolicLink() || !pathStats.isFile()) {
     throw new InvalidSkillError("SKILL.md is not a regular file");
   }
   if (pathStats.size > limits.maxSkillBytes) throw new InvalidSkillError("skill exceeds its byte limit");
@@ -606,13 +649,13 @@ async function readValidatedSkillAsync(
     if (!descriptorStats.isFile() || descriptorStats.size > limits.maxSkillBytes) {
       throw new InvalidSkillError("SKILL.md is not a bounded regular file");
     }
-    const afterOpen = assertNoLinkComponents(filePath);
+    const afterOpen = await assertNoLinkComponentsAsync(filePath);
     const afterOpenStats = await lstatAsync(filePath);
     if (!samePath(before, afterOpen) || !sameFileSnapshot(descriptorStats, afterOpenStats)) {
       throw new InvalidSkillError("skill path changed during open");
     }
     bytes = await handle.readFile();
-    const afterRead = assertNoLinkComponents(filePath);
+    const afterRead = await assertNoLinkComponentsAsync(filePath);
     const afterReadStats = await lstatAsync(filePath);
     if (!samePath(before, afterRead) || !sameFileSnapshot(descriptorStats, afterReadStats)) {
       throw new InvalidSkillError("skill path changed during read");
@@ -632,7 +675,7 @@ async function readValidatedSkillAsync(
   } catch {
     throw new InvalidSkillError("skill descriptor cannot be closed");
   }
-  return finishValidatedSkill(bytes, id, limits, finalSnapshot, before, root, filePath);
+  return finishValidatedSkill(bytes, id, limits, finalSnapshot, before, await assertNoLinkComponentsAsync(filePath), root);
 }
 
 function validateRoot(config: SkillRoot): ValidatedRoot {
@@ -718,6 +761,11 @@ export class SkillCatalog {
 
   private readonly skillCache = new Map<string, CachedSkill>();
 
+  /** Root and skill directories seen by the last refresh, with their mtimes. */
+  private watchedDirectories = new Map<string, number>();
+
+  private lastFreshnessCheck = 0;
+
   private refreshing = false;
 
   public constructor(options: SkillCatalogOptions) {
@@ -737,12 +785,14 @@ export class SkillCatalog {
     this.refreshing = true;
     try {
       const next = new Map<string, SkillRecord>();
+      const watched = new Map<string, number>();
       const seenCacheKeys = new Set<string>();
       let candidates = 0;
       outer: for (const root of this.roots) {
         let entries: Dirent[];
         try {
           // A deterministic order makes the candidate limit and duplicate handling stable.
+          watched.set(root.absolutePath, lstatSync(root.absolutePath).mtimeMs);
           entries = readdirSync(root.absolutePath, { withFileTypes: true }).sort((left, right) =>
             left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
           );
@@ -760,7 +810,9 @@ export class SkillCatalog {
             const childRealPath = assertNoLinkComponents(skillPath);
             if (!containedBy(root.realPath, childRealPath)) throw new InvalidSkillError("skill directory escapes its root");
             const childStats = lstatSync(skillPath);
-            if (childStats.isSymbolicLink() || isReparsePoint(childStats) || !childStats.isDirectory()) continue;
+            if (childStats.isSymbolicLink() || !childStats.isDirectory()) continue;
+            // A SKILL.md added or removed later changes this directory's mtime.
+            watched.set(skillPath, childStats.mtimeMs);
             const filePath = join(skillPath, "SKILL.md");
             const cacheKey = comparablePath(filePath);
             seenCacheKeys.add(cacheKey);
@@ -786,10 +838,45 @@ export class SkillCatalog {
         if (!seenCacheKeys.has(key)) this.skillCache.delete(key);
       }
       this.records = next;
+      this.watchedDirectories = watched;
+      this.lastFreshnessCheck = Date.now();
       return this.list();
     } finally {
       this.refreshing = false;
     }
+  }
+
+  /**
+   * Re-index when the disk changed since the last refresh: a skill directory
+   * was added or removed, or an indexed SKILL.md changed. The check costs one
+   * lstat per directory and indexed file, and runs at most every couple of
+   * seconds, so edits show up without an explicit refresh.
+   */
+  private ensureFresh(): void {
+    if (this.refreshing) return;
+    const now = Date.now();
+    if (now - this.lastFreshnessCheck < SKILL_FRESHNESS_CHECK_INTERVAL_MS) return;
+    this.lastFreshnessCheck = now;
+    if (this.changedOnDisk()) this.refresh();
+  }
+
+  private changedOnDisk(): boolean {
+    for (const [directory, mtimeMs] of this.watchedDirectories) {
+      try {
+        if (lstatSync(directory).mtimeMs !== mtimeMs) return true;
+      } catch {
+        return true;
+      }
+    }
+    for (const record of this.records.values()) {
+      const cached = this.skillCache.get(comparablePath(record.absoluteFilePath));
+      try {
+        if (cached === undefined || !sameSnapshot(fileSnapshot(lstatSync(record.absoluteFilePath)), cached.snapshot)) return true;
+      } catch {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Returns the validated root config for a source label, if present. */
@@ -799,6 +886,7 @@ export class SkillCatalog {
 
   /** Returns the catalog source owning an id, if indexed. */
   public sourceOf(id: string): string | undefined {
+    this.ensureFresh();
     const normalized = normalizeId(id);
     if (normalized === undefined) return undefined;
     return this.records.get(normalized)?.source;
@@ -806,6 +894,7 @@ export class SkillCatalog {
 
   /** Returns a deterministic public list, optionally filtered by a user/model query. */
   public list(query?: string): readonly SkillSummary[] {
+    this.ensureFresh();
     const normalizedQuery = query?.trim();
     return [...this.records.values()]
       .map((record) => ({ record, score: normalizedQuery ? searchScore(record, normalizedQuery) : 1 }))
@@ -816,6 +905,7 @@ export class SkillCatalog {
 
   /** Returns invocation hints kept separate from the public four-field catalog entry. */
   public invocationPolicy(id: string): SkillInvocationPolicy | undefined {
+    this.ensureFresh();
     const normalized = normalizeId(id);
     const record = normalized === undefined ? undefined : this.records.get(normalized);
     return record?.invocation;
@@ -823,6 +913,7 @@ export class SkillCatalog {
 
   /** Async path validation plus pre-parsed body; reloads with async I/O on cache miss. */
   public async readCachedValidated(id: string): Promise<SkillReadResult | undefined> {
+    this.ensureFresh();
     const normalized = normalizeId(id);
     if (normalized === undefined) return undefined;
     const record = this.records.get(normalized);
@@ -836,7 +927,6 @@ export class SkillCatalog {
         ]);
         if (
           !stats.isSymbolicLink() &&
-          !isReparsePoint(stats) &&
           stats.isFile() &&
           containedBy(record.rootRealPath, resolved) &&
           sameSnapshot(fileSnapshot(stats), cached.snapshot)
@@ -850,8 +940,9 @@ export class SkillCatalog {
     return this.readAsync(id);
   }
 
-  /** Returns the body parsed during refresh without filesystem I/O. */
+  /** Returns the body parsed during refresh; only the periodic freshness check touches the disk. */
   public readCached(id: string): SkillReadResult | undefined {
+    this.ensureFresh();
     const normalized = normalizeId(id);
     if (normalized === undefined) return undefined;
     const record = this.records.get(normalized);
@@ -874,13 +965,15 @@ export class SkillCatalog {
 
   /** Reads and validates one body after catalog discovery; paths never leave this class. */
   public read(id: string): SkillReadResult | undefined {
+    this.ensureFresh();
     return this.materializeRead(id, (root, record, normalized, cacheKey) => (
       readValidatedSkill(root, record.absoluteFilePath, normalized, this.limits, this.skillCache.get(cacheKey))
     ));
   }
 
-  /** Same contract as `read`, but never uses sync filesystem APIs. */
+  /** Same contract as `read`; the body is read with async filesystem calls only. */
   public async readAsync(id: string): Promise<SkillReadResult | undefined> {
+    this.ensureFresh();
     return this.materializeRead(id, (root, record, normalized, cacheKey) => (
       readValidatedSkillAsync(root, record.absoluteFilePath, normalized, this.limits, this.skillCache.get(cacheKey))
     ));

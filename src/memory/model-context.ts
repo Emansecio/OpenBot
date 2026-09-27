@@ -666,12 +666,24 @@ export function truncateProviderText(text: string, budgetTokens: number, tokeniz
     : text.includes("[[OPENBOT_UNTRUSTED_TOOL_HISTORY_BEGIN]]")
       ? `${TOOL_OUTPUT_TRUNCATION_END}${MODEL_CONTEXT_TRUNCATION_MARKER}`
       : MODEL_CONTEXT_TRUNCATION_MARKER;
-  let prefix = [...text].slice(0, Math.max(0, Math.floor(budgetTokens / 1.1))).join("");
   if (tokenizer.count(marker) > budgetTokens) return "";
-  let result = `${prefix}${marker}`;
-  while (tokenizer.count(result) > budgetTokens && prefix.length > 0) {
-    prefix = prefix.slice(0, Math.floor(prefix.length / 2));
-    result = `${prefix}${marker}`;
+  // Whole code points only, so a cut never leaves half a surrogate pair.
+  const cap = Math.floor(budgetTokens / 1.1);
+  const codePoints: string[] = [];
+  for (const codePoint of text) {
+    if (codePoints.length >= cap) break;
+    codePoints.push(codePoint);
   }
-  return result;
+  const withMarker = (length: number): string => `${codePoints.slice(0, length).join("")}${marker}`;
+  const whole = withMarker(codePoints.length);
+  if (tokenizer.count(whole) <= budgetTokens) return whole;
+  // The longest prefix that still fits alongside the marker.
+  let low = 0;
+  let high = codePoints.length - 1;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (tokenizer.count(withMarker(middle)) <= budgetTokens) low = middle;
+    else high = middle - 1;
+  }
+  return withMarker(low);
 }

@@ -118,7 +118,7 @@ describe.skipIf(process.platform !== "win32" || process.env.OPENBOT_RUN_LIVE_DES
           // Do not launch with SW_HIDE: visibility is part of this gate.
           cwd: root, maxBuffer: 2 * 1024 * 1024,
           env: cleanE2eEnvironment({ APPDATA: join(root, "roaming"), LOCALAPPDATA: join(root, "local"),
-            TEMP: join(root, "temp"), TMP: join(root, "temp"), OPENBOT_RELEASE_ROOT: root }),
+            TEMP: join(root, "temp"), TMP: join(root, "temp") }),
         }, (error, stdout, stderr) => {
           clearTimeout(timeout);
           pid = undefined;

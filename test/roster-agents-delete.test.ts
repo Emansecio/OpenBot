@@ -2,12 +2,15 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
 import { ConfigStore } from "../src/config/store.js";
 import type { ProviderAdapter, ProviderStreamEvent } from "../src/providers/router.js";
 import type { TranscriptEntry } from "../src/shared/contracts.js";
+import { McpManager } from "../src/mcp/manager.js";
+import { SkillCatalog } from "../src/skills/catalog.js";
+import { TempRoots } from "./helpers/temp-roots.js";
 
 type RegisterCleanup = (cleanup: () => Promise<void>) => void;
 
@@ -26,7 +29,6 @@ async function boot(onTestFinished: RegisterCleanup, seedDefault = true) {
   if (seedDefault) {
     const config = new ConfigStore({ configPath });
     config.update({ agents: [{ id: "openbot-default", name: "Local User", avatarId: "openbot-default" }] });
-    config.close();
   }
   handle = await startServer(0, {
     stateRoot: join(dir, "state"),
@@ -127,13 +129,17 @@ describe.concurrent("roster multi-agent", () => {
       handle.runtimeManager as typeof handle.runtimeManager & { releaseAgentFence: (agentId: string) => void },
       "releaseAgentFence",
     );
+    // Fail every commit path: roster mutations use both update() and mutate().
     const originalUpdate = handle.config.update.bind(handle.config);
+    const originalMutate = handle.config.mutate.bind(handle.config);
     handle.config.update = (() => { throw new Error("config update failed"); });
+    handle.config.mutate = (() => { throw new Error("config update failed"); });
     try {
       const failed = await post(handle, "deleteAgents", { ids: ["commit-victim"] });
       expect(failed.status).toBe(500);
     } finally {
       handle.config.update = originalUpdate;
+      handle.config.mutate = originalMutate;
     }
     expect(existsSync(home)).toBe(true);
     expect(handle.config.snapshot().agents.map((agent) => agent.id)).toEqual(["commit-victim"]);
@@ -154,30 +160,6 @@ describe.concurrent("roster multi-agent", () => {
     handle.store.append("partial-victim", [seedEntry]);
     handle.store.rememberAcceptedNonce("partial-victim", "seed:nonce");
     handle.store.rememberInteractionDecision("partial-victim", "seed:request", "tool", "allow");
-    const conversation = handle.conversationStore.ensureDefault("partial-victim");
-    const resumeScope = {
-      agentId: "partial-victim",
-      conversationId: conversation.id,
-      turnId: "turn-rollback",
-      provider: "xai",
-      model: "grok-4.6",
-    } as const;
-    handle.store.createResumeCheckpoint({
-      checkpointId: "checkpoint-rollback",
-      ...resumeScope,
-      cursor: "fixture-v1:rollback:1",
-      safeSequenceId: 0,
-      completedEffectIds: [],
-      expiresAtMs: Date.now() + 60_000,
-      version: 1,
-      budget: { maxProviderAttempts: 2, providerAttemptsUsed: 0, maxToolRounds: 8, toolRoundsUsed: 0, maxToolCalls: 16, toolCallsUsed: 0 },
-    });
-    handle.store.prepareResumeEffect(resumeScope, "effect-rollback", "hash-rollback");
-    const beforeResume = {
-      checkpoint: handle.store.getResumeCheckpoint(resumeScope),
-      effect: handle.store.getResumeEffect(resumeScope, "effect-rollback"),
-    };
-
     handle.registry.register({
       name: "xai",
       async streamChat(_request, emit) {
@@ -210,8 +192,6 @@ describe.concurrent("roster multi-agent", () => {
     expect(handle.store.hasAcceptedNonce("partial-victim", "seed:nonce")).toBe(true);
     expect(handle.store.getInteractionDecision("partial-victim", "seed:request", "tool"))
       .toMatchObject({ decision: "allow" });
-    expect(handle.store.getResumeCheckpoint(resumeScope)).toEqual(beforeResume.checkpoint);
-    expect(handle.store.getResumeEffect(resumeScope, "effect-rollback")).toEqual(beforeResume.effect);
     const afterActivity = ((await post(handle, "listAgents", {})).json.value as Array<{
       id: string;
       lastMessagePreview: string | null;
@@ -413,5 +393,68 @@ describe.concurrent("roster multi-agent", () => {
     expect(deleted.status).toBe(200);
     expect(calls).toBe(1);
     expect(handle.store.getEntries("fenced-victim")).toEqual([]);
+  });
+});
+
+describe("deleteAgents generation state", () => {
+  const temp = new TempRoots();
+  afterEach(async () => {
+    await temp.cleanup();
+  });
+
+  it("cleans generation state after committed delete but preserves it on rollback", async () => {
+    const root = temp.make("openbot-delete-lifecycle-");
+    const config = new ConfigStore({ configPath: join(root, "config.json") });
+    config.update({ agents: [
+      { id: "committed-agent", name: "Committed", avatarId: "committed-agent" },
+      { id: "rollback-agent", name: "Rollback", avatarId: "rollback-agent" },
+    ] });
+    const handle = await startServer(0, {
+      config,
+      storePath: join(root, "store.db"),
+      keystoreDir: join(root, "keys"),
+      runtimeRoot: join(root, "runtime"),
+      disableAgentHome: true,
+      allowUnauthenticatedLocalGateway: true,
+      sharedIntegrationsEnabled: false,
+      skillCatalog: new SkillCatalog({ roots: [] }),
+      mcpManager: new McpManager(),
+    });
+    try {
+      for (const agentId of ["committed-agent", "rollback-agent"]) {
+        handle.runner.sendPrompt({ agentId, prompt: "queued", clientNonce: `nonce:${agentId}` });
+        expect(handle.runner.cancelPrompt(agentId).cancelled).toBe(true);
+        await handle.runner.flush(agentId);
+      }
+      const state = handle.runner as unknown as { agentGenerations: Map<string, number> };
+      expect(state.agentGenerations.has("committed-agent")).toBe(true);
+      expect(state.agentGenerations.has("rollback-agent")).toBe(true);
+
+      const committedResponse = await fetch(`http://127.0.0.1:${handle.port}/api/deleteAgents`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ids: ["committed-agent"] }),
+      });
+      expect(committedResponse.status).toBe(200);
+      expect(state.agentGenerations.has("committed-agent")).toBe(false);
+
+      const clear = vi.spyOn(handle.store, "clear").mockImplementation(() => {
+        throw new Error("forced persistence rollback");
+      });
+      try {
+        const rollbackResponse = await fetch(`http://127.0.0.1:${handle.port}/api/deleteAgents`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ids: ["rollback-agent"] }),
+        });
+        expect(rollbackResponse.status).toBe(500);
+      } finally {
+        clear.mockRestore();
+      }
+      expect(state.agentGenerations.has("rollback-agent")).toBe(true);
+      expect(config.snapshot().agents.some((agent) => agent.id === "rollback-agent")).toBe(true);
+    } finally {
+      await stopServer(handle);
+    }
   });
 });

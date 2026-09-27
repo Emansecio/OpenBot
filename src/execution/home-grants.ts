@@ -1,6 +1,5 @@
 /**
- * Grants de pastas do usuário por bot (melhoria 1 do spec
- * 2026-08-21-workspace-quality-improvements-design.md).
+ * Grants de pastas do usuário por bot.
  *
  * `.openbot/grants.json` dentro da home decide se o bot enxerga a pasta
  * REAL do usuário (Desktop/Documents/...) e com qual acesso. Sem grant,

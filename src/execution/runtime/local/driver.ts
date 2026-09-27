@@ -6,8 +6,8 @@ import { WorkspaceSandbox } from "../../workspace.js";
 import { redactLogText } from "../../../local-logger.js";
 import type { ProcessRunRequest, RuntimeBoot, RuntimeDriver, RuntimeDriverLease, RuntimeHealth, RuntimeLease, RuntimeLeaseRequest, StopReason } from "../contracts.js";
 import { RuntimeManagerError } from "../manager.js";
-import type { RuntimeProcessRunner } from "../wsl/process-backend.js";
-import { nativeEnvironment } from "./environment.js";
+import type { RuntimeProcessRunner } from "../process-backend.js";
+import { inheritableEnvironment, nativeEnvironment } from "./environment.js";
 import { NativeJobHelperCache } from "./helper-cache.js";
 import { NATIVE_JOB_KIND, nativeJobName, nativeSandboxId, WindowsJobProcess } from "./windows-job.js";
 export { LocalRuntimeReconciler } from "./windows-job.js";
@@ -43,7 +43,8 @@ export class LocalRuntimeDriver implements RuntimeDriver {
     if (request.capability.kind !== "process.run" || request.capability.networkProfile !== "host") throw new RuntimeManagerError("unsupported_capability", "Native runtime only supports trusted host networking.");
     const executable = await this.helper?.executable(signal);
     signal?.throwIfAborted();
-    const job = new WindowsJobProcess(nativeJobName(request.runtimeBootId, request.leaseId), process.env, executable);
+    // The supervisor environment is what the command inherits: gateway secrets stay out.
+    const job = new WindowsJobProcess(nativeJobName(request.runtimeBootId, request.leaseId), inheritableEnvironment(), executable);
     this.leases.set(request.leaseId, { agentId: request.agentId, controller: new AbortController(), job });
     await job.start(signal);
     return { leaseId: request.leaseId, sandboxId: nativeSandboxId(request.leaseId) };
@@ -113,7 +114,7 @@ export class LocalProcessRunner implements RuntimeProcessRunner {
     }
     const stdout: Buffer[] = [], stderr: Buffer[] = [];
     let stdoutBytes = 0, stderrBytes = 0;
-    let outputLimit = false, timedOut = false, aborted = false, stdinFailed = false;
+    let outputLimit = false, timedOut = false, aborted = false;
     let exitCode: number | null = null;
     let termination: Promise<void> | undefined;
     let cleanupError: unknown;
@@ -128,7 +129,8 @@ export class LocalProcessRunner implements RuntimeProcessRunner {
     try {
       if (!signal.aborted) protocolOk = await job.run({ ...request, cwd, env: environment }, (frame) => {
         if (frame.kind === "exit") { exitCode = frame.code; return; }
-        if (frame.kind === "stdin-error") { stdinFailed = true; return; }
+        // The child may exit without reading all of stdin; its exit code decides the outcome.
+        if (frame.kind === "stdin-error") return;
         const chunk = Buffer.from(frame.data, "base64");
         const prior = frame.kind === "stdout" ? stdoutBytes : stderrBytes;
         const remaining = Math.max(0, MAX_PROCESS_OUTPUT_BYTES - prior);
@@ -153,8 +155,12 @@ export class LocalProcessRunner implements RuntimeProcessRunner {
     if (outputLimit) return interrupted("output_limit", "Process output exceeded the limit.");
     if (timedOut) return interrupted("timed_out", "Process execution timed out.");
     if (aborted || signal.aborted) return interrupted("process_aborted", "Process execution was aborted.");
-    if (stdinFailed) return interrupted("io_error", "Process stdin could not be delivered.");
-    if (!protocolOk || exitCode === null) return interrupted("io_error", "Process could not complete.");
+    if (!protocolOk || exitCode === null) {
+      // CreateProcess only appends .exe: npm, npx, yarn and other .cmd shims need their extension.
+      return interrupted("io_error", path.extname(request.executable) === ""
+        ? "Process could not start or complete. A bare name only resolves to an .exe; call scripts with their extension (npm.cmd) or through cmd /c."
+        : "Process could not complete.");
+    }
     return { ok: true, operation: "process.run", ...output };
   }
 }

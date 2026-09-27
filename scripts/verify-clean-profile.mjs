@@ -6,7 +6,18 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual, promisify } from "node:util";
-import { captureProcessEvidence, terminateOwnedProcess } from "./release-common.mjs";
+import { captureProcessEvidence, isWithin, readJson, terminateOwnedProcess } from "./common.mjs";
+import {
+  checkoutRootId,
+  gatewayEntryScript,
+  gatewayTokenPath,
+  newInstanceId,
+  removeProcessStateIfOwner,
+  stopGateway,
+  waitForGateway,
+  watchChild,
+  writeProcessState,
+} from "./gateway-control.mjs";
 import { connectCdp, startE2eWatchdog } from "./e2e-runtime.mjs";
 
 const execFile = promisify(execFileCallback);
@@ -25,10 +36,6 @@ const PROFILE_ENV_NAMES = new Set([
 ]);
 
 function cleanPath(value) { return resolve(String(value)); }
-function isWithin(root, candidate) {
-  const suffix = relative(cleanPath(root), cleanPath(candidate));
-  return suffix === "" || (suffix !== ".." && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix));
-}
 
 export function createCleanProfilePaths(tempRoot) {
   const root = cleanPath(tempRoot);
@@ -184,7 +191,6 @@ async function waitNoRootProcesses(root, timeoutMs = 10_000) {
   throw new Error("clean-profile owned process residue");
 }
 
-async function readJson(path) { return JSON.parse(await readFile(path, "utf8")); }
 async function fileExists(path) { return fs.access(path).then(() => true, () => false); }
 
 async function waitGatewayHealth(url, pid, timeoutMs = 20_000) {
@@ -321,20 +327,43 @@ async function closeElectron(session, root) {
   return { forced, graceful: !forced };
 }
 
-async function startOwnedGateway(paths, env, startGateway, productPort = 1340) {
+// The same spawn and ownership record the desktop launcher uses, run from
+// the isolated checkout copy (paths.installRoot).
+async function startOwnedGateway(paths, env, productPort = 1340) {
   const gatewayUrl = `http://127.0.0.1:${productPort}`;
-  const result = await startGateway({ installRoot: paths.installRoot, url: gatewayUrl, dataRoot: paths.dataRoot, env, adoptExisting: false, waitForReady: true, timeoutMs: 20_000 });
-  if (result.adopted === true || !(await fileExists(paths.processStatePath))) throw new Error("clean-profile gateway ownership was not established");
-  await waitGatewayHealth(gatewayUrl, result.pid);
-  return result;
+  const child = spawn(process.execPath, [gatewayEntryScript(paths.installRoot)], {
+    cwd: paths.installRoot, env, detached: true, windowsHide: true, stdio: "ignore",
+  });
+  const watch = watchChild(child);
+  if (!Number.isInteger(child.pid)) throw new Error("clean-profile gateway did not start");
+  const instanceId = newInstanceId();
+  const rootId = checkoutRootId(paths.installRoot);
+  try {
+    await writeProcessState(paths.processStatePath, {
+      instanceId, product: "OpenBot", rootId, url: gatewayUrl,
+      launcherPid: process.pid, gateway: { pid: child.pid }, startedAt: new Date().toISOString(),
+    });
+    await waitForGateway(gatewayUrl, child.pid, { watch, rootId, timeoutMs: 20_000 });
+    await waitGatewayHealth(gatewayUrl, child.pid);
+  } catch (error) {
+    // Never leave the spawned child behind; the live handle proves it is ours.
+    await stopGateway({ url: gatewayUrl, pid: child.pid, watch, rootId, tokenPath: gatewayTokenPath(paths.dataRoot, {}) }).catch(() => undefined);
+    await removeProcessStateIfOwner(paths.processStatePath, instanceId).catch(() => undefined);
+    throw error;
+  }
+  return { pid: child.pid, watch, instanceId };
 }
 
-async function stopOwnedGateway(paths, shutdownGateway, productPort = 1340) {
-  const result = await shutdownGateway({ installRoot: paths.installRoot, processStatePath: paths.processStatePath, dataRoot: paths.dataRoot, url: `http://127.0.0.1:${productPort}`, timeoutMs: 8_000, forceWaitMs: 2_000, removeState: true });
-  if (result.ok !== true || result.teardownProven !== true || result.forced === true || result.gracefulAccepted !== true || result.reason === "stale" || result.reason === "graceful-unavailable") throw new Error("clean-profile gateway did not stop gracefully");
+async function stopOwnedGateway(paths, gateway, productPort = 1340) {
+  const result = await stopGateway({
+    url: `http://127.0.0.1:${productPort}`, pid: gateway.pid, watch: gateway.watch,
+    rootId: checkoutRootId(paths.installRoot), tokenPath: gatewayTokenPath(paths.dataRoot, {}), timeoutMs: 8_000, forceWaitMs: 2_000,
+  });
+  if (result.stopped !== true || result.forced === true || result.gracefulAccepted !== true) throw new Error("clean-profile gateway did not stop gracefully");
+  await removeProcessStateIfOwner(paths.processStatePath, gateway.instanceId);
   if (await fileExists(paths.processStatePath)) throw new Error("clean-profile process.json residue");
   await assertProductPortFree(productPort);
-  return result;
+  return { ok: true, teardownProven: true, forced: false, gracefulAccepted: true, reason: result.reason };
 }
 
 async function collectFiles(root) {
@@ -374,12 +403,40 @@ export function isPersistedConfigStable(first, next) {
     && isDeepStrictEqual(firstValues, nextValues);
 }
 
+/**
+ * The TempRoot every clean-profile path derives from, in canonical form.
+ * Windows may spell %TEMP% with 8.3 aliases (C:UsersTHIAGO~1...), whose
+ * realpath differs from the spelling; assertCleanProfilePaths compares real
+ * paths against this root, so it must already be canonical. A link anywhere
+ * in the given chain is refused first, so realpath can only drop aliases and
+ * never follow a junction out of the intended location.
+ */
+export async function resolveCleanProfileTempRoot(tempRoot) {
+  const given = resolve(String(tempRoot ?? await mkdtemp(join(tmpdir(), "openbot-clean-profile-"))));
+  for (let current = given; ; current = dirname(current)) {
+    let info = null;
+    try {
+      info = await lstat(current);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    if (info?.isSymbolicLink()) throw new Error("clean-profile TempRoot must not traverse a reparse/symbolic path");
+    if (dirname(current) === current) break;
+  }
+  try {
+    return await realpath(given);
+  } catch (error) {
+    if (error?.code === "ENOENT") return given;
+    throw error;
+  }
+}
+
 /** Runs the real isolated gateway + Electron first-boot/restart gate. */
 export async function runCleanProfile(options = {}) {
   const productPort = Number(options.productPort ?? 1340);
   if (!Number.isInteger(productPort) || productPort < 1 || productPort > 65535) throw new Error("clean-profile product port is invalid");
   const ownRoot = options.tempRoot == null;
-  const tempRoot = options.tempRoot ?? await mkdtemp(join(tmpdir(), "openbot-clean-profile-"));
+  const tempRoot = await resolveCleanProfileTempRoot(options.tempRoot);
   const paths = createCleanProfilePaths(tempRoot);
   const environmentObject = process.env;
   const previousEnv = { ...environmentObject };
@@ -412,11 +469,10 @@ export async function runCleanProfile(options = {}) {
     } else {
       stage = "prepare.copy-install";
       await copyInstall(paths);
-      const { startGateway } = await import("./start-gateway.mjs");
-      const { shutdownGateway } = await import("./shutdown-gateway.mjs");
+      let running;
       lifecycle = {
-        startGateway: (rootPaths, env) => startOwnedGateway(rootPaths, env, startGateway, productPort),
-        stopGateway: (rootPaths) => stopOwnedGateway(rootPaths, shutdownGateway, productPort),
+        startGateway: async (rootPaths, env) => (running = await startOwnedGateway(rootPaths, env, productPort)),
+        stopGateway: (rootPaths) => stopOwnedGateway(rootPaths, running, productPort),
         launchElectron: (rootPaths, env, label) => launchElectron(rootPaths, env, label, productPort),
         closeElectron: (session, root) => closeElectron(session, root),
       };

@@ -1,6 +1,6 @@
 import { watch as watchFileSystem } from "node:fs";
 import { lstat, opendir } from "node:fs/promises";
-import { isAbsolute, join, relative as relativePath, resolve } from "node:path";
+import { isAbsolute, join, relative as relativePath, resolve, sep } from "node:path";
 
 import { WorkspaceQuotaError, type QuotaDelta, type WorkspaceUsage } from "./quota.js";
 import { isHomeTrashArchivePath } from "./user-files.js";
@@ -38,6 +38,12 @@ const defaultWatch: WorkspaceWatch = (root, options, listener) =>
   watchFileSystem(root, options, listener);
 
 const slashPath = (value: string): string => value.replaceAll("\\", "/");
+/**
+ * NTFS names are case-insensitive: a case-only rename reports both spellings,
+ * and both resolve to the same entries. One key per entry avoids counting a
+ * subtree twice.
+ */
+const pathKey = process.platform === "win32" ? (value: string): string => value.toLowerCase() : (value: string): string => value;
 const insideTrashPayload = (relative: string): boolean => {
   const normalized = slashPath(relative).toLowerCase();
   return normalized.startsWith(".openbot/trash/");
@@ -157,7 +163,21 @@ export class WorkspaceQuotaObserver {
     }
   }
 
-  /** Lost paths, queue overflow and structured writes require a new authority. */
+  /**
+   * A structured write already landed at `absolute`: reconcile just that
+   * path (and its subtree) on the next pass instead of rescanning everything.
+   * A path outside the root falls back to a full rescan.
+   */
+  touch(absolute: string): void {
+    const relative = relativePath(this.root, resolve(absolute));
+    if (relative === "" || relative === ".." || relative.startsWith(`..${sep}`) || isAbsolute(relative)) {
+      this.invalidate();
+      return;
+    }
+    this.enqueue(relative);
+  }
+
+  /** Lost paths, queue overflow and silent external writes require a new authority. */
   invalidate(): void {
     this.fullScan = true;
     this.pending.clear();
@@ -187,7 +207,7 @@ export class WorkspaceQuotaObserver {
       return;
     }
     const absolute = resolve(this.root, input);
-    let relative = slashPath(relativePath(this.root, absolute));
+    let relative = pathKey(slashPath(relativePath(this.root, absolute)));
     if (relative === "" || relative === ".." || relative.startsWith("../")) {
       this.fail(new Error("Workspace watcher reported a path outside the workspace"));
       return;
@@ -277,7 +297,8 @@ export class WorkspaceQuotaObserver {
   private async reconcile(relative: string): Promise<void> {
     this.counters.reconciledPaths += 1;
     const started = performance.now();
-    const current = await snapshotPath(this.root, relative, this.options.maxEntries ?? 100_000);
+    const current = new Map([...await snapshotPath(this.root, relative, this.options.maxEntries ?? 100_000)]
+      .map(([path, metadata]) => [pathKey(path), metadata] as const));
     if (relative === "") this.options.onScan?.(performance.now() - started);
     const previous = new Map<string, WatchedMetadata>();
     const pending = relative === "" ? [...(this.children.get("") ?? [])] : [relative];
