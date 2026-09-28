@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ConfigStore } from "../src/config/store.js";
-import { CLOSED_CAPABILITY, resolveProviderCapabilities } from "../src/providers/capabilities.js";
+import { CLOSED_CAPABILITY, discoveredModelCapability, resolveProviderCapabilities } from "../src/providers/capabilities.js";
 import { startServer, stopServer, type ServerHandle } from "../src/main.js";
 import { TempRoots } from "./helpers/temp-roots.js";
 
@@ -21,6 +21,9 @@ const STREAMING = { streaming: true, tools: true, cancellation: "abort-signal", 
 describe("provider capability matrix", () => {
   it("exports the complete capabilities for each known provider pair", () => {
     const expected = [
+      ["openai", "gpt-6-astra", { ...STREAMING, images: true }],
+      ["openai", "gpt-6-sol", { ...STREAMING, images: true }],
+      ["openai", "gpt-6-luna", { ...STREAMING, images: true }],
       ["openai", "gpt-5.6-luna", { ...STREAMING, images: true }],
       ["openai", "gpt-5.6-sol", { ...STREAMING, images: false }],
       ["xai", "grok-4.6", { ...STREAMING, images: true }],
@@ -42,6 +45,11 @@ describe("provider capability matrix", () => {
     for (const provider of ["openrouter", "codex-cli", "claude-code"]) {
       expect(resolveProviderCapabilities(provider, `${provider}:default`)).toEqual(closed);
     }
+  });
+
+  it("gives an account-listed model the provider's streaming contract, with images only when declared", () => {
+    expect(discoveredModelCapability(false)).toEqual({ ...STREAMING, images: false });
+    expect(discoveredModelCapability(true)).toEqual({ ...STREAMING, images: true });
   });
 });
 

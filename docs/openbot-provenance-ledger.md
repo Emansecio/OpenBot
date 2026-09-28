@@ -107,3 +107,19 @@ backoff. Snapshot generations reject obsolete responses; conversation changes,
 agent disposal and shutdown cancel pending retries. The coordinator artifact's
 hash and version are recorded in the client manifest and patch metadata. No
 renderer artifact or renderer-boundary baseline changes in this correction.
+
+## Settings and memory panel redesign — 2026-09-28
+
+The per-bot settings panel, the global provider section, the memory section
+and the memory manager dialog were reorganized inside the two permitted
+overlays: grouped cards (Modelo, Memória, Avançado), autosave instead of a save
+button, one custom select, pt-BR copy for leftover native English entries,
+user-facing error messages instead of raw IPC text, a same-frame mount contract
+between the overlays (`#openbot-memory-slot` and `openbot:settings-mounted`) and
+per-session model catalog caching. Only the two overlay hashes change in the
+renderer boundary; the new hashes and versions
+(`openbot-local-settings-v60-settings-redesign`,
+`openbot-memory-ui-v14-memory-redesign`) are recorded in the client manifest and
+`patches/client-artifacts.json`. Immutable renderer files and their aggregate
+baseline remain unchanged. These local changes do not grant redistribution
+rights to the surrounding extracted artifacts.

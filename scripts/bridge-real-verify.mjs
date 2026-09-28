@@ -655,7 +655,9 @@ async function verifyCatalogUi(evaluate, send, state, evidenceDir) {
       options: [...(model?.options || [])].map(o => ({ id:o.value, disabled:o.disabled })),
       reasoning: [...(reasoning?.options || [])].map(o => ({ id:o.value, disabled:o.disabled })),
       status: document.getElementById('openbot-model-status')?.textContent,
+      catalogState: document.getElementById('openbot-model-status')?.dataset.catalogState,
       saveStatus: document.getElementById('openbot-status')?.textContent,
+      saveState: document.getElementById('openbot-provider-settings')?.dataset.saveState,
       busy: document.getElementById('openbot-model-refresh')?.disabled };
   })()`);
   const wait = async predicate => {
@@ -678,7 +680,7 @@ async function verifyCatalogUi(evaluate, send, state, evidenceDir) {
     await send("Input.dispatchMouseEvent", { type: "mousePressed", ...point, button: "left", clickCount: 1 });
     await send("Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button: "left", clickCount: 1 });
   };
-  const initial = await wait(v => v.provider === "xai" && !v.busy && v.status?.includes("atualizado"));
+  const initial = await wait(v => v.provider === "xai" && !v.busy && v.catalogState === "fresh");
   if (initial.model !== "grok-4.6" || !initial.options.some(o => o.id === "xai/pending" && o.disabled)) throw new Error("Catalog UI lost saved model or enabled pending model");
   state.catalogMode.xai = "removed";
   await clickRefresh();
@@ -689,28 +691,36 @@ async function verifyCatalogUi(evaluate, send, state, evidenceDir) {
   const error = await wait(v => !v.busy && v.status?.includes("Falha local"));
   state.catalogMode.xai = "empty";
   await clickRefresh();
-  const empty = await wait(v => !v.busy && v.status?.includes("vazio confirmado"));
+  const empty = await wait(v => !v.busy && v.catalogState === "empty" && Boolean(v.status));
   if (empty.model !== initial.model || !empty.disabled) throw new Error("Empty catalog lost the saved selection");
   state.catalogMode.openai = "slow";
   await switchProvider("openai");
   await sleep(80);
   await switchProvider("opencode-go");
   const go = await wait(v => !v.busy && v.provider === "opencode-go" && v.status?.includes("Lista pública"));
+  // Autosave: switching the provider applied the (connected) OpenCode Go choice through real IPC.
+  const autosaved = await wait(v => v.saveState === "saved" && state.calls.some(call => call.method === "setProviderConfig" && call.body?.provider === "opencode-go"));
+  if (state.calls.some(call => call.method === "setProviderConfig" && call.body?.provider === "openai")) throw new Error("Autosave wrote the provider the user only passed through");
   await sleep(600);
   await evaluate(`(() => { const field = document.getElementById("openbot-apikey"); field.value = "catalog-ui-fixture"; field.dispatchEvent(new Event("input", {bubbles:true})); document.getElementById("openbot-apikey-save").click(); })()`);
   await wait(v => !v.busy && v.saveStatus?.includes("Chave salva.") && v.provider === "opencode-go" && v.options.some(o => o.id === "opencode-go/pending" && o.disabled));
   const afterLate = await inspect();
   if (afterLate.provider !== "opencode-go" || afterLate.options.some(o => o.id.startsWith("gpt-"))) throw new Error("Late catalog crossed provider selection");
   await switchProvider("xai");
-  const restoredSelection = await wait(v => !v.busy && v.provider === "xai" && v.status?.includes("vazio confirmado"));
+  const restoredSelection = await wait(v => !v.busy && v.provider === "xai" && v.catalogState === "empty");
   if (restoredSelection.model !== initial.model || !restoredSelection.disabled) throw new Error("Provider switching lost the saved removed model");
   state.catalogMode.openai = "fresh";
   await switchProvider("openai");
-  const openai = await wait(v => !v.busy && v.provider === "openai" && v.status?.includes("atualizado"));
+  const openai = await wait(v => !v.busy && v.provider === "openai" && v.catalogState === "fresh" && v.saveState === "blocked");
+  // Blocked choices (removed model, unsupported reasoning) stay on screen but are never written.
+  if (state.calls.filter(call => call.method === "setProviderConfig").length !== 1) throw new Error("Autosave wrote a blocked selection: " + JSON.stringify(openai));
   if (!openai.reasoning.some(o => o.id === "medium" && o.disabled) || !openai.reasoning.some(o => o.id === "high" && !o.disabled)) throw new Error("Reasoning efforts were not constrained");
   const screenshot = await send("Page.captureScreenshot", { format: "png" });
   writeFileSync(join(evidenceDir, "catalog-ui.png"), Buffer.from(screenshot.data, "base64"));
   await evaluate("document.getElementById('catalog-ui-fixture')?.remove()");
+  // The global panel autosaved OpenCode Go for the active bot above; start the bot panel from the gateway default again.
+  state.providerConfigs = {};
+  const providerSaves = () => state.calls.filter(call => call.method === 'setProviderConfig');
   const mountAgentSettings = () => evaluate(`(() => {
     document.getElementById('fast-ui-fixture')?.remove();
     const panel = document.createElement('div');
@@ -724,31 +734,34 @@ async function verifyCatalogUi(evaluate, send, state, evidenceDir) {
   await wait(v => v.provider === 'xai' && !v.busy);
   if (!await evaluate(`document.getElementById('openbot-speed-row').hidden`)) throw new Error('Fast shown for unsupported provider');
   await switchProvider('openai');
-  await wait(v => v.provider === 'openai' && !v.busy && v.status?.includes('atualizado'));
+  await wait(v => v.provider === 'openai' && !v.busy && v.catalogState === 'fresh');
   if (!await evaluate(`!document.getElementById('openbot-speed-row').hidden && !document.querySelector('#openbot-speed [value="priority"]').disabled`)) throw new Error('Fast missing for supported model');
+  const savesBeforeFast = providerSaves().length;
   await evaluate(`(() => {
     const speed=document.getElementById('openbot-speed'), reasoning=document.getElementById('openbot-reasoning');
     reasoning.value='high'; reasoning.dispatchEvent(new Event('change',{bubbles:true}));
     speed.value='priority'; speed.dispatchEvent(new Event('change',{bubbles:true}));
-    document.getElementById('openbot-save').click();
   })()`);
-  await wait(v => v.saveStatus?.includes('salv') && !v.saveStatus?.includes('Salvando'));
-  const fastSave = state.calls.filter(call => call.method === 'setProviderConfig').at(-1);
+  await wait(v => v.saveState === 'saved' && providerSaves().length > savesBeforeFast);
+  if (providerSaves().length !== savesBeforeFast + 1) throw new Error('Autosave did not coalesce reasoning and speed into one save');
+  const fastSave = providerSaves().at(-1);
   if (fastSave?.body?.serviceTier !== 'priority' || fastSave.body.reasoningEffort !== 'high') throw new Error('Fast selection lost in real IPC');
   await mountAgentSettings();
   await wait(v => v.provider === 'openai' && !v.busy);
   if (!await evaluate(`document.getElementById('openbot-speed').value === 'priority'`)) throw new Error('Fast did not reload');
   state.catalogMode.openai = 'no-fast';
+  const savesBeforeNoFast = providerSaves().length;
   await clickRefresh();
   await wait(v => !v.busy);
-  if (!await evaluate(`document.querySelector('#openbot-speed [value="priority"]').disabled && document.getElementById('openbot-speed').value === 'priority' && document.getElementById('openbot-save').disabled`)) throw new Error('Unsupported saved Fast was silently replaced or allowed');
-  await evaluate(`(() => {const speed=document.getElementById('openbot-speed');speed.value='default';speed.dispatchEvent(new Event('change',{bubbles:true}));document.getElementById('openbot-save').click();})()`);
-  await wait(v => v.saveStatus?.includes('salv') && !v.saveStatus?.includes('Salvando'));
-  if (state.calls.filter(call => call.method === 'setProviderConfig').at(-1)?.body?.serviceTier !== 'default') throw new Error('Standard selection lost in IPC');
+  await sleep(700);
+  if (providerSaves().length !== savesBeforeNoFast || !await evaluate(`document.querySelector('#openbot-speed [value="priority"]').disabled && document.getElementById('openbot-speed').value === 'priority' && !document.getElementById('openbot-speed-row').hidden && document.getElementById('openbot-speed-help').textContent.includes('Fast indisponível')`)) throw new Error('Unsupported saved Fast was silently replaced or allowed');
+  await evaluate(`(() => {const speed=document.getElementById('openbot-speed');speed.value='default';speed.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await wait(v => v.saveState === 'saved' && providerSaves().length > savesBeforeNoFast);
+  if (providerSaves().at(-1)?.body?.serviceTier !== 'default') throw new Error('Standard selection lost in IPC');
   await evaluate("document.getElementById('fast-ui-fixture')?.remove()");
   console.log("FAST_UI_GREEN");
   console.log("CATALOG_UI_GREEN");
-  return { initial, removed, error, empty, go, afterLate, restoredSelection, openai };
+  return { initial, removed, error, empty, go, autosaved, afterLate, restoredSelection, openai };
 }
 
 runBridgeRealVerify().catch((error) => {

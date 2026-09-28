@@ -28,13 +28,13 @@ describe("Electron client artifact baseline", () => {
     expect(manifest.artifacts.main.version).toBe("0.16.0");
     expect(manifest.artifacts.preload.version).toBe("0.16.0");
     expect(manifest.artifacts.rendererInjected).toMatchObject({
-      version: "openbot-local-settings-v59-conversation-status",
-      sha256: "8ec6f1d39580e0e74558115662c87f2cf0e5063334a01d0adef30bc03fb66f82",
+      version: "openbot-local-settings-v60-settings-redesign",
+      sha256: "2f367199839afa342de033a5be23341385e4dd9122459321408be56bd48a8b4b",
     });
     expect(manifest.artifacts.rendererMemoryUi).toMatchObject({
       path: "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
-      version: "openbot-memory-ui-v13-ordered-task-list",
-      sha256: "dd81390ad91a07ed8b23c6bb25601fe837253d2687ad7d4f2431beca26fbc7d0",
+      version: "openbot-memory-ui-v14-memory-redesign",
+      sha256: "7221fd7d1c49f5658366736ad0853f3be3e84c7deea985a7721e0478b4eb2813",
     }); // Change only with an intentional renderer overlay baseline update.
     for (const artifact of Object.values(manifest.artifacts)) expect(artifact.sha256).toMatch(/^[a-f0-9]{64}$/u);
     for (const asset of manifest.renderer.requiredAssets) expect(asset.sha256).toMatch(/^[a-f0-9]{64}$/u);

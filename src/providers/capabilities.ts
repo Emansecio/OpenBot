@@ -39,6 +39,8 @@ const STREAMING_API_KEY = { streaming: true, tools: true, cancellation: "abort-s
 const KNOWN_CAPABILITIES: Record<string, Record<string, ProviderCapability>> = {
   openai: {
     "gpt-6-astra": { ...STREAMING_API_KEY, images: true },
+    "gpt-6-sol": { ...STREAMING_API_KEY, images: true },
+    "gpt-6-luna": { ...STREAMING_API_KEY, images: true },
     "gpt-5.6-luna": { ...STREAMING_API_KEY, images: true },
     "gpt-5.6-sol": { ...STREAMING_API_KEY, images: false },
     "gpt-5.6-terra": { ...STREAMING_API_KEY, images: false },
@@ -90,6 +92,15 @@ export function resolveProviderCapabilities(provider: string, model?: string): P
   if (capability === undefined) return CLOSED_CAPABILITY;
   const override = CAPABILITY_TEST_OVERRIDES.get(provider + "\u0000" + model);
   return override === undefined ? capability : { ...capability, ...override };
+}
+
+/**
+ * Capability for a model the provider listed for the current account but that
+ * is not in the matrix yet (see ModelCatalogService). Same streaming/tool
+ * contract as its provider's known models; images only when declared.
+ */
+export function discoveredModelCapability(images: boolean): ProviderCapability {
+  return { ...STREAMING_API_KEY, images };
 }
 
 /** P2.3 image authority: exact pair must be known AND declare images. */

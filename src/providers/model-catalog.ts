@@ -3,11 +3,23 @@ import { join } from "node:path";
 import { MODEL_CATALOG } from "../config/models.js";
 import { REASONING_EFFORTS, type ModelCatalogEntry, type ReasoningEffort } from "../shared/contracts.js";
 import { writeFileAtomicSync } from "../shared/fs-atomic.js";
-import { resolveProviderCapabilities, type ProviderCapability } from "./capabilities.js";
+import { discoveredModelCapability, resolveProviderCapabilities, type ProviderCapability } from "./capabilities.js";
 import { resolveModelCapabilities } from "../memory/model-context.js";
 
 export const CATALOG_PROVIDERS = ["openai", "xai", "opencode-go", "openai-compat"] as const;
 export type CatalogProvider = typeof CATALOG_PROVIDERS[number];
+
+/**
+ * Conservative limits for a model the provider listed for this account before
+ * the static catalog knows it. Only providers that serve every model through
+ * one protocol are admitted; OpenCode Go stays fail-closed (per-model protocol)
+ * and openai-compat already has its own generic entry. Limits the provider
+ * reports win over these defaults.
+ */
+const DISCOVERY_ADMISSION: Readonly<Partial<Record<CatalogProvider, { contextWindow: number; maxOutputTokens: number; maxRequestBytes: number }>>> = {
+  openai: { contextWindow: 272_000, maxOutputTokens: 16_384, maxRequestBytes: 2 * 1024 * 1024 },
+  xai: { contextWindow: 128_000, maxOutputTokens: 16_384, maxRequestBytes: 1024 * 1024 },
+};
 export type ModelProtocol = "codex" | "chat" | "responses" | "messages";
 export type ServiceTier = "default" | "priority";
 
@@ -155,6 +167,17 @@ export class ModelCatalogService {
     return (this.options.resolveCapabilities ?? resolveProviderCapabilities)(provider, id);
   }
 
+  /**
+   * Static matrix first. A model outside it is admitted only when the provider
+   * listed it for the current connection and the provider has one protocol
+   * for every model (see DISCOVERY_ADMISSION).
+   */
+  private capabilityFor(provider: CatalogProvider, id: string, discovered: DiscoveredModel | undefined): ProviderCapability {
+    const known = this.capability(provider, id);
+    if (known.streaming || discovered === undefined || DISCOVERY_ADMISSION[provider] === undefined) return known;
+    return discoveredModelCapability(discovered.inputModalities?.includes("image") === true);
+  }
+
   async synchronize(provider: CatalogProvider): Promise<void> {
     const state = this.states.get(provider)!;
     const source = this.options.sources[provider];
@@ -221,18 +244,25 @@ export class ModelCatalogService {
       const known = local.get(id);
       const remote = discovered.get(id);
       const removed = saved !== undefined && remote === undefined;
-      const capability = this.capability(provider, id);
+      const capability = this.capabilityFor(provider, id, known ? undefined : remote);
       const compatFallback = provider === "openai-compat" && !known
         ? local.get("openai-compatible")
         : undefined;
-      const entry: ModelCatalogEntry = {
-        ...(compatFallback ? { ...compatFallback, id, displayName: id } : known ?? { id, provider, displayName: id }),
+      const admission = !known && remote !== undefined ? DISCOVERY_ADMISSION[provider] : undefined;
+      const merged: ModelCatalogEntry = {
+        ...(compatFallback ? { ...compatFallback, id, displayName: id }
+          : known ?? { id, provider, displayName: id, ...(admission ? { ...admission, tokenizerStrategy: "estimated" as const, safetyMargin: 0.2 } : {}) }),
         ...(remote?.displayName ? { displayName: remote.displayName } : {}),
         ...(remote?.contextWindow ? { contextWindow: remote.contextWindow } : {}),
         ...(remote?.maxOutputTokens ? { maxOutputTokens: remote.maxOutputTokens } : {}),
         ...(remote?.maxRequestBytes ? { maxRequestBytes: remote.maxRequestBytes } : {}),
         ...(remote?.inputModalities ? { supportsVision: capability.images && remote.inputModalities.includes("image") } : {}),
       };
+      // The default output reserve must fit a smaller window the provider
+      // reported; limits the provider states itself are never rewritten.
+      const entry = admission && !remote?.maxOutputTokens && merged.contextWindow && merged.maxOutputTokens && merged.maxOutputTokens > merged.contextWindow / 2
+        ? { ...merged, maxOutputTokens: Math.floor(merged.contextWindow / 2) }
+        : merged;
       let reason: string | undefined;
       // `!known` só bloqueia quando o modelo também não veio do endpoint — um
       // id descoberto com limites + protocolo + capacidade resolvidos é
@@ -361,7 +391,8 @@ export class ModelCatalogService {
     if (effort && entry.supportedReasoningEfforts && !entry.supportedReasoningEfforts.includes(effort)) {
       throw new Error("O esforço de raciocínio salvo não é suportado por este modelo. Revise as configurações.");
     }
-    return structuredClone({ entry, ...(provider === "openai" && serviceTier ? { serviceTier } : {}), capabilities: { ...this.capability(provider, model), images: entry.supportsVision === true },
+    const discovered = this.local(provider).some(m => m.id === model) ? undefined : this.savedFor(provider)?.models.find(m => m.id === model);
+    return structuredClone({ entry, ...(provider === "openai" && serviceTier ? { serviceTier } : {}), capabilities: { ...this.capabilityFor(provider, model, discovered), images: entry.supportsVision === true },
       protocol: this.protocol(provider, model)!, ...(entry.supportedReasoningEfforts ? { supportedReasoningEfforts: entry.supportedReasoningEfforts } : {}) });
   }
 

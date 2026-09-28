@@ -837,6 +837,20 @@
       "version": "openbot-ui-contract-v3-resync-retry",
       "sha256": "15d32914cc0b676a4bd0a59b562c10f716f979b787f99db3f2ce7a33c3d4cada",
       "status": "applied"
+    },
+    {
+      "id": "openbot-settings-panel-redesign",
+      "target": "client/extracted/dist/renderer/assets/openbot-local-settings.js",
+      "version": "openbot-local-settings-v60-settings-redesign",
+      "sha256": "2f367199839afa342de033a5be23341385e4dd9122459321408be56bd48a8b4b",
+      "status": "applied"
+    },
+    {
+      "id": "openbot-memory-panel-redesign",
+      "target": "client/extracted/dist/renderer/assets/openbot-memory-ui.js",
+      "version": "openbot-memory-ui-v14-memory-redesign",
+      "sha256": "7221fd7d1c49f5658366736ad0853f3be3e84c7deea985a7721e0478b4eb2813",
+      "status": "applied"
     }
   ],
   "sourceMapPolicy": {

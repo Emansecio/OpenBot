@@ -9,7 +9,7 @@
  */
 import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -167,7 +167,9 @@ async function main() {
     }
   };
   try {
-    runRoot = mkdtempSync(join(tmpdir(), "openbot-p23-"));
+    // An 8.3 TEMP (C:\Users\THIAGO~1\...) canonicalizes to a different path,
+    // so attachment staging would reject its own files as outside the root.
+    runRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "openbot-p23-")));
     const dataRoot = join(runRoot, "data");
     const userData = join(runRoot, "user-data");
     const appData = join(runRoot, "appdata");
@@ -177,7 +179,7 @@ async function main() {
     mkdirSync(userData, { recursive: true }); mkdirSync(appData, { recursive: true }); mkdirSync(localAppData, { recursive: true });
 
     const backendReadyPath = join(runRoot, "backend-ready.json");
-    const backendEnv = { ...process.env, OPENBOT_DATA_ROOT: dataRoot, OPENBOT_LOG_DIR: join(runRoot, "logs"), OPENBOT_VISUAL_TEST: "1" };
+    const backendEnv = { ...process.env, APPDATA: appData, LOCALAPPDATA: localAppData, OPENBOT_DATA_ROOT: dataRoot, OPENBOT_LOCAL_DATA_ROOT: join(runRoot, "local-data"), OPENBOT_LOG_DIR: join(runRoot, "logs"), OPENBOT_VISUAL_TEST: "1" };
     backend = spawn(process.execPath, [backendFixture, join(repoRoot, "dist", "main.js"), backendReadyPath], { cwd: repoRoot, env: backendEnv, detached: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     backendExited = new Promise((resolve) => backend.once("close", resolve));
     backend.stdout?.on("data", (d) => process.stdout.write(d)); backend.stderr?.on("data", (d) => process.stderr.write(d));

@@ -151,6 +151,8 @@ describe("contrato congelado (T2) — shapes", () => {
   it("expõe o catálogo local e os modelos conhecidos do OpenCode Go", () => {
     expect(MODEL_CATALOG.filter(({ provider }) => provider !== "opencode-go").map(({ id, provider }) => ({ id, provider }))).toEqual([
       { id: "gpt-6-astra", provider: "openai" },
+      { id: "gpt-6-sol", provider: "openai" },
+      { id: "gpt-6-luna", provider: "openai" },
       { id: "grok-4.6", provider: "xai" },
       { id: "gpt-5.6-luna", provider: "openai" },
       { id: "gpt-5.6-sol", provider: "openai" },
@@ -169,6 +171,8 @@ describe("contrato congelado (T2) — shapes", () => {
   it("declara explicitamente quais modelos aceitam imagens", () => {
     expect(MODEL_CATALOG.filter((entry) => entry.supportsVision).map((entry) => entry.id)).toEqual([
       "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
       "grok-4.6",
       "gpt-5.6-luna",
       "gpt-5.6-sol",

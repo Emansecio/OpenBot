@@ -111,7 +111,8 @@ async function main() {
     if (process.argv.includes("--delete-timeout-only")) gatewayArgs.push("--delete-drain-delay");
     gatewayChild = spawn(process.execPath, gatewayArgs, {
       cwd: repoRoot,
-      env: { ...process.env, E2E_GATEWAY_TOKEN: gatewayToken },
+      // The fixture leaves runtime/browser roots at their defaults; keep them in this run.
+      env: { ...process.env, APPDATA: appData, LOCALAPPDATA: localAppData, E2E_GATEWAY_TOKEN: gatewayToken },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -830,17 +831,21 @@ async function main() {
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const frames = await evalExpr(`new Promise(resolve => {
           const frames = [];
+          let emptySections = 0;
           document.querySelector('button[aria-label="Abrir menu da conta"],button[aria-label="Open account menu"]').click();
           const inspect = () => {
             const menu = document.querySelector('[role="menu"][aria-label="Account"],[role="menu"][aria-label="Conta"]');
             frames.push(menu?.innerText || '');
-            if (frames.length < 8) requestAnimationFrame(inspect); else resolve(frames);
+            // A visible section without visible items is an orphan divider.
+            emptySections = Math.max(emptySections, [...(menu?.querySelectorAll('[role="group"]') || [])].filter((group) => group.getClientRects().length > 0 && ![...group.querySelectorAll('[role="menuitem"]')].some((item) => item.getClientRects().length > 0)).length);
+            if (frames.length < 8) requestAnimationFrame(inspect); else resolve({ frames, emptySections });
           };
           requestAnimationFrame(inspect);
         })`);
         console.log("ACCOUNT_MENU_FRAMES", JSON.stringify(frames));
-        const visible = frames.filter(Boolean);
+        const visible = frames.frames.filter(Boolean);
         if (!visible.length || visible.some(text => /Settings|About|Help Center|Send Feedback|Log out/.test(text)) || !visible[0].includes("Configurações")) throw new Error("account menu exposed English before localization");
+        if (visible.some(text => /Central de ajuda|Enviar feedback|Sair/.test(text)) || frames.emptySections !== 0) throw new Error("account menu kept unavailable entries or an empty section: " + JSON.stringify(frames));
         await shot("account-menu-portuguese");
         await send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
         await send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
@@ -1551,7 +1556,7 @@ async function main() {
       const providerControl = providerRow?.querySelector(".ob-select-trigger") || providerRow?.querySelector("select");
       const selectRect = providerControl?.getBoundingClientRect();
       const selectStyle = providerControl ? getComputedStyle(providerControl) : null;
-      const saveRect = root?.querySelector("#openbot-save")?.getBoundingClientRect();
+      const groupLabel = root?.querySelector("#openbot-model-group-label")?.textContent?.trim() || "";
       const rootStyle = root ? getComputedStyle(root) : null;
       const cardStyle = root ? getComputedStyle(root.querySelector(".ob-provider-card")) : null;
       return {
@@ -1568,11 +1573,14 @@ async function main() {
         providerRowAligned: Boolean(labelRect && selectRect && Math.abs((labelRect.top + labelRect.bottom - selectRect.top - selectRect.bottom) / 2) < 4),
         providerControlHeight: selectRect?.height || 0,
         providerControlRadius: selectStyle?.borderRadius || null,
-        saveButtonHeight: saveRect?.height || 0,
+        groupLabel,
+        groupHelp: root?.querySelector("#openbot-model-group-help")?.textContent?.trim() || "",
+        statusInHeader: Boolean(root?.querySelector(".ob-group-head > #openbot-status[role='status']")),
+        saveButton: Boolean(root?.querySelector("#openbot-save")),
       };
     })()`);
     console.log("GLOBAL_PROVIDER_SETTINGS", JSON.stringify(globalProviderState));
-    if (!globalProviderState.visible || globalProviderState.scope !== "global" || globalProviderState.providers.join("|") !== "xAI|OpenAI Codex|OpenCode Go" || !globalProviderState.authAction || !globalProviderState.legacyCursorHidden || globalProviderState.cursorComposerCopy || !globalProviderState.replacedNativeSurface || !globalProviderState.flatRoot || !globalProviderState.nestedCardRemoved || !globalProviderState.providerRowAligned || Math.abs(globalProviderState.providerControlHeight - 30) > 1 || globalProviderState.providerControlRadius !== "6px" || Math.abs(globalProviderState.saveButtonHeight - 30) > 1) {
+    if (!globalProviderState.visible || globalProviderState.scope !== "global" || globalProviderState.providers.join("|") !== "xAI|OpenAI Codex|OpenCode Go" || !globalProviderState.authAction || !globalProviderState.legacyCursorHidden || globalProviderState.cursorComposerCopy || !globalProviderState.replacedNativeSurface || !globalProviderState.flatRoot || !globalProviderState.nestedCardRemoved || !globalProviderState.providerRowAligned || Math.abs(globalProviderState.providerControlHeight - 28) > 1 || globalProviderState.providerControlRadius !== "8px" || !/^Provedor e modelo (?:do bot|padrão)$/.test(globalProviderState.groupLabel) || !globalProviderState.groupHelp || !globalProviderState.statusInHeader || globalProviderState.saveButton) {
       throw new Error(`OpenBot global provider settings regression: ${JSON.stringify(globalProviderState)}`);
     }
     await shot("visual-global-settings");
@@ -1800,13 +1808,13 @@ async function main() {
       if (!panel) return { panel: null };
       const rect = panel.getBoundingClientRect();
       const advanced = panel.querySelector("#openbot-advanced");
-        const provider = panel.querySelector("#openbot-provider");
-        const save = panel.querySelector("#openbot-save");
+        const provider = panel.querySelector("#openbot-provider-trigger");
+        const advancedCard = panel.querySelector("#openbot-advanced .ob-card");
         const host = panel.closest(".sand-agent-settings");
         const botInput = host?.querySelector("input:not([type='checkbox'])");
         const botDescription = host?.querySelector("textarea");
         const title = host?.closest(".sand-info-pane__nav-root")?.querySelector(".sand-info-pane__subpage-title");
-        return { panel: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, visible: rect.width > 0 && rect.height > 0 }, hasDocuments: /Abrir Documents/.test(panel.textContent || ""), hasProjects: /Abrir Projects/.test(panel.textContent || ""), hasAdvanced: Boolean(advanced), advancedOpen: Boolean(advanced?.open), providerHeight: provider?.getBoundingClientRect().height || 0, saveHeight: save?.getBoundingClientRect().height || 0, advancedRadius: advanced ? getComputedStyle(advanced).borderRadius : null, botInputHeight: botInput?.getBoundingClientRect().height || 0, botInputRadius: botInput ? getComputedStyle(botInput).borderRadius : null, botDescriptionPlaceholder: botDescription?.getAttribute("placeholder") || "", titleText: title?.textContent?.trim() || "", titleTruncated: title ? title.scrollWidth > title.clientWidth : null };
+        return { panel: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, visible: rect.width > 0 && rect.height > 0 }, hasDocuments: /Abrir Documentos/.test(panel.textContent || ""), hasProjects: /Abrir Projetos/.test(panel.textContent || ""), hasAdvanced: Boolean(advanced), advancedOpen: Boolean(advanced?.open), providerHeight: provider?.getBoundingClientRect().height || 0, groups: [...panel.querySelectorAll(":scope > .ob-group")].map((group) => group.dataset.group).join(","), memorySlot: Boolean(panel.querySelector('#openbot-memory-slot[data-openbot-memory-slot="1"]')), saveButton: Boolean(panel.querySelector("#openbot-save")), advancedRadius: advancedCard ? getComputedStyle(advancedCard).borderRadius : null, botInputHeight: botInput?.getBoundingClientRect().height || 0, botInputRadius: botInput ? getComputedStyle(botInput).borderRadius : null, botDescriptionPlaceholder: botDescription?.getAttribute("placeholder") || "", titleText: title?.textContent?.trim() || "", titleTruncated: title ? title.scrollWidth > title.clientWidth : null };
     })()`);
     console.log("INITIAL_SETTINGS", JSON.stringify(initialSettingsState, null, 2));
     await shot("visual-settings-native-open");
@@ -1849,19 +1857,18 @@ async function main() {
         if (!panel) return { panel: null };
         const rect = panel.getBoundingClientRect();
         const advanced = panel.querySelector("#openbot-advanced");
-        const provider = panel.querySelector("#openbot-provider");
-        const save = panel.querySelector("#openbot-save");
-        return { panel: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, visible: rect.width > 0 && rect.height > 0 }, hasDocuments: /Abrir Documents/.test(panel.textContent || ""), hasProjects: /Abrir Projects/.test(panel.textContent || ""), overflow: panel.scrollWidth > panel.clientWidth, hasAdvanced: Boolean(advanced), advancedOpen: Boolean(advanced?.open), providerHeight: provider?.getBoundingClientRect().height || 0, saveHeight: save?.getBoundingClientRect().height || 0, advancedRadius: advanced ? getComputedStyle(advanced).borderRadius : null };
+        const provider = panel.querySelector("#openbot-provider-trigger");
+        const advancedCard = panel.querySelector("#openbot-advanced .ob-card");
+        return { panel: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, visible: rect.width > 0 && rect.height > 0 }, hasDocuments: /Abrir Documentos/.test(panel.textContent || ""), hasProjects: /Abrir Projetos/.test(panel.textContent || ""), overflow: panel.scrollWidth > panel.clientWidth, hasAdvanced: Boolean(advanced), advancedOpen: Boolean(advanced?.open), providerHeight: provider?.getBoundingClientRect().height || 0, groups: [...panel.querySelectorAll(":scope > .ob-group")].map((group) => group.dataset.group).join(","), memorySlot: Boolean(panel.querySelector('#openbot-memory-slot[data-openbot-memory-slot="1"]')), saveButton: Boolean(panel.querySelector("#openbot-save")), advancedRadius: advancedCard ? getComputedStyle(advancedCard).borderRadius : null };
       })()`);
       console.log("FIXTURE_SETTINGS", JSON.stringify(verifiedSettingsState, null, 2));
     }
-    if (!verifiedSettingsState.panel?.visible || verifiedSettingsState.overflow || !verifiedSettingsState.hasDocuments || !verifiedSettingsState.hasProjects || !verifiedSettingsState.hasAdvanced || verifiedSettingsState.advancedOpen || Math.abs(verifiedSettingsState.providerHeight - 30) > 1 || Math.abs(verifiedSettingsState.saveHeight - 30) > 1 || verifiedSettingsState.advancedRadius !== "6px" || (verifiedSettingsState.botInputHeight && (verifiedSettingsState.botInputHeight < 30 || verifiedSettingsState.botInputHeight > 36)) || (verifiedSettingsState.botInputRadius && verifiedSettingsState.botInputRadius !== "6px") || (verifiedSettingsState.botDescriptionPlaceholder && verifiedSettingsState.botDescriptionPlaceholder !== "Descreva a função deste bot") || verifiedSettingsState.titleTruncated === true) {
+    if (!verifiedSettingsState.panel?.visible || verifiedSettingsState.overflow || !verifiedSettingsState.hasDocuments || !verifiedSettingsState.hasProjects || !verifiedSettingsState.hasAdvanced || verifiedSettingsState.advancedOpen || Math.abs(verifiedSettingsState.providerHeight - 30) > 1 || verifiedSettingsState.groups !== "model,memory,advanced" || !verifiedSettingsState.memorySlot || verifiedSettingsState.saveButton || verifiedSettingsState.advancedRadius !== "6px" || (verifiedSettingsState.botInputHeight && (verifiedSettingsState.botInputHeight < 30 || verifiedSettingsState.botInputHeight > 36)) || (verifiedSettingsState.botInputRadius && verifiedSettingsState.botInputRadius !== "6px") || (verifiedSettingsState.botDescriptionPlaceholder && verifiedSettingsState.botDescriptionPlaceholder !== "Descreva a função deste bot") || verifiedSettingsState.titleTruncated === true) {
       throw new Error(`OpenBot settings panel failed visual verification: ${JSON.stringify(verifiedSettingsState)}`);
     }
     const neutralPrimary = await evalExpr(`(() => {
-      const button = document.getElementById("openbot-save");
+      const button = document.getElementById("openbot-auth-action");
       if (!button) return null;
-      button.disabled = false;
       const style = getComputedStyle(button);
       return { background: style.backgroundColor, color: style.color };
     })()`);
@@ -1886,7 +1893,7 @@ async function main() {
     }
     await shot("visual-settings-expanded");
     const focusSeeded = await evalExpr(`(() => {
-      const provider = document.getElementById("openbot-provider");
+      const provider = document.getElementById("openbot-provider-trigger");
       provider?.focus();
       return document.activeElement === provider;
     })()`);
@@ -1991,7 +1998,10 @@ async function main() {
     if (settingsOnly) {
       await evalExpr(`(() => {
         const agent = { ...window.desktop.agent };
-        const state = { agentId: "bot-settings-persist", provider: "xai", model: "grok-4.6", reasoningEffort: "medium", saves: [] };
+        // The overlay refuses a config that belongs to another bot than the selected one, so the
+        // stub answers for the bot that is actually selected in the sidebar.
+        const selectedAgentId = document.querySelector('.sand-agent-item[data-agent-id][aria-current="page"]')?.getAttribute("data-agent-id") || "bot-settings-persist";
+        const state = { agentId: selectedAgentId, provider: "xai", model: "grok-4.6", reasoningEffort: "medium", saves: [] };
         window.__openbotVisualProviderPersistence = { state };
         agent.getProviderConfig = async () => ({ agentId: state.agentId, provider: state.provider, model: state.model, reasoningEffort: state.reasoningEffort });
         agent.setProviderConfig = async (patch) => {
@@ -2028,18 +2038,23 @@ async function main() {
       const providerSaved = await evalExpr(`(async () => {
         const provider = document.getElementById("openbot-provider");
         const model = document.getElementById("openbot-model");
-        const save = document.getElementById("openbot-save");
-        if (!provider || !model || !save) return { mounted: false };
+        if (!provider || !model || document.getElementById("openbot-save")) return { mounted: false };
         provider.value = "openai";
         provider.dispatchEvent(new Event("change", { bubbles: true }));
         await new Promise((resolve) => setTimeout(resolve, 40));
         model.value = "gpt-5.6-terra";
+        model.dispatchEvent(new Event("change", { bubbles: true }));
         const reasoning = document.getElementById("openbot-reasoning");
         reasoning.value = "high";
-        save.click();
-        await new Promise((resolve) => setTimeout(resolve, 80));
+        reasoning.dispatchEvent(new Event("change", { bubbles: true }));
+        const deadline = performance.now() + 4000;
+        while (performance.now() < deadline && !(window.__openbotVisualProviderPersistence.state.saves.length && document.getElementById("openbot-provider-settings")?.dataset.saveState === "saved")) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
         return {
           mounted: true,
+          saves: window.__openbotVisualProviderPersistence.state.saves.length,
+          saveState: document.getElementById("openbot-provider-settings")?.dataset.saveState || null,
           saved: window.__openbotVisualProviderPersistence.state.saves.at(-1),
           whatsappAbsent: !document.getElementById("openbot-whatsapp"),
           status: document.getElementById("openbot-status")?.textContent || "",
@@ -2051,7 +2066,8 @@ async function main() {
         window.__openbotLocalSettingsScan?.();
         return true;
       })()`);
-      await waitForEval("document.querySelector('#openbot-visual-settings-persistence #openbot-provider-settings')?.dataset.agentId === 'bot-settings-persist'");
+      await waitForEval("document.querySelector('#openbot-visual-settings-persistence #openbot-provider-settings')?.dataset.agentId === window.__openbotVisualProviderPersistence.state.agentId");
+      const persistedAgentId = await evalExpr("window.__openbotVisualProviderPersistence.state.agentId");
       const providerReopened = await evalExpr(`(() => {
         const root = document.getElementById("openbot-provider-settings");
         const header = document.querySelector("#openbot-visual-settings-persistence .sand-info-pane__top");
@@ -2067,8 +2083,7 @@ async function main() {
           model: root?.querySelector("#openbot-model")?.value || null,
           reasoningEffort: root?.querySelector("#openbot-reasoning")?.value || null,
           whatsappAbsent: !root?.querySelector("#openbot-whatsapp"),
-          advancedHelp: root?.querySelector(".ob-advanced-help")?.textContent?.trim() || null,
-          advancedSections: [...(root?.querySelectorAll(".ob-advanced-section .ob-section-title") || [])].map((element) => element.textContent?.trim() || ""),
+          advancedRows: [...(root?.querySelectorAll("#openbot-advanced .ob-row-label") || [])].map((element) => element.textContent?.trim() || ""),
           headerHeight: header?.getBoundingClientRect().height || 0,
           headerBorder: headerStyle?.borderBottomWidth || null,
           headerBackground: headerStyle?.backgroundColor || null,
@@ -2080,7 +2095,7 @@ async function main() {
         };
       })()`);
       console.log("PROVIDER_SETTINGS_PERSISTENCE", JSON.stringify({ saved: providerSaved, reopened: providerReopened }));
-      if (!providerSaved.mounted || !providerSaved.whatsappAbsent || providerSaved.saved?.agentId !== "bot-settings-persist" || providerSaved.saved?.provider !== "openai" || providerSaved.saved?.model !== "gpt-5.6-terra" || providerSaved.saved?.reasoningEffort !== "high" || !providerReopened.mounted || providerReopened.agentId !== "bot-settings-persist" || providerReopened.provider !== "openai" || providerReopened.model !== "gpt-5.6-terra" || providerReopened.reasoningEffort !== "high" || !providerReopened.whatsappAbsent || providerReopened.advancedHelp !== "Arquivos e runtime" || JSON.stringify(providerReopened.advancedSections) !== '["Arquivos","Runtime"]' || Math.abs(providerReopened.headerHeight - 54) > 1 || providerReopened.headerBorder !== "1px" || providerReopened.hostGap !== "12px" || providerReopened.hostPadding !== "12px" || providerReopened.cardRadius !== "6px" || providerReopened.cardBackground !== "rgba(0, 0, 0, 0)" || providerReopened.cardBorder !== "1px") {
+      if (!providerSaved.mounted || providerSaved.saves !== 1 || providerSaved.saveState !== "saved" || !providerSaved.whatsappAbsent || providerSaved.saved?.agentId !== persistedAgentId || providerSaved.saved?.provider !== "openai" || providerSaved.saved?.model !== "gpt-5.6-terra" || providerSaved.saved?.reasoningEffort !== "high" || !providerReopened.mounted || providerReopened.agentId !== persistedAgentId || providerReopened.provider !== "openai" || providerReopened.model !== "gpt-5.6-terra" || providerReopened.reasoningEffort !== "high" || !providerReopened.whatsappAbsent || JSON.stringify(providerReopened.advancedRows) !== '["Arquivos do bot","Espaço de trabalho","Ambiente de execução"]' || Math.abs(providerReopened.headerHeight - 54) > 1 || providerReopened.headerBorder !== "1px" || providerReopened.hostGap !== "12px" || providerReopened.hostPadding !== "12px" || providerReopened.cardRadius !== "6px" || providerReopened.cardBackground !== "rgba(0, 0, 0, 0)" || providerReopened.cardBorder !== "1px") {
         throw new Error(`provider/model persistence or settings chrome failed: ${JSON.stringify({ providerSaved, providerReopened })}`);
       }
       await shot("visual-settings-persisted");
@@ -2520,6 +2535,15 @@ async function main() {
       await sleep(100);
     }
     console.log("WORKFLOW_MENU", JSON.stringify(workflowMenu));
+    const workflowCopy = await evalExpr(`(() => {
+      const menu = document.querySelector(".sand-workflow-listbox");
+      const visible = [...(menu?.querySelectorAll("[role='option']") || [])].filter((option) => option.getClientRects().length > 0).map((option) => option.innerText.replace(/\\s+/g, " ").trim());
+      return { visible, label: menu?.querySelector("[role='listbox']")?.getAttribute("aria-label") || "" };
+    })()`);
+    console.log("WORKFLOW_MENU_COPY", JSON.stringify(workflowCopy));
+    if (!workflowCopy.visible.length || workflowCopy.visible.some((text) => /Settings|Theme:|Chat Settings|Plugins|Updates|\bAction\b|\bSkill$/.test(text)) || workflowCopy.label === "Reference a skill") {
+      throw new Error(`native workflow menu exposed English or unsupported actions: ${JSON.stringify(workflowCopy)}`);
+    }
     if (!workflowMenu?.hasSharedSkill || !workflowMenu.withinViewport || workflowMenu.motion !== "surface" || workflowMenu.duration !== "220" || workflowMenu.runs !== "1") {
       throw new Error(`native workflow menu failed visual verification: ${JSON.stringify(workflowMenu)}`);
     }
@@ -2969,14 +2993,14 @@ async function main() {
       };
     })()`);
     console.log("MEMORY_UI_DIALOG", JSON.stringify(memoryDialog, null, 2));
-    if (!memoryDialog?.exists || memoryDialog.role !== "dialog" || memoryDialog.modal !== "true" || memoryDialog.jobsSanitized !== true || !memoryDialog.topmost || Math.abs(memoryDialog.width - 860) > 1 || Math.abs(memoryDialog.height - 620) > 1 || memoryDialog.radius !== "14px" || Math.abs(memoryDialog.headHeight - 54) > 1 || memoryDialog.bodyPadding !== "24px" || Math.abs(memoryDialog.closeHeight - 30) > 1 || memoryDialog.closeRadius !== "6px") {
+    if (!memoryDialog?.exists || memoryDialog.role !== "dialog" || memoryDialog.modal !== "true" || memoryDialog.jobsSanitized !== true || !memoryDialog.topmost || Math.abs(memoryDialog.width - 720) > 1 || memoryDialog.height < 360 || memoryDialog.height > Math.round(768 * 0.8) + 1 || memoryDialog.radius !== "14px" || Math.abs(memoryDialog.headHeight - 64) > 1 || memoryDialog.bodyPadding !== "0px 24px 24px" || Math.abs(memoryDialog.closeHeight - 30) > 1 || memoryDialog.closeRadius !== "6px") {
       throw new Error(`memory dialog gate failed: ${JSON.stringify(memoryDialog)}`);
     }
     await shot("visual-memory-dialog");
     await send("Emulation.setDeviceMetricsOverride", { width: 820, height: 640, deviceScaleFactor: 1, mobile: false });
     await sleep(220);
     const compactMemoryDialog = await evalExpr(`(() => { const panel = document.querySelector('#openbot-memory-dialog [role="dialog"]'); const rect = panel?.getBoundingClientRect(); return rect ? { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom, width: rect.width, height: rect.height, fits: rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight, horizontalOverflow: panel.scrollWidth > panel.clientWidth } : null; })()`);
-    if (!compactMemoryDialog?.fits || compactMemoryDialog.horizontalOverflow || compactMemoryDialog.width < 780 || compactMemoryDialog.height < 600) throw new Error(`memory dialog failed compact layout: ${JSON.stringify(compactMemoryDialog)}`);
+    if (!compactMemoryDialog?.fits || compactMemoryDialog.horizontalOverflow || Math.abs(compactMemoryDialog.width - 720) > 1 || compactMemoryDialog.height < 360 || compactMemoryDialog.height > Math.round(640 * 0.8) + 1) throw new Error(`memory dialog failed compact layout: ${JSON.stringify(compactMemoryDialog)}`);
     await shot("visual-memory-dialog-compact");
     await send("Emulation.setDeviceMetricsOverride", { width: 1024, height: 768, deviceScaleFactor: 1, mobile: false });
     await sleep(220);
@@ -3186,7 +3210,7 @@ async function main() {
     const reducedMotion = await waitForMotion("#openbot-provider-settings");
     const reducedState = await evalExpr(`(() => {
       const fixture = document.getElementById("openbot-motion-reduced-fixture");
-      const button = fixture?.querySelector("#openbot-save");
+      const button = fixture?.querySelector("#openbot-auth-action");
       const activeOpenBotAnimations = [...document.querySelectorAll('[data-openbot-motion]')]
         .reduce((count, element) => count + element.getAnimations().length, 0);
       return {

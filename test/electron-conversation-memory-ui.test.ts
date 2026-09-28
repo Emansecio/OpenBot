@@ -32,6 +32,8 @@ function ipcHandler(source: string, channel: string): string {
   return source.slice(start, next < 0 ? source.length : next);
 }
 
+const settle = () => new Promise<void>((done) => setImmediate(done));
+
 function functionBody(source: string, name: string): string {
   const start = source.indexOf(`function ${name}(`);
   expect(start, `${name} must exist`).toBeGreaterThanOrEqual(0);
@@ -139,6 +141,20 @@ describe("Electron conversation/memory UI bridge", () => {
     expect(memoryUi).toContain("return scan();");
   });
 
+  it("keeps the mounted memory section while a native menu or modal hides the app", () => {
+    const start = memoryUi.indexOf("function ensureMemorySection(");
+    const ensure = memoryUi.slice(start, memoryUi.indexOf("\n  function ", start + 1));
+    expect(ensure.indexOf("if (existing?.isConnected && modalLayerOpen()) return existing;")).toBeGreaterThan(-1);
+    expect(ensure.indexOf("modalLayerOpen()")).toBeLessThan(ensure.indexOf("existing?.remove();"));
+    const layerOpen = (layers: Array<{ rects: number }>) => new Function("document", "MODAL_LAYER_SELECTOR", `${functionBody(memoryUi, "modalLayerOpen")}; return modalLayerOpen;`)(
+      { querySelectorAll: (selector: string) => (selector.includes('[role="menu"]') ? layers.map(({ rects }) => ({ getClientRects: () => ({ length: rects }) })) : []) },
+      '.ui-menu__backdrop,[role="menu"],[role="dialog"][aria-modal="true"],[role="alertdialog"]',
+    )();
+    expect(layerOpen([{ rects: 1 }])).toBe(true);
+    expect(layerOpen([{ rects: 0 }])).toBe(false);
+    expect(layerOpen([])).toBe(false);
+  });
+
   it("loads the memory manager through bounded server pages", () => {
     expect(memoryUi).toContain("api.listMemoriesPage");
     expect(memoryUi).toContain('data-action="set-scope"');
@@ -201,6 +217,109 @@ describe("Electron conversation/memory UI bridge", () => {
     reject(new Error("late error"));
     await pending;
     expect(sectionState).toEqual({ agentId: "beta", loading: true, error: "" });
+  });
+
+  it("mounts into the settings memory slot synchronously and keeps the standalone fallback", () => {
+    expect(memoryUi).toContain('const MEMORY_SLOT_ID = "openbot-memory-slot"');
+    expect(memoryUi).toContain('window.addEventListener("openbot:settings-mounted", () => mountMemorySectionNow())');
+    const resolve = functionBody(memoryUi, "resolveMemoryMount");
+    expect(resolve).toContain("findVisibleProviderSettingsRoot()");
+    expect(resolve).toContain("providerRoot.querySelector(`#${MEMORY_SLOT_ID}`)");
+    expect(resolve).toContain("{ parent: slot, slotted: true }");
+    expect(resolve).toContain("{ parent: providerRoot, slotted: false }");
+    expect(resolve).toContain("findExpandedNativeSettingsRoot()");
+    const mountNow = functionBody(memoryUi, "mountMemorySectionNow");
+    expect(mountNow).toContain("ensureMemorySection(mount, { fetch: false })");
+    expect(mountNow).not.toContain("scheduleScan(80)");
+    expect(functionBody(memoryUi, "startObserver")).toContain("if (memorySlotNeedsMount()) mountMemorySectionNow();");
+    expect(functionBody(memoryUi, "mutationNeedsMemoryScan")).toContain("#${MEMORY_SLOT_ID}");
+    const markup = functionBody(memoryUi, "memorySectionMarkup");
+    expect(markup).toContain('variant === "standalone" ? `<h3 class="ob-mem-heading"');
+    expect(markup).toContain('name="openbot-memory-mode"');
+    expect(markup).toContain('data-action="open-memory-manager">Gerenciar<span class="ob-sr-only"> memória</span>');
+    expect(markup).toContain('data-action="retry-memory-section"');
+    // Loads once per mounted element; re-renders update the DOM in place without refetching.
+    const ensure = memoryUi.slice(memoryUi.indexOf("function ensureMemorySection("), memoryUi.indexOf("function mountMemorySectionNow("));
+    expect(ensure).toContain("!fetchedSections.has(root)");
+    expect(ensure).toContain("fetchedSections.add(root)");
+    expect(functionBody(memoryUi, "renderMemorySection")).not.toContain("innerHTML");
+    expect(functionBody(memoryUi, "renderMemorySection")).not.toContain("loadMemorySection");
+  });
+
+  it("never shows raw IPC or technical errors and keeps human pt-BR messages", () => {
+    const sanitize = runInNewContext(`${functionBody(memoryUi, "sanitizeError")} sanitizeError`, {
+      Error,
+      STALE_ACTIVE_AGENT_MESSAGE: "Bot ativo mudou; abra novamente.",
+      TECHNICAL_ERROR_PATTERN: runInNewContext(memoryUi.match(/const TECHNICAL_ERROR_PATTERN = (\/.*\/i);/)![1]!),
+      PT_BR_HINT_PATTERN: runInNewContext(memoryUi.match(/const PT_BR_HINT_PATTERN = (\/.*\/i);/)![1]!),
+    });
+    const fallback = "Não foi possível carregar a memória.";
+    expect(sanitize(new Error("Error invoking remote method 'sand:memory-status-get': Error: connect ECONNREFUSED 127.0.0.1:9"), fallback)).toBe(fallback);
+    expect(sanitize(new Error("Error invoking remote method 'sand:memory-settings-get': TypeError: Cannot read properties of undefined"), fallback)).toBe(fallback);
+    expect(sanitize(new Error("Error invoking remote method 'sand:memory-list-page': Error: Memória não encontrada"), fallback)).toBe("Memória não encontrada");
+    expect(sanitize(new Error("Error invoking remote method 'sand:memory-settings-set': Error: OpenBot active agent changed; stale request."), fallback)).toBe("Bot ativo mudou; abra novamente.");
+    expect(sanitize(Object.assign(new Error("anything"), { code: "stale-active-agent" }), fallback)).toBe("Bot ativo mudou; abra novamente.");
+    expect(sanitize(new Error("Error invoking remote method 'sand:memory-status-get': Error: RPC timed out after 3000ms"), fallback)).toBe("A memória demorou para responder. Tente novamente.");
+    expect(sanitize("", fallback)).toBe(fallback);
+    expect(sanitize({ message: "Error invoking remote method" }, fallback)).toBe(fallback);
+  });
+
+  it("summarizes memory status in one human line", () => {
+    const helpers = runInNewContext(`${functionBody(memoryUi, "memoryCountLabel")}\n${functionBody(memoryUi, "memoryJobsLabel")}\n${functionBody(memoryUi, "summarizeMemoryStatus")}\n({ memoryCountLabel, memoryJobsLabel, summarizeMemoryStatus })`);
+    const status = (active: number, jobs: Record<string, unknown> = {}) => ({ counts: { active }, jobs: { pending: 0, running: 0, retry: 0, dead: [], ...jobs } });
+    expect(helpers.memoryCountLabel(status(0))).toBe("Sem memórias salvas");
+    expect(helpers.memoryCountLabel(status(1))).toBe("1 memória salva");
+    expect(helpers.memoryCountLabel(status(3))).toBe("3 memórias salvas");
+    expect(helpers.memoryJobsLabel(status(3))).toBe("");
+    expect(helpers.memoryJobsLabel(status(3, { pending: 1, running: 1, dead: [{ lastErrorText: "segredo interno" }] }))).toBe("2 em processamento · 1 com falha");
+    expect(helpers.summarizeMemoryStatus(status(3, { retry: 1 }), "agent")).toBe("3 memórias salvas · 1 em processamento");
+    expect(helpers.summarizeMemoryStatus(status(0), "agent")).toBe("");
+    expect(helpers.summarizeMemoryStatus(status(2, { dead: [{}] }), "user")).toBe("1 com falha");
+    for (const value of [status(0), status(2, { pending: 1, dead: [{ lastErrorText: "segredo interno do job" }] })]) {
+      const text = `${helpers.memoryCountLabel(value)} ${helpers.memoryJobsLabel(value)} ${helpers.summarizeMemoryStatus(value)}`;
+      expect(text).not.toMatch(/memórias ativas|Sem processamentos pendentes|segredo interno/);
+    }
+  });
+
+  it("saves memory modes optimistically, coalesces rapid changes and reverts on failure", async () => {
+    const pending: Array<{ mode: string; resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+    const renders: string[] = [];
+    const state: Record<string, unknown> = { agentId: "alpha", loading: false, savingMode: false, mode: "off", confirmedMode: "off", modeRevision: 0, queuedMode: null, retryMode: null, status: { counts: { active: 0 } }, error: "" };
+    const section = { isConnected: true };
+    const context = {
+      memorySectionState: state,
+      MEMORY_SECTION_ID: "memory",
+      MEMORY_MODE_VALUES: ["automatic", "explicit", "off"],
+      HTMLInputElement: class {},
+      document: { getElementById: () => section },
+      createAgentBinding: () => ({ expectedAgentId: "alpha" }),
+      isBindingCurrent: () => true,
+      ensureCurrentAgentBinding: async () => "alpha",
+      desktopAgent: () => ({ setMemorySettings: ({ mode }: { mode: string }) => new Promise((resolve, reject) => pending.push({ mode, resolve, reject })) }),
+      renderMemorySection: () => renders.push(String(state.mode)),
+      sanitizeError: (_error: unknown, fallback: string) => fallback,
+    };
+    const api = runInNewContext(`${functionBody(memoryUi, "normalizeMemoryMode")}\nasync ${functionBody(memoryUi, "saveMemoryMode")}\n${functionBody(memoryUi, "handleMemoryModeChange")}\n({ handleMemoryModeChange })`, context);
+    const change = (value: string) => {
+      const target = Object.assign(new context.HTMLInputElement(), { name: "openbot-memory-mode", value });
+      api.handleMemoryModeChange({ target });
+    };
+    change("explicit");
+    await settle();
+    expect(state).toMatchObject({ mode: "explicit", savingMode: true });
+    change("automatic");
+    change("explicit");
+    change("automatic");
+    expect(pending).toHaveLength(1);
+    expect(state).toMatchObject({ mode: "automatic", queuedMode: "automatic" });
+    pending[0]!.resolve({ mode: "explicit" });
+    await settle();
+    expect(pending.map((call) => call.mode)).toEqual(["explicit", "automatic"]);
+    expect(state).toMatchObject({ confirmedMode: "explicit", mode: "automatic", savingMode: true, queuedMode: null });
+    pending[1]!.reject(new Error("Error invoking remote method 'sand:memory-settings-set': Error: boom"));
+    await settle();
+    expect(state).toMatchObject({ mode: "explicit", confirmedMode: "explicit", savingMode: false, retryMode: "automatic", error: "Não foi possível salvar o modo de memória." });
+    expect(renders.at(-1)).toBe("explicit");
   });
 
   it("pins focus recovery and accessible memory UI announcements", () => {

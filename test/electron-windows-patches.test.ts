@@ -119,6 +119,11 @@ describe("Electron/Windows local integration patches", () => {
     expect(oauthPoll).toContain("Math.min(8000");
     expect(settings).toContain("getAvailableModelsCached");
     expect(settings).toContain("Date.now() + 30_000");
+    // Provider catalogs are read once per session; only the explicit refresh forces a new read.
+    const loadCatalog = between(settings, "const loadCatalog = async", 'catalogRefresh.addEventListener("click"');
+    expect(loadCatalog).toContain("if (cached?.catalog) {");
+    expect(loadCatalog).toContain("await updateCatalog();");
+    expect(settings).toContain('catalogRefresh.addEventListener("click", () => void updateCatalog(true));');
   });
 
   it("guards the real remote MCP marketplace path only in explicit local mode", () => {
@@ -190,7 +195,11 @@ describe("Electron/Windows local integration patches", () => {
     expect(settings).toContain("const provider = providerEl.value");
     expect(settings).toContain("oauth[provider]");
     expect(settings).toContain(".catch(() => undefined)");
-    expect(settings).toContain("saveEl.disabled = true");
+    // Autosave replaces the save button: only user-made, unblocked changes are written.
+    expect(settings).not.toContain('id="openbot-save"');
+    // ...and never while the selected provider's catalog (reasoning/Fast limits) is still loading.
+    expect(settings).toContain("if (userTouched && catalogPendingFor !== providerEl.value && selection() !== persisted && !blockedReason())");
+    expect(settings).toContain("const AUTOSAVE_DELAY_MS = 300;");
     expect(settings).toMatch(/loadState\([^;\n]*globalScope\)/);
     expect(settings).not.toContain("api.agent.getDefaultModel().catch");
     expect(settings).not.toContain("api.agent.getActiveProvider().catch");
@@ -301,7 +310,7 @@ describe("Electron/Windows local integration patches", () => {
     expect(settings).toContain("openWorkspace()");
     expect(settings).toContain("openUserDocuments()");
     expect(settings).not.toContain("openWorkspace(activeAgentId)");
-    expect(settings).toContain("Abrir Projects");
+    expect(settings).toContain("Abrir Projetos");
   });
 
   it("opens Documents in the active bot's canonical physical home", async () => {
@@ -354,7 +363,12 @@ describe("Electron/Windows local integration patches", () => {
     expect(preload).toContain('invoke("sand:runtime-repair", args ?? {})');
     expect(settings).toContain("getLocalRuntimeStatus");
     expect(settings).toContain("repairLocalRuntime");
-    expect(settings).toContain("Reparar runtime");
+    expect(settings).toContain('id="openbot-runtime-repair" class="ob-button">Reparar</button>');
+    // Runtime states are shown in pt-BR, never as raw identifiers.
+    expect(settings).toContain('stopped: "Parado"');
+    expect(settings).toContain('ready: "Em execução"');
+    expect(settings).toContain('RUNTIME_STATE_LABELS[state] || "Estado desconhecido"');
+    expect(settings).toContain('show(status, "Verificado")');
   });
 
   it("bridges the persisted local profile through guarded IPC", () => {

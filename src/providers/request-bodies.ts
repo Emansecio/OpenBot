@@ -89,7 +89,7 @@ export function buildCodexResponsesBody(req: ProviderChatRequest): Record<string
  * nunca divirjam.
  */
 export function usesResponsesApi(model: string): boolean {
-  return model === "gpt-6-astra" || model.startsWith("gpt-5.6-");
+  return model.startsWith("gpt-6-") || model.startsWith("gpt-5.6-");
 }
 
 export function providerRequestBody(

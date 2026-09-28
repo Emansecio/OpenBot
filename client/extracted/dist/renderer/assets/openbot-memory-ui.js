@@ -1,14 +1,32 @@
 (() => {
-  // openbot-memory-ui-v13-ordered-task-list
+  // openbot-memory-ui-v14-memory-redesign
   const STYLE_ID = "openbot-memory-ui-style";
   const MEMORY_SECTION_ID = "openbot-memory-settings";
+  const MEMORY_SLOT_ID = "openbot-memory-slot";
   const MEMORY_DIALOG_ID = "openbot-memory-dialog";
   const MOTION_EASING = "cubic-bezier(.22,1,.36,1)";
+  const DIALOG_ENTER_MS = 160;
+  const DIALOG_EXIT_MS = 140;
+  const LOADING_HINT_DELAY_MS = 150;
   const DIALOG_PAGE_SIZE = 20;
   const MEMORY_PAGE_LIMIT = 20;
   const STALE_ACTIVE_AGENT_MESSAGE = "Bot ativo mudou; abra novamente.";
+  const MISSING_AGENT_MESSAGE = "Não foi possível identificar o bot. Tente novamente.";
   const LOCAL_TIMERS = new Set();
   const ACTIVE_DIALOG_CLASS = "ob-dialog-open";
+  // Native menus and modal dialogs mark the rest of the app aria-hidden while open.
+  const MODAL_LAYER_SELECTOR = '.ui-menu__backdrop,[role="menu"],[role="dialog"][aria-modal="true"],[role="alertdialog"]';
+  const MEMORY_MODE_OPTIONS = Object.freeze([
+    Object.freeze({ value: "automatic", label: "Automática", copy: "Lembra automaticamente o que for útil." }),
+    Object.freeze({ value: "explicit", label: "Explícita", copy: "Só salva memória quando você pedir." }),
+    Object.freeze({ value: "off", label: "Desligada", copy: "Não salva memória entre conversas." }),
+  ]);
+  const MEMORY_MODE_VALUES = Object.freeze(MEMORY_MODE_OPTIONS.map((option) => option.value));
+  const MEMORY_MODE_NOTICE = Object.freeze({
+    automatic: "Memória automática neste bot",
+    explicit: "Memória explícita: só salva quando você pedir",
+    off: "Memória desligada para este bot",
+  });
 
   let localUiClosed = false;
   let observer = null;
@@ -17,6 +35,9 @@
   let scanPending = false;
   let dialogState = null;
   let restoreFocusTimer = 0;
+  let memoryLoadingHintTimer = 0;
+  let memoryLoadingSlow = false;
+  const fetchedSections = new WeakSet();
   let toolbarState = {
     agentId: null,
   };
@@ -27,119 +48,160 @@
     loaded: false,
     agentId: null,
     refreshedAtMs: 0,
+    pending: null,
   };
-  let memorySectionState = {
-    agentId: null,
-    loading: false,
-    savingMode: false,
-    mode: "automatic",
-    status: null,
-    error: "",
-  };
+  let memorySectionState = createMemorySectionState(null);
+
+  function createMemorySectionState(agentId) {
+    return {
+      agentId: typeof agentId === "string" && agentId ? agentId : null,
+      loading: false,
+      savingMode: false,
+      mode: "automatic",
+      confirmedMode: null,
+      modeRevision: 0,
+      queuedMode: null,
+      retryMode: null,
+      status: null,
+      error: "",
+    };
+  }
 
   const css = `
 #${STYLE_ID}-noop{display:none}
+.ob-sr-only{position:absolute!important;width:1px!important;height:1px!important;margin:-1px!important;padding:0!important;overflow:hidden!important;clip:rect(0 0 0 0)!important;white-space:nowrap!important;border:0!important}
 #${MEMORY_SECTION_ID} .ob-button,
-.ob-dialog .ob-button{min-height:30px;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 14%,transparent));border-radius:6px;padding:5px 9px;background:var(--cursor-button-secondary-background,var(--cursor-bg-tertiary,color-mix(in srgb,currentColor 8%,transparent)));color:var(--cursor-button-secondary-foreground,var(--cursor-text-primary,currentColor));font:inherit;font-size:var(--cursor-font-size-base,13px);line-height:1.35;cursor:pointer;touch-action:manipulation;transition:transform var(--cursor-duration-fast,.1s) var(--cursor-easing-default,ease),background-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease),border-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
+.ob-dialog .ob-button{display:inline-flex;align-items:center;justify-content:center;gap:6px;box-sizing:border-box;min-height:28px;height:auto;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 14%,transparent));border-radius:6px;padding:4px 10px;background:var(--cursor-button-secondary-background,var(--cursor-bg-tertiary,color-mix(in srgb,currentColor 8%,transparent)));color:var(--cursor-button-secondary-foreground,var(--cursor-text-primary,currentColor));font:inherit;font-size:var(--cursor-font-size-base,13px);font-weight:400;line-height:18px;white-space:nowrap;cursor:pointer;touch-action:manipulation;transition:transform var(--cursor-duration-fast,.1s) var(--cursor-easing-default,ease),background-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease),border-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
 #${MEMORY_SECTION_ID} .ob-button:hover,
 .ob-dialog .ob-button:hover{border-color:var(--cursor-stroke-primary,color-mix(in srgb,currentColor 22%,transparent));background:var(--cursor-button-secondary-hover-background,var(--cursor-bg-secondary,color-mix(in srgb,currentColor 12%,transparent)))}
 #${MEMORY_SECTION_ID} .ob-button:focus-visible,
 .ob-dialog .ob-button:focus-visible,
-#${MEMORY_SECTION_ID} input:focus-visible,
-#${MEMORY_SECTION_ID} textarea:focus-visible,
-#${MEMORY_SECTION_ID} select:focus-visible,
+#${MEMORY_SECTION_ID} .ob-mem-link:focus-visible,
+.ob-dialog .ob-link:focus-visible,
+.ob-dialog .ob-seg-option:focus-visible,
 .ob-dialog input:focus-visible,
 .ob-dialog textarea:focus-visible,
 .ob-dialog select:focus-visible,
 .ob-dialog summary:focus-visible{outline:2px solid var(--cursor-focus,var(--cursor-base,#f0f0f0));outline-offset:2px;border-color:var(--cursor-focus,var(--cursor-base,#f0f0f0))}
 #${MEMORY_SECTION_ID} .ob-button:active,
 .ob-dialog .ob-button:active{transform:scale(.96)}
-.ob-dialog .ob-button[aria-pressed="true"]{border-color:var(--cursor-stroke-primary,color-mix(in srgb,currentColor 22%,transparent));background:color-mix(in srgb,currentColor 14%,transparent);font-weight:600}
 #${MEMORY_SECTION_ID} .ob-button[disabled],
 .ob-dialog .ob-button[disabled]{opacity:.55;cursor:default;transform:none}
-.ob-dialog .ob-button:is([data-action="rename-save"],[data-action="save-memory"],[data-action="activate"]):not(:disabled){border-color:var(--cursor-text-primary,#f0f0f0);background:var(--cursor-text-primary,#f0f0f0);color:#171717;font-weight:600}
-.ob-dialog .ob-button:is([data-action="delete-request"],[data-action="forget-request"]){color:var(--cursor-danger,#e34671)}
-.ob-dialog .ob-button:is([data-action="delete-confirm"],[data-action="forget-confirm"]):not(:disabled){border-color:color-mix(in srgb,var(--cursor-danger,#e34671) 52%,transparent);background:color-mix(in srgb,var(--cursor-danger,#e34671) 18%,transparent);color:var(--cursor-danger,#f07a9a);font-weight:600}
-#${MEMORY_SECTION_ID}{margin-top:14px;padding-top:14px;border-top:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));color:var(--cursor-text-primary,currentColor);font:inherit}
-#${MEMORY_SECTION_ID} .ob-memory-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
-#${MEMORY_SECTION_ID} .ob-memory-title{margin:0;font-size:var(--cursor-font-size-base,13px);font-weight:var(--cursor-font-weight-semibold,600);line-height:1.35}
-#${MEMORY_SECTION_ID} .ob-memory-help{margin:2px 0 0;color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px);line-height:1.45;text-wrap:pretty}
-#${MEMORY_SECTION_ID} .ob-memory-modes{display:grid;gap:0;margin-top:8px;border-block:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 10%,transparent))}
-#${MEMORY_SECTION_ID} .ob-memory-mode{display:grid;grid-template-columns:16px minmax(0,1fr);align-items:center;gap:9px;min-height:44px;box-sizing:border-box;padding:6px 4px;border:0;border-top:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 8%,transparent));border-radius:0;background:transparent;cursor:pointer;transition:background-color var(--cursor-duration-fast,.1s) var(--cursor-easing-default,ease)}
-#${MEMORY_SECTION_ID} .ob-memory-mode:first-child{border-top:0}
-#${MEMORY_SECTION_ID} .ob-memory-mode:has(input:checked){background:color-mix(in srgb,currentColor 3%,transparent)}
-#${MEMORY_SECTION_ID} .ob-memory-mode:active{background:color-mix(in srgb,currentColor 6%,transparent)}
-#${MEMORY_SECTION_ID} .ob-memory-mode>span{min-width:0}
-#${MEMORY_SECTION_ID} .ob-memory-mode input[type="radio"]{appearance:none;flex:none;width:16px!important;height:16px!important;min-width:16px!important;min-height:16px!important;max-width:16px!important;max-height:16px!important;margin:0!important;padding:0!important;border:1px solid var(--cursor-stroke-primary,color-mix(in srgb,currentColor 32%,transparent));border-radius:50%!important;background:transparent;box-shadow:none!important;cursor:pointer}
-#${MEMORY_SECTION_ID} .ob-memory-mode input[type="radio"]:checked{border-color:var(--cursor-focus,var(--cursor-text-primary,currentColor));background:radial-gradient(circle,var(--cursor-focus,var(--cursor-text-primary,currentColor)) 0 3px,transparent 3.5px)}
-#${MEMORY_SECTION_ID} .ob-memory-mode input[type="radio"]:disabled{opacity:.55;cursor:default}
-#${MEMORY_SECTION_ID} .ob-memory-mode-label{font-size:var(--cursor-font-size-sm,12px);font-weight:var(--cursor-font-weight-semibold,600);line-height:1.25}
-#${MEMORY_SECTION_ID} .ob-memory-mode-copy{overflow:hidden;margin-top:1px;color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-xs,11px);line-height:1.3;text-overflow:ellipsis;white-space:nowrap}
-@media (hover:hover) and (pointer:fine){#${MEMORY_SECTION_ID} .ob-memory-mode:hover{background:color-mix(in srgb,currentColor 5%,transparent)}}
-#${MEMORY_SECTION_ID} .ob-memory-status{min-height:18px;margin-top:10px;color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px);line-height:1.4}
-#${MEMORY_SECTION_ID} .ob-memory-status.is-error,
-.ob-dialog .ob-error{color:var(--cursor-danger,#e34671)}
-#${MEMORY_SECTION_ID} .ob-memory-status.is-ok,
-.ob-dialog .ob-ok{color:var(--cursor-green,#45a557)}
-.ob-dialog-backdrop{position:fixed;inset:0;z-index:0;background:rgba(0,0,0,.58);pointer-events:auto}
+.ob-dialog .ob-list[aria-busy="true"] .ob-button[disabled]{opacity:1;cursor:progress}
+.ob-dialog .ob-button:is([data-action="rename-save"],[data-action="save-memory"],[data-action="activate"]):not(:disabled){border-color:var(--cursor-text-primary,#f0f0f0);background:var(--cursor-text-primary,#f0f0f0);color:#171717;font-weight:500}
+.ob-dialog .ob-button:is([data-action="delete-request"],[data-action="forget-request"]){color:var(--cursor-danger,#ff5667)}
+.ob-dialog .ob-button:is([data-action="delete-confirm"],[data-action="forget-confirm"]):not(:disabled){border-color:color-mix(in srgb,var(--cursor-danger,#ff5667) 52%,transparent);background:color-mix(in srgb,var(--cursor-danger,#ff5667) 18%,transparent);color:var(--cursor-danger,#ff5667);font-weight:500}
+#${MEMORY_SECTION_ID}{display:block;box-sizing:border-box;margin:0;padding:0;border:0;color:var(--cursor-text-primary,currentColor);font:inherit;font-size:var(--cursor-font-size-base,13px);line-height:18px;text-align:left}
+#${MEMORY_SECTION_ID}[data-variant="standalone"]{margin-top:14px}
+#${MEMORY_SECTION_ID} .ob-mem-heading{margin:0 0 8px;font-size:var(--cursor-font-size-base,13px);font-weight:var(--cursor-font-weight-semibold,600);line-height:18px}
+#${MEMORY_SECTION_ID}[data-variant="standalone"] .ob-mem-card{padding:0 10px;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 14%,transparent));border-radius:6px}
+#${MEMORY_SECTION_ID} .ob-mem-row{min-width:0;min-inline-size:0;box-sizing:border-box;margin:0;padding:8px 0;border:0}
+#${MEMORY_SECTION_ID} .ob-mem-row+.ob-mem-row{border-top:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 14%,transparent))}
+#${MEMORY_SECTION_ID} .ob-mem-seg{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:2px;box-sizing:border-box;height:30px;padding:2px;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 14%,transparent));border-radius:6px;background:var(--cursor-bg-editor,transparent)}
+#${MEMORY_SECTION_ID} .ob-mem-seg .ob-mem-option{position:relative;display:flex;align-items:center;justify-content:center;min-width:0;margin:0;padding:0;border-radius:4px;color:var(--cursor-text-primary,currentColor);font-size:var(--cursor-font-size-sm,12px);font-weight:400;line-height:16px;cursor:pointer;transition:background-color var(--cursor-duration-fast,.1s) var(--cursor-easing-default,ease),color var(--cursor-duration-fast,.1s) var(--cursor-easing-default,ease)}
+#${MEMORY_SECTION_ID} .ob-mem-seg .ob-mem-option>input{position:absolute;inset:0;width:100%;height:100%;min-width:0;min-height:0;margin:0;padding:0;border:0;border-radius:inherit;background:none;opacity:0;cursor:inherit;appearance:none}
+#${MEMORY_SECTION_ID} .ob-mem-seg .ob-mem-option>span{overflow:hidden;padding:0 4px;text-overflow:ellipsis;white-space:nowrap;pointer-events:none}
+#${MEMORY_SECTION_ID} .ob-mem-seg .ob-mem-option:has(>input:checked){background:var(--cursor-bg-primary,color-mix(in srgb,currentColor 18%,transparent));font-weight:var(--cursor-font-weight-medium,500)}
+#${MEMORY_SECTION_ID} .ob-mem-seg .ob-mem-option:has(>input:focus-visible){outline:2px solid var(--cursor-focus,var(--cursor-base,#f0f0f0));outline-offset:1px}
+#${MEMORY_SECTION_ID} .ob-mem-seg .ob-mem-option:has(>input:disabled){cursor:default}
+#${MEMORY_SECTION_ID}:is([data-state="loading-slow"],[data-state="error"]) .ob-mem-seg .ob-mem-option{color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 60%,transparent))}
+@media (hover:hover) and (pointer:fine){#${MEMORY_SECTION_ID} .ob-mem-seg .ob-mem-option:not(:has(>input:checked,>input:disabled)):hover{background:var(--cursor-bg-tertiary,color-mix(in srgb,currentColor 8%,transparent))}}
+#${MEMORY_SECTION_ID} .ob-mem-mode-copy{min-height:16px;margin:6px 0 0;overflow:hidden;color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px);line-height:16px;text-overflow:ellipsis;white-space:nowrap}
+#${MEMORY_SECTION_ID} .ob-mem-saved{display:flex;align-items:center;justify-content:space-between;gap:8px}
+#${MEMORY_SECTION_ID} .ob-mem-summary{display:flex;flex:1;flex-direction:column;justify-content:center;box-sizing:border-box;min-width:0;min-height:34px}
+#${MEMORY_SECTION_ID} .ob-mem-count{overflow:hidden;font-size:var(--cursor-font-size-base,13px);line-height:18px;text-overflow:ellipsis;white-space:nowrap}
+#${MEMORY_SECTION_ID}:is([data-state="loading"],[data-state="loading-slow"]) .ob-mem-count:empty::before{content:"";display:block;width:88px;max-width:100%;height:8px;margin:5px 0;border-radius:4px;background:var(--cursor-bg-tertiary,color-mix(in srgb,currentColor 8%,transparent))}
+#${MEMORY_SECTION_ID}[data-state="loading-slow"] .ob-mem-count{color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 60%,transparent))}
+#${MEMORY_SECTION_ID} .ob-mem-jobs{overflow:hidden;color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px);line-height:16px;text-overflow:ellipsis;white-space:nowrap}
+#${MEMORY_SECTION_ID} .ob-mem-jobs:empty{display:none}
+#${MEMORY_SECTION_ID} .ob-mem-saved .ob-button{flex:none;min-height:30px}
+#${MEMORY_SECTION_ID} .ob-mem-error{margin:0 0 8px;color:var(--cursor-danger,#ff5667);font-size:var(--cursor-font-size-sm,12px);line-height:16px;text-wrap:pretty}
+#${MEMORY_SECTION_ID} .ob-mem-error[hidden]{display:none}
+#${MEMORY_SECTION_ID} .ob-mem-error .ob-mem-link{display:inline;min-height:0;margin:0;padding:0;border:0;border-radius:2px;background:none;color:var(--cursor-text-primary,currentColor);font:inherit;text-decoration:underline;text-underline-offset:2px;cursor:pointer;transform:none}
+.ob-dialog-backdrop{position:fixed;inset:0;z-index:0;background:rgba(0,0,0,.5);pointer-events:auto}
 .ob-dialog{position:fixed;inset:0;z-index:2147483401;display:flex;justify-content:flex-end;pointer-events:none}
-.ob-dialog[data-kind="memory"]{justify-content:center;align-items:center;padding:16px}
-.ob-dialog .ob-panel{position:relative;z-index:1;pointer-events:auto;display:flex;flex-direction:column;width:min(520px,100vw);max-height:100vh;border-left:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));background:#202020;color:var(--cursor-text-primary,currentColor);box-shadow:-16px 0 40px rgba(0,0,0,.28)}
-.ob-dialog[data-kind="memory"] .ob-panel{box-sizing:border-box;width:min(860px,calc(100vw - 32px));height:min(620px,calc(100vh - 32px));max-height:min(620px,calc(100vh - 32px));border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));border-radius:14px;box-shadow:0 26px 70px rgba(0,0,0,.4)}
-.ob-dialog[data-kind="memory"] .ob-dialog-head{box-sizing:border-box;min-height:54px;padding:0 14px 0 24px}
-.ob-dialog[data-kind="memory"] .ob-dialog-body{padding:24px}
+.ob-dialog[data-kind="memory"]{box-sizing:border-box;justify-content:center;align-items:flex-start;padding:max(16px,10vh) 16px 16px}
+.ob-dialog .ob-panel{position:relative;z-index:1;pointer-events:auto;display:flex;flex-direction:column;width:min(520px,100vw);max-height:100vh;border-left:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));background:var(--cursor-bg-elevated,#181818);color:var(--cursor-text-primary,currentColor);box-shadow:-16px 0 40px rgba(0,0,0,.28)}
+.ob-dialog[data-kind="memory"] .ob-panel{box-sizing:border-box;width:min(720px,100%);height:auto;min-height:min(360px,100%);max-height:min(80vh,100%);overflow:hidden;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 14%,transparent));border-radius:14px;box-shadow:0 24px 64px rgba(0,0,0,.45)}
 .ob-dialog-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 20px 14px;border-bottom:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent))}
+.ob-dialog[data-kind="memory"] .ob-dialog-head{flex:none;box-sizing:border-box;align-items:flex-start;padding:20px 12px 0 24px;border-bottom:0}
 .ob-dialog-title{margin:0;font-size:var(--cursor-font-size-lg,15px);font-weight:var(--cursor-font-weight-semibold,600);line-height:1.35}
+.ob-dialog[data-kind="memory"] .ob-dialog-title{font-size:17px;font-weight:var(--cursor-font-weight-medium,500);line-height:24px}
 .ob-dialog-subtitle{margin:4px 0 0;color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px);line-height:1.45}
+.ob-dialog[data-kind="memory"] .ob-dialog-subtitle{margin:2px 0 0;color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-base,13px);line-height:18px;text-wrap:pretty}
 .ob-dialog-body{display:flex;flex:1;flex-direction:column;min-height:0;padding:18px 20px 20px;overflow:auto}
+.ob-dialog[data-kind="memory"] .ob-dialog-body{padding:0 24px 24px;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:var(--cursor-stroke-primary,rgba(252,252,252,.2)) transparent}
 .ob-dialog-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .ob-dialog .ob-field,
 .ob-dialog textarea,
-.ob-dialog select{width:100%;box-sizing:border-box;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));border-radius:6px;background:var(--cursor-bg-editor,var(--cursor-editor,transparent));color:var(--cursor-text-primary,currentColor);padding:6px 9px;font:inherit;line-height:1.45}
+.ob-dialog select{width:100%;box-sizing:border-box;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));border-radius:6px;background:var(--cursor-bg-editor,var(--cursor-editor,transparent));color:var(--cursor-text-primary,currentColor);padding:6px 9px;font:inherit;font-size:var(--cursor-font-size-base,13px);line-height:18px}
 .ob-dialog .ob-field::placeholder,
 .ob-dialog textarea::placeholder{color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 58%,transparent))}
 .ob-dialog textarea{min-height:96px;resize:vertical}
-.ob-dialog .ob-list{display:grid;gap:12px}
-.ob-dialog .ob-item{padding:13px;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));border-radius:9px;background:var(--cursor-bg-tertiary,color-mix(in srgb,currentColor 7%,transparent))}
+.ob-dialog .ob-mem-toolbar{position:sticky;top:0;z-index:1;display:flex;align-items:center;gap:12px;padding:16px 0 10px;background:var(--cursor-bg-elevated,#181818)}
+.ob-dialog .ob-mem-toolbar .ob-field{flex:1;min-width:0;height:32px;border-radius:8px;padding:0 10px}
+.ob-dialog .ob-seg{display:inline-flex;flex:none;gap:2px;box-sizing:border-box;height:32px;padding:2px;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 14%,transparent));border-radius:8px;background:var(--cursor-bg-editor,transparent)}
+.ob-dialog .ob-seg .ob-seg-option{min-height:0;height:26px;margin:0;padding:0 12px;border:0;border-radius:6px;background:transparent;color:var(--cursor-text-primary,currentColor);font:inherit;font-size:var(--cursor-font-size-base,13px);font-weight:400;line-height:18px;white-space:nowrap;cursor:pointer;transition:background-color var(--cursor-duration-fast,.1s) var(--cursor-easing-default,ease)}
+.ob-dialog .ob-seg .ob-seg-option[aria-pressed="true"]{background:var(--cursor-bg-primary,color-mix(in srgb,currentColor 18%,transparent));cursor:default}
+@media (hover:hover) and (pointer:fine){.ob-dialog .ob-seg .ob-seg-option[aria-pressed="false"]:hover{background:var(--cursor-bg-tertiary,color-mix(in srgb,currentColor 8%,transparent))}}
+.ob-dialog .ob-mem-meta{display:flex;align-items:center;justify-content:space-between;gap:4px 16px;flex-wrap:wrap;min-height:20px;margin:0 0 12px;color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px);line-height:16px}
+.ob-dialog .ob-mem-meta .ob-status{min-height:16px;margin:0;font-size:inherit;line-height:inherit}
+.ob-dialog .ob-mem-modeline{display:inline-flex;align-items:center;gap:6px;min-width:0}
+.ob-dialog .ob-mem-dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--cursor-text-secondary,currentColor)}
+.ob-dialog .ob-mem-modeline[data-mode="automatic"] .ob-mem-dot{background:var(--cursor-green,#00c972)}
+.ob-dialog .ob-mem-modeline[data-mode="off"]{color:var(--cursor-text-primary,currentColor)}
+.ob-dialog .ob-mem-modeline[data-mode="off"] .ob-mem-dot{background:transparent;box-shadow:inset 0 0 0 1px currentColor}
+.ob-dialog .ob-link{min-height:0;margin:0;padding:0;border:0;border-radius:2px;background:none;color:var(--cursor-text-primary,currentColor);font:inherit;text-decoration:underline;text-underline-offset:2px;cursor:pointer}
+.ob-dialog .ob-list{display:grid;gap:8px}
+.ob-dialog .ob-item{padding:12px 14px;border:1px solid var(--cursor-stroke-tertiary,color-mix(in srgb,currentColor 10%,transparent));border-radius:10px;background:var(--cursor-bg-tertiary,color-mix(in srgb,currentColor 7%,transparent))}
 .ob-dialog .ob-item-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
-.ob-dialog .ob-item-title{margin:0;font-size:var(--cursor-font-size-base,13px);font-weight:var(--cursor-font-weight-semibold,600);line-height:1.4}
-.ob-dialog .ob-item-meta{margin-top:4px;color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px);line-height:1.45}
-.ob-dialog .ob-item-copy{margin-top:10px;color:var(--cursor-text-primary,currentColor);font-size:var(--cursor-font-size-base,13px);line-height:1.5;white-space:pre-wrap;word-break:break-word}
-.ob-dialog .ob-item-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}
-.ob-dialog .ob-item-actions .ob-button{min-height:30px}
-.ob-dialog .ob-badge{display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:4px 9px;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));border-radius:999px;background:var(--cursor-bg-editor,var(--cursor-editor,transparent));color:var(--cursor-text-secondary,currentColor);font-size:var(--cursor-font-size-sm,12px);line-height:1.2}
+.ob-dialog .ob-item-title{display:flex;align-items:center;gap:8px;margin:0;font-size:var(--cursor-font-size-base,13px);font-weight:var(--cursor-font-weight-medium,500);line-height:18px}
+.ob-dialog .ob-item-meta{margin-top:2px;color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px);line-height:16px}
+.ob-dialog .ob-item-copy{margin-top:8px;color:var(--cursor-text-primary,currentColor);font-size:var(--cursor-font-size-base,13px);line-height:19px;white-space:pre-wrap;word-break:break-word}
+.ob-dialog .ob-item-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:10px}
+.ob-dialog .ob-badge{display:inline-flex;align-items:center;gap:6px;padding:1px 7px;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));border-radius:999px;background:transparent;color:var(--cursor-text-secondary,currentColor);font-size:11px;font-weight:400;line-height:16px}
 .ob-dialog .ob-badge.is-active{color:#111;background:var(--cursor-text-primary,#f0f0f0)}
-.ob-dialog .ob-badge.is-danger{color:var(--cursor-danger,#e34671)}
+.ob-dialog .ob-badge.is-danger{color:var(--cursor-danger,#ff5667)}
 .ob-dialog .ob-split{display:grid;gap:12px;grid-template-columns:repeat(2,minmax(0,1fr))}
-.ob-dialog .ob-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.ob-dialog .ob-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .ob-dialog .ob-space{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.ob-dialog .ob-empty,.ob-dialog .ob-loading{padding:24px;border:1px dashed var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 16%,transparent));border-radius:9px;color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 60%,transparent));text-align:center;line-height:1.5}
-.ob-dialog .ob-inline-confirm{margin-top:12px;padding:10px 12px;border:1px solid color-mix(in srgb,var(--cursor-danger,#e34671) 30%,transparent);border-radius:var(--cursor-radius-base,8px);background:color-mix(in srgb,var(--cursor-danger,#e34671) 7%,transparent)}
+.ob-dialog .ob-empty,.ob-dialog .ob-loading{display:flex;flex:1;flex-direction:column;align-items:center;justify-content:center;gap:4px;min-height:168px;box-sizing:border-box;padding:24px;color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-base,13px);line-height:18px;text-align:center;text-wrap:pretty}
+.ob-dialog .ob-empty-title{color:var(--cursor-text-primary,currentColor);font-weight:var(--cursor-font-weight-medium,500)}
+.ob-dialog .ob-empty-copy{max-width:44ch;margin:0}
+.ob-dialog .ob-empty .ob-button{margin-top:10px}
+.ob-dialog .ob-inline-confirm{margin-top:12px;padding:10px 12px;border:1px solid color-mix(in srgb,var(--cursor-danger,#ff5667) 30%,transparent);border-radius:var(--cursor-radius-base,8px);background:color-mix(in srgb,var(--cursor-danger,#ff5667) 7%,transparent)}
 .ob-dialog .ob-inline-confirm-copy{margin:0 0 10px;font-size:var(--cursor-font-size-sm,12px);line-height:1.45}
 .ob-dialog .ob-inline-confirm .ob-row{justify-content:flex-end}
 .ob-dialog details{border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));border-radius:var(--cursor-radius-lg,10px);background:var(--cursor-bg-tertiary,color-mix(in srgb,currentColor 6%,transparent))}
 .ob-dialog summary{display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer;list-style:none;padding:14px 16px}
 .ob-dialog summary::-webkit-details-marker{display:none}
 .ob-dialog .ob-archive-body{padding:0 14px 14px}
-.ob-dialog .ob-pagination{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:16px}
-.ob-dialog .ob-status{min-height:18px;margin-top:10px;color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px);line-height:1.4}
-.ob-dialog .ob-close{width:30px;min-width:30px;min-height:30px;border:0;border-radius:6px;padding:0;background:transparent;font-size:20px;line-height:1}
+.ob-dialog .ob-pagination{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:12px}
+.ob-dialog .ob-status{min-height:18px;margin-top:10px;color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px);line-height:1.4}
+.ob-dialog .ob-error{color:var(--cursor-danger,#ff5667)}
+.ob-dialog .ob-ok{color:var(--cursor-green,#00c972)}
+.ob-dialog .ob-close{flex:none;width:30px;min-width:30px;min-height:30px;border:0;border-radius:6px;padding:0;background:transparent;font-size:20px;line-height:1}
+.ob-dialog[data-kind="memory"] .ob-close{margin-top:-8px}
 body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
-.ob-dialog.is-closing{opacity:0;transition:opacity 140ms ease;pointer-events:none}
+.ob-dialog.is-closing{opacity:0;transition:opacity ${DIALOG_EXIT_MS}ms ease;pointer-events:none}
 @media (max-width:520px){
-  #${MEMORY_SECTION_ID} .ob-memory-head,
   .ob-dialog .ob-space,
   .ob-dialog .ob-item-head{align-items:stretch}
   .ob-dialog .ob-split{grid-template-columns:1fr}
   .ob-dialog{justify-content:stretch}
   .ob-dialog .ob-panel{width:100vw;max-height:100vh}
-  .ob-dialog[data-kind="memory"]{padding:0}
-  .ob-dialog[data-kind="memory"] .ob-panel{width:100vw;max-height:100vh;border-radius:0}
+  .ob-dialog[data-kind="memory"]{align-items:stretch;padding:0}
+  .ob-dialog[data-kind="memory"] .ob-panel{width:100vw;min-height:100vh;max-height:100vh;border-radius:0}
+  .ob-dialog .ob-mem-toolbar{flex-wrap:wrap}
+  .ob-dialog .ob-mem-toolbar .ob-field{flex-basis:100%}
 }
 @media (prefers-reduced-motion:reduce){
   #${MEMORY_SECTION_ID} .ob-button,
+  #${MEMORY_SECTION_ID} .ob-mem-seg .ob-mem-option,
   .ob-dialog .ob-button,
-  .ob-dialog .ob-panel{transition:none}
+  .ob-dialog .ob-seg .ob-seg-option,
+  .ob-dialog .ob-panel,
+  .ob-dialog.is-closing{transition:none}
 }
 `;
 
@@ -180,8 +242,18 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     return (node?.textContent || "").replace(/\s+/g, " ").trim();
   }
 
+  function setText(node, value) {
+    if (!(node instanceof Element)) return;
+    const next = String(value || "");
+    if (node.textContent !== next) node.textContent = next;
+  }
+
   function motionReduced() {
     return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+  }
+
+  function modalLayerOpen() {
+    return [...document.querySelectorAll(MODAL_LAYER_SELECTOR)].some((layer) => layer.getClientRects().length > 0);
   }
 
   function isVisibleElement(element) {
@@ -191,20 +263,20 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     return style.display !== "none" && style.visibility !== "hidden" && element.getClientRects().length > 0;
   }
 
-  function animatePanel(element) {
-    if (!(element instanceof Element) || motionReduced() || typeof element.animate !== "function" || !isVisibleElement(element)) return;
-    element.dataset.openbotMotionSurface = "panel";
-    element.animate(
+  function animateDialogEntrance(root, panel) {
+    if (!(panel instanceof Element) || motionReduced() || typeof panel.animate !== "function" || !isVisibleElement(panel)) return;
+    panel.dataset.openbotMotionSurface = "panel";
+    panel.animate(
       [
         { opacity: 0, transform: "translate3d(0,6px,0) scale(.985)" },
         { opacity: 1, transform: "translate3d(0,0,0) scale(1)" },
       ],
-      {
-        duration: 220,
-        easing: MOTION_EASING,
-        fill: "none",
-      },
+      { duration: DIALOG_ENTER_MS, easing: MOTION_EASING, fill: "none" },
     );
+    const backdrop = root.querySelector(".ob-dialog-backdrop");
+    if (backdrop instanceof Element && typeof backdrop.animate === "function") {
+      backdrop.animate([{ opacity: 0 }, { opacity: 1 }], { duration: DIALOG_ENTER_MS, easing: "ease-out", fill: "none" });
+    }
   }
 
   function escapeHtml(value) {
@@ -287,11 +359,24 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     return `<div id="${id}" class="ob-error" role="alert" aria-atomic="true">${escapeHtml(message)}</div>`;
   }
 
+  // Only human, pt-BR messages reach the UI: IPC wrappers ("Error invoking remote
+  // method …"), error-class prefixes and technical/English diagnostics fall back to
+  // the caller's friendly copy.
+  const TECHNICAL_ERROR_PATTERN = /\b(?:ECONN[A-Z]+|ETIMEDOUT|ENOTFOUND|EPIPE|EACCES|ENOENT|EPERM|EADDRINUSE|EAI_AGAIN|fetch failed|socket|stack|undefined|null|NaN|TypeError|ReferenceError|SyntaxError|RangeError|is not a function|Cannot read|Unexpected token|JSON|RPC|IPC|ipcRenderer|invoke|status code|HTTP\s?\d{3})\b/i;
+  const PT_BR_HINT_PATTERN = /[áàâãéêíóôõúç]|\b(?:nao|memoria|bot|tente|salv|carreg|encontrad|invalid|permit|conversa)/i;
+
   function sanitizeError(error, fallback = "Não foi possível concluir agora.") {
-    const message = error instanceof Error ? error.message : String(error || "");
-    const trimmed = message.replace(/\s+/g, " ").trim();
-    if (!trimmed) return fallback;
-    return trimmed.length > 160 ? `${trimmed.slice(0, 157)}...` : trimmed;
+    if (error && typeof error === "object" && error.code === "stale-active-agent") return STALE_ACTIVE_AGENT_MESSAGE;
+    const raw = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+    let message = String(raw || "").replace(/\s+/g, " ").trim();
+    message = message.replace(/^Error invoking remote method '[^']*':\s*/i, "");
+    for (let guard = 0; guard < 3 && /^[A-Za-z]*Error:\s*/.test(message); guard += 1) message = message.replace(/^[A-Za-z]*Error:\s*/, "");
+    message = message.trim();
+    if (!message) return fallback;
+    if (/active agent changed|stale request/i.test(message)) return STALE_ACTIVE_AGENT_MESSAGE;
+    if (/timed?\s?out|ETIMEDOUT/i.test(message)) return "A memória demorou para responder. Tente novamente.";
+    if (TECHNICAL_ERROR_PATTERN.test(message) || !PT_BR_HINT_PATTERN.test(message)) return fallback;
+    return message.length > 160 ? `${message.slice(0, 157)}…` : message;
   }
 
   function formatDateTime(value) {
@@ -306,7 +391,6 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     }
   }
 
-  const MEMORY_MODE_LABELS = Object.freeze({ automatic: "Automática", explicit: "Explícita", off: "Desligada" });
   const MEMORY_KIND_LABELS = Object.freeze({
     identity: "Identidade",
     preference: "Preferência",
@@ -323,8 +407,8 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     return key && Object.hasOwn(labels, key) ? labels[key] : key || fallback;
   }
 
-  function memoryModeLabel(value) {
-    return localizedMemoryValue(MEMORY_MODE_LABELS, value, "Automática");
+  function normalizeMemoryMode(value) {
+    return MEMORY_MODE_VALUES.includes(value) ? value : null;
   }
 
   function memoryKindLabel(value) {
@@ -334,17 +418,34 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
   function memoryStatusLabel(value) {
     return localizedMemoryValue(MEMORY_STATUS_LABELS, value, "Estado desconhecido");
   }
-  function summarizeJobStatus(status) {
-    if (!status || typeof status !== "object") return "Status de memória indisponível.";
-    const jobs = status.jobs || {};
+
+  function memoryCountLabel(status) {
+    const active = status?.counts?.active;
+    if (!Number.isInteger(active) || active < 0) return "Memórias salvas";
+    if (active === 0) return "Sem memórias salvas";
+    return active === 1 ? "1 memória salva" : `${active} memórias salvas`;
+  }
+
+  function memoryJobsLabel(status) {
+    const jobs = status?.jobs && typeof status.jobs === "object" ? status.jobs : {};
+    const count = (value) => (Number.isInteger(value) && value > 0 ? value : 0);
+    const busy = count(jobs.pending) + count(jobs.running) + count(jobs.retry);
+    const failed = Array.isArray(jobs.dead) ? jobs.dead.length : 0;
     const bits = [];
-    if (Number.isInteger(jobs.pending) && jobs.pending > 0) bits.push(`${jobs.pending} pendente${jobs.pending > 1 ? "s" : ""}`);
-    if (Number.isInteger(jobs.running) && jobs.running > 0) bits.push(`${jobs.running} em execução`);
-    if (Number.isInteger(jobs.retry) && jobs.retry > 0) bits.push(`${jobs.retry} em nova tentativa`);
-    if (Array.isArray(jobs.dead) && jobs.dead.length > 0) bits.push(`${jobs.dead.length} com falha`);
-    const counts = status.counts || {};
-    const memories = Number.isInteger(counts.active) ? `${counts.active} memória${counts.active === 1 ? "" : "s"} ativa${counts.active === 1 ? "" : "s"}` : "Memórias ativas indisponíveis";
-    return bits.length > 0 ? `${memories}. Processamentos internos: ${bits.join(", ")}.` : `${memories}. Sem processamentos pendentes.`;
+    if (busy > 0) bits.push(`${busy} em processamento`);
+    if (failed > 0) bits.push(`${failed} com falha`);
+    return bits.join(" · ");
+  }
+
+  // Dialog status line: the agent count (omitted at zero, the empty state already says
+  // so) plus background processing; the section renders the same pieces on two lines.
+  function summarizeMemoryStatus(status, scope = "agent") {
+    if (!status || typeof status !== "object") return "";
+    const parts = [];
+    if (scope === "agent" && status.counts?.active !== 0) parts.push(memoryCountLabel(status));
+    const jobs = memoryJobsLabel(status);
+    if (jobs) parts.push(jobs);
+    return parts.join(" · ");
   }
 
   async function getAuthoritativeProviderConfig() {
@@ -357,12 +458,27 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     return document.querySelector('.sand-agent-item[data-layout="expanded"][aria-current="page"]')?.getAttribute("data-agent-id") || null;
   }
 
+  function resetMemorySectionState(agentId) {
+    clearLocalTimeout(memoryLoadingHintTimer);
+    memoryLoadingHintTimer = 0;
+    memoryLoadingSlow = false;
+    memorySectionState = createMemorySectionState(agentId);
+  }
+
   async function refreshAgentContext(force = false) {
     if (!force && agentContext.loaded && Date.now() - agentContext.refreshedAtMs < 500) return agentContext.agentId;
-    if (agentContext.loading) return agentContext.agentId;
+    // Concurrent callers (the mount scan and an early click on "Gerenciar") share the
+    // in-flight resolution instead of acting on a bot that is not known yet.
+    if (agentContext.loading && agentContext.pending) return agentContext.pending;
     agentContext.loading = true;
     const token = agentContext.token + 1;
     agentContext.token = token;
+    const pending = resolveAgentContext(token);
+    agentContext.pending = pending;
+    return pending;
+  }
+
+  async function resolveAgentContext(token) {
     const previousAgentId = agentContext.agentId;
     const hadLoaded = agentContext.loaded;
     try {
@@ -374,16 +490,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       agentContext.agentId = nextAgentId;
       agentContext.refreshedAtMs = Date.now();
       toolbarState.agentId = nextAgentId;
-      if (memorySectionState.agentId !== nextAgentId) {
-        memorySectionState = {
-          agentId: nextAgentId,
-          loading: false,
-          savingMode: false,
-          mode: "automatic",
-          status: null,
-          error: "",
-        };
-      }
+      if (memorySectionState.agentId !== nextAgentId) resetMemorySectionState(nextAgentId);
       if (changed) handleActiveAgentChange(nextAgentId, "");
       return nextAgentId;
     } catch {
@@ -395,7 +502,10 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       }
       return null;
     } finally {
-      if (token === agentContext.token) agentContext.loading = false;
+      if (token === agentContext.token) {
+        agentContext.loading = false;
+        agentContext.pending = null;
+      }
     }
   }
 
@@ -419,12 +529,28 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     agentContext.generation += 1;
     agentContext.agentId = typeof nextAgentId === "string" && nextAgentId ? nextAgentId : null;
     toolbarState.agentId = agentContext.agentId;
-    memorySectionState.agentId = agentContext.agentId;
+    resetMemorySectionState(agentContext.agentId);
+    if (dialogState) closeDialog();
+  }
+
+  // The settings pane closed: stop in-flight work but keep the last confirmed data
+  // of this bot so reopening renders the final layout at once (then revalidates).
+  function suspendMemorySection() {
+    agentContext.generation += 1;
+    agentContext.token += 1;
+    agentContext.loaded = false;
+    agentContext.loading = false;
+    agentContext.refreshedAtMs = 0;
+    clearLocalTimeout(memoryLoadingHintTimer);
+    memoryLoadingHintTimer = 0;
+    memoryLoadingSlow = false;
+    const confirmedMode = normalizeMemoryMode(memorySectionState.confirmedMode);
+    if (confirmedMode) memorySectionState.mode = confirmedMode;
     memorySectionState.loading = false;
     memorySectionState.savingMode = false;
-    memorySectionState.status = null;
+    memorySectionState.queuedMode = null;
+    memorySectionState.retryMode = null;
     memorySectionState.error = "";
-    if (dialogState) closeDialog();
   }
 
   async function ensureCurrentAgentBinding(binding) {
@@ -471,6 +597,26 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     return findVisibleProviderSettingsRoot() || findExpandedNativeSettingsRoot();
   }
 
+  // Mount contract with the settings overlay: when its agent-scope root reserves
+  // #openbot-memory-slot (inside the "Memória" group card), the section lives there
+  // without its own heading; otherwise it is appended to the settings root (or the
+  // native-only pane) with its own heading and card.
+  function resolveMemoryMount() {
+    const providerRoot = findVisibleProviderSettingsRoot();
+    if (providerRoot) {
+      const slot = providerRoot.querySelector(`#${MEMORY_SLOT_ID}`);
+      if (slot instanceof HTMLElement) return { parent: slot, slotted: true };
+      return { parent: providerRoot, slotted: false };
+    }
+    const nativeRoot = findExpandedNativeSettingsRoot();
+    return nativeRoot ? { parent: nativeRoot, slotted: false } : null;
+  }
+
+  function memorySlotNeedsMount() {
+    const slot = document.getElementById(MEMORY_SLOT_ID);
+    return slot instanceof HTMLElement && !slot.querySelector(`#${MEMORY_SECTION_ID}`);
+  }
+
   function closeDialog({ immediate = false, restoreFocus: shouldRestoreFocus = true } = {}) {
     if (!dialogState) return;
     if (dialogState.finishClose) {
@@ -478,7 +624,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       return;
     }
     const state = dialogState;
-    const { root, restoreFocus, restoreFocusFallback, keydownHandler, backdropHandler, appRoot } = dialogState;
+    const { root, restoreFocus, restoreFocusFallback, keydownHandler, backdropHandler, appRoot, scrollPositions } = dialogState;
     const resolveRestoreFocus = () => {
       if (dialogState || localUiClosed) return null;
       if (restoreFocus instanceof HTMLElement && restoreFocus.isConnected && isVisibleElement(restoreFocus)) return restoreFocus;
@@ -491,6 +637,9 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     let timer = 0;
     state.finishClose = (restore = shouldRestoreFocus) => {
       clearLocalTimeout(timer);
+      if (typeof state.onClose === "function") {
+        try { state.onClose(); } catch {}
+      }
       window.removeEventListener("keydown", keydownHandler, true);
       root.removeEventListener("mousedown", backdropHandler, true);
       root.remove();
@@ -498,6 +647,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       dialogState = null;
       document.body.classList.remove(ACTIVE_DIALOG_CLASS);
       if (appRoot instanceof HTMLElement) appRoot.inert = false;
+      restoreScrollPositions(scrollPositions);
       if (!localUiClosed) scheduleScan(0);
       if (restore && !localUiClosed) restoreFocusTimer = setLocalTimeout(() => {
         restoreFocusTimer = 0;
@@ -509,9 +659,25 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       return;
     }
     root.inert = true;
-    for (const animation of state.panel.getAnimations()) animation.cancel();
+    for (const animation of root.getAnimations({ subtree: true })) animation.cancel();
     root.classList.add("is-closing");
-    timer = setLocalTimeout(() => state.finishClose(), 140);
+    timer = setLocalTimeout(() => state.finishClose(), DIALOG_EXIT_MS);
+  }
+
+  function captureScrollPositions(element) {
+    const positions = [];
+    for (let node = element instanceof Element ? element.parentElement : null; node && node !== document.documentElement; node = node.parentElement) {
+      if (node.scrollTop > 0 || node.scrollLeft > 0) positions.push([node, node.scrollTop, node.scrollLeft]);
+    }
+    return positions;
+  }
+
+  function restoreScrollPositions(positions) {
+    for (const [node, top, left] of Array.isArray(positions) ? positions : []) {
+      if (!(node instanceof Element) || !node.isConnected) continue;
+      if (node.scrollTop !== top) node.scrollTop = top;
+      if (node.scrollLeft !== left) node.scrollLeft = left;
+    }
   }
 
   function trapFocus(event, root) {
@@ -547,14 +713,17 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     restoreFocusTimer = 0;
     closeDialog({ immediate: true, restoreFocus: false });
     ensureStyle();
-    const appRoot = document.getElementById("root");
-    if (appRoot instanceof HTMLElement) appRoot.inert = true;
-    document.body.classList.add(ACTIVE_DIALOG_CLASS);
     const restoreFocus = options.restoreFocusTarget instanceof HTMLElement
       ? options.restoreFocusTarget
       : document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
+    // Making the app inert can collapse the settings pane behind the dialog (and
+    // reset its scroll); remember where the opener was so closing lands back there.
+    const scrollPositions = captureScrollPositions(restoreFocus);
+    const appRoot = document.getElementById("root");
+    if (appRoot instanceof HTMLElement) appRoot.inert = true;
+    document.body.classList.add(ACTIVE_DIALOG_CLASS);
     const root = document.createElement("div");
     root.id = options.id;
     root.className = "ob-dialog";
@@ -562,13 +731,13 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     root.setAttribute("lang", "pt-BR");
     root.innerHTML = `
       <div class="ob-dialog-backdrop" aria-hidden="true"></div>
-      <section class="ob-panel" role="dialog" aria-modal="true" aria-labelledby="${options.id}-title" tabindex="-1">
+      <section class="ob-panel" role="dialog" aria-modal="true" aria-labelledby="${options.id}-title" aria-describedby="${options.id}-subtitle" tabindex="-1">
         <header class="ob-dialog-head">
           <div>
             <h2 class="ob-dialog-title" id="${options.id}-title">${escapeHtml(options.title)}</h2>
-            <p class="ob-dialog-subtitle">${escapeHtml(options.subtitle || "")}</p>
+            <p class="ob-dialog-subtitle" id="${options.id}-subtitle">${escapeHtml(options.subtitle || "")}</p>
           </div>
-          <button type="button" class="ob-button ob-close" data-action="close-dialog" aria-label="Fechar">Fechar</button>
+          <button type="button" class="ob-button ob-close" data-action="close-dialog" aria-label="Fechar" title="Fechar">×</button>
         </header>
         <div class="ob-dialog-body"></div>
       </section>
@@ -577,7 +746,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     const body = root.querySelector(".ob-dialog-body");
     if (!(panel instanceof HTMLElement) || !(body instanceof HTMLElement)) return;
     document.body.appendChild(root);
-    animatePanel(panel);
+    animateDialogEntrance(root, panel);
     const keydownHandler = (event) => {
       if (!dialogState || dialogState.root !== root) return;
       if (event.key === "Escape") {
@@ -593,10 +762,49 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     };
     window.addEventListener("keydown", keydownHandler, true);
     root.addEventListener("mousedown", backdropHandler, true);
-    root.querySelector('[data-action="close-dialog"]')?.addEventListener("click", closeDialog);
-    dialogState = { id: options.id, root, panel, body, appRoot, restoreFocus, restoreFocusFallback: options.restoreFocusFallback, keydownHandler, backdropHandler };
+    root.querySelector('[data-action="close-dialog"]')?.addEventListener("click", () => closeDialog());
+    dialogState = { id: options.id, root, panel, body, appRoot, restoreFocus, restoreFocusFallback: options.restoreFocusFallback, keydownHandler, backdropHandler, scrollPositions, onClose: null };
     panel.focus({ preventScroll: true });
     options.mount(body, panel);
+  }
+
+  function memorySectionMarkup(variant) {
+    const copyId = `${MEMORY_SECTION_ID}-mode-copy`;
+    return `
+      ${variant === "standalone" ? `<h3 class="ob-mem-heading" id="${MEMORY_SECTION_ID}-heading">Memória deste bot</h3>` : ""}
+      <div class="ob-mem-card">
+        <fieldset class="ob-mem-row ob-mem-mode" aria-describedby="${copyId}">
+          <legend class="ob-sr-only">Modo de memória</legend>
+          <div class="ob-mem-seg">
+            ${MEMORY_MODE_OPTIONS.map((option) => `<label class="ob-mem-option"><input type="radio" name="openbot-memory-mode" value="${option.value}" disabled><span>${option.label}</span></label>`).join("")}
+          </div>
+          <p class="ob-mem-mode-copy" id="${copyId}"></p>
+        </fieldset>
+        <div class="ob-mem-row ob-mem-saved">
+          <div id="${MEMORY_SECTION_ID}-status" class="ob-mem-summary" role="status" aria-live="polite" aria-atomic="true">
+            <div class="ob-mem-count"></div>
+            <div class="ob-mem-jobs"></div>
+          </div>
+          <button type="button" class="ob-button" data-action="open-memory-manager">Gerenciar<span class="ob-sr-only"> memória</span></button>
+        </div>
+        <p class="ob-mem-error" role="alert" hidden><span class="ob-mem-error-text"></span> <button type="button" class="ob-mem-link" data-action="retry-memory-section">Tentar novamente</button></p>
+      </div>
+    `;
+  }
+
+  function createMemorySection(variant) {
+    const root = document.createElement("section");
+    root.id = MEMORY_SECTION_ID;
+    root.className = "ob-mem";
+    root.dataset.variant = variant;
+    root.dataset.state = "loading";
+    root.setAttribute("lang", "pt-BR");
+    if (variant === "standalone") root.setAttribute("aria-labelledby", `${MEMORY_SECTION_ID}-heading`);
+    else root.setAttribute("aria-label", "Memória");
+    root.innerHTML = memorySectionMarkup(variant);
+    root.addEventListener("change", handleMemoryModeChange);
+    root.addEventListener("click", handleMemorySectionClick);
+    return root;
   }
 
   async function loadMemorySection() {
@@ -604,6 +812,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     memorySectionState.loading = true;
     memorySectionState.error = "";
     const binding = createAgentBinding(memorySectionState.agentId);
+    const modeRevision = memorySectionState.modeRevision;
     const section = document.getElementById(MEMORY_SECTION_ID);
     const current = () => isBindingCurrent(binding) && section?.isConnected && document.getElementById(MEMORY_SECTION_ID) === section;
     renderMemorySection();
@@ -615,11 +824,17 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
         api.getMemoryStatus({ agentId, expectedAgentId: binding.expectedAgentId }),
       ]);
       if (!current()) return;
-      memorySectionState.mode = settings?.mode || "automatic";
-      memorySectionState.status = status;
+      const mode = normalizeMemoryMode(settings?.mode) || normalizeMemoryMode(status?.settings?.mode) || "automatic";
+      // A save started after this read owns the selection; never roll it back.
+      if (memorySectionState.modeRevision === modeRevision && !memorySectionState.savingMode) {
+        memorySectionState.mode = mode;
+        memorySectionState.confirmedMode = mode;
+      }
+      memorySectionState.status = status && typeof status === "object" ? status : { counts: {}, jobs: {} };
     } catch (error) {
       if (!current()) return;
-      memorySectionState.error = sanitizeError(error, "Memória indisponível.");
+      memorySectionState.error = sanitizeError(error, "Não foi possível carregar a memória.");
+      memorySectionState.retryMode = null;
     } finally {
       if (current()) {
         memorySectionState.loading = false;
@@ -628,139 +843,257 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     }
   }
 
-  function ensureMemorySection() {
-    const settingsRoot = findMemorySectionMountRoot();
+  // Loads once per mounted section. The placeholder layout is already final, so the
+  // "Carregando…" text only appears when data takes longer than LOADING_HINT_DELAY_MS.
+  function startMemorySectionLoad() {
+    clearLocalTimeout(memoryLoadingHintTimer);
+    memoryLoadingHintTimer = 0;
+    memoryLoadingSlow = false;
+    if (!memorySectionState.status) {
+      memoryLoadingHintTimer = setLocalTimeout(() => {
+        memoryLoadingHintTimer = 0;
+        if (memorySectionState.status || !memorySectionState.loading) return;
+        memoryLoadingSlow = true;
+        renderMemorySection();
+      }, LOADING_HINT_DELAY_MS);
+    }
+    void loadMemorySection();
+  }
+
+  function ensureMemorySection(mount = resolveMemoryMount(), { fetch = true } = {}) {
     const existing = document.getElementById(MEMORY_SECTION_ID);
-    if (!(settingsRoot instanceof Element)) {
+    if (!mount) {
+      // Behind an open menu or dialog the pane is only aria-hidden: keep the section.
+      if (existing?.isConnected && modalLayerOpen()) return existing;
       existing?.remove();
-      return;
+      return null;
     }
+    const variant = mount.slotted ? "slot" : "standalone";
     let root = existing;
-    if (!root || root.parentElement !== settingsRoot) {
+    if (!(root instanceof HTMLElement) || root.parentElement !== mount.parent || root.dataset.variant !== variant) {
       root?.remove();
-      root = document.createElement("section");
-      root.id = MEMORY_SECTION_ID;
-      root.setAttribute("lang", "pt-BR");
-      settingsRoot.appendChild(root);
-      root.addEventListener("change", handleMemoryModeChange);
-      root.addEventListener("click", handleMemorySectionClick);
-      memorySectionState.loading = false;
-      memorySectionState.status = null;
-      memorySectionState.error = toolbarState.agentId ? "" : "Não foi possível identificar o bot. Tente novamente.";
-    }
-    if (memorySectionState.agentId !== toolbarState.agentId) {
-      memorySectionState.agentId = toolbarState.agentId;
-      memorySectionState.mode = "automatic";
-      memorySectionState.status = null;
-      memorySectionState.error = "";
+      root = createMemorySection(variant);
+      mount.parent.appendChild(root);
+      // Work started for a previous element is discarded by its binding check.
       memorySectionState.loading = false;
       memorySectionState.savingMode = false;
+      memorySectionState.queuedMode = null;
+      memorySectionState.retryMode = null;
+      memorySectionState.error = "";
     }
-    if (!toolbarState.agentId) memorySectionState.error = "Não foi possível identificar o bot. Tente novamente.";
+    if (fetch) {
+      if (memorySectionState.agentId !== toolbarState.agentId) resetMemorySectionState(toolbarState.agentId);
+      if (!toolbarState.agentId) memorySectionState.error = MISSING_AGENT_MESSAGE;
+    }
     renderMemorySection();
-    if (!memorySectionState.loading && memorySectionState.status == null && !memorySectionState.error) void loadMemorySection();
+    const needsData = !fetchedSections.has(root) || (!memorySectionState.status && !memorySectionState.loading);
+    if (fetch && memorySectionState.agentId && !memorySectionState.error && needsData) {
+      fetchedSections.add(root);
+      startMemorySectionLoad();
+    }
+    return root;
+  }
+
+  // Synchronous path for `openbot:settings-mounted` and slot insertions: render the
+  // final layout in the same frame as the settings pane, then resolve data async.
+  function mountMemorySectionNow() {
+    if (localUiClosed || !document.body || dialogState) return;
+    ensureStyle();
+    const mount = resolveMemoryMount();
+    if (!mount) {
+      scheduleScan();
+      return;
+    }
+    const sidebarAgentId = selectedBotId();
+    if (memorySectionState.agentId && sidebarAgentId && sidebarAgentId !== memorySectionState.agentId) resetMemorySectionState(null);
+    ensureMemorySection(mount, { fetch: false });
+    void scan();
+  }
+
+  function memorySectionView() {
+    const state = memorySectionState;
+    const hydrated = Boolean(state.agentId && state.status);
+    const mode = normalizeMemoryMode(state.mode) || "automatic";
+    const option = MEMORY_MODE_OPTIONS.find((candidate) => candidate.value === mode);
+    const slow = !hydrated && state.loading && memoryLoadingSlow;
+    return {
+      state: state.error && !hydrated ? "error" : hydrated ? "ready" : slow ? "loading-slow" : "loading",
+      mode: hydrated ? mode : "",
+      copy: hydrated ? option.copy : "",
+      count: hydrated ? memoryCountLabel(state.status) : slow ? "Carregando…" : "",
+      jobs: hydrated ? memoryJobsLabel(state.status) : "",
+      error: state.error || "",
+      busy: Boolean(state.loading || state.savingMode),
+    };
   }
 
   function renderMemorySection() {
     const root = document.getElementById(MEMORY_SECTION_ID);
     if (!(root instanceof HTMLElement)) return;
-    const statusText = memorySectionState.error || (memorySectionState.savingMode ? "Salvando preferência…" : memorySectionState.loading ? "Carregando memória…" : memorySectionState.status ? summarizeJobStatus(memorySectionState.status) : "Carregando memória…");
-    const renderKey = JSON.stringify([memorySectionState.agentId, memorySectionState.mode, memorySectionState.loading, memorySectionState.savingMode, memorySectionState.error, statusText]);
+    const view = memorySectionView();
+    const renderKey = JSON.stringify([memorySectionState.agentId, view]);
     if (root.dataset.renderKey === renderKey) return;
-    let pendingFocus = null;
-    if (document.activeElement instanceof HTMLElement && root.contains(document.activeElement)) {
-      if (document.activeElement.dataset.action === "open-memory-manager") {
-        pendingFocus = { selector: '[data-action="open-memory-manager"]' };
-      } else if (document.activeElement instanceof HTMLInputElement && document.activeElement.name === "openbot-memory-mode") {
-        pendingFocus = { selector: `input[name="openbot-memory-mode"][value="${escapeHtml(document.activeElement.value)}"]` };
+    root.dataset.renderKey = renderKey;
+    // Update in place: focus, hover and selection survive every state change.
+    root.dataset.state = view.state;
+    root.setAttribute("aria-busy", view.busy ? "true" : "false");
+    for (const input of root.querySelectorAll('input[name="openbot-memory-mode"]')) {
+      input.checked = view.mode === input.value;
+      input.disabled = !view.mode;
+    }
+    const copy = root.querySelector(".ob-mem-mode-copy");
+    setText(copy, view.copy);
+    if (copy instanceof HTMLElement) copy.title = view.copy;
+    setText(root.querySelector(".ob-mem-count"), view.count);
+    setText(root.querySelector(".ob-mem-jobs"), view.jobs);
+    const errorLine = root.querySelector(".ob-mem-error");
+    if (errorLine instanceof HTMLElement) {
+      const focusWasInError = errorLine.contains(document.activeElement);
+      setText(errorLine.querySelector(".ob-mem-error-text"), view.error);
+      errorLine.hidden = !view.error;
+      if (focusWasInError && !view.error) {
+        const checked = root.querySelector('input[name="openbot-memory-mode"]:checked');
+        focusSoon(() => checked instanceof HTMLElement && memorySectionState.retryMode === null && !memorySectionState.loading
+          ? checked
+          : root.querySelector('[data-action="open-memory-manager"]'));
       }
     }
-    const statusClass = memorySectionState.error ? "ob-memory-status is-error" : "ob-memory-status";
-    const options = [
-      { value: "automatic", label: "Automática", copy: "Lembra automaticamente o que for útil." },
-      { value: "explicit", label: "Explícita", copy: "Só salva memória quando você pedir." },
-      { value: "off", label: "Desligada", copy: "Não salva memória entre conversas." },
-    ];
-    root.innerHTML = `
-      <div class="ob-memory-head">
-        <div>
-          <h3 class="ob-memory-title">Memória deste bot</h3>
-          <p class="ob-memory-help">Escolha como este bot guarda contexto útil entre conversas.</p>
-        </div>
-        <button type="button" class="ob-button" data-action="open-memory-manager"${!memorySectionState.agentId ? " disabled" : ""}>Gerenciar memória</button>
-      </div>
-      <div class="ob-memory-modes">
-        ${options.map((option) => `
-          <label class="ob-memory-mode">
-            <input type="radio" name="openbot-memory-mode" value="${option.value}"${memorySectionState.status && memorySectionState.mode === option.value ? " checked" : ""}${memorySectionState.savingMode || memorySectionState.loading || !memorySectionState.status ? " disabled" : ""}>
-            <span>
-              <div class="ob-memory-mode-label">${option.label}</div>
-              <div class="ob-memory-mode-copy">${option.copy}</div>
-            </span>
-          </label>
-        `).join("")}
-      </div>
-      <div id="${MEMORY_SECTION_ID}-status" class="${statusClass}" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(statusText)}</div>
-      ${memorySectionState.error ? '<button type="button" class="ob-button" data-action="retry-memory-section">Tentar novamente</button>' : ""}
-    `;
-    root.dataset.renderKey = renderKey;
-    renderPendingFocus(root, pendingFocus);
   }
 
-  async function handleMemoryModeChange(event) {
-    const target = event.target;
-    if (!(target instanceof HTMLInputElement) || target.name !== "openbot-memory-mode") return;
-    if (memorySectionState.savingMode || memorySectionState.loading || !memorySectionState.status) return;
-    const nextMode = target.value;
-    if (!["automatic", "explicit", "off"].includes(nextMode)) return;
-    const previousMode = memorySectionState.mode;
+  async function saveMemoryMode(nextMode) {
+    const previousMode = normalizeMemoryMode(memorySectionState.confirmedMode) || normalizeMemoryMode(memorySectionState.mode) || "automatic";
+    memorySectionState.mode = nextMode;
     memorySectionState.savingMode = true;
+    memorySectionState.modeRevision += 1;
     memorySectionState.error = "";
+    memorySectionState.retryMode = null;
     const binding = createAgentBinding(memorySectionState.agentId);
     const section = document.getElementById(MEMORY_SECTION_ID);
     const current = () => isBindingCurrent(binding) && section?.isConnected && document.getElementById(MEMORY_SECTION_ID) === section;
     renderMemorySection();
+    let failed = false;
     try {
       const agentId = await ensureCurrentAgentBinding(binding);
       const updated = await desktopAgent().setMemorySettings({ mode: nextMode, agentId, expectedAgentId: binding.expectedAgentId });
       if (!current()) return;
-      if (updated?.mode !== nextMode) throw new Error("A persistência não confirmou a preferência enviada.");
-      memorySectionState.mode = updated.mode;
+      if (updated?.mode !== nextMode) throw new Error("A preferência de memória não foi confirmada.");
+      memorySectionState.confirmedMode = updated.mode;
     } catch (error) {
       if (!current()) return;
-      memorySectionState.mode = previousMode;
+      failed = true;
+      memorySectionState.mode = normalizeMemoryMode(memorySectionState.confirmedMode) || previousMode;
+      memorySectionState.queuedMode = null;
+      memorySectionState.retryMode = nextMode;
       memorySectionState.error = sanitizeError(error, "Não foi possível salvar o modo de memória.");
     } finally {
       if (current()) {
         memorySectionState.savingMode = false;
-        renderMemorySection();
+        const queued = memorySectionState.queuedMode;
+        memorySectionState.queuedMode = null;
+        if (!failed && queued && queued !== memorySectionState.confirmedMode) {
+          void saveMemoryMode(queued);
+        } else {
+          if (!failed) memorySectionState.mode = memorySectionState.confirmedMode;
+          renderMemorySection();
+        }
       }
     }
   }
 
+  // Radios stay enabled while a save is in flight (disabling the focused radio would
+  // drop keyboard focus); newer choices are coalesced and saved after the current one.
+  function handleMemoryModeChange(event) {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement) || target.name !== "openbot-memory-mode") return;
+    const nextMode = normalizeMemoryMode(target.value);
+    if (!nextMode) return;
+    if (!memorySectionState.agentId || !memorySectionState.status) {
+      renderMemorySection();
+      return;
+    }
+    memorySectionState.error = "";
+    memorySectionState.retryMode = null;
+    if (memorySectionState.savingMode) {
+      memorySectionState.queuedMode = nextMode;
+      memorySectionState.mode = nextMode;
+      renderMemorySection();
+      return;
+    }
+    if (nextMode === memorySectionState.confirmedMode && nextMode === memorySectionState.mode) {
+      renderMemorySection();
+      return;
+    }
+    void saveMemoryMode(nextMode);
+  }
+
+  function retryMemorySection() {
+    const retryMode = normalizeMemoryMode(memorySectionState.retryMode);
+    memorySectionState.error = "";
+    if (retryMode && memorySectionState.status && !memorySectionState.savingMode) {
+      void saveMemoryMode(retryMode);
+      return;
+    }
+    memorySectionState.retryMode = null;
+    renderMemorySection();
+    void refreshAgentContext(true).then(() => {
+      if (localUiClosed || !document.getElementById(MEMORY_SECTION_ID)) return;
+      if (memorySectionState.agentId !== toolbarState.agentId) resetMemorySectionState(toolbarState.agentId);
+      if (!toolbarState.agentId) {
+        memorySectionState.error = MISSING_AGENT_MESSAGE;
+        renderMemorySection();
+        return;
+      }
+      startMemorySectionLoad();
+    });
+  }
+
   function handleMemorySectionClick(event) {
     const action = event.target instanceof Element ? event.target.closest("[data-action]")?.dataset.action : null;
-    if (action === "retry-memory-section") {
-      void refreshAgentContext(true).then(() => loadMemorySection());
-    }
+    if (action === "retry-memory-section") retryMemorySection();
     if (action === "open-memory-manager") {
       const opener = event.target instanceof Element ? event.target.closest("[data-action='open-memory-manager']") : null;
       void openMemoryDialog(opener instanceof HTMLElement ? opener : null);
     }
   }
 
+  function dialogMemoryMode(binding, status) {
+    const sectionMode = memorySectionState.status && memorySectionState.agentId === binding.expectedAgentId
+      ? normalizeMemoryMode(memorySectionState.confirmedMode) || normalizeMemoryMode(memorySectionState.mode)
+      : null;
+    return sectionMode || normalizeMemoryMode(status?.settings?.mode);
+  }
+
+  function syncSectionFromDialogStatus(binding, status) {
+    if (!status || typeof status !== "object" || memorySectionState.agentId !== binding.expectedAgentId) return;
+    memorySectionState.status = status;
+    const mode = normalizeMemoryMode(status.settings?.mode);
+    if (mode && !memorySectionState.savingMode) {
+      memorySectionState.mode = mode;
+      memorySectionState.confirmedMode = mode;
+    }
+    renderMemorySection();
+  }
+
   async function openMemoryDialog(opener = null) {
     await refreshAgentContext();
-    if (!toolbarState.agentId) throw new Error("Bot ativo indisponível.");
+    if (!toolbarState.agentId) {
+      memorySectionState.error = MISSING_AGENT_MESSAGE;
+      renderMemorySection();
+      return;
+    }
     const binding = createAgentBinding();
     const state = {
       binding,
       scope: "agent",
       loading: true,
+      loadedOnce: false,
+      slowLoading: false,
+      slowTimer: 0,
       error: "",
       alert: "",
       items: [],
       query: "",
+      loadedQuery: "",
       page: 1,
       editingId: null,
       editText: "",
@@ -784,12 +1117,55 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
       restoreFocusFallback: () => document.querySelector(`#${MEMORY_SECTION_ID} [data-action="open-memory-manager"]`),
       mount(body) {
         const current = () => body.isConnected && isBindingCurrent(state.binding);
+        if (dialogState?.body === body) {
+          dialogState.onClose = () => {
+            clearLocalTimeout(state.slowTimer);
+            clearLocalTimeout(state.searchTimer);
+          };
+        }
         const scopeSubtitle = (scope) => scope === "user"
-          ? "Perfil compartilhado por todos os bots: quem você é e como prefere ser atendido. Não define a tarefa de cada bot."
+          ? "Perfil compartilhado por todos os bots: quem você é e como prefere ser atendido."
           : "Revise, ajuste ou esqueça o que este bot guardou.";
-        const emptyStateCopy = (scope) => scope === "user"
-          ? "Nenhuma memória no perfil compartilhado ainda. Os bots adicionam identidade e preferências suas automaticamente, ou peça: \"lembre que…\"."
-          : "Nenhuma memória corresponde ao filtro atual.";
+        const emptyState = () => {
+          const query = state.loadedQuery.trim();
+          if (query) {
+            return {
+              title: `Nada encontrado para “${query}”`,
+              copy: "Tente outras palavras ou limpe a busca.",
+              action: '<button type="button" class="ob-button" data-action="clear-search">Limpar busca</button>',
+            };
+          }
+          if (state.scope === "user") {
+            return {
+              title: "Nenhuma memória no perfil compartilhado",
+              copy: "Os bots guardam aqui quem você é e suas preferências. Você também pode pedir: “lembre que…”.",
+              action: "",
+            };
+          }
+          const mode = dialogMemoryMode(state.binding, state.status);
+          return {
+            title: "Nenhuma memória salva",
+            copy: mode === "off"
+              ? "A memória está desligada para este bot, então nada novo é guardado."
+              : mode === "explicit"
+                ? "Peça ao bot para lembrar algo, por exemplo: “lembre que prefiro respostas curtas”."
+                : "Conforme vocês conversam, o bot guarda aqui o que for útil.",
+            action: "",
+          };
+        };
+        const modeLine = () => {
+          if (state.scope !== "agent") return "";
+          const mode = dialogMemoryMode(state.binding, state.status);
+          if (!mode) return "";
+          const canChange = Boolean(document.querySelector(`#${MEMORY_SECTION_ID} input[name="openbot-memory-mode"]`));
+          return `
+            <div class="ob-mem-modeline" data-mode="${mode}">
+              <span class="ob-mem-dot" aria-hidden="true"></span>
+              <span>${escapeHtml(MEMORY_MODE_NOTICE[mode])}</span>
+              ${canChange ? '<button type="button" class="ob-link" data-action="change-memory-mode">Alterar</button>' : ""}
+            </div>
+          `;
+        };
         const render = () => {
           if (!current()) return;
           const activeEditor = body.querySelector('textarea[data-role="memory-text"]');
@@ -799,46 +1175,65 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
           const searchSelection = activeSearch instanceof HTMLInputElement && document.activeElement === activeSearch
             ? [activeSearch.selectionStart, activeSearch.selectionEnd, activeSearch.selectionDirection]
             : null;
+          const focusedAction = document.activeElement instanceof HTMLElement && body.contains(document.activeElement) && document.activeElement.dataset.action === "set-scope"
+            ? document.activeElement.dataset.scope
+            : null;
           const visibleItems = state.items;
           const statusId = `${MEMORY_DIALOG_ID}-status`;
           const alertId = `${MEMORY_DIALOG_ID}-alert`;
-          const asyncMessage = state.loading ? "Carregando memórias…" : state.pendingMemoryId ? "Atualizando memória…" : state.error || state.notice || (state.status ? summarizeJobStatus(state.status) : "");
+          const asyncMessage = state.pendingMemoryId
+            ? "Atualizando memória…"
+            : state.error
+              ? state.error
+              : state.loading
+                ? (state.slowLoading ? "Carregando memórias…" : summarizeMemoryStatus(state.status, state.scope))
+                : state.notice || summarizeMemoryStatus(state.status, state.scope);
           const statusClass = state.error ? "ob-status ob-error" : "ob-status";
           const subtitle = document.querySelector(`#${MEMORY_DIALOG_ID} .ob-dialog-subtitle`);
           if (subtitle) subtitle.textContent = scopeSubtitle(state.scope);
+          const showList = state.loadedOnce && !state.error && visibleItems.length > 0;
+          const listBusy = state.loading || Boolean(state.pendingMemoryId);
+          const empty = state.loadedOnce && !state.loading && !state.error && visibleItems.length === 0 ? emptyState() : null;
+          const showPagination = showList && (state.page > 1 || Boolean(state.nextCursor));
           body.innerHTML = `
-            <div class="ob-space">
-              <input class="ob-field" type="search" maxlength="128" value="${escapeHtml(state.query)}" placeholder="Buscar por texto, tipo ou origem" aria-label="Buscar memória" aria-describedby="${statusId}">
-              <div class="ob-row">
-                <button type="button" class="ob-button" data-action="set-scope" data-scope="agent" aria-pressed="${state.scope === "agent" ? "true" : "false"}">Deste bot</button>
-                <button type="button" class="ob-button" data-action="set-scope" data-scope="user" aria-pressed="${state.scope === "user" ? "true" : "false"}">Perfil compartilhado</button>
-                <div class="ob-badge">${escapeHtml(memoryModeLabel(memorySectionState.mode))}</div>
+            <div class="ob-mem-toolbar">
+              <div class="ob-seg" role="group" aria-label="Origem das memórias">
+                <button type="button" class="ob-seg-option" data-action="set-scope" data-scope="agent" aria-pressed="${state.scope === "agent" ? "true" : "false"}">Deste bot</button>
+                <button type="button" class="ob-seg-option" data-action="set-scope" data-scope="user" aria-pressed="${state.scope === "user" ? "true" : "false"}">Perfil compartilhado</button>
               </div>
+              <input class="ob-field" type="search" maxlength="128" value="${escapeHtml(state.query)}" placeholder="Buscar por texto, tipo ou origem" aria-label="Buscar memória" aria-describedby="${statusId}">
             </div>
-            ${statusMarkup(statusId, asyncMessage, statusClass)}
+            <div class="ob-mem-meta">
+              ${statusMarkup(statusId, asyncMessage, statusClass)}
+              ${modeLine()}
+            </div>
             ${alertMarkup(alertId, state.alert)}
-            ${!state.loading && state.error ? `<div class="ob-status"><button type="button" class="ob-button" data-action="retry-memory-load">Tentar novamente</button></div>` : ""}
-            ${!state.loading && !state.error && visibleItems.length === 0 ? `<div class="ob-empty">${escapeHtml(emptyStateCopy(state.scope))}</div>` : ""}
-            ${!state.loading && !state.error && visibleItems.length > 0 ? `
-              <div class="ob-list">
+            ${!state.loading && state.error ? `<div class="ob-empty"><button type="button" class="ob-button" data-action="retry-memory-load">Tentar novamente</button></div>` : ""}
+            ${!state.loadedOnce && !state.error ? '<div class="ob-loading" aria-hidden="true"></div>' : ""}
+            ${empty ? `
+              <div class="ob-empty">
+                <div class="ob-empty-title">${escapeHtml(empty.title)}</div>
+                <p class="ob-empty-copy">${escapeHtml(empty.copy)}</p>
+                ${empty.action}
+              </div>
+            ` : ""}
+            ${showList ? `
+              <div class="ob-list" aria-busy="${listBusy ? "true" : "false"}">
                 ${visibleItems.map((item) => {
                   const isEditing = state.editingId === item.id;
                   const when = formatDateTime(item.updatedAtMs || item.createdAtMs);
                   const origin = state.scope === "user"
-                    ? "Origem: perfil compartilhado"
-                    : item.sourceConversationId ? `Origem: conversa ${item.sourceConversationId.slice(0, 8)}` : "Origem: manual";
+                    ? "Perfil compartilhado"
+                    : item.sourceConversationId ? `Conversa ${item.sourceConversationId.slice(0, 8)}` : "Adicionada manualmente";
+                  const meta = [origin, when, memoryStatusLabel(item.status), `Importância ${item.importance}`].filter(Boolean).join(" · ");
                   const describedBy = describeBy(statusId, isEditing ? alertId : "");
+                  const itemDisabled = state.loading || state.pendingMemoryId === item.id ? " disabled" : "";
                   return `
                     <article class="ob-item" data-memory-id="${escapeHtml(item.id)}">
                       <div class="ob-item-head">
                         <div>
-                          <h3 class="ob-item-title">${escapeHtml(memoryKindLabel(item.kind))} ${item.pinned ? '<span class="ob-badge">Fixada</span>' : ""}</h3>
-                          <div class="ob-item-meta">
-                            <span>${escapeHtml(origin)}</span>
-                            ${when ? `<span>${escapeHtml(when)}</span>` : ""}
-                            <span>${escapeHtml(memoryStatusLabel(item.status))}</span>
-                            <span>Importância: ${escapeHtml(String(item.importance))}</span>
-                          </div>
+                          <h3 class="ob-item-title">${escapeHtml(memoryKindLabel(item.kind))}${item.pinned ? ' <span class="ob-badge">Fixada</span>' : ""}</h3>
+                          <div class="ob-item-meta">${escapeHtml(meta)}</div>
                         </div>
                       </div>
                       ${isEditing
@@ -859,20 +1254,20 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
                         : `<div class="ob-item-copy">${escapeHtml(item.text)}</div>`
                       }
                       <div class="ob-item-actions">
-                        ${item.status === "active" ? `<button type="button" class="ob-button" data-action="toggle-pin" data-memory-id="${escapeHtml(item.id)}"${state.pendingMemoryId === item.id ? " disabled" : ""}>${item.pinned ? "Desafixar" : "Fixar"}</button>` : ""}
-                        ${item.status === "active" && !isEditing ? `<button type="button" class="ob-button" data-action="edit-memory" data-memory-id="${escapeHtml(item.id)}">Editar</button>` : ""}
+                        ${item.status === "active" ? `<button type="button" class="ob-button" data-action="toggle-pin" data-memory-id="${escapeHtml(item.id)}"${itemDisabled}>${item.pinned ? "Desafixar" : "Fixar"}</button>` : ""}
+                        ${item.status === "active" && !isEditing ? `<button type="button" class="ob-button" data-action="edit-memory" data-memory-id="${escapeHtml(item.id)}"${state.loading ? " disabled" : ""}>Editar</button>` : ""}
                         ${isEditing ? `
-                          <button type="button" class="ob-button" data-action="save-memory" data-memory-id="${escapeHtml(item.id)}"${state.pendingMemoryId === item.id ? " disabled" : ""}>Salvar</button>
+                          <button type="button" class="ob-button" data-action="save-memory" data-memory-id="${escapeHtml(item.id)}"${itemDisabled}>Salvar</button>
                           <button type="button" class="ob-button" data-action="cancel-edit">Cancelar</button>
                         ` : ""}
-                        ${item.status === "active" ? `<button type="button" class="ob-button" data-action="forget-request" data-memory-id="${escapeHtml(item.id)}"${state.pendingMemoryId === item.id ? " disabled" : ""}>Esquecer</button>` : ""}
+                        ${item.status === "active" ? `<button type="button" class="ob-button" data-action="forget-request" data-memory-id="${escapeHtml(item.id)}"${itemDisabled}>Esquecer</button>` : ""}
                       </div>
                       ${state.confirmForgetId === item.id ? `
                         <div class="ob-inline-confirm" aria-describedby="${statusId}">
                           <p class="ob-inline-confirm-copy">Esquecer esta memória agora? Ela e as fontes vinculadas deixam de ser usadas automaticamente, incluindo respostas, resumos e memórias derivadas automaticamente. Conversas e arquivos continuam no histórico. Isso não apaga o texto da conversa aberta nem o que já foi enviado ao provedor. Você pode informar o fato novamente. Cópias antigas sem vínculo de origem podem continuar disponíveis.</p>
                           <div class="ob-row">
                             <button type="button" class="ob-button" data-action="forget-cancel">Cancelar</button>
-                            <button type="button" class="ob-button" data-action="forget-confirm" data-memory-id="${escapeHtml(item.id)}"${state.pendingMemoryId === item.id ? " disabled" : ""}>Esquecer</button>
+                            <button type="button" class="ob-button" data-action="forget-confirm" data-memory-id="${escapeHtml(item.id)}"${itemDisabled}>Esquecer</button>
                           </div>
                         </div>
                       ` : ""}
@@ -880,18 +1275,20 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
                   `;
                 }).join("")}
               </div>
-              <div class="ob-pagination">
-                <span class="ob-item-meta">Página ${state.page}${state.nextCursor ? " · mais resultados" : ""}</span>
-                <div class="ob-row">
-                  <button type="button" class="ob-button" data-action="prev-page"${state.loading || state.page <= 1 ? " disabled" : ""}>Anterior</button>
-                  <button type="button" class="ob-button" data-action="load-next-memory-page"${state.loading || !state.nextCursor ? " disabled" : ""}>Próxima</button>
+              ${showPagination ? `
+                <div class="ob-pagination">
+                  <span class="ob-item-meta">Página ${state.page}${state.nextCursor ? " · há mais resultados" : ""}</span>
+                  <div class="ob-row">
+                    <button type="button" class="ob-button" data-action="prev-page"${state.loading || state.page <= 1 ? " disabled" : ""}>Anterior</button>
+                    <button type="button" class="ob-button" data-action="load-next-memory-page"${state.loading || !state.nextCursor ? " disabled" : ""}>Próxima</button>
+                  </div>
                 </div>
-              </div>
+              ` : ""}
             ` : ""}
           `;
           const search = body.querySelector('input[type="search"]');
           if (search instanceof HTMLInputElement && search.value !== state.query) search.value = state.query;
-          const pendingFocus = state.pendingFocus;
+          const pendingFocus = state.pendingFocus || (focusedAction ? { selector: `[data-action="set-scope"][data-scope="${focusedAction}"]` } : null);
           state.pendingFocus = null;
           renderPendingFocus(body, pendingFocus);
           if (!pendingFocus && searchSelection && search instanceof HTMLInputElement) {
@@ -909,10 +1306,19 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
         const loadPage = async (pageNumber, cursor = null, reset = false) => {
           if (!current() || state.pendingMemoryId) return;
           const loadToken = ++state.loadToken;
+          const requestedQuery = state.query.trim();
           state.loading = true;
+          state.slowLoading = false;
           state.error = "";
           state.alert = "";
           state.notice = "";
+          clearLocalTimeout(state.slowTimer);
+          state.slowTimer = setLocalTimeout(() => {
+            state.slowTimer = 0;
+            if (loadToken !== state.loadToken || !state.loading || !current()) return;
+            state.slowLoading = true;
+            render();
+          }, LOADING_HINT_DELAY_MS);
           render();
           try {
             const api = desktopAgent();
@@ -921,7 +1327,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
               api.listMemoriesPage({
                 limit: MEMORY_PAGE_LIMIT,
                 includeInactive: true,
-                query: state.query.trim(),
+                query: requestedQuery,
                 scope: state.scope,
                 ...(cursor ? { cursor } : {}),
                 agentId,
@@ -935,14 +1341,18 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
             state.items = Array.isArray(pageResult?.items) ? pageResult.items : [];
             state.nextCursor = typeof pageResult?.nextCursor === "string" ? pageResult.nextCursor : null;
             state.status = status;
-            memorySectionState.status = status;
-            renderMemorySection();
+            state.loadedQuery = requestedQuery;
+            syncSectionFromDialogStatus(state.binding, status);
           } catch (error) {
             if (loadToken !== state.loadToken || !current()) return;
             state.error = sanitizeError(error, "Não foi possível carregar as memórias.");
           } finally {
             if (loadToken !== state.loadToken || !current()) return;
+            clearLocalTimeout(state.slowTimer);
+            state.slowTimer = 0;
             state.loading = false;
+            state.slowLoading = false;
+            state.loadedOnce = true;
             render();
           }
         };
@@ -972,8 +1382,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
             void desktopAgent().getMemoryStatus({ agentId, expectedAgentId: state.binding.expectedAgentId }).then((status) => {
               if (!current() || commitToken !== state.loadToken) return;
               state.status = status;
-              memorySectionState.status = status;
-              renderMemorySection();
+              syncSectionFromDialogStatus(state.binding, status);
             }).catch(() => {
               if (!current() || commitToken !== state.loadToken) return;
               memorySectionState.error = "Memória atualizada; não foi possível atualizar o resumo. Tente novamente.";
@@ -985,6 +1394,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
             state.pendingFocus = { selector: state.editingId ? 'textarea[data-role="memory-text"]' : '[data-action="forget-confirm"]' };
           } finally {
             state.pendingMemoryId = null;
+            state.loading = false;
             render();
           }
         };
@@ -1022,6 +1432,18 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
           const action = target.dataset.action;
           const memoryId = target.dataset.memoryId || null;
           if (action === "retry-memory-load") void reload();
+          if (action === "clear-search") {
+            state.query = "";
+            clearLocalTimeout(state.searchTimer);
+            state.pendingFocus = { selector: 'input[type="search"]' };
+            void reload();
+          }
+          if (action === "change-memory-mode") {
+            const radios = [...document.querySelectorAll(`#${MEMORY_SECTION_ID} input[name="openbot-memory-mode"]`)];
+            const target = radios.find((radio) => radio.checked) || radios[0];
+            if (dialogState && target instanceof HTMLElement) dialogState.restoreFocus = target;
+            closeDialog();
+          }
           if (action === "set-scope") {
             const nextScope = target.dataset.scope;
             if (nextScope !== "agent" && nextScope !== "user") return;
@@ -1032,6 +1454,8 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
             state.editingId = null;
             state.confirmForgetId = null;
             state.alert = "";
+            state.items = [];
+            state.loadedOnce = false;
             void reload();
           }
           if (action === "prev-page" && !state.loading && state.page > 1) {
@@ -1043,7 +1467,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
             state.pageCursors[targetPage - 1] = state.nextCursor;
             void loadPage(targetPage, state.nextCursor);
           }
-          if (action === "edit-memory" && memoryId) {
+          if (action === "edit-memory" && memoryId && !state.loading) {
             const current = state.items.find((item) => item.id === memoryId);
             if (!current) return;
             state.editingId = memoryId;
@@ -1059,12 +1483,12 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
             state.alert = "";
             render();
           }
-          if (action === "toggle-pin" && memoryId) {
+          if (action === "toggle-pin" && memoryId && !state.loading) {
             const current = state.items.find((item) => item.id === memoryId);
             if (!current) return;
             void commit(memoryId, (agentId) => desktopAgent().updateMemory({ memoryId, pinned: !current.pinned, scope: state.scope, agentId, expectedAgentId: state.binding.expectedAgentId }));
           }
-          if (action === "save-memory" && memoryId) {
+          if (action === "save-memory" && memoryId && !state.loading) {
             const text = (state.editText || "").trim();
             if (!text) {
               state.alert = "O texto da memória não pode ficar vazio.";
@@ -1074,7 +1498,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
             }
             void commit(memoryId, (agentId) => desktopAgent().updateMemory({ memoryId, text, importance: state.editImportance, scope: state.scope, agentId, expectedAgentId: state.binding.expectedAgentId }));
           }
-          if (action === "forget-request" && memoryId) {
+          if (action === "forget-request" && memoryId && !state.loading) {
             state.confirmForgetId = memoryId;
             state.alert = "";
             state.pendingFocus = { selector: '[data-action="forget-cancel"]' };
@@ -1085,7 +1509,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
             state.alert = "";
             render();
           }
-          if (action === "forget-confirm" && memoryId) {
+          if (action === "forget-confirm" && memoryId && !state.loading) {
             void commit(memoryId, (agentId) => desktopAgent().deleteMemory({ memoryId, scope: state.scope, agentId, expectedAgentId: state.binding.expectedAgentId }));
           }
         });
@@ -1117,14 +1541,12 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     scanInFlight = true;
     try {
       ensureStyle();
-      if (!findMemorySectionMountRoot() && !dialogState) {
+      // Behind the memory dialog the app is inert (the settings root may even be
+      // hidden); keep the section where it is, closing the dialog rescans.
+      if (dialogState) return;
+      if (!findMemorySectionMountRoot()) {
         const section = document.getElementById(MEMORY_SECTION_ID);
-        if (section || memorySectionState.status || memorySectionState.loading) {
-          handleActiveAgentChange(null, "");
-          agentContext.token += 1;
-          agentContext.loaded = false;
-          agentContext.loading = false;
-        }
+        if (section || memorySectionState.loading || memorySectionState.savingMode) suspendMemorySection();
         section?.remove();
         return;
       }
@@ -1148,7 +1570,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
   }
 
   function mutationNeedsMemoryScan(record) {
-    const selector = "#openbot-provider-settings,main.sand-chat,.sand-info-pane,.sand-agent-item,.sand-onboarding__meet,[aria-label='View agent settings']";
+    const selector = `#openbot-provider-settings,#${MEMORY_SLOT_ID},main.sand-chat,.sand-info-pane,.sand-agent-item,.sand-onboarding__meet,[aria-label='View agent settings']`;
     if (record.type === "attributes") return record.target instanceof Element && record.target.matches(selector);
     return [...record.addedNodes, ...record.removedNodes].some((node) => {
       const element = node instanceof Element ? node : node.parentElement;
@@ -1161,7 +1583,10 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     observer = new MutationObserver((records) => {
       if (localUiClosed) return;
       const touched = records.some((record) => !isOwnMutation(record) && mutationNeedsMemoryScan(record));
-      if (touched) scheduleScan();
+      if (!touched) return;
+      // A freshly inserted slot is filled before the next paint; everything else is debounced.
+      if (memorySlotNeedsMount()) mountMemorySectionNow();
+      else scheduleScan();
     });
     observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["aria-expanded", "aria-current", "data-active"] });
   }
@@ -1184,7 +1609,7 @@ body.${ACTIVE_DIALOG_CLASS}{overflow:hidden}
     void scan();
   }
 
-  window.addEventListener("openbot:settings-mounted", () => scheduleScan(0));
+  window.addEventListener("openbot:settings-mounted", () => mountMemorySectionNow());
 
   window.addEventListener("openbot:memory-ui-rescan", () => {
     if (localUiClosed) return;

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 // the TypeScript build. Its small pure helpers remain importable for regression
 // coverage.
 // @ts-expect-error -- no declaration file is emitted for scripts/*.mjs
-import { buildIsolatedEnvironment, evaluateCommandResult, getRootProcesses, listStaleReadinessRoots, parseVitestSkipEvidence, READINESS_GATES } from "../scripts/verify-readiness.mjs";
+import { buildIsolatedEnvironment, evaluateCommandResult, getRootProcesses, listStaleReadinessRoots, parseVitestSkipEvidence, READINESS_GATES, removeTempRootIfEmpty } from "../scripts/verify-readiness.mjs";
 
 describe("readiness runner classification", () => {
   it("isolates OS defaults without changing explicit OpenBot root contracts", () => {
@@ -83,6 +83,24 @@ describe("readiness runner classification", () => {
       await symlink(target, stale, process.platform === "win32" ? "junction" : "dir");
 
       await expect(listStaleReadinessRoots(current)).resolves.toEqual([stale]);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("removes a failed run's TempRoot only when it holds no diagnostics", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "openbot-readiness-parent-"));
+    const empty = join(parent, "openbot-readiness-empty");
+    const withEvidence = join(parent, "openbot-readiness-evidence");
+    try {
+      await mkdir(empty);
+      await mkdir(withEvidence);
+      await writeFile(join(withEvidence, "gate.log"), "diagnostic");
+
+      await expect(removeTempRootIfEmpty(empty)).resolves.toBe(true);
+      await expect(access(empty)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(removeTempRootIfEmpty(withEvidence)).resolves.toBe(false);
+      await expect(access(join(withEvidence, "gate.log"))).resolves.toBeUndefined();
     } finally {
       await rm(parent, { recursive: true, force: true });
     }

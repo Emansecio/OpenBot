@@ -384,17 +384,21 @@ describe("Electron/Windows local integration patches", () => {
     let resolveSave!: (value: unknown) => void;
     let rejectSave!: (error: Error) => void;
     let calls = 0;
-    const statuses: string[] = [];
+    const autosaves: number[] = [];
     const control = { value: "gpt-5.6-sol", disabled: false, selectedOptions: [{ disabled: false }] };
     const scope = {
       saving: false, authBusy: false, persisted: "previous", activeAgentId: "alpha", globalScope: false,
+      saveError: null as null | { selection: string; message: string }, notice: { kind: "ok", text: "Conta conectada." } as unknown,
+      lastSavedAt: 0, savedMessage: "Salvo", savePromise: null as unknown, savedTimer: 0,
       speedEl: { value: "default", selectedOptions: [{ disabled: false }] },
       providerEl: { value: "openai" }, modelEl: control, reasoningEl: { value: "high", selectedOptions: [{ disabled: false }] },
       oauth: { openai: { state: "connected" } }, openCodeConfigured: false,
-      loadingControls: [control], isCurrent: () => current,
+      isCurrent: () => current,
       selection: () => JSON.stringify(["openai", control.value, "high", "default"]),
       syncSave: () => {}, syncAuth: () => {},
-      setStatus: (_kind: string, text: string) => statuses.push(text),
+      scheduleAutosave: (delay = 300) => { autosaves.push(delay); },
+      setLocalTimeout: () => 1, clearLocalTimeout: () => {}, SAVED_VISIBLE_MS: 2000,
+      userFacingError: runInNewContext(`${between(settings, "const IPC_ERROR_PREFIX", "const SETTINGS_LABELS")} userFacingError`, {}),
       desktop: () => ({ agent: { setProviderConfig: () => {
         calls += 1;
         return new Promise((resolve, reject) => { resolveSave = resolve; rejectSave = reject; });
@@ -406,23 +410,38 @@ describe("Electron/Windows local integration patches", () => {
     const failed = save("salvo");
     await save("duplicado");
     expect(calls).toBe(1);
-    expect(control.disabled).toBe(true);
-    rejectSave(new Error("offline"));
+    expect(scope.saving).toBe(true);
+    // Autosave keeps the controls usable while the request is in flight.
+    expect(control.disabled).toBe(false);
+    rejectSave(new Error("Error invoking remote method 'sand:provider-config-set': Error: offline"));
     await failed;
     expect(control.value).toBe("gpt-5.6-sol");
     expect(scope.persisted).toBe("previous");
-    expect(statuses.at(-1)).toContain("Tente novamente");
+    // The failure stays visible (with its retry action in the UI) in pt-BR, without IPC details.
+    expect(scope.saveError).toEqual({ selection: scope.selection(), message: "Não foi possível salvar as alterações." });
+    expect(autosaves).toEqual([]);
     const retry = save("salvo");
     resolveSave({ agentId: "alpha", provider: "openai", model: control.value, reasoningEffort: "high" });
     await retry;
     expect(scope.persisted).toBe(scope.selection());
-    expect(statuses.at(-1)).toBe("salvo");
+    expect(scope.saveError).toBeNull();
+    expect(scope.savedMessage).toBe("salvo");
+    expect(scope.notice).toBeNull();
+    // A choice made while a save is in flight is saved right after it, not dropped.
+    control.value = "gpt-5.6-terra";
+    const queued = save("salvo");
     control.value = "gpt-5.6-luna";
+    resolveSave({ agentId: "alpha", provider: "openai", model: "gpt-5.6-terra", reasoningEffort: "high" });
+    await queued;
+    expect(JSON.parse(scope.persisted)[1]).toBe("gpt-5.6-terra");
+    expect(autosaves).toEqual([0]);
+    control.value = "gpt-5.6-nova";
     const late = save("resposta atrasada");
     current = false;
     resolveSave({ agentId: "alpha", provider: "openai", model: control.value, reasoningEffort: "high" });
     await late;
-    expect(statuses).not.toContain("resposta atrasada");
+    expect(scope.savedMessage).not.toBe("resposta atrasada");
+    expect(JSON.parse(scope.persisted)[1]).toBe("gpt-5.6-terra");
   });
 
   it.each(["retry", "inspect", "none", "unknown-contract"])("offers recovery actions only when the backend confirms them (%s)", async (mode) => {

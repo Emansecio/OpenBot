@@ -48,8 +48,15 @@ registry.register({
     emit({ type: "delta", delta: "ok" });
   },
 });
+// Runtime and browser roots default to %LOCALAPPDATA%\OpenBot; keep every root in the temp dir.
+const serverOptions = {
+  registry, storePath, configPath, keystoreDir,
+  workspacesRoot: join(dir, "workspaces"),
+  runtimeRoot: join(dir, "runtime"),
+  browserRoot: join(dir, "browser"),
+};
 try {
-  handle = await startServer(0, { registry, storePath, configPath, keystoreDir, workspacesRoot: join(dir, "workspaces") });
+  handle = await startServer(0, serverOptions);
   assert(typeof handle.gatewayToken === "string" && handle.gatewayToken.length > 0, "gateway token ausente no primeiro boot");
   const initial = await post(handle.port, handle.gatewayToken, "listAgents", {});
   assert(Array.isArray(initial) && initial.length === 0, "smoke iniciou com bots inesperados");
@@ -65,7 +72,7 @@ try {
   const first = await post(handle.port, handle.gatewayToken, "getAgentTranscriptTail", { agentId, limit: 20 });
   assert(first.entries.some((e) => e.content === "smoke ok"), "resposta ausente no transcript");
   await stopServer(handle); handle = undefined;
-  handle = await startServer(0, { registry, storePath, configPath, keystoreDir, workspacesRoot: join(dir, "workspaces") });
+  handle = await startServer(0, serverOptions);
   assert(typeof handle.gatewayToken === "string" && handle.gatewayToken.length > 0, "gateway token ausente após restart");
   const afterRestart = await post(handle.port, handle.gatewayToken, "listAgents", {});
   assert(afterRestart.length === 1 && afterRestart[0].id === agentId, "bot temporário não persistiu após restart");
@@ -76,7 +83,7 @@ try {
   const empty = await post(handle.port, handle.gatewayToken, "listAgents", {});
   assert(Array.isArray(empty) && empty.length === 0, "roster não voltou a zero após exclusão");
   await stopServer(handle); handle = undefined;
-  handle = await startServer(0, { registry, storePath, configPath, keystoreDir, workspacesRoot: join(dir, "workspaces") });
+  handle = await startServer(0, serverOptions);
   assert(typeof handle.gatewayToken === "string" && handle.gatewayToken.length > 0, "gateway token ausente após restart final");
   const afterDeleteRestart = await post(handle.port, handle.gatewayToken, "listAgents", {});
   assert(Array.isArray(afterDeleteRestart) && afterDeleteRestart.length === 0, "bot foi recriado após restart pós-exclusão");

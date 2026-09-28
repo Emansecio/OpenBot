@@ -1,7 +1,8 @@
 (() => {
-  // openbot-local-settings-v57-queue-recovery
+  // openbot-local-settings-v60-settings-redesign
   window.performance?.mark?.("openbot:local-settings-evaluated");
   const ROOT_ID = "openbot-provider-settings";
+  const MODAL_LAYER_SELECTOR = '.ui-menu__backdrop,[role="menu"],[role="dialog"][aria-modal="true"],[role="alertdialog"]';
   const EMPTY_ID = "openbot-empty-agent-state";
   const STOP_ID = "openbot-stop-turn";
   const STYLE_ID = "openbot-local-ui-style";
@@ -78,7 +79,7 @@
           await desktop()?.clientPersistence?.recoverFailedSend({ nonce, agentId: selectedAgentRow()?.getAttribute("data-agent-id") });
         } catch (error) {
           recover.disabled = false;
-          draftRecoveryError = error.message;
+          draftRecoveryError = userFacingError(error, "Não foi possível recuperar o rascunho. Tente novamente.");
           renderDraftPersistence();
         }
       });
@@ -104,99 +105,100 @@
 
   const css = `
 #${STYLE_ID}-noop{display:none}
-#${ROOT_ID}{margin:12px 0 0;padding:12px 0 0;border-top:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));color:var(--cursor-text-primary,currentColor);font:inherit}
-#${ROOT_ID}[data-scope="global"]{flex:1 1 calc(100% - 64px);width:calc(100% - 64px);max-width:calc(100% - 64px);box-sizing:border-box;margin:20px 32px 24px;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}
+#${ROOT_ID}{--ob-stroke:var(--cursor-stroke-secondary,rgba(252,252,252,.15));--ob-text-2:var(--cursor-text-secondary,rgba(252,252,252,.6));--ob-text-3:var(--cursor-text-tertiary,rgba(252,252,252,.4));--ob-control-h:30px;--ob-control-r:6px;--ob-control-bg:var(--cursor-bg-input,var(--cursor-bg-editor,#070707));--ob-control-border:var(--cursor-stroke-secondary,rgba(252,252,252,.15));--ob-label-col:64px;--ob-menu-r:8px;display:flex;min-width:0;box-sizing:border-box;flex-direction:column;gap:14px;margin:4px 0 0;padding:0;border:0;color:var(--cursor-text-primary,currentColor);font:inherit;font-size:var(--cursor-font-size-base,13px);line-height:18px}
+#${ROOT_ID}[data-scope="global"]{--ob-control-h:28px;--ob-control-r:8px;--ob-control-bg:var(--cursor-bg-tertiary,rgba(119,119,119,.17));--ob-control-border:rgba(252,252,252,.05);--ob-menu-r:10px;flex:1 1 calc(100% - 64px);width:calc(100% - 64px);max-width:calc(100% - 64px);margin:20px 32px 24px;gap:24px}
 #${ROOT_ID}[data-scope="global"][data-native-section="1"]{flex:0 0 auto;width:100%;max-width:100%;margin:0}
 #${ROOT_ID},#${EMPTY_ID},#${STOP_ID}{color-scheme:dark}
-#${ROOT_ID} .ob-kicker{margin:0 0 2px;font-size:var(--cursor-font-size-base,13px);font-weight:var(--cursor-font-weight-semibold,600);line-height:1.35}
-#${ROOT_ID} .ob-help{margin:0 0 12px;color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 74%,transparent));font-size:var(--cursor-font-size-sm,12px);line-height:1.4}
-#${ROOT_ID} label{display:block;margin:10px 0 4px;color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px)}
-#${ROOT_ID} select,#${ROOT_ID} input{width:100%;min-height:30px;box-sizing:border-box;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));border-radius:6px;outline:none;background:var(--cursor-bg-editor,var(--cursor-editor,transparent));color:var(--cursor-text-primary,currentColor);padding:4px 9px;font-family:var(--cursor-font-family-sans,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif);font-size:var(--cursor-font-size-base,13px);line-height:var(--cursor-line-height-base,20px);transition:border-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease),background-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
-#${ROOT_ID} select:hover,#${ROOT_ID} input:hover{border-color:var(--cursor-stroke-primary,color-mix(in srgb,currentColor 20%,transparent))}
-#${ROOT_ID} select:focus-visible,#${ROOT_ID} input:focus-visible,#${EMPTY_ID} input:focus-visible{outline:2px solid var(--cursor-focus,var(--cursor-base,#f0f0f0));outline-offset:2px;border-color:var(--cursor-focus,var(--cursor-base,#f0f0f0))}
-#${ROOT_ID} select option{background:var(--cursor-bg-elevated,#181818);color:var(--cursor-text-primary,currentColor)}
-#${ROOT_ID} button{min-height:30px;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));border-radius:6px;padding:4px 9px;background:var(--cursor-button-secondary-background,var(--cursor-bg-tertiary,color-mix(in srgb,currentColor 8%,transparent)));color:var(--cursor-button-secondary-foreground,var(--cursor-text-primary,currentColor));font-family:var(--cursor-font-family-sans,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif);font-size:var(--cursor-font-size-base,13px);line-height:var(--cursor-line-height-base,20px);cursor:pointer;touch-action:manipulation;transition:transform var(--cursor-duration-fast,.1s) var(--cursor-easing-default,ease),background-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease),border-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
-#${ROOT_ID} button:hover{border-color:var(--cursor-stroke-primary,color-mix(in srgb,currentColor 20%,transparent));background:var(--cursor-button-secondary-hover-background,var(--cursor-bg-secondary,color-mix(in srgb,currentColor 14%,transparent)))}
-#${ROOT_ID} button:focus-visible{outline:2px solid var(--cursor-focus,currentColor);outline-offset:2px}
-#${ROOT_ID} button:active{transform:scale(.96)}
-#${ROOT_ID} button[disabled]{opacity:.5;cursor:default;transform:none}
-#${ROOT_ID} #openbot-save{border-color:var(--cursor-stroke-primary,rgba(255,255,255,.24));background:var(--cursor-text-primary,#f0f0f0);color:#171717;font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.18)}
-#${ROOT_ID} #openbot-save:hover{border-color:var(--cursor-text-primary,#f0f0f0);background:#fff;color:#111}
-#${ROOT_ID} .ok{margin-top:8px;font-size:var(--cursor-font-size-sm,12px);color:var(--cursor-green,#45a557)}
-#${ROOT_ID} .err{margin-top:8px;font-size:var(--cursor-font-size-sm,12px);color:var(--cursor-danger,#e34671)}
+#${ROOT_ID} [hidden]{display:none!important}
+#${ROOT_ID} .ob-group{display:flex;min-width:0;flex-direction:column}
+#${ROOT_ID} .ob-group-label{display:block;box-sizing:border-box;margin:0;padding:0 8px 6px;color:var(--ob-text-2);font-size:var(--cursor-font-size-sm,12px);font-weight:400;line-height:16px}
+#${ROOT_ID}[data-scope="global"] .ob-group-label{margin:0 0 8px;padding:0 4px 0 8px}
+#${ROOT_ID} .ob-group-help{margin:-2px 0 8px;padding:0 8px;color:var(--ob-text-3);font-size:var(--cursor-font-size-sm,12px);line-height:16px;text-wrap:pretty}
+#${ROOT_ID}[data-scope="global"] .ob-group-help{margin:-4px 0 10px}
+#${ROOT_ID} .ob-card{min-width:0;box-sizing:border-box;border:1px solid var(--ob-stroke);border-radius:6px;padding:0 10px;background:transparent}
+#${ROOT_ID}[data-scope="global"] .ob-card{border:0;border-radius:14px;padding:0 14px;background:var(--cursor-bg-tertiary,rgba(119,119,119,.17))}
+#${ROOT_ID} .ob-field-row{display:grid;grid-template-columns:var(--ob-label-col) minmax(0,1fr);align-items:center;column-gap:10px;min-height:46px;box-sizing:border-box;padding:8px 0;border-top:1px solid var(--ob-stroke)}
+#${ROOT_ID} .ob-card>.ob-field-row:first-child{border-top:0}
+#${ROOT_ID}[data-scope="global"] .ob-field-row{grid-template-columns:minmax(0,1fr) auto;column-gap:16px;min-height:52px;padding:10px 0}
+#${ROOT_ID} .ob-auth-row,#${ROOT_ID} .ob-advanced .ob-field-row{grid-template-columns:auto minmax(0,1fr)}
+#${ROOT_ID} .ob-field-row.ob-stack-row,#${ROOT_ID}[data-scope="global"] .ob-field-row.ob-stack-row{grid-template-columns:minmax(0,1fr);row-gap:8px}
+#${ROOT_ID} .ob-row-label{display:block;min-width:0;margin:0;overflow:hidden;color:var(--ob-text-2);font-size:var(--cursor-font-size-sm,12px);font-weight:400;line-height:16px;text-overflow:ellipsis;white-space:nowrap}
+#${ROOT_ID}[data-scope="global"] .ob-row-label{color:var(--cursor-text-primary,currentColor);font-size:var(--cursor-font-size-base,13px);line-height:18px}
+#${ROOT_ID} .ob-row-control{display:flex;min-width:0;align-items:center;justify-content:flex-end;gap:6px}
+#${ROOT_ID} .ob-auth-control{gap:8px}
+#${ROOT_ID} .ob-row-note{grid-column:1/-1;min-width:0;margin:6px 0 0;color:var(--ob-text-2);font-size:var(--cursor-font-size-sm,12px);line-height:16px;overflow-wrap:anywhere;text-wrap:pretty}
+#${ROOT_ID} .ob-row-note.err{color:var(--cursor-danger,#ff5667)}
+#${ROOT_ID} .ob-row-note.is-reserved{visibility:hidden}
+#${ROOT_ID} .ob-native-select{position:absolute!important;width:1px!important;height:1px!important;min-height:1px!important;margin:0!important;padding:0!important;border:0!important;opacity:0!important;pointer-events:none!important}
+#${ROOT_ID} .ob-select{position:relative;display:flex;min-width:0;flex:1 1 auto}
+#${ROOT_ID}[data-scope="global"] .ob-select{flex:0 1 auto;max-width:320px}
+#${ROOT_ID} .ob-select-trigger{display:flex;width:100%;min-width:0;height:var(--ob-control-h);box-sizing:border-box;align-items:center;gap:6px;margin:0;border:1px solid var(--ob-control-border);border-radius:var(--ob-control-r);padding:0 8px;background:var(--ob-control-bg);color:var(--cursor-text-primary,currentColor);font:inherit;font-size:var(--cursor-font-size-base,13px);font-weight:400;line-height:18px;text-align:left;cursor:pointer;touch-action:manipulation;transition:border-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease),background-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
+#${ROOT_ID}[data-scope="global"] .ob-select-trigger{padding:0 5px 0 8px}
+#${ROOT_ID} .ob-select-value{min-width:0;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#${ROOT_ID} .ob-select-trigger::after{content:"";flex:none;width:5px;height:5px;margin:0 3px 3px 2px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;opacity:.6;transform:rotate(45deg);transition:transform var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
+#${ROOT_ID} .ob-select-trigger[aria-expanded="true"]::after{margin-bottom:-2px;transform:rotate(225deg)}
+#${ROOT_ID} .ob-select-trigger:hover:not(:disabled),#${ROOT_ID} .ob-select-trigger[aria-expanded="true"]{border-color:var(--cursor-stroke-primary,rgba(252,252,252,.24))}
+#${ROOT_ID} .ob-select-trigger:disabled{cursor:default;opacity:.5}
+#${ROOT_ID}[data-loading="1"] .ob-select-trigger:disabled{opacity:1}
+#${ROOT_ID}[data-loading="1"] .ob-select-value,#${ROOT_ID}[data-loading="1"] #openbot-auth-action{visibility:hidden}
+#${ROOT_ID} .ob-select-menu{position:absolute;z-index:80;top:calc(100% + 4px);right:0;min-width:100%;width:max-content;max-width:min(320px,calc(100vw - 32px));max-height:240px;box-sizing:border-box;overflow-y:auto;padding:4px;border:1px solid var(--cursor-stroke-primary,rgba(252,252,252,.18));border-radius:var(--ob-menu-r);background:var(--cursor-bg-elevated,#1f1f1f);box-shadow:0 12px 30px rgba(0,0,0,.38)}
+#${ROOT_ID} .ob-select.is-open-up .ob-select-menu{top:auto;bottom:calc(100% + 4px)}
+#${ROOT_ID} .ob-select-option{display:grid;width:100%;grid-template-columns:minmax(0,1fr) 14px;align-items:center;gap:8px;min-height:28px;box-sizing:border-box;margin:0;border:0;border-radius:calc(var(--ob-menu-r) - 3px);padding:4px 8px;background:transparent;color:var(--cursor-text-primary,currentColor);font:inherit;font-size:var(--cursor-font-size-base,13px);font-weight:400;line-height:18px;text-align:left;white-space:nowrap;cursor:pointer}
+#${ROOT_ID} .ob-select-option:hover:not(:disabled),#${ROOT_ID} .ob-select-option:focus-visible{background:var(--cursor-bg-secondary,rgba(252,252,252,.1));outline:0}
+#${ROOT_ID} .ob-select-option[aria-selected="true"]{background:color-mix(in srgb,currentColor 8%,transparent)}
+#${ROOT_ID} .ob-select-option[aria-selected="true"]::after{content:"✓";justify-self:center;font-size:12px}
+#${ROOT_ID} .ob-select-option:disabled{opacity:.5;cursor:not-allowed}
+#${ROOT_ID} .ob-button{display:inline-flex;flex:none;height:var(--ob-control-h);min-width:0;box-sizing:border-box;align-items:center;justify-content:center;margin:0;border:1px solid var(--ob-control-border);border-radius:var(--ob-control-r);padding:0 10px;background:var(--cursor-button-secondary-background,var(--cursor-bg-tertiary,rgba(252,252,252,.08)));color:var(--cursor-button-secondary-foreground,var(--cursor-text-primary,currentColor));font:inherit;font-size:var(--cursor-font-size-base,13px);font-weight:400;line-height:18px;white-space:nowrap;cursor:pointer;touch-action:manipulation;transition:transform var(--cursor-duration-fast,.1s) var(--cursor-easing-default,ease),background-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease),border-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
+#${ROOT_ID} .ob-button:hover:not(:disabled){border-color:var(--cursor-stroke-primary,rgba(252,252,252,.24));background:var(--cursor-button-secondary-hover-background,var(--cursor-bg-secondary,rgba(252,252,252,.14)))}
+#${ROOT_ID} .ob-button:active:not(:disabled){transform:scale(.96)}
+#${ROOT_ID} .ob-button:disabled{opacity:.5;cursor:default;transform:none}
+#${ROOT_ID} .ob-icon-button{width:var(--ob-control-h);padding:0;color:var(--ob-text-2)}
+#${ROOT_ID} .ob-icon-button:hover:not(:disabled){color:var(--cursor-text-primary,currentColor)}
+#${ROOT_ID} .ob-icon-button svg{display:block;width:14px;height:14px}
+#${ROOT_ID} .ob-icon-button.is-busy:disabled{opacity:1}
+#${ROOT_ID} .ob-icon-button.is-busy svg{animation:ob-settings-spin .9s linear infinite}
+@keyframes ob-settings-spin{to{transform:rotate(360deg)}}
+#${ROOT_ID} .ob-link-button{display:inline;height:auto;margin:0;border:0;padding:0;background:transparent;color:var(--cursor-text-primary,currentColor);font:inherit;text-decoration:underline;text-underline-offset:2px;cursor:pointer}
+#${ROOT_ID} :is(.ob-button,.ob-select-trigger,.ob-link-button,.ob-advanced>summary):focus-visible{outline:2px solid var(--cursor-focus,var(--cursor-base,#f0f0f0));outline-offset:2px}
+#${ROOT_ID} .ob-input{width:100%;min-width:0;height:var(--ob-control-h);box-sizing:border-box;border:1px solid var(--ob-control-border);border-radius:var(--ob-control-r);outline:none;padding:0 8px;background:var(--ob-control-bg);color:var(--cursor-text-primary,currentColor);font:inherit;font-size:var(--cursor-font-size-base,13px);line-height:18px;transition:border-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
+#${ROOT_ID} .ob-input:hover{border-color:var(--cursor-stroke-primary,rgba(252,252,252,.24))}
+#${ROOT_ID} .ob-input:focus-visible,#${EMPTY_ID} input:focus-visible{outline:2px solid var(--cursor-focus,var(--cursor-base,#f0f0f0));outline-offset:2px;border-color:var(--cursor-focus,var(--cursor-base,#f0f0f0))}
+#${ROOT_ID} .ob-input[aria-invalid="true"]{border-color:var(--cursor-danger,#ff5667)}
 #${ROOT_ID} .compat{display:none}
 #${ROOT_ID}.compat-on .compat{display:block}
 #${ROOT_ID} .ob-found{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0}
 #${ROOT_ID} .ob-found button{min-height:28px;padding:4px 8px;font-size:var(--cursor-font-size-sm,12px)}
-#${ROOT_ID} .ob-secret-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-#${ROOT_ID} .ob-secret-row input{flex:1 1 220px;min-width:0}
-#${ROOT_ID} .ob-key-status{color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px);white-space:nowrap}
-#${ROOT_ID} .ob-key-status.saved{color:var(--cursor-green,#45a557)}
-#${ROOT_ID} .ob-key-status.error,#${ROOT_ID} .ob-remove{color:var(--cursor-danger,#e34671)}
-#${ROOT_ID} .ob-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;margin:0;padding-top:10px;border-top:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 10%,transparent))}
-#${ROOT_ID} .ob-provider-card{padding:0;border-radius:0;background:transparent;box-shadow:none}
-#${ROOT_ID} .ob-field-row{display:grid;grid-template-columns:minmax(84px,.72fr) minmax(140px,1.28fr);align-items:center;gap:12px;min-height:44px;padding:4px 0;border-top:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 10%,transparent))}
-#${ROOT_ID} .ob-field-row:first-child{border-top:0}
-#${ROOT_ID} .ob-model-catalog{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:10px}
-#${ROOT_ID} #openbot-model-status{flex:1;min-width:180px;font-size:12px;line-height:1.5;color:var(--cursor-text-secondary,currentColor)}
-#${ROOT_ID} .ob-select-option:disabled{opacity:.5;cursor:not-allowed}
-#${ROOT_ID} .ob-field-row label{margin:0;color:var(--cursor-text-secondary,currentColor)}
-#${ROOT_ID} .ob-auth-row{display:flex;min-height:44px;align-items:center;justify-content:space-between;gap:10px;margin:0;padding:4px 0;border-top:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 10%,transparent))}
-#${ROOT_ID} .ob-auth-row button{flex:none;min-height:30px}
-#${ROOT_ID} #openbot-api-key-row{padding:8px 0;border-top:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 10%,transparent))}
-#${ROOT_ID} #openbot-api-key-row>label{margin:0 0 6px}
-#${ROOT_ID}[data-scope="global"]>.ob-kicker{display:block;box-sizing:border-box;margin:0 0 8px;padding:0 4px 0 8px;color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-sm,12px);font-weight:400;line-height:16px}
-#${ROOT_ID}[data-scope="global"]>.ob-help{display:none}
-#${ROOT_ID}[data-scope="global"] .ob-provider-card{position:relative;border-radius:14px;background:var(--cursor-bg-tertiary,#1f1f1f)}
-#${ROOT_ID}[data-scope="global"] .ob-field-row{position:relative;display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,320px);align-items:center;gap:12px;min-height:54px;box-sizing:border-box;padding:9px 14px;border:0}
-#${ROOT_ID}[data-scope="global"] .ob-field-row label{margin:0;color:var(--cursor-text-primary,currentColor);font-size:var(--cursor-font-size-base,13px)}
-#${ROOT_ID}[data-scope="global"] .ob-auth-row{position:relative;min-height:54px;box-sizing:border-box;margin:0;padding:9px 14px;border:0}
-#${ROOT_ID}[data-scope="global"] .ob-auth-row::before,#${ROOT_ID}[data-scope="global"] .ob-field-row:not(:first-child)::before,#${ROOT_ID}[data-scope="global"] .ob-actions::before,#${ROOT_ID}[data-scope="global"] #openbot-api-key-row::before{content:"";position:absolute;top:0;right:14px;left:14px;height:1px;background:var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 10%,transparent))}
-#${ROOT_ID}[data-scope="global"] #openbot-api-key-row{position:relative;box-sizing:border-box;padding:11px 14px;border:0}
-#${ROOT_ID}[data-scope="global"] .ob-actions{position:relative;min-height:52px;box-sizing:border-box;align-items:center;margin:0;padding:10px 14px;border:0}
-#${ROOT_ID}[data-scope="global"] #openbot-save{min-height:30px}
-#${ROOT_ID}[data-scope="global"] .ob-key-status.saved{display:inline-flex;align-items:center;gap:7px;color:var(--cursor-text-secondary,currentColor)}
-#${ROOT_ID}[data-scope="global"] .ob-key-status.saved::before{content:"";width:7px;height:7px;flex:none;border-radius:50%;background:var(--cursor-green,#45a557);box-shadow:0 0 0 2px color-mix(in srgb,var(--cursor-green,#45a557) 18%,transparent)}
-#${ROOT_ID}[data-scope="global"] .ob-select{position:relative;width:min(100%,320px);justify-self:end}
-#${ROOT_ID}[data-scope="global"] .ob-native-select{position:absolute!important;width:1px!important;height:1px!important;min-height:1px!important;margin:0!important;padding:0!important;opacity:0!important;pointer-events:none!important}
-#${ROOT_ID}[data-scope="global"] .ob-select-trigger{display:grid;width:100%;grid-template-columns:minmax(0,1fr) 14px;align-items:center;gap:8px;min-height:30px;padding:4px 8px 4px 10px;border-radius:6px;background:var(--cursor-button-secondary-background,var(--cursor-bg-tertiary,#2b2b2b));text-align:left;font-weight:400;box-shadow:none;transform:none}
-#${ROOT_ID}[data-scope="global"] .ob-select-trigger::after{content:"";width:6px;height:6px;justify-self:center;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;opacity:.68;transform:translateY(-2px) rotate(45deg);transition:transform var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
-#${ROOT_ID}[data-scope="global"] .ob-select-trigger[aria-expanded="true"]{border-color:var(--cursor-stroke-primary,color-mix(in srgb,currentColor 24%,transparent));background:var(--cursor-bg-tertiary,#2b2b2b)}
-#${ROOT_ID}[data-scope="global"] .ob-select-trigger[aria-expanded="true"]::after{transform:translateY(2px) rotate(225deg)}
-#${ROOT_ID}[data-scope="global"] .ob-select-value{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#${ROOT_ID}[data-scope="global"] .ob-select-menu{position:absolute;z-index:80;top:calc(100% + 6px);right:0;width:100%;max-height:224px;box-sizing:border-box;overflow-y:auto;padding:4px;border:1px solid var(--cursor-stroke-primary,color-mix(in srgb,currentColor 18%,transparent));border-radius:10px;background:var(--cursor-bg-elevated,#242424);box-shadow:0 12px 30px rgba(0,0,0,.38)}
-#${ROOT_ID}[data-scope="global"] .ob-select.is-open-up .ob-select-menu{top:auto;bottom:calc(100% + 6px)}
-#${ROOT_ID}[data-scope="global"] .ob-select-menu[hidden]{display:none}
-#${ROOT_ID}[data-scope="global"] .ob-select-option{display:grid;width:100%;grid-template-columns:minmax(0,1fr) 14px;align-items:center;gap:8px;min-height:32px;padding:5px 8px;border:0;border-radius:7px;background:transparent;text-align:left;font-weight:400;box-shadow:none;transform:none}
-#${ROOT_ID}[data-scope="global"] .ob-select-option:hover,#${ROOT_ID}[data-scope="global"] .ob-select-option:focus-visible{border:0;background:var(--cursor-bg-secondary,color-mix(in srgb,currentColor 10%,transparent));outline:0}
-#${ROOT_ID}[data-scope="global"] .ob-select-option[aria-selected="true"]{background:color-mix(in srgb,currentColor 10%,transparent)}
-#${ROOT_ID}[data-scope="global"] .ob-select-option[aria-selected="true"]::after{content:"✓";justify-self:center;color:var(--cursor-text-primary,currentColor);font-size:12px}
-#${ROOT_ID} .ob-advanced{margin-top:12px;overflow:hidden;border-radius:6px;background:transparent;box-shadow:inset 0 0 0 1px var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 10%,transparent))}
-#${ROOT_ID} .ob-advanced[open]{background:var(--cursor-bg-tertiary,color-mix(in srgb,currentColor 4%,transparent))}
-#${ROOT_ID} .ob-advanced summary{display:grid;grid-template-columns:minmax(0,1fr) auto;min-height:44px;box-sizing:border-box;align-items:center;gap:8px;padding:7px 10px;border-radius:6px;cursor:pointer;list-style:none;touch-action:manipulation}
-#${ROOT_ID} .ob-advanced summary::-webkit-details-marker{display:none}
-#${ROOT_ID} .ob-advanced summary:focus-visible{outline:2px solid var(--cursor-focus,currentColor);outline-offset:2px}
-#${ROOT_ID} .ob-advanced summary::after{content:"›";color:var(--cursor-text-tertiary,currentColor);font-size:16px;line-height:1;transform:rotate(0);transition:transform var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
-#${ROOT_ID} .ob-advanced[open] summary::after{transform:rotate(90deg)}
-#${ROOT_ID} .ob-advanced[open] summary{border-radius:6px 6px 0 0;box-shadow:inset 0 -1px var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 10%,transparent))}
-#${ROOT_ID} .ob-advanced-heading{display:grid;min-width:0;gap:1px}
-#${ROOT_ID} .ob-advanced-title{font-size:var(--cursor-font-size-base,13px);font-weight:var(--cursor-font-weight-semibold,600)}
-#${ROOT_ID} .ob-advanced-help{overflow:hidden;color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-xs,11px);line-height:1.25;text-overflow:ellipsis;white-space:nowrap}
-#${ROOT_ID} .ob-advanced-body{padding:0 10px}
-#${ROOT_ID} .ob-advanced-section{padding:12px 0;border-top:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 10%,transparent))}
-#${ROOT_ID} .ob-advanced-section:first-child{border-top:0}
-#${ROOT_ID} .ob-section-title{display:block;margin:0;color:var(--cursor-text-primary,currentColor);font-size:var(--cursor-font-size-sm,12px);font-weight:var(--cursor-font-weight-semibold,600);line-height:1.35}
-#${ROOT_ID} .ob-section-help{margin:2px 0 9px;color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-xs,11px);line-height:1.35;text-wrap:pretty}
-#${ROOT_ID} .ob-folder-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-#${ROOT_ID} .ob-folder-actions button{min-width:0;width:100%;padding-inline:6px;font-size:var(--cursor-font-size-sm,12px)}
-#${ROOT_ID} .ob-advanced-section select{margin:0}
-#${ROOT_ID} .ob-runtime-list{margin-top:5px}
-#${ROOT_ID} .ob-runtime-row{display:grid;grid-template-columns:72px minmax(0,1fr);align-items:start;gap:8px;padding:7px 0;border-top:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 8%,transparent))}
-#${ROOT_ID} .ob-runtime-row:first-child{border-top:0}
-#${ROOT_ID} .ob-runtime-label{color:var(--cursor-text-secondary,currentColor);font-size:var(--cursor-font-size-xs,11px);font-weight:500;line-height:1.35}
-#${ROOT_ID} .ob-lifecycle-status{margin:0;color:var(--cursor-text-tertiary,color-mix(in srgb,currentColor 60%,transparent));font-size:var(--cursor-font-size-xs,11px);line-height:1.35;text-align:right;text-wrap:pretty}
-#${ROOT_ID} .ob-runtime-actions{display:flex;justify-content:flex-end;padding-top:10px;border-top:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 8%,transparent))}
-@media (hover:hover) and (pointer:fine){#${ROOT_ID} .ob-advanced summary:hover{background:var(--cursor-bg-secondary,color-mix(in srgb,currentColor 7%,transparent))}}
+#${ROOT_ID} .ob-remove{color:var(--cursor-danger,#e34671)}
+#${ROOT_ID} .ob-secret-row{display:flex;min-width:0;align-items:center;gap:6px}
+#${ROOT_ID} .ob-secret-row .ob-input{flex:1 1 auto}
+#${ROOT_ID} .ob-key-status{display:inline-flex;min-width:0;align-items:center;gap:6px;color:var(--ob-text-2);font-size:var(--cursor-font-size-sm,12px);line-height:16px;white-space:nowrap}
+#${ROOT_ID}[data-scope="global"] .ob-key-status{font-size:var(--cursor-font-size-base,13px);line-height:18px}
+#${ROOT_ID} .ob-key-status::before{content:"";flex:none;width:7px;height:7px;border-radius:50%;background:var(--ob-text-3)}
+#${ROOT_ID} .ob-key-status[data-state="loading"]::before{background:var(--ob-stroke)}
+#${ROOT_ID} .ob-key-status[data-state="connected"]::before{background:var(--cursor-green,#00c972);box-shadow:0 0 0 2px color-mix(in srgb,var(--cursor-green,#00c972) 18%,transparent)}
+#${ROOT_ID} .ob-key-status[data-state="pending"]::before{background:transparent;box-shadow:inset 0 0 0 1.5px var(--ob-text-2)}
+#${ROOT_ID} .ob-key-status[data-state="error"]::before{background:var(--cursor-danger,#ff5667)}
+#${ROOT_ID} .ob-group-head{display:flex;min-width:0;box-sizing:border-box;flex-wrap:wrap;align-items:baseline;justify-content:space-between;column-gap:12px;row-gap:2px;padding:0 8px 6px}
+#${ROOT_ID}[data-scope="global"] .ob-group-head{margin:0 0 8px;padding:0 4px 0 8px}
+#${ROOT_ID} .ob-group-head>.ob-group-label,#${ROOT_ID}[data-scope="global"] .ob-group-head>.ob-group-label{flex:none;margin:0;padding:0}
+#${ROOT_ID} .ob-group-status{display:flex;min-width:0;align-items:baseline;justify-content:flex-end;flex-wrap:wrap;column-gap:8px;margin:0;padding:0;color:var(--ob-text-2);font-size:var(--cursor-font-size-sm,12px);line-height:16px;text-align:right;overflow-wrap:anywhere}
+#${ROOT_ID} .ob-group-status.ok .ob-status-text::before{content:"✓";margin-right:5px;color:var(--cursor-green,#00c972)}
+#${ROOT_ID} .ob-group-status.err{color:var(--cursor-danger,#ff5667)}
+#${ROOT_ID} .ob-group-head>.ob-group-status:is(.err,.warn){flex:1 0 100%;justify-content:flex-start;text-align:left}
+#${ROOT_ID} .ob-group-status.err .ob-link-button{color:var(--cursor-text-primary,currentColor)}
+#${ROOT_ID} .ob-advanced{min-width:0}
+#${ROOT_ID} .ob-advanced>summary{display:flex;width:max-content;max-width:100%;box-sizing:border-box;align-items:center;gap:6px;padding:0 8px 6px;border-radius:4px;color:var(--ob-text-2);font-size:var(--cursor-font-size-sm,12px);line-height:16px;cursor:pointer;list-style:none;user-select:none;touch-action:manipulation;transition:color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
+#${ROOT_ID} .ob-advanced>summary::-webkit-details-marker{display:none}
+#${ROOT_ID} .ob-advanced>summary::after{content:"";width:5px;height:5px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;opacity:.8;transform:translateY(-1px) rotate(-45deg);transition:transform var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
+#${ROOT_ID} .ob-advanced[open]>summary::after{transform:translateY(-2px) rotate(45deg)}
+@media (hover:hover) and (pointer:fine){#${ROOT_ID} .ob-advanced>summary:hover{color:var(--cursor-text-primary,currentColor)}}
+#${ROOT_ID} .ob-folder-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+#${ROOT_ID} .ob-folder-actions .ob-button{width:100%;padding:0 6px;font-size:var(--cursor-font-size-sm,12px)}
+#${ROOT_ID} .ob-lifecycle-status{min-width:0;color:var(--cursor-text-primary,currentColor);font-size:var(--cursor-font-size-sm,12px);line-height:16px;text-align:right;text-wrap:pretty}
+#${ROOT_ID} .ob-lifecycle-status.err{color:var(--cursor-danger,#ff5667)}
+#${ROOT_ID} .ob-runtime-actions{display:flex;justify-content:flex-end;min-height:46px;box-sizing:border-box;align-items:center;border-top:1px solid var(--ob-stroke)}
+#${ROOT_ID} .ob-advanced-status{justify-content:flex-start;margin:6px 0 0;padding:0 8px;text-align:left}
+#${ROOT_ID} .ob-advanced-status:empty,#${ROOT_ID} .ob-advanced-status:has(.ob-status-text:empty){margin:0}
 [data-placeholder*="Sign in to Cursor in settings" i]::before{content:"Crie ou selecione um bot para começar."!important}
 [data-openbot-p23-launch]{display:none!important}
 [data-openbot-sand-restore-wall="1"]{display:none!important}
@@ -268,11 +270,11 @@
 #${FOOTER_PROFILE_EDITOR_ID} input{width:100%;min-width:0;box-sizing:border-box;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 14%,transparent));border-radius:6px;outline:none;background:var(--cursor-bg-input,var(--cursor-bg-editor,#181818));color:var(--cursor-text-primary,currentColor);padding:4px 6px;font:inherit}
 #${FOOTER_PROFILE_EDITOR_ID} input:focus-visible{outline:2px solid var(--cursor-focus,var(--cursor-icon-accent-primary,currentColor));outline-offset:1px}
 #${FOOTER_PROFILE_EDITOR_ID} input[aria-invalid="true"]{border-color:var(--cursor-danger,#e34671)}
-@media (max-width:720px){#${ROOT_ID}[data-scope="global"]{flex-basis:calc(100% - 32px);width:calc(100% - 32px);max-width:calc(100% - 32px);margin-inline:16px}#${ROOT_ID}[data-scope="global"][data-native-section="1"]{flex-basis:auto;width:100%;max-width:100%;margin:0}#${ROOT_ID}[data-scope="global"] .ob-field-row{grid-template-columns:1fr;gap:7px;padding-block:11px}#${ROOT_ID}[data-scope="global"] .ob-select{width:100%;justify-self:stretch}}
-@media (max-width:520px){#${ROOT_ID} .ob-secret-row>*{flex-basis:100%}#${ROOT_ID} .ob-secret-row button,#${ROOT_ID} .ob-workspace button{width:100%}#${ROOT_ID} .ob-field-row{grid-template-columns:1fr;gap:6px;padding:9px 0}#${ROOT_ID} .ob-field-row select{justify-self:stretch}#${ROOT_ID} .ob-auth-row{align-items:stretch;flex-direction:column}#${ROOT_ID} .ob-auth-row button{align-self:flex-start}#${ROOT_ID}[data-scope="global"] .ob-field-row{padding:11px 14px}#${ROOT_ID}[data-scope="global"] .ob-auth-row{padding:11px 14px}}
+@media (max-width:720px){#${ROOT_ID}[data-scope="global"]{flex-basis:calc(100% - 32px);width:calc(100% - 32px);max-width:calc(100% - 32px);margin-inline:16px}#${ROOT_ID}[data-scope="global"][data-native-section="1"]{flex-basis:auto;width:100%;max-width:100%;margin:0}#${ROOT_ID}[data-scope="global"] .ob-field-row{grid-template-columns:minmax(0,1fr);row-gap:8px}#${ROOT_ID}[data-scope="global"] .ob-row-control{justify-content:stretch}#${ROOT_ID}[data-scope="global"] .ob-select{flex:1 1 auto;max-width:none}}
+@media (max-width:520px){#${ROOT_ID} .ob-secret-row{flex-wrap:wrap}#${ROOT_ID} .ob-secret-row>*{flex-basis:100%}}
 @media (max-width:520px){#${PROFILE_ID} .ob-profile-row{align-items:stretch;flex-direction:column}#${PROFILE_ID} button{width:100%}}
 @media (max-width:520px){#${WELCOME_ID}{padding:28px 22px}#${WELCOME_ID} .ob-welcome-copy{line-height:1.5}#${WELCOME_ID} button{width:min(260px,100%)}}
-@media (prefers-reduced-motion:reduce){#${ROOT_ID} button,#${ROOT_ID} .ob-advanced summary::after,#${EMPTY_ID} button,#${PROFILE_ID} input,#${PROFILE_ID} button,#${STOP_ID},#${WELCOME_ID},#${WELCOME_ID} .ob-welcome-kicker,#${WELCOME_ID} h1,#${WELCOME_ID} .ob-welcome-copy,#${WELCOME_ID} .ob-welcome-note,#${WELCOME_ID} button,#${WELCOME_ID}.is-leaving .ob-welcome-content,.sand-info-pane__top :is(button,[role="button"]),.sand-agent-item[data-layout="expanded"],#${CREATE_ID} .ob-create-avatar,#${ROOT_ID}[data-scope="global"] .ob-select-trigger::after,#${ROOT_ID} select,#${ROOT_ID} input{transition:none}#${EMPTY_ID} .ob-empty-character{animation:none}}
+@media (prefers-reduced-motion:reduce){#${ROOT_ID} :is(.ob-button,.ob-select-trigger,.ob-input,.ob-advanced>summary),#${ROOT_ID} .ob-advanced>summary::after,#${EMPTY_ID} button,#${PROFILE_ID} input,#${PROFILE_ID} button,#${STOP_ID},#${WELCOME_ID},#${WELCOME_ID} .ob-welcome-kicker,#${WELCOME_ID} h1,#${WELCOME_ID} .ob-welcome-copy,#${WELCOME_ID} .ob-welcome-note,#${WELCOME_ID} button,#${WELCOME_ID}.is-leaving .ob-welcome-content,.sand-info-pane__top :is(button,[role="button"]),.sand-agent-item[data-layout="expanded"],#${CREATE_ID} .ob-create-avatar,#${ROOT_ID} .ob-select-trigger::after{transition:none}#${ROOT_ID} .ob-icon-button.is-busy svg,#${EMPTY_ID} .ob-empty-character{animation:none}}
 #${STOP_ID}{position:fixed;z-index:2147483000;display:grid;place-items:center;box-sizing:border-box;border:1px solid var(--cursor-stroke-secondary,rgba(255,255,255,.14));border-radius:8px;padding:0;background:#262626;color:var(--cursor-text-primary,#ececec);font-size:0;cursor:pointer;transition:transform var(--cursor-duration-fast,.1s) var(--cursor-easing-default,ease),background-color var(--cursor-duration-normal,.15s) var(--cursor-easing-default,ease)}
 #${STOP_ID}::before{content:"";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:8px;height:8px;border-radius:2px;background:currentColor}
 #${STOP_ID}:hover{background:var(--cursor-button-secondary-background,#333)}
@@ -344,6 +346,8 @@
 /* Keep the centered settings surface below native controls, including zoom/resize.
    Without a controls overlay, the original 48px vertical margin is preserved. */
 .sand-settings-dialog .sand-settings-layout{height:min(700px,calc(100dvh - 2 * max(48px,calc(env(titlebar-area-height,0px) + 16px))))!important}
+.sand-settings-nav[data-openbot-single-nav="1"]{display:none!important}
+.ob-readonly-status{display:inline-flex;align-items:center;color:var(--cursor-text-secondary,rgba(252,252,252,.6));font-size:var(--cursor-font-size-base,13px);line-height:18px;white-space:nowrap}
 .sand-info-pane__section-content{min-height:0;scrollbar-gutter:stable}
 .sand-agent-settings{display:flex!important;flex-direction:column!important;gap:12px!important;padding:12px!important}
 .sand-agent-settings input,.sand-agent-settings textarea{box-sizing:border-box;width:100%;min-width:0;border:1px solid var(--cursor-stroke-secondary,color-mix(in srgb,currentColor 12%,transparent));border-radius:6px;background:var(--cursor-bg-input,var(--cursor-bg-editor,#181818));color:var(--cursor-text-primary,currentColor);font:inherit}
@@ -379,7 +383,7 @@ body .ui-menu__content [role="menuitem"]:is(:hover,:focus-visible){background:va
 body :is(.sand-workflow-listbox,.sand-reference-menu,.sand-mention-menu,.sand-pr-menu,.sand-emoji-menu,.sand-new-chat-menu){color-scheme:dark!important;background:var(--cursor-bg-elevated,#1f1f1f)!important;border-color:var(--cursor-stroke-secondary,#414141)!important;color:var(--cursor-text-primary,#ececec)!important}
 body :is(.sand-workflow-listbox,.sand-reference-menu,.sand-mention-menu,.sand-pr-menu,.sand-emoji-menu,.sand-new-chat-menu) :is([role="option"],button){color:var(--cursor-text-primary,#ececec)!important}
 body :is(.sand-workflow-listbox,.sand-reference-menu,.sand-mention-menu,.sand-pr-menu,.sand-emoji-menu,.sand-new-chat-menu) :is([role="option"],button):is(:hover,:focus-visible,[aria-selected="true"]){background:var(--cursor-bg-hover,var(--cursor-bg-secondary,#303030))!important}
-[aria-hidden="true"] #${ROOT_ID},[inert] #${ROOT_ID}{display:none!important}
+body:not(.ob-dialog-open):not(:has(${MODAL_LAYER_SELECTOR})) :is([aria-hidden="true"],[inert]) #${ROOT_ID}{display:none!important}
 @media (max-width:900px){#sand-conversation-details[data-openbot-responsive-settings="1"]{position:fixed!important;inset:0 0 0 auto!important;z-index:2147482500!important;display:block!important;width:min(360px,100vw)!important;min-width:min(360px,100vw)!important;max-width:min(360px,100vw)!important;height:100vh!important;max-height:100vh!important;overflow:hidden!important;visibility:visible!important;opacity:1!important;background:var(--cursor-bg-editor,#181818)!important;box-shadow:-18px 0 42px rgba(0,0,0,.38)!important}#sand-conversation-details[data-openbot-responsive-settings="1"] .sand-info-pane__inner{position:absolute!important;inset:0!important;display:flex!important;width:auto!important;min-width:0!important;max-width:none!important;height:auto!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important}#sand-conversation-details[data-openbot-responsive-settings="1"] .sand-info-pane__nav-root{width:100%!important;min-width:0!important;max-width:100%!important;height:100%!important;flex:1 1 100%!important}#sand-conversation-details[data-openbot-responsive-settings="1"] :is(.sand-info-pane__section-content,[data-openbot-agent-settings-host="1"],#${ROOT_ID}){width:100%!important;min-width:0!important;max-width:100%!important;box-sizing:border-box!important}#sand-conversation-details[data-openbot-responsive-settings="1"] #${ROOT_ID}{display:block!important}}
 .sand-agent-item__preview-row{min-width:0}
 .sand-agent-item__preview,.sand-agent-item__activity{display:block;overflow:hidden;color:var(--cursor-text-secondary,color-mix(in srgb,currentColor 74%,transparent));text-overflow:ellipsis;white-space:nowrap}
@@ -526,12 +530,33 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   const desktop = () => window.__openbotLocalSettingsDesktop || window.desktop;
   const profileAgent = () => window.__openbotLocalProfileAgent || desktop()?.agent;
   const textOf = (el) => (el?.textContent || "").replace(/\s+/g, " ").trim();
+  // Single normalizer for every failure this overlay shows: strips Electron IPC
+  // and Error prefixes, maps known transport/contract failures to short pt-BR
+  // copy and falls back to the caller's operation message for anything that is
+  // still technical or not Portuguese. It never turns a failure into success copy.
+  const IPC_ERROR_PREFIX = /^Error invoking remote method '[^']*':\s*/i;
+  const KNOWN_ERRORS = [
+    [/Descoberta indispon[ií]vel/i, "A lista de modelos não pode ser consultada neste ambiente."],
+    [/stale-active-agent|active agent changed|stale request|o bot ativo mudou|bot selecionado mudou/i, "O bot selecionado mudou. Reabra as configurações."],
+    [/ECONNREFUSED|ECONNRESET|ENOTFOUND|fetch failed|Failed to fetch|NetworkError|socket hang up/i, "O OpenBot local não respondeu. Tente novamente."],
+    [/\btimed? ?out\b|timeout|AbortError|operation was aborted/i, "A operação demorou demais. Tente novamente."],
+    [/configuração alterada; tente novamente|\b409\b/i, "A configuração mudou em outro lugar. Tente novamente."],
+    [/unauthorized|forbidden|not-signed-in|\b40[13]\b/i, "O OpenBot local recusou a solicitação. Reinicie o aplicativo e tente novamente."],
+    [/OpenBot local mode is required/i, "Disponível apenas no modo local do OpenBot."],
+    [/Invalid (?:OAuth )?(?:provider|service tier|reasoning effort)/i, "Opção não suportada por este provedor."],
+  ];
+  const PORTUGUESE_HINT = /[ãõçáéíóúâêôà]|\b(?:não|nao|de|do|da|para|com|sem|está|foi|falha|erro|modelo|conta|chave|bot|tente)\b/i;
   const userFacingError = (error, fallback) => {
-    const message = error instanceof Error ? error.message : String(error || "");
-    return /(?:invoking remote method|unauthorized|gateway-command-failed|\bsand:)/i.test(message) ? fallback : (message || fallback);
+    const raw = (error instanceof Error ? error.message : typeof error === "string" ? error : typeof error?.message === "string" ? error.message : "").trim();
+    for (const [pattern, text] of KNOWN_ERRORS) if (pattern.test(raw)) return text;
+    const message = raw.replace(IPC_ERROR_PREFIX, "").replace(/^(?:[A-Za-z]*Error:\s*)+/, "").replace(/^[a-z][A-Za-z]+:\s+/, "").trim();
+    if (!message || /invoking remote method|gateway-command-failed|\bsand:|[{}<>]|\bat\s+\S+\s*\(|https?:\/\/|\b[a-z]\w*\.[a-z]\w*/i.test(message) || !PORTUGUESE_HINT.test(message)) return fallback;
+    return message.charAt(0).toLocaleUpperCase("pt-BR") + message.slice(1);
   };
   const SETTINGS_LABELS = /^(Name|Nome|Title|Título|Titulo|Description|Descrição|Descricao|Notifications|Notificações|Notificacoes)$/i;
-  const UNAVAILABLE_NAV_LABELS = /^(Help Center|Send Feedback|Updates)$/i;
+  // Help Center opens cursor.com and Send Feedback posts to the Cursor backend
+  // with a Cursor token; neither works in the local build, in any language.
+  const UNAVAILABLE_NAV_LABELS = /^(Help Center|Send Feedback|Updates|Central de ajuda|Enviar feedback)$/i;
   const UNSUPPORTED_COMMAND_LABELS = /^(Start a thread|Iniciar (?:uma )?thread|Settings: Updates|Plugins|Feature Flags…?|Capture Backend RPC Trace(?: \(2 min\))?|Update OpenBot(?:'s|’s) Computer)$/i;
   const UNSAFE_SECTION_ACTION = /^(Move to new section|Mover para nova seção)$/i;
   const LEGACY_SCREEN_LABELS = /^(?:Can't reach .+ screen|.+['’]s screen)$/i;
@@ -608,7 +633,10 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
 
   function openCreateAgent() {
     const current = document.getElementById(CREATE_ID);
-    if (current) {
+    // A surface still fading out from a cancel is about to be removed; reusing
+    // it would make the new one disappear. Start a fresh one instead.
+    if (current?.classList.contains("is-leaving")) current.remove();
+    else if (current) {
       current.querySelector("input[name='name']")?.focus({ preventScroll: true });
       return current;
     }
@@ -972,31 +1000,47 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     return (element?.innerText || textOf(element)).split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "";
   }
 
+  const COMMAND_TRANSLATIONS = new Map([
+    ["All", "Tudo"],
+    ["Messages", "Mensagens"],
+    ["Agents", "Bots"],
+    ["Groups", "Grupos"],
+    ["Files", "Arquivos"],
+    ["Routines", "Rotinas"],
+    ["Actions", "Ações"],
+    ["Agent", "Bot"],
+    ["Chat Settings", "Configurações da conversa"],
+    ["Current chat", "Conversa atual"],
+    ["Settings: General", "Configurações: Geral"],
+    ["Settings", "Configurações"],
+    ["Action", "Ação"],
+    ["Skill", "Habilidade"],
+    ["Theme: System", "Tema: Sistema"],
+    ["Theme: Light", "Tema: Claro"],
+    ["Theme: Dark", "Tema: Escuro"],
+    ["Settings · Appearance", "Configurações · Aparência"],
+  ]);
+  const TOOLTIP_TRANSLATIONS = new Map([
+    // The only "New chat" tooltip is the sidebar "+", which opens bot creation.
+    ["New chat", "Novo bot"],
+  ]);
+
   function polishCommandPalette() {
+    // The slash menu lists the same native actions as the palette.
+    for (const menu of document.querySelectorAll(".sand-workflow-listbox")) {
+      for (const option of menu.querySelectorAll("[role='option']")) {
+        if (UNSUPPORTED_COMMAND_LABELS.test(firstVisibleLine(option))) hideMatching(option);
+      }
+      replaceExactText(menu, COMMAND_TRANSLATIONS);
+      const listbox = menu.querySelector("[role='listbox']");
+      if (listbox?.getAttribute("aria-label") === "Reference a skill") listbox.setAttribute("aria-label", "Comandos e habilidades");
+    }
     for (const palette of document.querySelectorAll(".sand-command-palette")) {
       palette.setAttribute("aria-label", "Buscar");
       for (const option of palette.querySelectorAll("[role='option']")) {
         if (UNSUPPORTED_COMMAND_LABELS.test(firstVisibleLine(option))) hideMatching(option);
       }
-      replaceExactText(palette, new Map([
-        ["All", "Tudo"],
-        ["Messages", "Mensagens"],
-        ["Agents", "Bots"],
-        ["Groups", "Grupos"],
-        ["Files", "Arquivos"],
-        ["Routines", "Rotinas"],
-        ["Actions", "Ações"],
-        ["Agent", "Bot"],
-        ["Chat Settings", "Configurações da conversa"],
-        ["Current chat", "Conversa atual"],
-        ["Settings: General", "Configurações: Geral"],
-        ["Settings", "Configurações"],
-        ["Action", "Ação"],
-        ["Theme: System", "Tema: Sistema"],
-        ["Theme: Light", "Tema: Claro"],
-        ["Theme: Dark", "Tema: Escuro"],
-        ["Settings · Appearance", "Configurações · Aparência"],
-      ]));
+      replaceExactText(palette, COMMAND_TRANSLATIONS);
       for (const input of palette.querySelectorAll("input")) {
         if (/^Search$/i.test(input.getAttribute("placeholder") || "")) input.setAttribute("placeholder", "Buscar");
         if (/^Search$/i.test(input.getAttribute("aria-label") || "")) input.setAttribute("aria-label", "Buscar");
@@ -1008,9 +1052,81 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     }
   }
 
+  // A hidden unsupported option can still be the keyboard-active one; Enter on
+  // it would run an action the local build does not offer.
+  function blockHiddenCommandActivation(event) {
+    if (event.key !== "Enter" && event.key !== "Tab") return;
+    const active = document.querySelector(".sand-workflow-listbox [role='option'][aria-selected='true'], .sand-command-palette [role='option'][aria-selected='true']");
+    if (!active?.closest('[data-openbot-hide="1"]')) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }
+
+  function polishTooltips(scope = document) {
+    const tooltips = scope instanceof Element && scope.matches('[role="tooltip"]') ? [scope] : [...(scope.querySelectorAll?.('[role="tooltip"]') || [])];
+    for (const tooltip of tooltips) replaceExactText(tooltip, TOOLTIP_TRANSLATIONS);
+  }
+
+  function polishAccountMenu() {
+    for (const menu of document.querySelectorAll('[role="menu"][aria-label="Account"],[role="menu"][aria-label="Conta"]')) {
+      for (const item of menu.querySelectorAll("[role='menuitem']")) {
+        if (UNAVAILABLE_NAV_LABELS.test(unavailableNavigationLabel(item)) || isLegacySignOutControl(item)) hideMatching(item);
+      }
+      // A section whose items are all hidden would leave only its divider behind.
+      for (const group of menu.querySelectorAll("[role='group']")) {
+        const items = [...group.querySelectorAll("[role='menuitem']")];
+        const empty = items.length > 0 && items.every((item) => item.closest('[data-openbot-hide="1"]'));
+        if (empty && group.getAttribute("data-openbot-hide") !== "1") group.setAttribute("data-openbot-hide", "1");
+        else if (!empty && group.getAttribute("data-openbot-hide") === "1") group.removeAttribute("data-openbot-hide");
+      }
+    }
+  }
+
+  function polishSettingsNavigation() {
+    for (const nav of document.querySelectorAll(".sand-settings-nav")) {
+      const controls = [...nav.querySelectorAll("button, [role='button'], a")];
+      for (const control of controls) {
+        if (UNAVAILABLE_NAV_LABELS.test(unavailableNavigationLabel(control))) hideMatching(control);
+      }
+      // A navigation with a single destination is only an empty column.
+      const single = controls.filter((control) => !control.hidden && !control.closest('[data-openbot-hide="1"]')).length === 1;
+      if (single && nav.dataset.openbotSingleNav !== "1") nav.dataset.openbotSingleNav = "1";
+      else if (!single && nav.hasAttribute("data-openbot-single-nav")) nav.removeAttribute("data-openbot-single-nav");
+    }
+  }
+
+  // Local tools run without a per-action prompt in this build: show the current
+  // native policy read-only instead of an unlabeled row, and never re-enable it.
+  function polishLocalExecutionSetting() {
+    for (const control of document.querySelectorAll('button[aria-label="Execution on Local Computer"]')) {
+      const cell = control.parentElement;
+      const row = cell?.parentElement;
+      if (!cell || !row || row === document.body) continue;
+      if (control.getAttribute("data-openbot-hide") !== "1") control.setAttribute("data-openbot-hide", "1");
+      const policy = cell.querySelector("input[aria-hidden='true']")?.value;
+      let status = cell.querySelector(".ob-readonly-status");
+      if (policy !== "always") {
+        status?.remove();
+        if (row.getAttribute("data-openbot-hide") !== "1") row.setAttribute("data-openbot-hide", "1");
+        continue;
+      }
+      if (row.getAttribute("data-openbot-hide") === "1") row.removeAttribute("data-openbot-hide");
+      if (!status) {
+        status = document.createElement("span");
+        status.className = "ob-readonly-status";
+        status.textContent = "Sempre permitida";
+        cell.appendChild(status);
+      }
+    }
+  }
+
   function polishNativeLanguage() {
     if (document.documentElement.lang !== "pt-BR") document.documentElement.lang = "pt-BR";
     polishCommandPalette();
+    polishTooltips();
+    polishAccountMenu();
+    polishSettingsNavigation();
+    polishLocalExecutionSetting();
     const replacements = new Map([
       ["Settings", "Configurações"],
       ["About", "Sobre"],
@@ -1030,7 +1146,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       ["Model", "Modelo"],
       ["Timezone", "Fuso horário"],
       ["Execution on Local Computer", "Execução no computador local"],
-      ["Let the assistant open files and run tasks on your computer. Auto-review still checks everything first.", "Permita que o bot abra arquivos e execute tarefas neste computador."],
+      ["Let the assistant open files and run tasks on your computer. Auto-review still checks everything first.", "O bot pode abrir arquivos e executar tarefas neste computador."],
       ["Ask every time", "Perguntar sempre"],
       ["Auto-review", "Revisão automática"],
       ["OpenBot checks each action before it runs and asks you first when needed. Add rules to customize what it can do automatically.", "O OpenBot verifica cada ação antes de executar e pede sua confirmação quando necessário."],
@@ -1811,6 +1927,13 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     return null;
   }
 
+  // Native menus and modal dialogs mark the rest of the app aria-hidden while they
+  // are open. That is transient: the settings pane is still there underneath.
+  function modalLayerOpen() {
+    if (document.body.classList.contains("ob-dialog-open")) return true;
+    return [...document.querySelectorAll(MODAL_LAYER_SELECTOR)].some((layer) => layer.getClientRects().length > 0);
+  }
+
   function isVisibleElement(el) {
     if (!el?.isConnected || el.closest('[hidden], [aria-hidden="true"], [data-openbot-hide="1"]')) return false;
     const style = getComputedStyle(el);
@@ -2015,6 +2138,24 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     element.dataset.openbotMotion = "message";
     element.dataset.openbotMotionDuration = String(config.duration);
     element.dataset.openbotMotionRuns = String(Number(element.dataset.openbotMotionRuns || 0) + 1);
+  }
+
+  // Records that an element had its entrance handled without starting another
+  // animation (the surface around it is already animating it into view).
+  function stampMotion(element, kind) {
+    if (!(element instanceof Element) || animatedElements.has(element)) return;
+    animatedElements.add(element);
+    const config = MOTION[kind] || MOTION.surface;
+    element.dataset.openbotMotion = kind;
+    element.dataset.openbotMotionDuration = String(config.duration);
+    element.dataset.openbotMotionRuns = String(Number(element.dataset.openbotMotionRuns || 0) + 1);
+  }
+
+  function ancestorMotionActive(element) {
+    for (let node = element?.parentElement; node; node = node.parentElement) {
+      if (pendingMotion.has(node) || elementAnimations.has(node)) return true;
+    }
+    return false;
   }
 
   function flushMotionQueue() {
@@ -2330,6 +2471,9 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     styledSelects.get(select)?.render();
   }
 
+  // One custom select for every OpenBot settings context. The native <select>
+  // stays the source of truth: value, disabled state and "change" events keep
+  // flowing through it, so gates and handlers can keep dispatching on it.
   function enhanceStyledSelect(select) {
     if (!(select instanceof HTMLSelectElement) || styledSelects.has(select)) return;
     const shell = document.createElement("div");
@@ -2354,8 +2498,15 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     shell.append(trigger, menu);
     select.classList.add("ob-native-select");
     select.tabIndex = -1;
+    select.setAttribute("aria-hidden", "true");
     select.insertAdjacentElement("afterend", shell);
-    select.closest(".ob-field-row")?.querySelector(`label[for="${select.id}"]`)?.setAttribute("for", triggerId);
+    const label = select.closest(".ob-field-row")?.querySelector(`label[for="${select.id}"]`);
+    if (label) {
+      label.setAttribute("for", triggerId);
+      if (!label.id) label.id = `${select.id}-label`;
+      trigger.setAttribute("aria-labelledby", `${label.id} ${triggerId}`);
+      menu.setAttribute("aria-labelledby", label.id);
+    }
 
     const close = (restoreFocus = false) => {
       if (menu.hidden) return;
@@ -2380,7 +2531,9 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     const render = () => {
       const options = [...select.options];
       const selected = options.find((entry) => entry.selected) || options[0];
-      value.textContent = selected?.textContent || "Selecione";
+      const text = selected?.textContent || (options.length ? "" : "Sem opções");
+      if (value.textContent !== text) value.textContent = text;
+      trigger.title = selected?.title || text;
       trigger.disabled = select.disabled || options.length === 0;
       menu.replaceChildren(...options.map((entry) => {
         const item = document.createElement("button");
@@ -2396,6 +2549,22 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
         return item;
       }));
     };
+    const boundsOf = () => {
+      // Open towards the side with room inside the surface that clips it:
+      // the settings dialog, the scrolling bot pane or the window.
+      let bottom = window.innerHeight;
+      let top = 0;
+      for (let node = shell.parentElement; node && node !== document.body; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (node.matches('[role="dialog"], [aria-modal="true"]') || /(auto|scroll|hidden)/.test(style.overflowY)) {
+          const rect = node.getBoundingClientRect();
+          bottom = Math.min(bottom, rect.bottom);
+          top = Math.max(top, rect.top);
+          break;
+        }
+      }
+      return { top, bottom };
+    };
     const open = (focusOffset = 0) => {
       if (trigger.disabled || !menu.children.length) return;
       if (openStyledSelect && openStyledSelect.select !== select) openStyledSelect.close();
@@ -2403,14 +2572,16 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       trigger.setAttribute("aria-expanded", "true");
       shell.classList.remove("is-open-up");
       const triggerRect = trigger.getBoundingClientRect();
-      const dialogRect = shell.closest('[role="dialog"], [aria-modal="true"]')?.getBoundingClientRect();
-      const lowerEdge = Math.min(window.innerHeight, dialogRect?.bottom || window.innerHeight);
-      if (menu.scrollHeight + 8 > lowerEdge - triggerRect.bottom && triggerRect.top > menu.scrollHeight + 12) shell.classList.add("is-open-up");
+      const bounds = boundsOf();
+      const needed = menu.scrollHeight + 8;
+      if (needed > bounds.bottom - triggerRect.bottom && triggerRect.top - bounds.top > bounds.bottom - triggerRect.bottom) shell.classList.add("is-open-up");
       openStyledSelect = { select, close };
       document.addEventListener("pointerdown", onOutside, true);
       const options = [...menu.querySelectorAll(".ob-select-option:not(:disabled)")];
       const selectedIndex = Math.max(0, options.findIndex((entry) => entry.getAttribute("aria-selected") === "true"));
-      options[Math.min(options.length - 1, Math.max(0, selectedIndex + focusOffset))]?.focus({ preventScroll: true });
+      const target = options[Math.min(options.length - 1, Math.max(0, selectedIndex + focusOffset))];
+      target?.focus({ preventScroll: true });
+      target?.scrollIntoView?.({ block: "nearest" });
     };
     trigger.addEventListener("click", () => menu.hidden ? open() : close());
     trigger.addEventListener("keydown", (event) => {
@@ -2435,6 +2606,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
         event.preventDefault();
         const next = event.key === "Home" ? 0 : event.key === "End" ? options.length - 1 : Math.min(options.length - 1, Math.max(0, index + (event.key === "ArrowDown" ? 1 : -1)));
         options[next]?.focus({ preventScroll: true });
+        options[next]?.scrollIntoView?.({ block: "nearest" });
       } else if (event.key === "Tab") close();
     });
     select.addEventListener("change", render);
@@ -2545,55 +2717,145 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     }
   }
 
+  const RUNTIME_STATE_LABELS = {
+    "lite-ready": "Modo leve (sem isolamento)",
+    "runtime-unavailable": "Indisponível",
+    "runtime-installing": "Instalando…",
+    stopped: "Parado",
+    starting: "Iniciando…",
+    ready: "Em execução",
+    busy: "Em execução",
+    "waiting-approval": "Aguardando aprovação",
+    stopping: "Parando…",
+    unhealthy: "Com problemas",
+    "quota-exceeded": "Sem espaço disponível",
+    "repair-required": "Reparo necessário",
+  };
+  // Loading copy only appears when data is slower than this; fast loads go
+  // straight from the neutral skeleton to the final state.
+  const SLOW_FEEDBACK_MS = 150;
+  const AUTOSAVE_DELAY_MS = 300;
+  const SAVED_VISIBLE_MS = 2000;
+  const CATALOG_FAILURE_TTL_MS = 60_000;
+  const SPEED_HELP = "Mais rápido, consome mais franquia.";
+  const MEMORY_SLOT_HEIGHT_KEY = "openbot.settings.memory-slot-height.v1";
+  const DEFAULT_MEMORY_SLOT_HEIGHT = 121;
+  const MODEL_REFRESH_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.25 8a5.25 5.25 0 1 1-1.54-3.71"/><path d="M13.25 2.75v3h-3"/></svg>';
+  // Session memory (renderer lifetime): catalogs per provider (explicit refresh
+  // forces a new read), the row layout last shown for each bot so the skeleton
+  // reserves the final height, and choices that could not be applied yet.
+  const providerCatalogCache = new Map();
+  const SETTINGS_LAYOUT_KEY = "openbot.settings.layout.v1";
+  let settingsLayoutMemory = null;
+  const pendingProviderSelections = new Map();
+  let memorySlotHeight = 0;
+
+  // The last layout per bot is also kept for this viewer across restarts, so
+  // even the first open of a session starts at its final height.
+  function layoutMemory() {
+    if (!settingsLayoutMemory) {
+      settingsLayoutMemory = new Map();
+      try {
+        for (const [key, value] of Object.entries(JSON.parse(localStorage.getItem(SETTINGS_LAYOUT_KEY) || "{}"))) {
+          if (value && typeof value === "object") settingsLayoutMemory.set(key, value);
+        }
+      } catch { /* start without remembered layouts */ }
+    }
+    return settingsLayoutMemory;
+  }
+
+  function rememberSettingsLayout(key, value) {
+    const memory = layoutMemory();
+    if (JSON.stringify(memory.get(key)) === JSON.stringify(value)) return;
+    memory.delete(key);
+    memory.set(key, value);
+    while (memory.size > 50) memory.delete(memory.keys().next().value);
+    try { localStorage.setItem(SETTINGS_LAYOUT_KEY, JSON.stringify(Object.fromEntries(memory))); } catch { /* per-viewer convenience only */ }
+  }
+
+  function reservedMemorySlotHeight() {
+    if (!memorySlotHeight) {
+      try { memorySlotHeight = Number(localStorage.getItem(MEMORY_SLOT_HEIGHT_KEY)) || 0; } catch { memorySlotHeight = 0; }
+    }
+    return memorySlotHeight || DEFAULT_MEMORY_SLOT_HEIGHT;
+  }
+
+  // Called from the shared observer when the memory overlay fills the slot: the
+  // reservation is released and the real height is remembered for next time.
+  function settleMemorySlot() {
+    const slot = document.getElementById("openbot-memory-slot");
+    if (!(slot instanceof HTMLElement) || !slot.firstElementChild) return;
+    if (slot.style.minHeight) slot.style.minHeight = "";
+    const height = Math.round(slot.getBoundingClientRect().height);
+    if (!height || height === memorySlotHeight) return;
+    memorySlotHeight = height;
+    try { localStorage.setItem(MEMORY_SLOT_HEIGHT_KEY, String(height)); } catch { /* per-viewer convenience only */ }
+  }
+
+  function syncRepairVisibility(repairEl) {
+    const row = repairEl?.closest(".ob-runtime-actions");
+    if (row) row.hidden = repairEl.disabled && repairEl.dataset.busy !== "1";
+  }
+
   async function updateLifecycleStatus(root, agentId) {
     const status = root.querySelector("#openbot-lifecycle-status");
     const runtimeStatus = root.querySelector("#openbot-runtime-status");
     const repairEl = root.querySelector("#openbot-runtime-repair");
+    const advancedStatus = root.querySelector("#openbot-advanced-status");
     const api = desktop()?.agent;
     const updates = [];
+    const failures = [];
     let runtimeState = null;
+    const show = (element, text, failed = false) => {
+      if (element.textContent !== text) element.textContent = text;
+      element.classList.toggle("err", failed);
+    };
+    const slow = setLocalTimeout(() => {
+      for (const element of [status, runtimeStatus]) if (element && !element.textContent) show(element, "Verificando…");
+    }, SLOW_FEEDBACK_MS);
     if (status) {
       updates.push((async () => {
-      if (typeof api?.getWorkspaceInventory !== "function") {
-        status.textContent = "Inventário indisponível neste desktop";
-      } else {
+        if (typeof api?.getWorkspaceInventory !== "function") return show(status, "Indisponível neste aplicativo");
         try {
           const inventory = await api.getWorkspaceInventory({ agentId });
           const entries = Array.isArray(inventory) ? inventory : inventory?.entries;
           if (!Array.isArray(entries)) throw new Error("O gateway não retornou um inventário verificável.");
-          status.textContent = `${entries.length} entradas verificadas`;
+          show(status, "Verificado");
+          status.title = `${entries.length} ${entries.length === 1 ? "item verificado" : "itens verificados"}`;
         } catch (error) {
-          status.textContent = `Falha na verificação · ${error instanceof Error ? error.message : String(error)}`;
+          show(status, "Falha na verificação", true);
+          failures.push(userFacingError(error, "Não foi possível verificar os arquivos do bot."));
         }
-      }
       })());
     }
     if (runtimeStatus) {
       updates.push((async () => {
-      if (typeof api?.getLocalRuntimeStatus !== "function") {
-        runtimeStatus.textContent = "Status indisponível neste desktop";
-        if (repairEl) repairEl.disabled = true;
-      } else {
+        if (typeof api?.getLocalRuntimeStatus !== "function") {
+          show(runtimeStatus, "Indisponível neste aplicativo");
+          if (repairEl) repairEl.disabled = true;
+          return;
+        }
         try {
           const runtime = await api.getLocalRuntimeStatus({ agentId });
           const state = typeof runtime?.state === "string" ? runtime.state : "unknown";
           runtimeState = state;
-          runtimeStatus.textContent = state === "repair-required"
-            ? "Reparo necessário"
-            : state === "unhealthy"
-              ? "Não saudável"
-              : state === "lite-ready"
-                ? "Modo Lite · sem sandbox Linux"
-                : state;
+          show(runtimeStatus, RUNTIME_STATE_LABELS[state] || "Estado desconhecido", state === "repair-required" || state === "unhealthy");
           if (repairEl) repairEl.disabled = state !== "repair-required" && state !== "unhealthy";
+          syncRepairVisibility(repairEl);
         } catch (error) {
-          runtimeStatus.textContent = `Falha na verificação · ${error instanceof Error ? error.message : String(error)}`;
+          show(runtimeStatus, "Falha na verificação", true);
+          failures.push(userFacingError(error, "Não foi possível consultar o ambiente de execução."));
           if (repairEl) repairEl.disabled = false;
+          syncRepairVisibility(repairEl);
         }
-      }
       })());
     }
     await Promise.all(updates);
+    clearLocalTimeout(slow);
+    if (failures.length && advancedStatus && root.isConnected) {
+      advancedStatus.className = "ob-group-status ob-advanced-status err";
+      advancedStatus.firstElementChild.textContent = failures.join(" ");
+    }
     return runtimeState;
   }
 
@@ -2618,6 +2880,29 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     if (directLabels.length >= 2 && directFields.length >= 2) host.dataset.openbotSimpleFields = "1";
   }
 
+  // The sidebar row can sit under a modal (aria-hidden), so the name is read
+  // from the current row itself rather than from the visible-row lookup.
+  function currentAgentRow(agentId = "") {
+    if (agentId) {
+      const exact = [...document.querySelectorAll(".sand-agent-item[data-agent-id]")].find((row) => row.getAttribute("data-agent-id") === agentId);
+      if (exact) return exact;
+    }
+    return selectedAgentRow() || document.querySelector('.sand-agent-item[data-agent-id][aria-current="page"], .sand-agent-item[data-agent-id][data-active="true"]');
+  }
+
+  function botDisplayName(row) {
+    return textOf(row?.querySelector(".sand-agent-item__name")) || row?.getAttribute("aria-label") || "";
+  }
+
+  function modelGroupCopy(globalScope, agentId, botName) {
+    if (!globalScope) return { label: "Modelo", help: "" };
+    // The gateway applies these fields to the selected bot whenever one exists;
+    // only without bots do they become the default that new bots inherit.
+    return agentId
+      ? { label: "Provedor e modelo do bot", help: `Vale para o bot selecionado${botName ? ` (${botName})` : ""}. Cada bot tem a sua configuração.` }
+      : { label: "Provedor e modelo padrão", help: "Bots novos usam esta configuração." };
+  }
+
   function renderSettings(host, scope = "agent") {
     const globalScope = scope === "global";
     if (!globalScope) prepareAgentSettingsHost(host);
@@ -2630,105 +2915,123 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     // A fresh node avoids carrying provider/model state and event handlers over.
     existing?.remove();
     ensureStyle();
+    const selectedRow = selectedAgentRow();
+    const selectedId = selectedRow?.getAttribute("data-agent-id") || "";
+    // The complete final skeleton goes in now, in the same frame as the native
+    // pane; hydration only fills it in. Rows the bot showed last time keep
+    // their space so the panel height does not jump when data arrives.
+    const layout = layoutMemory().get(`${scope}|${selectedId}`) || {};
     const root = document.createElement("div");
     root.id = ROOT_ID;
     root.setAttribute("lang", "pt-BR");
     root.dataset.scope = scope;
     root.dataset.contextKey = contextKey;
+    root.dataset.loading = "1";
+    root.dataset.saveState = "idle";
     root.innerHTML = `
-      <div class="ob-kicker">${globalScope ? "Conexão com IA" : "Modelo deste bot"}</div>
-      <p id="openbot-settings-bot" class="ob-help"></p>
-      <p class="ob-help">${globalScope ? "Conecte um provedor e escolha o modelo usado pelo OpenBot." : "Escolha o provedor, conecte sua conta e selecione o modelo."}</p>
-      <div class="ob-provider-card">
-        <div class="ob-field-row">
-          <label for="openbot-provider">Provedor</label>
-          <select id="openbot-provider">
-            <option value="xai">xAI</option>
-            <option value="openai">OpenAI Codex</option>
-            <option value="opencode-go">OpenCode Go</option>
-          </select>
+      <section class="ob-group" data-group="model" aria-labelledby="openbot-model-group-label">
+        <div class="ob-group-head">
+          <div id="openbot-model-group-label" class="ob-group-label"></div>
+          <div id="openbot-status" class="ob-group-status" role="status" aria-live="polite"><span class="ob-status-text"></span><button type="button" id="openbot-status-action" class="ob-link-button" hidden></button></div>
         </div>
-        <div id="openbot-api-key-row" hidden>
-          <label for="openbot-apikey">API key do OpenCode Go</label>
-          <div class="ob-secret-row">
-            <input id="openbot-apikey" type="password" maxlength="8192" autocomplete="off" spellcheck="false" placeholder="Cole sua API key" />
-            <button type="button" id="openbot-apikey-save">Salvar chave</button>
-          </div>
-        </div>
-        <div class="ob-auth-row">
-          <span id="openbot-auth-status" class="ob-key-status" role="status">Verificando…</span>
-          <button type="button" id="openbot-auth-action">Entrar</button>
-        </div>
-        <div class="ob-field-row">
-          <label for="openbot-model">Modelo</label>
-          <select id="openbot-model"></select>
-          <div class="ob-model-catalog">
-            <button type="button" id="openbot-model-refresh">Atualizar modelos</button>
-            <div id="openbot-model-status" aria-live="polite"></div>
-          </div>
-        </div>
-        <div id="openbot-speed-row" class="ob-field-row" hidden>
-          <label for="openbot-speed">Velocidade</label>
-          <select id="openbot-speed"><option value="default">Padrão</option><option value="priority">Fast</option></select>
-          <div id="openbot-speed-help" class="ob-help">Fast pode consumir mais da sua franquia. A aplicação depende do provedor.</div>
-          <div id="openbot-speed-result" class="ob-help"></div>
-        </div>
-        <div id="openbot-reasoning-row" class="ob-field-row">
-          <label for="openbot-reasoning">Raciocínio</label>
-          <select id="openbot-reasoning">
-            <option value="minimal">Mínimo</option>
-            <option value="low">Baixo</option>
-            <option value="medium">Médio</option>
-            <option value="high">Alto</option>
-            <option value="xhigh">Muito alto</option>
-          </select>
-        </div>
-        <div class="ob-actions">
-          <button type="button" id="openbot-save" aria-describedby="openbot-save-help">Salvar alterações</button>
-          <span id="openbot-save-help" class="ob-help" role="status">Carregando configurações…</span>
-        </div>
-      </div>
-      <details id="openbot-advanced" class="ob-advanced" ${globalScope ? "hidden" : ""}>
-        <summary>
-          <span class="ob-advanced-heading">
-            <span class="ob-advanced-title">Avançado</span>
-            <span class="ob-advanced-help">Arquivos e runtime</span>
-          </span>
-        </summary>
-        <div class="ob-advanced-body">
-          <div class="ob-advanced-section">
-            <div class="ob-section-title">Arquivos</div>
-            <p class="ob-section-help">Documents, Downloads e Projects ficam no espaço deste bot. Pastas compartilhadas são acessadas explicitamente.</p>
-            <div class="ob-folder-actions">
-              <button type="button" id="openbot-open-documents">Abrir Documents</button>
-              <button type="button" id="openbot-open-workspace">Abrir Projects</button>
+        <p id="openbot-model-group-help" class="ob-group-help" hidden></p>
+        <div class="ob-card ob-provider-card">
+          <div class="ob-field-row" data-row="provider">
+            <label class="ob-row-label" for="openbot-provider">Provedor</label>
+            <div class="ob-row-control">
+              <select id="openbot-provider">
+                <option value="xai">xAI</option>
+                <option value="openai">OpenAI Codex</option>
+                <option value="opencode-go">OpenCode Go</option>
+              </select>
             </div>
           </div>
-          <div class="ob-advanced-section">
-            <div class="ob-section-title">Runtime</div>
-            <div class="ob-runtime-list">
-              <div class="ob-runtime-row">
-                <span class="ob-runtime-label">Workspace</span>
-                <span id="openbot-lifecycle-status" class="ob-lifecycle-status" aria-live="polite">Verificando…</span>
+          <div class="ob-field-row ob-auth-row" data-row="account">
+            <span class="ob-row-label">Conta</span>
+            <div class="ob-row-control ob-auth-control">
+              <span id="openbot-auth-status" class="ob-key-status" data-state="loading" role="status" aria-live="polite"></span>
+              <button type="button" id="openbot-auth-action" class="ob-button">Entrar</button>
+            </div>
+            <p id="openbot-auth-note" class="ob-row-note" hidden></p>
+          </div>
+          <div id="openbot-api-key-row" class="ob-field-row ob-stack-row" data-row="api-key"${layout.apiKey ? "" : " hidden"}>
+            <label class="ob-row-label" for="openbot-apikey">Chave de API do OpenCode Go</label>
+            <div class="ob-secret-row">
+              <input id="openbot-apikey" type="password" class="ob-input" maxlength="8192" autocomplete="off" spellcheck="false" placeholder="Cole a chave" />
+              <button type="button" id="openbot-apikey-save" class="ob-button">Salvar chave</button>
+            </div>
+          </div>
+          <div class="ob-field-row" data-row="model">
+            <label class="ob-row-label" for="openbot-model">Modelo</label>
+            <div class="ob-row-control ob-model-control">
+              <select id="openbot-model"></select>
+              <button type="button" id="openbot-model-refresh" class="ob-button ob-icon-button" aria-label="Atualizar lista de modelos" title="Atualizar lista de modelos">${MODEL_REFRESH_ICON}</button>
+            </div>
+            <p id="openbot-model-status" class="ob-row-note${layout.modelNote ? " is-reserved" : ""}" aria-live="polite"${layout.modelNote ? ` style="min-height:${Math.min(96, Number(layout.modelNote) || 16)}px"` : " hidden"}>${layout.modelNote ? "&nbsp;" : ""}</p>
+          </div>
+          <div id="openbot-reasoning-row" class="ob-field-row" data-row="reasoning"${layout.reasoning ? "" : " hidden"}>
+            <label class="ob-row-label" for="openbot-reasoning">Raciocínio</label>
+            <div class="ob-row-control">
+              <select id="openbot-reasoning">
+                <option value="minimal">Mínimo</option>
+                <option value="low">Baixo</option>
+                <option value="medium">Médio</option>
+                <option value="high">Alto</option>
+                <option value="xhigh">Muito alto</option>
+              </select>
+            </div>
+          </div>
+          <div id="openbot-speed-row" class="ob-field-row" data-row="speed"${layout.speed ? "" : " hidden"}>
+            <label class="ob-row-label" for="openbot-speed">Velocidade</label>
+            <div class="ob-row-control">
+              <select id="openbot-speed"><option value="default">Padrão</option><option value="priority">Fast</option></select>
+            </div>
+            <p id="openbot-speed-help" class="ob-row-note">${SPEED_HELP}</p>
+            <p id="openbot-speed-result" class="ob-row-note" hidden></p>
+          </div>
+        </div>
+      </section>${globalScope ? "" : `
+      <section class="ob-group" data-group="memory" aria-labelledby="openbot-memory-group-label">
+        <div id="openbot-memory-group-label" class="ob-group-label">Memória</div>
+        <div id="openbot-memory-slot" class="ob-card" data-openbot-memory-slot="1"></div>
+      </section>
+      <section class="ob-group" data-group="advanced">
+        <details id="openbot-advanced" class="ob-advanced">
+          <summary>Avançado</summary>
+          <div class="ob-advanced-body">
+            <div class="ob-card">
+              <div class="ob-field-row ob-stack-row" data-row="files">
+                <span class="ob-row-label">Arquivos do bot</span>
+                <div class="ob-folder-actions">
+                  <button type="button" id="openbot-open-documents" class="ob-button">Abrir Documentos</button>
+                  <button type="button" id="openbot-open-workspace" class="ob-button">Abrir Projetos</button>
+                </div>
               </div>
-              <div class="ob-runtime-row">
-                <span class="ob-runtime-label">Developer</span>
-                <span id="openbot-runtime-status" class="ob-lifecycle-status" aria-live="polite">Verificando…</span>
+              <div class="ob-field-row" data-row="workspace">
+                <span class="ob-row-label">Espaço de trabalho</span>
+                <span id="openbot-lifecycle-status" class="ob-lifecycle-status" aria-live="polite"></span>
+              </div>
+              <div class="ob-field-row" data-row="runtime">
+                <span class="ob-row-label">Ambiente de execução</span>
+                <span id="openbot-runtime-status" class="ob-lifecycle-status" aria-live="polite"></span>
+              </div>
+              <div class="ob-runtime-actions" hidden>
+                <button type="button" id="openbot-runtime-repair" class="ob-button">Reparar</button>
               </div>
             </div>
-            <div class="ob-runtime-actions">
-              <button type="button" id="openbot-runtime-repair">Reparar runtime</button>
-            </div>
+            <div id="openbot-advanced-status" class="ob-group-status ob-advanced-status" role="status" aria-live="polite"><span class="ob-status-text"></span></div>
           </div>
-        </div>
-      </details>
-      <div id="openbot-status" aria-live="polite"></div>
-      <button type="button" id="openbot-settings-retry" hidden>Tentar novamente</button>
+        </details>
+      </section>`}
     `;
-    root.querySelector("#openbot-settings-retry").addEventListener("click", () => {
-      root.remove();
-      renderSettings(host, scope);
-    });
+    const currentRow = selectedRow || (globalScope ? currentAgentRow() : null);
+    const copy = modelGroupCopy(globalScope, currentRow?.getAttribute("data-agent-id") || "", botDisplayName(currentRow));
+    root.querySelector("#openbot-model-group-label").textContent = copy.label;
+    const groupHelp = root.querySelector("#openbot-model-group-help");
+    groupHelp.textContent = copy.help;
+    groupHelp.hidden = !copy.help;
+    const memorySlot = root.querySelector("#openbot-memory-slot");
+    if (memorySlot instanceof HTMLElement) memorySlot.style.minHeight = `${reservedMemorySlotHeight()}px`;
     const globalMount = globalScope ? prepareGlobalSettingsMount(host) : null;
     host.dataset.openbotMotionSurface = "settings";
     if (globalMount?.content instanceof HTMLElement) {
@@ -2736,19 +3039,31 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       globalMount.content.insertBefore(root, globalMount.before?.parentElement === globalMount.content ? globalMount.before : null);
     } else if (globalMount?.legacyAccount?.parentElement) globalMount.legacyAccount.parentElement.insertBefore(root, globalMount.legacyAccount);
     else host.appendChild(root);
-    queueMotionTarget(root, "settings");
+    // One entrance motion: when the native surface is already fading in (or the
+    // panel is only re-rendering for another bot), the section rides along
+    // instead of starting a second, offset fade.
+    if (host.dataset.openbotSettingsShown === "1" || ancestorMotionActive(root)) stampMotion(root, "settings");
+    else queueMotionTarget(root, "settings");
+    host.dataset.openbotSettingsShown = "1";
     window.dispatchEvent(new Event("openbot:settings-mounted"));
-    void hydrateOAuthSettings(root);
+    void hydrateOAuthSettings(root, () => {
+      root.remove();
+      renderSettings(host, scope);
+    });
   }
 
-  async function hydrateOAuthSettings(root) {
+  async function hydrateOAuthSettings(root, reload = () => undefined) {
     const globalScope = root.dataset.scope === "global";
     const status = root.querySelector("#openbot-status");
+    const statusText = status.querySelector(".ob-status-text");
+    const statusAction = root.querySelector("#openbot-status-action");
+    const advancedStatus = root.querySelector("#openbot-advanced-status");
+    const groupLabelEl = root.querySelector("#openbot-model-group-label");
+    const groupHelpEl = root.querySelector("#openbot-model-group-help");
     const providerEl = root.querySelector("#openbot-provider");
     const modelEl = root.querySelector("#openbot-model");
     const catalogStatus = root.querySelector("#openbot-model-status");
     const catalogRefresh = root.querySelector("#openbot-model-refresh");
-    const catalogs = new Map();
     const modelSelections = new Map();
     let shownProvider;
     let catalogGeneration = 0;
@@ -2756,52 +3071,134 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     const reasoningRowEl = root.querySelector("#openbot-reasoning-row");
     const speedEl = root.querySelector("#openbot-speed");
     const speedRow = root.querySelector("#openbot-speed-row");
+    const speedHelp = root.querySelector("#openbot-speed-help");
+    const speedResult = root.querySelector("#openbot-speed-result");
     const authStatusEl = root.querySelector("#openbot-auth-status");
     const authActionEl = root.querySelector("#openbot-auth-action");
+    const authNoteEl = root.querySelector("#openbot-auth-note");
     const apiKeyRow = root.querySelector("#openbot-api-key-row");
     const apiKeyEl = root.querySelector("#openbot-apikey");
     const apiKeySaveEl = root.querySelector("#openbot-apikey-save");
-    const saveEl = root.querySelector("#openbot-save");
     const openWorkspaceEl = root.querySelector("#openbot-open-workspace");
     const openDocumentsEl = root.querySelector("#openbot-open-documents");
     const repairRuntimeEl = root.querySelector("#openbot-runtime-repair");
     const advancedEl = root.querySelector("#openbot-advanced");
     const advancedBodyEl = root.querySelector(".ob-advanced-body");
+    const selects = [providerEl, modelEl, reasoningEl, speedEl];
     const loadingControls = [providerEl, modelEl, reasoningEl, speedEl, authActionEl, apiKeyEl, apiKeySaveEl];
-    loadingControls.forEach((control) => { control.disabled = true; });
-    repairRuntimeEl.disabled = true;
-    if (globalScope) [providerEl, modelEl, reasoningEl, speedEl].forEach(enhanceStyledSelect);
+    selects.forEach(enhanceStyledSelect);
+    const setControlsDisabled = (disabled) => {
+      loadingControls.forEach((control) => { control.disabled = disabled; });
+      selects.forEach(refreshStyledSelect);
+    };
+    setControlsDisabled(true);
+    for (const button of [repairRuntimeEl, openWorkspaceEl, openDocumentsEl]) if (button) button.disabled = true;
     let activeAgentId;
     let oauth = {};
     let openCodeConfigured = false;
+    let stateModels = [];
     let pollToken = 0;
     let saving = false;
+    let savePromise = null;
     let authBusy = false;
     let persisted = "";
+    let loaded = false;
+    let userTouched = false;
+    let saveError = null;
+    let notice = null;
+    let lastSavedAt = 0;
+    let savedMessage = "Salvo";
+    let autosaveTimer = 0;
+    let savedTimer = 0;
+    let statusActionRun = null;
+    let catalogPendingFor = "";
     const selectedId = selectedAgentRow()?.getAttribute("data-agent-id") || null;
+    const layoutKey = `${root.dataset.scope}|${selectedId || ""}`;
     const isCurrent = () => root.isConnected && root.dataset.contextKey === settingsContextKey(null, root.dataset.scope);
     const selection = () => JSON.stringify([providerEl.value, modelEl.value, reasoningEl.value, speedEl.value]);
-    const syncSave = () => {
-      const supported = ["openai", "xai", "opencode-go"].includes(providerEl.value);
-      const authenticated = providerEl.value === "opencode-go" ? openCodeConfigured : oauth[providerEl.value]?.state === "connected";
-      const reason = saving ? "Salvando alterações…"
-        : authBusy ? "Aguarde a operação de conexão terminar."
-        : !supported ? "Este provedor persistido não pode ser alterado por este painel."
-        : !authenticated ? "Conecte o provedor para salvar."
-        : modelEl.selectedOptions[0]?.disabled ? modelEl.selectedOptions[0].title || "Modelo pendente ou indisponível."
-        : reasoningEl.selectedOptions[0]?.disabled ? "Revise o esforço de raciocínio salvo."
-        : speedEl.selectedOptions[0]?.disabled ? "Fast não confirmado. Atualize os modelos ou selecione Padrão."
-        : !modelEl.value ? "Nenhum modelo disponível. Tente carregar novamente."
-        : selection() === persisted ? "Nenhuma alteração pendente." : "Alterações pendentes.";
-      saveEl.disabled = saving || authBusy || !supported || !authenticated || !modelEl.value || modelEl.selectedOptions[0]?.disabled || reasoningEl.selectedOptions[0]?.disabled || speedEl.selectedOptions[0]?.disabled || selection() === persisted;
-      saveEl.textContent = saving ? "Salvando…" : "Salvar alterações";
-      root.querySelector("#openbot-save-help").textContent = reason;
-    };
-    const setStatus = (kind, text) => {
+    const catalogFor = (provider) => providerCatalogCache.get(provider)?.catalog;
+    const setStatus = (kind, text, action = null) => {
       if (!isCurrent()) return;
-      status.className = kind;
-      status.textContent = text;
-      queueChangedStatus(status);
+      // The retry link already says it; do not repeat "Tente novamente." before it.
+      if (action?.label === "Tentar novamente") text = text.replace(/s*Tente novamente.?$/i, "");
+      const changed = statusText.textContent !== text || (status.dataset.kind || "") !== kind;
+      status.dataset.kind = kind;
+      status.className = `ob-group-status${kind ? ` ${kind}` : ""}`;
+      if (statusText.textContent !== text) statusText.textContent = text;
+      statusActionRun = action?.run || null;
+      statusAction.hidden = !action;
+      if (statusAction.textContent !== (action?.label || "")) statusAction.textContent = action?.label || "";
+      if (changed && text) queueChangedStatus(status);
+    };
+    statusAction.addEventListener("click", () => statusActionRun?.());
+    const setAdvancedStatus = (kind, text) => {
+      if (!advancedStatus || !isCurrent()) return;
+      advancedStatus.className = `ob-group-status ob-advanced-status${kind ? ` ${kind}` : ""}`;
+      advancedStatus.firstElementChild.textContent = text;
+      if (text) queueChangedStatus(advancedStatus);
+    };
+    let modelNoteHeight = 0;
+    const rememberLayout = () => {
+      if (!loaded) return;
+      rememberSettingsLayout(layoutKey, { reasoning: !reasoningRowEl.hidden, speed: !speedRow.hidden, apiKey: !apiKeyRow.hidden, modelNote: catalogStatus.hidden ? 0 : modelNoteHeight || 16 });
+    };
+    const blockedReason = () => {
+      const provider = providerEl.value;
+      if (!["openai", "xai", "opencode-go"].includes(provider)) return "Este provedor não pode ser alterado aqui.";
+      const authenticated = provider === "opencode-go" ? openCodeConfigured : oauth[provider]?.state === "connected";
+      if (!authenticated) return provider === "opencode-go" ? "Salve a chave de API para aplicar." : "Entre na conta para aplicar.";
+      if (!modelEl.value) return "Nenhum modelo disponível.";
+      if (modelEl.selectedOptions[0]?.disabled) return "Modelo indisponível; escolha outro.";
+      if (reasoningEl.selectedOptions[0]?.disabled) return "Raciocínio não aceito por este modelo.";
+      if (speedEl.selectedOptions[0]?.disabled) return "Fast indisponível; escolha Padrão.";
+      return "";
+    };
+    // One status line for the group, by precedence: saving, a failed save (with
+    // retry), an account/key notice, what blocks a pending choice, then "Salvo".
+    const syncSave = () => {
+      if (!isCurrent() || !loaded) return;
+      const dirty = selection() !== persisted;
+      if (dirty && userTouched) pendingProviderSelections.set(activeAgentId || "", selection());
+      else if (!dirty) pendingProviderSelections.delete(activeAgentId || "");
+      if (saving) {
+        root.dataset.saveState = "saving";
+        return setStatus("", "Salvando…");
+      }
+      if (saveError && saveError.selection === selection()) {
+        root.dataset.saveState = "error";
+        return setStatus("err", saveError.message, { label: "Tentar novamente", run: () => { saveError = null; void persistSelection(); } });
+      }
+      const reason = dirty ? blockedReason() : "";
+      if (notice) {
+        root.dataset.saveState = dirty ? (reason ? "blocked" : "pending") : root.dataset.saveState === "saved" ? "saved" : "idle";
+        return setStatus(notice.kind, notice.text, notice.action || null);
+      }
+      if (dirty) {
+        root.dataset.saveState = reason ? "blocked" : "pending";
+        return setStatus(reason ? "warn" : "", reason);
+      }
+      if (lastSavedAt) {
+        root.dataset.saveState = "saved";
+        return setStatus(Date.now() - lastSavedAt < SAVED_VISIBLE_MS ? "ok" : "", Date.now() - lastSavedAt < SAVED_VISIBLE_MS ? savedMessage : "");
+      }
+      root.dataset.saveState = "idle";
+      setStatus("", "");
+    };
+    // Changes save on their own after a short pause; nothing is written for a
+    // difference the user did not make.
+    const scheduleAutosave = (delay = AUTOSAVE_DELAY_MS) => {
+      clearLocalTimeout(autosaveTimer);
+      autosaveTimer = 0;
+      if (!isCurrent() || !loaded) return;
+      // While the selected provider's catalog is still loading, its limits
+      // (reasoning levels, Fast) are unknown: wait for it before writing.
+      if (userTouched && catalogPendingFor !== providerEl.value && selection() !== persisted && !blockedReason()) {
+        autosaveTimer = setLocalTimeout(() => {
+          autosaveTimer = 0;
+          void persistSelection();
+        }, delay);
+      }
+      syncSave();
     };
     const fillModels = (models, provider, selected) => {
       const usable = models.filter((model) => (model.vendorName || model.provider) === provider);
@@ -2810,107 +3207,171 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
         const id = model.name || model.id;
         const entry = option(id, model.clientDisplayName || model.displayName || id, id === selected);
         entry.disabled = model.selectable === false;
-        entry.title = model.reason || "";
+        entry.title = model.reason ? userFacingError(model.reason, "Modelo indisponível no momento.") : "";
         if (entry.disabled) entry.textContent += " (indisponível)";
         modelEl.appendChild(entry);
       }
       if (selected && ![...modelEl.options].some((entry) => entry.value === selected)) {
-        const missing = option(selected, `${selected} (salvo; fora do catálogo atual)`, true);
+        const missing = option(selected, `${selected} (fora da lista atual)`, true);
         missing.disabled = true;
-        missing.title = "Modelo salvo não validado no catálogo atual.";
+        missing.title = "Este modelo não aparece na lista atual do provedor.";
         modelEl.appendChild(missing);
       }
       if (selected) modelEl.value = selected;
       if (![...modelEl.options].some((entry) => entry.selected) && modelEl.options[0]) modelEl.selectedIndex = 0;
       refreshStyledSelect(modelEl);
     };
+    // OpenAI always takes an effort; other providers only when the selected model declares its levels.
+    const reasoningAvailable = () => {
+      if (providerEl.value === "openai") return true;
+      const efforts = catalogFor(providerEl.value)?.models?.find(m => m.id === modelEl.value)?.supportedReasoningEfforts;
+      return Array.isArray(efforts) && efforts.length > 0;
+    };
     const syncReasoning = () => {
-      const supportsFast = Boolean(activeAgentId) && providerEl.value === "openai" && catalogs.get("openai")?.models?.find(m => m.id === modelEl.value)?.serviceTiers?.includes("priority");
+      const supportsFast = Boolean(activeAgentId) && providerEl.value === "openai" && catalogFor("openai")?.models?.find(m => m.id === modelEl.value)?.serviceTiers?.includes("priority");
       speedEl.querySelector('[value="priority"]').disabled = !supportsFast;
       speedRow.hidden = !supportsFast && speedEl.value !== "priority";
-      root.querySelector("#openbot-speed-help").textContent = speedEl.value === "priority"
-        ? "Fast solicitado. Pode consumir mais da sua franquia; a aplicação depende do provedor."
-        : "Fast pode consumir mais da sua franquia. A aplicação depende do provedor.";
+      const unsupportedFast = speedEl.value === "priority" && !supportsFast;
+      const help = unsupportedFast ? "Fast indisponível para este modelo. Escolha Padrão." : SPEED_HELP;
+      if (speedHelp.textContent !== help) speedHelp.textContent = help;
+      speedHelp.classList.toggle("err", unsupportedFast);
       refreshStyledSelect(speedEl);
-      const efforts = catalogs.get(providerEl.value)?.models?.find(m => m.id === modelEl.value)?.supportedReasoningEfforts;
+      const efforts = catalogFor(providerEl.value)?.models?.find(m => m.id === modelEl.value)?.supportedReasoningEfforts;
       for (const entry of reasoningEl.options) entry.disabled = Array.isArray(efforts) && !efforts.includes(entry.value);
+      if (["openai", "xai", "opencode-go"].includes(providerEl.value)) reasoningRowEl.hidden = !reasoningAvailable();
       refreshStyledSelect(reasoningEl);
+      rememberLayout();
+    };
+    const renderCatalogNote = (provider, catalog, failure = "") => {
+      const labels = { stale: "Lista de modelos desatualizada.", empty: "Nenhum modelo disponível para este provedor.", unavailable: "Lista de modelos ainda não confirmada." };
+      const selected = catalog?.models?.find((model) => model.id === modelEl.value);
+      const text = [
+        failure || (catalog?.error ? userFacingError(catalog.error, "Não foi possível atualizar a lista de modelos.") : labels[catalog?.state] || ""),
+        selected?.reason ? userFacingError(selected.reason, "Este modelo não está disponível agora.") : "",
+        provider === "opencode-go" && catalog ? "Lista pública; o acesso da sua conta não foi confirmado." : "",
+      ].filter(Boolean).join(" ");
+      catalogStatus.dataset.catalogState = failure ? "error" : catalog?.state || "";
+      catalogStatus.classList.remove("is-reserved");
+      catalogStatus.style.removeProperty("min-height");
+      if (catalogStatus.textContent !== text) catalogStatus.textContent = text;
+      catalogStatus.hidden = !text;
+      modelNoteHeight = text ? Math.round(catalogStatus.getBoundingClientRect().height) : 0;
+      catalogRefresh.title = catalog?.updatedAt
+        ? `Atualizar lista de modelos (atualizada em ${new Date(catalog.updatedAt).toLocaleString("pt-BR")})`
+        : "Atualizar lista de modelos";
+      rememberLayout();
     };
     const updateCatalog = async (refresh) => {
       const provider = providerEl.value;
       const api = desktop()?.agent;
       if (!api?.getProviderModelCatalog || !["openai", "xai", "opencode-go"].includes(provider)) return;
       const generation = ++catalogGeneration;
+      catalogPendingFor = provider;
       catalogRefresh.disabled = true;
-      catalogStatus.textContent = refresh !== undefined ? "Atualizando catálogo…" : "Consultando catálogo local…";
+      catalogRefresh.classList.add("is-busy");
+      catalogRefresh.setAttribute("aria-busy", "true");
       try {
         const catalog = await api.getProviderModelCatalog({ provider, refresh });
+        providerCatalogCache.set(provider, { catalog, at: Date.now() });
         if (!isCurrent() || generation !== catalogGeneration || providerEl.value !== provider) return;
-        catalogs.set(provider, catalog);
         fillModels(catalog.models || [], provider, modelEl.value);
         syncReasoning();
-        const labels = { fresh: "Catálogo atualizado", stale: "Catálogo desatualizado", empty: "Catálogo vazio confirmado", unavailable: "Catálogo ainda não validado" };
-        catalogStatus.textContent = [labels[catalog.state] || "Catálogo indisponível", catalog.updatedAt ? new Date(catalog.updatedAt).toLocaleString() : "", catalog.error || "", catalog.models?.find(m => m.id === modelEl.value)?.reason || "", catalog.models?.some(m => m.selectable === false && m.availability !== "removed") ? "Modelos pendentes aguardam metadados confirmados." : "", provider === "opencode-go" ? "Lista pública; acesso da conta não confirmado." : ""].filter(Boolean).join(" · ");
-        syncSave();
+        renderCatalogNote(provider, catalog);
       } catch (error) {
-        if (isCurrent() && generation === catalogGeneration) catalogStatus.textContent = error instanceof Error ? error.message : "Falha ao atualizar catálogo.";
+        const failure = userFacingError(error, "Não foi possível atualizar a lista de modelos.");
+        if (!catalogFor(provider)) providerCatalogCache.set(provider, { failure, at: Date.now() });
+        if (isCurrent() && generation === catalogGeneration && providerEl.value === provider) renderCatalogNote(provider, catalogFor(provider), failure);
       } finally {
-        if (isCurrent() && generation === catalogGeneration) catalogRefresh.disabled = false;
+        if (isCurrent() && generation === catalogGeneration) {
+          catalogPendingFor = "";
+          catalogRefresh.disabled = false;
+          catalogRefresh.classList.remove("is-busy");
+          catalogRefresh.removeAttribute("aria-busy");
+          scheduleAutosave();
+        }
       }
     };
+    // First use of a provider in this session reads the local catalog and then
+    // lets the gateway refresh it if stale; later opens reuse that result.
+    const loadCatalog = async (provider) => {
+      const cached = providerCatalogCache.get(provider);
+      if (cached?.catalog) {
+        fillModels(cached.catalog.models || [], provider, modelEl.value);
+        syncReasoning();
+        renderCatalogNote(provider, cached.catalog);
+        return;
+      }
+      if (cached?.failure && Date.now() - cached.at < CATALOG_FAILURE_TTL_MS) {
+        renderCatalogNote(provider, undefined, cached.failure);
+        return;
+      }
+      await updateCatalog();
+      if (isCurrent() && providerEl.value === provider && catalogFor(provider)) await updateCatalog(false);
+    };
     catalogRefresh.addEventListener("click", () => void updateCatalog(true));
+    const setAuthState = (state, text, note = "", noteIsError = false) => {
+      authStatusEl.dataset.state = state;
+      if (authStatusEl.textContent !== text) authStatusEl.textContent = text;
+      if (authNoteEl.textContent !== note) authNoteEl.textContent = note;
+      authNoteEl.classList.toggle("err", noteIsError);
+      authNoteEl.hidden = !note;
+    };
     const syncAuth = () => {
-      authActionEl.disabled = saving || authBusy;
+      authActionEl.disabled = !loaded || authBusy;
       if (!["openai", "xai", "opencode-go"].includes(providerEl.value)) {
         apiKeyRow.hidden = true;
         reasoningRowEl.hidden = true;
         authActionEl.hidden = true;
-        authStatusEl.textContent = "Provedor persistido fora das conexões deste painel";
+        setAuthState("error", "Fora deste painel");
+        rememberLayout();
         syncSave();
         return;
       }
       const openCode = providerEl.value === "opencode-go";
-      reasoningRowEl.hidden = providerEl.value !== "openai";
+      reasoningRowEl.hidden = !reasoningAvailable();
       apiKeyRow.hidden = !openCode;
       apiKeySaveEl.disabled = saving || authBusy || !openCode || !apiKeyEl.value.trim();
+      apiKeyEl.placeholder = openCodeConfigured ? "Cole uma nova chave" : "Cole a chave";
       if (openCode) {
-        authStatusEl.classList.toggle("saved", openCodeConfigured);
-        authStatusEl.classList.remove("error");
-        authStatusEl.textContent = openCodeConfigured ? "Chave salva" : "Chave não configurada";
+        setAuthState(openCodeConfigured ? "connected" : "disconnected", openCodeConfigured ? "Chave salva" : "Sem chave");
         authActionEl.hidden = !openCodeConfigured;
-        authActionEl.textContent = "Desconectar";
+        authActionEl.textContent = "Remover chave";
+        rememberLayout();
         syncSave();
         return;
       }
       authActionEl.hidden = false;
       const current = oauth[providerEl.value] || { state: "disconnected" };
-      authStatusEl.classList.toggle("saved", current.state === "connected");
-      authStatusEl.classList.toggle("error", current.state === "error");
       if (current.state === "connected") {
-        authStatusEl.textContent = "Conectado";
+        setAuthState("connected", "Conectado");
         authActionEl.textContent = "Desconectar";
       } else if (current.state === "pending") {
-        authStatusEl.textContent = current.userCode ? `Digite o código ${current.userCode} no navegador` : "Conclua o login no navegador";
+        setAuthState("pending", "Aguardando login", current.userCode ? `Digite o código ${current.userCode} no navegador para concluir.` : "Conclua o login no navegador.");
         authActionEl.textContent = "Cancelar";
+      } else if (current.state === "error" || current.message) {
+        setAuthState("error", "Não conectado", userFacingError(current.message, "Não foi possível verificar a conexão."), true);
+        authActionEl.textContent = "Entrar";
       } else {
-        authStatusEl.textContent = current.message || "Não conectado";
+        setAuthState("disconnected", "Não conectado");
         authActionEl.textContent = "Entrar";
       }
+      rememberLayout();
       syncSave();
     };
-    const persistSelection = async (message) => {
+    const persistSelection = async (message = "Salvo") => {
       if (saving || authBusy || !isCurrent()) return;
       const provider = providerEl.value;
       const authenticated = provider === "opencode-go"
         ? openCodeConfigured
         : oauth[provider]?.state === "connected";
-      if (!authenticated || !modelEl.value || modelEl.selectedOptions[0]?.disabled || reasoningEl.selectedOptions[0]?.disabled || speedEl.selectedOptions[0]?.disabled) return;
-      if (selection() === persisted) return;
+      if (!authenticated || !modelEl.value || modelEl.selectedOptions[0]?.disabled || reasoningEl.selectedOptions[0]?.disabled || speedEl.selectedOptions[0]?.disabled) return syncSave();
+      if (selection() === persisted) return syncSave();
       saving = true;
+      saveError = null;
       const submitted = selection();
-      loadingControls.forEach((control) => { control.disabled = true; });
       syncSave();
-      setStatus("", "Salvando alterações…");
+      let settle;
+      savePromise = new Promise((resolve) => { settle = resolve; });
       try {
         const saved = await desktop().agent.setProviderConfig({ agentId: activeAgentId, provider, model: modelEl.value, reasoningEffort: reasoningEl.value, ...(activeAgentId ? { serviceTier: speedEl.value } : {}) });
         if (!isCurrent()) return;
@@ -2918,15 +3379,24 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
           throw new Error("A persistência não confirmou a seleção enviada.");
         }
         persisted = submitted;
-        setStatus("ok", message);
+        lastSavedAt = Date.now();
+        savedMessage = message;
+        notice = null;
         return saved;
       } catch (error) {
-        setStatus("err", `${error instanceof Error ? error.message : String(error)} Tente novamente.`);
+        if (!isCurrent()) return;
+        saveError = { selection: submitted, message: userFacingError(error, "Não foi possível salvar as alterações.") };
       } finally {
         saving = false;
+        settle();
         if (isCurrent()) {
-          loadingControls.forEach((control) => { control.disabled = false; });
           syncAuth();
+          // A choice made while the previous save was in flight is saved next.
+          if (!saveError && selection() !== persisted) scheduleAutosave(0);
+          else if (lastSavedAt && !saveError) {
+            clearLocalTimeout(savedTimer);
+            savedTimer = setLocalTimeout(syncSave, SAVED_VISIBLE_MS + 20);
+          }
         }
       }
     };
@@ -2946,17 +3416,14 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
           if (!isCurrent() || token !== pollToken) return;
           failures += 1;
           if (failures >= 5) {
-            oauth[provider] = { state: "error", message: error instanceof Error ? error.message : "Falha ao verificar a autenticação." };
+            oauth[provider] = { state: "error", message: userFacingError(error, "Não foi possível confirmar o login.") };
           } else {
             delayMs = Math.min(8000, 1000 * (2 ** failures));
           }
         }
         if (providerEl.value === provider) {
           syncAuth();
-          if (oauth[provider]?.state === "connected") {
-            void updateCatalog(true);
-            setStatus("ok", "Conta conectada. Salve as alterações do modelo quando estiver pronto.");
-          }
+          if (oauth[provider]?.state === "connected") applyAfterConnect();
         }
       }
     };
@@ -2966,14 +3433,25 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       button.textContent = "Abrindo…";
       try {
         await opener();
-        if (root.isConnected) setStatus("ok", okText);
+        setAdvancedStatus("ok", okText);
       } catch (error) {
-        if (root.isConnected) setStatus("err", `${error instanceof Error ? error.message : String(error)} Verifique o acesso à pasta local.`);
+        setAdvancedStatus("err", userFacingError(error, "Não foi possível abrir a pasta. Verifique o acesso aos arquivos do bot."));
       } finally {
         button.disabled = false;
         button.textContent = original;
       }
     });
+    // After a login or a saved key, the choice the user was waiting to apply
+    // goes through the same guarded save; nothing else is written.
+    const applyAfterConnect = () => {
+      notice = { kind: "ok", text: "Conta conectada." };
+      syncSave();
+      void updateCatalog(true).then(() => {
+        if (!isCurrent()) return;
+        if (userTouched && selection() !== persisted) notice = null;
+        scheduleAutosave(0);
+      });
+    };
     if (!globalScope && advancedEl && advancedBodyEl) advancedEl.addEventListener("toggle", () => {
       if (!advancedEl.open) {
         elementAnimations.get(advancedBodyEl)?.cancel();
@@ -2983,58 +3461,87 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       animatedElements.delete(advancedBodyEl);
       queueMotionTarget(advancedBodyEl, "disclosure");
     });
-    if (!globalScope) bindFolderOpen(openWorkspaceEl, async () => desktop().agent.openWorkspace(), "Projects aberto no Explorer.");
-    if (!globalScope) bindFolderOpen(openDocumentsEl, async () => desktop().agent.openUserDocuments(), "Documents aberto no Explorer.");
+    if (!globalScope) bindFolderOpen(openWorkspaceEl, async () => desktop().agent.openWorkspace(), "Pasta Projetos aberta no Explorador de Arquivos.");
+    if (!globalScope) bindFolderOpen(openDocumentsEl, async () => desktop().agent.openUserDocuments(), "Pasta Documentos aberta no Explorador de Arquivos.");
     if (!globalScope) repairRuntimeEl?.addEventListener("click", async () => {
       const original = repairRuntimeEl.textContent;
       repairRuntimeEl.disabled = true;
+      repairRuntimeEl.dataset.busy = "1";
       repairRuntimeEl.textContent = "Reparando…";
+      setAdvancedStatus("", "");
       try {
         const repaired = await desktop().agent.repairLocalRuntime({ agentId: activeAgentId });
         const runtimeState = await updateLifecycleStatus(root, activeAgentId);
         if (!["ready", "busy"].includes(repaired?.state) || !["ready", "busy", "lite-ready"].includes(runtimeState)) {
-          throw new Error(repaired?.state === "repair-required" || runtimeState === "repair-required" ? "O runtime ainda precisa de reparo." : "Não foi possível confirmar o reparo do runtime.");
+          throw new Error(repaired?.state === "repair-required" || runtimeState === "repair-required" ? "O ambiente ainda precisa de reparo." : "Não foi possível confirmar o reparo do ambiente.");
         }
-        setStatus("ok", "Runtime reparado.");
+        setAdvancedStatus("ok", "Ambiente reparado.");
       } catch (error) {
         repairRuntimeEl.disabled = false;
-        setStatus("err", `${error instanceof Error ? error.message : String(error)} Tente novamente.`);
+        setAdvancedStatus("err", userFacingError(error, "Não foi possível reparar o ambiente. Tente novamente."));
       } finally {
+        delete repairRuntimeEl.dataset.busy;
         repairRuntimeEl.textContent = original;
+        syncRepairVisibility(repairRuntimeEl);
       }
     });
-    saveEl.disabled = true;
-    openWorkspaceEl.disabled = true;
-    openDocumentsEl.disabled = true;
+    const slowLoad = setLocalTimeout(() => {
+      if (!loaded && isCurrent()) setStatus("", "Carregando…");
+    }, SLOW_FEEDBACK_MS);
     try {
       const state = await loadState(selectedId || undefined, globalScope);
       if (!isCurrent()) return;
       if (selectedId && state.agentId !== selectedId) throw new Error("O bot selecionado mudou. Reabra as configurações.");
+      clearLocalTimeout(slowLoad);
       activeAgentId = state.agentId;
       root.dataset.agentId = activeAgentId;
-      root.querySelector("#openbot-settings-bot").textContent = activeAgentId
-        ? `Bot: ${selectedAgentRow()?.getAttribute("aria-label") || activeAgentId}` : "Configuração padrão do OpenBot";
+      const copy = modelGroupCopy(globalScope, activeAgentId, botDisplayName(currentAgentRow(activeAgentId)));
+      if (groupLabelEl.textContent !== copy.label) groupLabelEl.textContent = copy.label;
+      if (groupHelpEl.textContent !== copy.help) groupHelpEl.textContent = copy.help;
+      groupHelpEl.hidden = !copy.help;
       oauth = state.oauth;
       openCodeConfigured = state.openCodeConfigured;
-      loadingControls.forEach((control) => { control.disabled = false; });
+      stateModels = state.models;
       if (![...providerEl.options].some((entry) => entry.value === state.provider)) providerEl.appendChild(option(state.provider, `${state.provider} (salvo)`, true));
       providerEl.value = state.provider;
       shownProvider = state.provider;
       modelSelections.set(state.provider, state.modelId);
-      fillModels(state.models, state.provider, state.modelId);
+      fillModels(catalogFor(state.provider)?.models || state.models, state.provider, state.modelId);
       reasoningEl.value = state.reasoningEffort || "medium";
       speedEl.value = activeAgentId ? state.serviceTier : "default";
       const actual = state.lastServiceTier?.actual;
-      root.querySelector("#openbot-speed-result").textContent = !actual?.length ? ""
-        : actual.length > 1 ? "Última resposta: processamento misto ou parcialmente confirmado."
+      speedResult.textContent = !actual?.length ? ""
+        : actual.length > 1 ? "Última resposta: velocidade mista ou parcialmente confirmada."
         : actual[0] === "priority" ? "Última resposta: Fast confirmado pelo provedor."
-        : actual[0] === "default" ? "Última resposta: Padrão aplicado pelo provedor."
-        : "Última resposta: o provedor não confirmou a velocidade aplicada.";
+        : actual[0] === "default" ? "Última resposta: velocidade Padrão."
+        : "Última resposta: o provedor não confirmou a velocidade.";
+      speedResult.hidden = !speedResult.textContent;
       persisted = JSON.stringify([state.provider, state.modelId || "", state.reasoningEffort || "medium", speedEl.value]);
-      void updateCatalog().then(() => { if (isCurrent() && providerEl.value === state.provider) void updateCatalog(false); });
-      refreshStyledSelect(providerEl);
-      refreshStyledSelect(reasoningEl);
+      // A choice made earlier in this session that could not be applied yet
+      // (for example before signing in) is shown again instead of dropped.
+      const pending = pendingProviderSelections.get(activeAgentId || "");
+      if (pending && pending !== persisted) {
+        try {
+          const [provider, model, reasoning, speed] = JSON.parse(pending);
+          if ([...providerEl.options].some((entry) => entry.value === provider)) {
+            providerEl.value = provider;
+            shownProvider = provider;
+            modelSelections.set(provider, model);
+            fillModels(catalogFor(provider)?.models || state.models, provider, model);
+            reasoningEl.value = reasoning;
+            speedEl.value = speed;
+            userTouched = true;
+          }
+        } catch {
+          pendingProviderSelections.delete(activeAgentId || "");
+        }
+      }
+      loaded = true;
+      setControlsDisabled(false);
+      delete root.dataset.loading;
+      syncReasoning();
       syncAuth();
+      void loadCatalog(providerEl.value);
       if (oauth[providerEl.value]?.state === "pending") void pollOAuth(providerEl.value, pollToken);
       if (!globalScope) {
         openWorkspaceEl.disabled = false;
@@ -3042,38 +3549,53 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
         void updateLifecycleStatus(root, activeAgentId);
       }
       providerEl.addEventListener("change", () => {
+        userTouched = true;
+        notice = null;
         speedEl.value = "default";
-        root.querySelector("#openbot-speed-result").textContent = "";
+        speedResult.textContent = "";
+        speedResult.hidden = true;
         pollToken += 1;
         modelSelections.set(shownProvider, modelEl.value);
         shownProvider = providerEl.value;
-        fillModels(catalogs.get(providerEl.value)?.models || state.models, providerEl.value, modelSelections.get(providerEl.value));
+        fillModels(catalogFor(providerEl.value)?.models || stateModels, providerEl.value, modelSelections.get(providerEl.value));
         syncReasoning();
-        const selectedProvider = providerEl.value;
-        void updateCatalog().then(() => { if (isCurrent() && providerEl.value === selectedProvider) void updateCatalog(false); });
         syncAuth();
+        void loadCatalog(providerEl.value);
         if (oauth[providerEl.value]?.state === "pending") void pollOAuth(providerEl.value, pollToken);
-        setStatus("", "");
+        scheduleAutosave();
       });
       for (const control of [modelEl, reasoningEl, speedEl]) control.addEventListener("change", () => {
-        if (control === modelEl) { speedEl.value = "default"; root.querySelector("#openbot-speed-result").textContent = ""; }
-        syncReasoning(); syncSave(); setStatus("", "");
+        userTouched = true;
+        notice = null;
+        if (control === modelEl) {
+          speedEl.value = "default";
+          speedResult.textContent = "";
+          speedResult.hidden = true;
+          const catalog = catalogFor(providerEl.value);
+          if (catalog) renderCatalogNote(providerEl.value, catalog);
+        }
+        syncReasoning();
+        scheduleAutosave();
       });
       apiKeyEl.addEventListener("input", () => {
         apiKeyEl.removeAttribute("aria-invalid");
         syncAuth();
       });
       apiKeySaveEl.addEventListener("click", async () => {
+        if (authBusy || !isCurrent()) return;
+        if (saving) await savePromise;
         if (authBusy || saving || !isCurrent()) return;
         const apiKey = apiKeyEl.value.trim();
         if (!apiKey) {
           apiKeyEl.setAttribute("aria-invalid", "true");
           apiKeyEl.focus({ preventScroll: true });
-          return setStatus("err", "Informe a API key do OpenCode Go.");
+          notice = { kind: "err", text: "Informe a chave de API do OpenCode Go." };
+          return syncSave();
         }
         authBusy = true;
-        loadingControls.forEach((control) => { control.disabled = true; });
-        syncSave();
+        notice = null;
+        setControlsDisabled(true);
+        syncAuth();
         try {
           await desktop().agent.setProviderApiKey("opencode-go", apiKey);
           if (!isCurrent()) return;
@@ -3081,24 +3603,29 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
           apiKeyEl.value = "";
           await updateCatalog(true);
           if (!isCurrent()) return;
-          setStatus("ok", "Chave salva. Consulte o estado do catálogo acima.");
+          notice = { kind: "ok", text: "Chave salva." };
         } catch (error) {
-          setStatus("err", `${error instanceof Error ? error.message : String(error)} Verifique a chave.`);
+          if (!isCurrent()) return;
+          notice = { kind: "err", text: userFacingError(error, "Não foi possível salvar a chave. Confira se ela está correta."), action: { label: "Tentar novamente", run: () => apiKeySaveEl.click() } };
         } finally {
           authBusy = false;
           if (isCurrent()) {
-            loadingControls.forEach((control) => { control.disabled = false; });
+            setControlsDisabled(false);
             syncAuth();
+            scheduleAutosave(0);
           }
         }
       });
       authActionEl.addEventListener("click", async () => {
-        if (authBusy || saving || !isCurrent()) return;
+        if (authBusy || !isCurrent()) return;
+        if (saving) await savePromise;
+        if (authBusy || !isCurrent()) return;
         const provider = providerEl.value;
         const current = oauth[provider] || { state: "disconnected" };
         authBusy = true;
-        loadingControls.forEach((control) => { control.disabled = true; });
-        syncSave();
+        notice = null;
+        setControlsDisabled(true);
+        syncAuth();
         try {
           pollToken += 1;
           if (provider === "opencode-go") {
@@ -3108,31 +3635,34 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
           else if (current.state === "pending") oauth[provider] = await desktop().agent.cancelProviderOAuth(provider);
           else oauth[provider] = await desktop().agent.startProviderOAuth(provider);
           if (provider === "opencode-go" || current.state === "connected") {
-            catalogs.delete(provider);
+            providerCatalogCache.delete(provider);
             await updateCatalog();
           }
           if (!isCurrent()) return;
-          syncAuth();
           if (oauth[provider]?.state === "pending") void pollOAuth(provider, pollToken);
+          else if (oauth[provider]?.state === "connected" && current.state !== "connected") applyAfterConnect();
         } catch (error) {
-          setStatus("err", `${error instanceof Error ? error.message : String(error)} Tente novamente.`);
+          if (!isCurrent()) return;
+          const fallback = provider === "opencode-go" ? "Não foi possível remover a chave."
+            : current.state === "connected" ? "Não foi possível desconectar a conta."
+            : current.state === "pending" ? "Não foi possível cancelar o login."
+            : "Não foi possível iniciar o login.";
+          notice = { kind: "err", text: userFacingError(error, fallback), action: { label: "Tentar novamente", run: () => authActionEl.click() } };
         } finally {
           authBusy = false;
           if (isCurrent()) {
-            loadingControls.forEach((control) => { control.disabled = false; });
+            setControlsDisabled(false);
             syncAuth();
           }
         }
       });
     } catch (error) {
+      clearLocalTimeout(slowLoad);
       if (!isCurrent()) return;
-      setStatus("err", userFacingError(error, "Não foi possível carregar as configurações de IA. Tente novamente."));
-      root.querySelector("#openbot-save-help").textContent = "Carregue as configurações para poder salvar.";
-      root.querySelector("#openbot-settings-retry").hidden = false;
+      delete root.dataset.loading;
+      authStatusEl.dataset.state = "error";
+      setStatus("err", userFacingError(error, "Não foi possível carregar as configurações de IA."), { label: "Tentar novamente", run: reload });
     }
-    saveEl.addEventListener("click", async () => {
-      await persistSelection("Configuração do modelo salva.");
-    });
   }
 
 
@@ -3820,7 +4350,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
         const result = await desktop()?.agent?.retryPrompt?.({
           agentId, conversationId, expectedFailureEntryId,
         });
-        if (!result?.accepted) throw new Error("Retry não aceito");
+        if (!result?.accepted) throw new Error("A nova tentativa não foi aceita.");
         busyAgentIds.add(agentId);
         optimisticGeneration = false;
         lastSendAt = Date.now();
@@ -4161,6 +4691,9 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       settingsOpenGraceUntil = 0;
       document.getElementById(EMPTY_ID)?.remove();
       renderSettings(mount, globalMount ? "global" : "agent");
+    } else if (document.getElementById(ROOT_ID)?.isConnected && modalLayerOpen()) {
+      // The pane is only aria-hidden behind an open menu or dialog; keep the section.
+      scheduleSettingsScan(400);
     } else {
       missingMount += 1;
       if (missingMount > 1 && Date.now() >= settingsOpenGraceUntil) closeEmptyConversationDetails();
@@ -4200,7 +4733,9 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     missingMount = 0;
     settingsOpenGraceUntil = settingsButton.getAttribute("aria-expanded") === "true" ? 0 : Date.now() + 1500;
     const retryToken = ++settingsRetryToken;
-    const delays = [90, 220, 420, 760, 1200];
+    // The first attempt runs in the next frame, after React commits the pane
+    // and before it is painted; the later ones only cover slow native mounts.
+    const delays = [0, 90, 220, 420, 760, 1200];
     const run = (index) => {
       if (retryToken !== settingsRetryToken || localUiClosed) return;
       ensureConversationDetailsVisible();
@@ -4209,10 +4744,37 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
         renderSettings(mount);
         return;
       }
-      scan();
+      if (index > 0) scan();
       if (index + 1 < delays.length) setLocalTimeout(() => run(index + 1), delays[index + 1] - delays[index]);
     };
-    setLocalTimeout(() => run(0), delays[0]);
+    window.requestAnimationFrame(() => run(0));
+  }
+
+  // Direct mounts for the observer: a settings surface that just appeared gets
+  // its OpenBot section in the same frame, without waiting for the debounced scan.
+  function mountAgentSettingsNow() {
+    if (localUiClosed) return;
+    // The native pane host is the mount the label search resolves to (the last
+    // visible settings surface); using it directly avoids walking every text
+    // node while the pane is opening.
+    const native = [...document.querySelectorAll(".sand-agent-settings")]
+      .filter((host) => host instanceof HTMLElement && host.querySelector("input, textarea") && isVisibleElement(host))
+      .at(-1);
+    const mount = native || findAgentSettingsMount() || findExpandedConversationDetailsMount();
+    if (!mount) return;
+    missingMount = 0;
+    settingsOpenGraceUntil = 0;
+    renderSettings(mount);
+    ensureConversationDetailsVisible();
+  }
+
+  function mountGlobalSettingsNow() {
+    if (localUiClosed) return;
+    hideUnavailableAutoReview();
+    removeUnavailableNavigation();
+    polishNativeLanguage();
+    const mount = findGlobalSettingsMount();
+    if (mount) renderSettings(mount, "global");
   }
 
   function handleNativePortalTriggerClick(event) {
@@ -4250,6 +4812,10 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     let settingsScanNeeded = false;
     let accountMenuAdded = false;
     let messageMenuAdded = false;
+    let agentSettingsAdded = false;
+    let globalSettingsAdded = false;
+    let commandSurfaceChanged = false;
+    let memorySlotChanged = false;
     for (const mutation of mutations) {
       if (mutation.type === "childList") {
         if (mutation.target instanceof Element && mutation.target.closest(".obp23-dialog")) localFeatureAdded = true;
@@ -4257,6 +4823,12 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
           const element = node instanceof Element ? node : node.parentElement;
           if (element?.closest('[role="menu"][aria-label="More message actions"], [role="menu"][aria-label="Message actions"]') || element?.querySelector('[role="menu"][aria-label="More message actions"], [role="menu"][aria-label="Message actions"]')) messageMenuAdded = true;
           if (element?.closest('[role="menu"][aria-label="Account"], [role="menu"][aria-label="Conta"]') || element?.querySelector('[role="menu"][aria-label="Account"]')) accountMenuAdded = true;
+          if (element instanceof Element) {
+            if (!agentSettingsAdded && (element.matches(".sand-agent-settings") || element.querySelector(".sand-agent-settings"))) agentSettingsAdded = true;
+            if (!globalSettingsAdded && (element.id === "sand-settings-panel-general" || element.querySelector("#sand-settings-panel-general"))) globalSettingsAdded = true;
+            if (!commandSurfaceChanged && (element.closest(".sand-workflow-listbox,.sand-command-palette,[role='tooltip']") || element.querySelector(".sand-workflow-listbox,.sand-command-palette,[role='tooltip']"))) commandSurfaceChanged = true;
+            if (!memorySlotChanged && element.closest("#openbot-memory-slot")) memorySlotChanged = true;
+          }
           collectMotionTargets(node);
           if (node instanceof Element) {
             if (!promptStatusTimer && (node.matches(".sand-activity-label__text") || node.querySelector(".sand-activity-label__text"))) schedulePromptStatus(0);
@@ -4289,6 +4861,13 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
       hideChrome();
       polishNativeLanguage();
     }
+    if (commandSurfaceChanged) {
+      polishCommandPalette();
+      polishTooltips();
+    }
+    if (globalSettingsAdded) mountGlobalSettingsNow();
+    if (agentSettingsAdded) mountAgentSettingsNow();
+    if (memorySlotChanged) settleMemorySlot();
     if (localFeatureAdded) polishLocalFeatureCopy();
     if (avatarChanged) reconcileAgentAvatars();
     queueTranscriptReconciliation(mutations);
@@ -4381,6 +4960,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
     document.removeEventListener("click", handleFooterProfileClick, true);
     document.removeEventListener("click", releaseFocusBeforeDetailsClose, true);
     document.removeEventListener("keydown", trapLocalModalFocus, true);
+    document.removeEventListener("keydown", blockHiddenCommandActivation, true);
     document.removeEventListener("visibilitychange", handleVisibilityChange);
     window.removeEventListener("resize", handleWindowResize);
     window.removeEventListener("blur", handleVisibilityChange);
@@ -4435,6 +5015,7 @@ body :is(.ob-dialog .ob-close,.obp23-panel .obp23-close,#openbot-tasks-dialog .o
   document.addEventListener("click", handleFooterProfileClick, true);
   document.addEventListener("click", releaseFocusBeforeDetailsClose, true);
   document.addEventListener("keydown", trapLocalModalFocus, true);
+  document.addEventListener("keydown", blockHiddenCommandActivation, true);
   document.addEventListener("visibilitychange", handleVisibilityChange);
   window.addEventListener("resize", handleWindowResize);
   window.addEventListener("blur", handleVisibilityChange);

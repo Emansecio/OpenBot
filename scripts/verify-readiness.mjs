@@ -298,6 +298,11 @@ async function main() {
       () => undefined,
     );
     cleanup = "temp-root-removed";
+  } else {
+    // An empty root holds no diagnostics; left behind, it would fail the next
+    // run's initial inventory as a stale readiness root.
+    assertOwnedTempRoot(tempRoot, parentTemp);
+    if (await removeTempRootIfEmpty(tempRoot).catch(() => false)) cleanup = "empty-temp-root-removed";
   }
 
   const status = terminalStatus ?? "GREEN";
@@ -552,6 +557,13 @@ export async function listStaleReadinessRoots(currentRoot) {
     })
     .map((entry) => join(parent, entry.name))
     .sort();
+}
+
+/** Removes a failed run's TempRoot only when nothing was left to diagnose. */
+export async function removeTempRootIfEmpty(root) {
+  if ((await readdir(root)).length > 0) return false;
+  await rmdir(root);
+  return true;
 }
 
 async function pruneEmptyDirectories(root) {

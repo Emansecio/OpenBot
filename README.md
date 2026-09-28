@@ -23,13 +23,11 @@ checkout. Foi ajustado ao [guia oficial do Astra](https://developers.openai.com/
 consultado em 04/09/2026, preservando o escopo mínimo, a execução em um único
 agente por padrão e a confirmação por senha para operações irreversíveis.
 
-Esta orientação de desenvolvimento não altera os modelos dos bots. O catálogo
-continua em [src/config/models.ts](src/config/models.ts), sem entrada para
-`gpt-6-astra` nesta revisão. O [adapter OpenAI](src/providers/openai.ts) já possui
-transporte Responses, mas a seleção automática por nome cobre `gpt-5.6-*`;
-também existem overrides explícitos de protocolo. Para Astra, ferramentas exigem
-Responses API. Uma integração do modelo no produto precisa validar catálogo,
-seleção de transporte e parâmetros; esta atualização é apenas documental.
+Esta orientação de desenvolvimento é independente dos modelos dos bots. O
+catálogo em [src/config/models.ts](src/config/models.ts) inclui a família `gpt-6-*` (Astra, Sol e Luna), e o
+[adapter OpenAI](src/providers/openai.ts) a envia pela Responses API junto com
+`gpt-5.6-*` (`usesResponsesApi` em [request-bodies.ts](src/providers/request-bodies.ts));
+também existem overrides explícitos de protocolo. Um modelo que a descoberta lista para a conta conectada (OpenAI/Codex ou xAI) e que ainda não está no catálogo estático fica selecionável com limites conservadores ([model-catalog.ts](src/providers/model-catalog.ts)); o OpenCode Go continua restrito aos modelos conhecidos.
 
 ## Decisões históricas do MVP (11/08/2026)
 
@@ -43,7 +41,7 @@ A tabela registra o escopo original. Para comportamento atual, consulte o fluxo 
 | §8.4 | VNC/cloud computer | **Stubs inertes**: `getForeverBoxStatus → {vncUrl:null, windows:[]}`; botão Computer / Plugins / Log out ocultos no cliente local |
 | §8.5 | Transcribe de áudio | **Off (no-op)** no MVP |
 
-Modelo **por bot** (fallback global `grok-4.6`). Catálogo OpenAI: `gpt-5.6-luna`,
+Modelo **por bot** (fallback global `grok-4.6`). Catálogo OpenAI: `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-luna`,
 `gpt-5.6-sol` e `gpt-5.6-terra`. Sem conta/backend/cloud; chaves do usuário via
 safeStorage/DPAPI (T4+). Telemetria/updates: off (T17+).
 

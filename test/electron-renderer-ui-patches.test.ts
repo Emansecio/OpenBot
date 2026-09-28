@@ -24,23 +24,99 @@ describe("Electron/Windows local integration patches", () => {
 
   it("keeps user-document actions and removes the dedicated WhatsApp setting", () => {
     expect(settings).toContain("openUserDocuments()");
-    expect(settings).toContain("Abrir Documents");
+    expect(settings).toContain("Abrir Documentos");
+    expect(settings).not.toContain("Abrir Documents");
     expect(preload).toContain('invoke("sand:open-user-documents")');
     expect(main).toContain('"sand:open-user-documents"');
     expect(settings).not.toMatch(/whatsapp|wacli/i);
     expect(preload).not.toMatch(/agent-whatsapp|getAgentWhatsapp|setAgentWhatsapp/i);
     expect(main).not.toMatch(/agent-whatsapp|getAgentWhatsapp|setAgentWhatsapp/i);
-    expect(settings).toContain("Arquivos e runtime");
+    expect(settings).toContain("<summary>Avançado</summary>");
+    expect(settings).toContain('<span class="ob-row-label">Arquivos do bot</span>');
+    expect(settings).toContain('<span class="ob-row-label">Ambiente de execução</span>');
+  });
+
+  it("groups the bot panel as Modelo, Memória slot and Avançado without redundant copy or a save button", () => {
+    const skeleton = between(settings, "function renderSettings(host", "async function hydrateOAuthSettings(");
+    const model = skeleton.indexOf('data-group="model"');
+    const memory = skeleton.indexOf('data-group="memory"');
+    const advanced = skeleton.indexOf('data-group="advanced"');
+    expect(model).toBeGreaterThan(0);
+    expect(memory).toBeGreaterThan(model);
+    expect(advanced).toBeGreaterThan(memory);
+    expect(skeleton).toContain('<div id="openbot-memory-slot" class="ob-card" data-openbot-memory-slot="1"></div>');
+    expect(skeleton).toContain('memorySlot.style.minHeight = `${reservedMemorySlotHeight()}px`');
+    expect(skeleton).toContain('<details id="openbot-advanced" class="ob-advanced">');
+    expect(skeleton).toContain('aria-label="Atualizar lista de modelos"');
+    expect(settings).toContain('if (!globalScope) return { label: "Modelo", help: "" };');
+    expect(settings).not.toContain("Modelo deste bot");
+    expect(settings).not.toContain("Escolha o provedor, conecte sua conta e selecione o modelo.");
+    expect(settings).not.toContain('id="openbot-settings-bot"');
+    expect(settings).not.toContain('id="openbot-save"');
+    // The mount event still follows the insertion of the complete skeleton.
+    expect(skeleton.indexOf('window.dispatchEvent(new Event("openbot:settings-mounted"))')).toBeGreaterThan(skeleton.indexOf("else host.appendChild(root);"));
+    expect(skeleton.indexOf('window.dispatchEvent(new Event("openbot:settings-mounted"))')).toBeLessThan(skeleton.indexOf("void hydrateOAuthSettings(root"));
+  });
+
+  it("shows the reasoning control whenever the selected model declares effort levels", () => {
+    const source = between(settings, "const reasoningAvailable = () => {", "const syncReasoning");
+    const available = (provider: string, efforts?: string[]) => {
+      const catalog = { models: [{ id: "m", ...(efforts ? { supportedReasoningEfforts: efforts } : {}) }] };
+      const factory = new Function("providerEl", "modelEl", "catalogFor", `${source}; return reasoningAvailable;`);
+      return factory({ value: provider }, { value: "m" }, () => catalog)();
+    };
+    expect(available("openai")).toBe(true);
+    expect(available("xai", ["low", "medium", "high", "xhigh"])).toBe(true);
+    expect(available("xai")).toBe(false);
+    expect(available("opencode-go", [])).toBe(false);
+    expect(settings).toContain("reasoningRowEl.hidden = !reasoningAvailable();");
+    expect(settings).not.toContain('reasoningRowEl.hidden = providerEl.value !== "openai"');
+  });
+
+  it("keeps the settings section painted and mounted while a native menu or modal is open", () => {
+    expect(settings).toContain("body:not(.ob-dialog-open):not(:has(${MODAL_LAYER_SELECTOR})) :is([aria-hidden=\"true\"],[inert]) #${ROOT_ID}{display:none!important}");
+    const scan = between(settings, "const mount = globalMount || findAgentSettingsMount()", "reconcileAgentAvatars();");
+    expect(scan.indexOf("modalLayerOpen()")).toBeGreaterThan(-1);
+    expect(scan.indexOf("modalLayerOpen()")).toBeLessThan(scan.indexOf("missingMount += 1;"));
+    const layerOpen = (dialogOpen: boolean, rects: number[]) => new Function("document", "MODAL_LAYER_SELECTOR", `${between(settings, "function modalLayerOpen() {", "function isVisibleElement")}; return modalLayerOpen;`)(
+      { body: { classList: { contains: (name: string) => dialogOpen && name === "ob-dialog-open" } }, querySelectorAll: () => rects.map((length) => ({ getClientRects: () => ({ length }) })) },
+      '.ui-menu__backdrop,[role="menu"]',
+    )();
+    expect(layerOpen(false, [1])).toBe(true);
+    expect(layerOpen(true, [])).toBe(true);
+    expect(layerOpen(false, [0])).toBe(false);
+    expect(layerOpen(false, [])).toBe(false);
+  });
+
+  it("normalizes every surfaced failure into short pt-BR copy without IPC details", () => {
+    const friendly = runInNewContext(`${between(settings, "const IPC_ERROR_PREFIX", "const SETTINGS_LABELS")} userFacingError`, {});
+    expect(friendly(new Error("Error invoking remote method 'sand:provider-model-catalog': Error: Descoberta indisponível neste backend"), "x"))
+      .toBe("A lista de modelos não pode ser consultada neste ambiente.");
+    expect(friendly(new Error("Error invoking remote method 'sand:provider-config-set': Error: fetch failed"), "x")).toBe("O OpenBot local não respondeu. Tente novamente.");
+    expect(friendly(new Error("OpenBot active agent changed; stale request."), "x")).toBe("O bot selecionado mudou. Reabra as configurações.");
+    expect(friendly(new Error("Error invoking remote method 'sand:retry-prompt': Error: retryPrompt: a falha selecionada não é mais a falha atual"), "x"))
+      .toBe("A falha selecionada não é mais a falha atual");
+    expect(friendly(new Error("Error invoking remote method 'sand:provider-config-set': Error: offline"), "Não foi possível salvar as alterações."))
+      .toBe("Não foi possível salvar as alterações.");
+    expect(friendly(new Error("Could not open Documents"), "Não foi possível abrir a pasta.")).toBe("Não foi possível abrir a pasta.");
+    expect(friendly(new Error("desktop.agent indisponível"), "fallback")).toBe("fallback");
+    expect(friendly("Falha local de catálogo", "fallback")).toBe("Falha local de catálogo");
+    expect(friendly(undefined, "fallback")).toBe("fallback");
+    for (const message of ["Error invoking remote method 'sand:x': Error: at foo (file.js:1)", "gateway-command-failed", "{\"code\":500}"]) {
+      expect(friendly(new Error(message), "fallback")).toBe("fallback");
+    }
+    expect(settings).not.toContain("error instanceof Error ? error.message : String(error)");
   });
 
   it("declares responsive, reduced-motion and ARIA affordances for the new actions", () => {
     expect(settings).toContain('class="ob-secret-row"');
-    expect(settings).toContain('class="ob-actions"');
+    expect(settings).toContain('class="ob-group"');
+    expect(settings).toContain('id="openbot-status" class="ob-group-status" role="status" aria-live="polite"');
     expect(settings).toContain('aria-live="polite"');
     expect(settings).toContain('id="openbot-auth-status"');
     expect(settings).toContain('id="openbot-auth-action"');
-    expect(settings).toContain("Escolha o provedor, conecte sua conta e selecione o modelo.");
     expect(settings).toContain('id="openbot-advanced"');
+    expect(settings).toContain('#${ROOT_ID} .ob-icon-button.is-busy svg,#${EMPTY_ID} .ob-empty-character{animation:none}');
     expect(settings).toContain("@media (max-width:520px)");
     expect(settings).toContain("@media (prefers-reduced-motion:reduce)");
     expect(settings).toContain("var(--cursor-stroke-secondary");
@@ -83,6 +159,24 @@ describe("Electron/Windows local integration patches", () => {
     expect(settings.match(/new MutationObserver/g)).toHaveLength(1);
     expect(settings).not.toContain("transition:all");
     expect(settings).not.toContain("message: { duration: 200");
+  });
+
+  it("inserts the settings skeleton in the frame the native pane appears, with a single entrance motion", () => {
+    const observerBody = between(settings, "const observer = new MutationObserver(", "function observePortalRoot(");
+    expect(observerBody).toContain('element.matches(".sand-agent-settings") || element.querySelector(".sand-agent-settings")');
+    expect(observerBody).toContain("if (agentSettingsAdded) mountAgentSettingsNow();");
+    expect(observerBody).toContain("if (globalSettingsAdded) mountGlobalSettingsNow();");
+    expect(observerBody).toContain("if (memorySlotChanged) settleMemorySlot();");
+    // Debounced scans stay in place for everything else.
+    expect(observerBody).toContain("if (settingsScanNeeded && !scanTimer) scheduleSettingsScan(120);");
+    const click = between(settings, "function handleSettingsButtonClick(", "function mountAgentSettingsNow(");
+    expect(click).toContain("window.requestAnimationFrame(() => run(0));");
+    expect(click).toContain("Date.now() + 1500");
+    const skeleton = between(settings, "function renderSettings(host", "async function hydrateOAuthSettings(");
+    expect(skeleton).toContain('if (host.dataset.openbotSettingsShown === "1" || ancestorMotionActive(root)) stampMotion(root, "settings");');
+    expect(skeleton).toContain('else queueMotionTarget(root, "settings");');
+    expect(settings).toContain("const SLOW_FEEDBACK_MS = 150;");
+    expect(settings).toContain('if (!loaded && isCurrent()) setStatus("", "Carregando…");');
   });
 
   it("applies confirmed profile saves after unmount without accepting stale acknowledgements", async () => {
@@ -229,6 +323,32 @@ describe("Electron/Windows local integration patches", () => {
     expect(settings).toContain('/^General$/i');
     expect(settings).toContain("UNSUPPORTED_COMMAND_LABELS");
     expect(settings).toContain("UNSAFE_SECTION_ACTION");
+    // The account menu is translated before these checks run, so pt-BR labels are covered too.
+    expect(settings).toContain("Central de ajuda|Enviar feedback");
+    const accountMenu = between(settings, "function polishAccountMenu()", "function polishSettingsNavigation()");
+    expect(accountMenu).toContain("items.every((item) => item.closest('[data-openbot-hide=\"1\"]'))");
+    expect(accountMenu).toContain('group.setAttribute("data-openbot-hide", "1")');
+    const navigation = between(settings, "function polishSettingsNavigation()", "function polishLocalExecutionSetting()");
+    expect(navigation).toContain("=== 1");
+    expect(settings).toContain('.sand-settings-nav[data-openbot-single-nav="1"]{display:none!important}');
+  });
+
+  it("localizes the slash menu, the sidebar tooltip and the local execution row", () => {
+    const palette = between(settings, "function polishCommandPalette()", "function blockHiddenCommandActivation(");
+    expect(palette).toContain('document.querySelectorAll(".sand-workflow-listbox")');
+    expect(palette).toContain("UNSUPPORTED_COMMAND_LABELS.test(firstVisibleLine(option))");
+    expect(settings).toContain('["Skill", "Habilidade"]');
+    expect(settings).toContain('["Action", "Ação"]');
+    expect(settings).toContain('["New chat", "Novo bot"]');
+    expect(settings).toContain('document.addEventListener("keydown", blockHiddenCommandActivation, true)');
+    expect(settings).toContain('document.removeEventListener("keydown", blockHiddenCommandActivation, true)');
+    const localExecution = between(settings, "function polishLocalExecutionSetting()", "function polishNativeLanguage()");
+    expect(localExecution).toContain('if (policy !== "always")');
+    expect(localExecution).toContain('status.textContent = "Sempre permitida"');
+    // Read-only: the native policy control stays hidden and is never re-enabled.
+    expect(localExecution).toContain('control.setAttribute("data-openbot-hide", "1")');
+    expect(localExecution).not.toContain('control.removeAttribute("data-openbot-hide")');
+    expect(settings).toContain('"O bot pode abrir arquivos e executar tarefas neste computador."');
   });
 
   it("repairs the confirmed inherited UI inconsistencies without changing provider routing", () => {

@@ -187,7 +187,8 @@ describe("model catalog", () => {
     expect(discover).toHaveBeenCalledTimes(1);
     const fresh = await catalog.get("xai", true);
     expect(discover).toHaveBeenCalledTimes(2);
-    expect(fresh.models.find(m => m.id === "future")).toMatchObject({ selectable: false, availability: "listed" });
+    // Listed for this xAI account: admitted with conservative limits.
+    expect(fresh.models.find(m => m.id === "future")).toMatchObject({ selectable: true, availability: "listed", contextWindow: 128_000, maxOutputTokens: 16_384 });
     expect(catalog.resolve("xai", "grok-4.6").entry.id).toBe("grok-4.6");
     fail = true;
     const stale = await catalog.get("xai", true);
@@ -229,8 +230,10 @@ describe("model catalog", () => {
   it("preserves unverified saved selections on restart and blocks pending models through direct RPC", async () => {
     const configPath = join(root(), "config.json");
     const config = new ConfigStore({ configPath, allowUnverifiedModels: true });
-    const catalog = new ModelCatalogService({ sources: { xai: { connectionKey: async () => connection, discover: async () => [{ id: "grok-4.6" }, { id: "future" }] } } });
+    // A listed model whose own limits are inconsistent stays pending even though discovery admits new models.
+    const catalog = new ModelCatalogService({ sources: { xai: { connectionKey: async () => connection, discover: async () => [{ id: "grok-4.6" }, { id: "future", contextWindow: 4_096, maxOutputTokens: 8_192 }] } } });
     await catalog.get("xai");
+    expect(catalog.peek("xai").models.find(m => m.id === "future")).toMatchObject({ selectable: false });
     config.modelCatalog = catalog;
     config.update({ activeProvider: "xai", globalModel: "grok-4.6" });
     expect(() => config.update({ agents: [{ id: "model-only", name: "Model only", avatarId: "default", model: "gpt-5.6-sol" }] })).not.toThrow();
@@ -347,6 +350,45 @@ describe("discovery protocols", () => {
 
       // Com catálogo descoberto, modelo que o endpoint não anuncia é rejeitado.
       expect(() => catalog.resolve("openai-compat", "not-served")).toThrow();
+    } finally { catalog.close(); }
+  });
+
+  it("ships the GPT-6 family and admits models the account lists before the static catalog knows them", async () => {
+    const catalog = new ModelCatalogService({ sources: {
+      openai: { connectionKey: async () => connection, discover: async () => [
+        { id: "gpt-6-sol", supportedReasoningEfforts: ["low", "high"], inputModalities: ["text", "image"], serviceTiers: ["priority"] },
+        { id: "gpt-7-preview", displayName: "GPT-7 Preview", supportedReasoningEfforts: ["medium"], inputModalities: ["text"] },
+        { id: "gpt-no-efforts", inputModalities: ["text"] },
+      ] },
+      xai: { connectionKey: async () => connection, discover: async () => [{ id: "grok-small-window", contextWindow: 8_192 }] },
+      "opencode-go": { connectionKey: async () => connection, discover: async () => [{ id: "opencode-go/brand-new" }] },
+    } });
+    try {
+      // Static entries exist before any discovery.
+      for (const id of ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]) {
+        expect(catalog.peek("openai").models.find(m => m.id === id)).toMatchObject({ selectable: true, contextWindow: 272_000, supportsVision: true });
+      }
+      const openai = await catalog.get("openai", true);
+      expect(openai.models.find(m => m.id === "gpt-6-sol")).toMatchObject({ selectable: true, contextWindow: 272_000, serviceTiers: ["priority"] });
+      expect(openai.models.find(m => m.id === "gpt-7-preview")).toMatchObject({
+        selectable: true, availability: "listed", displayName: "GPT-7 Preview", contextWindow: 272_000, maxOutputTokens: 16_384, supportsVision: false,
+      });
+      const resolution = catalog.resolve("openai", "gpt-7-preview", "medium");
+      expect(resolution.protocol).toBe("codex");
+      expect(resolution.capabilities).toMatchObject({ streaming: true, tools: true, images: false });
+      expect(() => catalog.resolve("openai", "gpt-7-preview", "high")).toThrow(/esforço/);
+      // Codex models must still declare reasoning efforts.
+      expect(openai.models.find(m => m.id === "gpt-no-efforts")).toMatchObject({ selectable: false });
+      // An id the account did not list is never admitted.
+      expect(() => catalog.resolve("openai", "gpt-unlisted")).toThrow();
+
+      // A small window reported by the provider keeps the output reserve inside it.
+      const xai = await catalog.get("xai", true);
+      expect(xai.models.find(m => m.id === "grok-small-window")).toMatchObject({ selectable: true, contextWindow: 8_192, maxOutputTokens: 4_096 });
+
+      // OpenCode Go serves models over per-model protocols: unknown ids stay fail-closed.
+      const opencode = await catalog.get("opencode-go", true);
+      expect(opencode.models.find(m => m.id === "opencode-go/brand-new")).toMatchObject({ selectable: false, availability: "listed" });
     } finally { catalog.close(); }
   });
 
