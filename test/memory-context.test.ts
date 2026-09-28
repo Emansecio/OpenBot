@@ -8,6 +8,7 @@ import { createProviderRegistry, type ProviderChatRequest } from "../src/provide
 import { createFakeAdapter } from "./mocks/fake-provider-adapter.js";
 import { createContextTokenizer } from "../src/memory/model-context.js";
 import { applyReflectionResult } from "../src/memory/reflection.js";
+import { ftsMatchExpression, significantSearchTerms } from "../src/memory/search-query.js";
 import { USER_PROFILE_AGENT_ID } from "../src/memory/types.js";
 import { formatAttachmentContext } from "../src/rpc/attachments.js";
 import { makeToolCallEntry, toolCallLocalId } from "../src/execution/tool-card.js";
@@ -185,6 +186,84 @@ describe("memory context integration", () => {
     expect(isExplicitMemoryIntent("Responda normalmente e continue a conversa.")).toBe(false);
     expect(isExplicitMemoryIntent("A opção remember me aparece no login.")).toBe(false);
     expect(isExplicitMemoryIntent("Explique a frase no olvides esta preferencia.")).toBe(false);
+  });
+
+  it("recognizes note-taking phrasings as memory intent only with a memory-shaped target", () => {
+    const positives = [
+      "Anota aí que meu voo é dia 3",
+      "anota que prefiro café",
+      "Anote isso",
+      "Anote isso para depois.",
+      "Anota isso aí!",
+      "Anota aí: meu voo é dia 3",
+      "Anote o seguinte: prefiro respostas curtas.",
+      "Toma nota: o servidor é o alpha",
+      "Tome nota disso",
+      "Tome nota de que uso Windows.",
+      "Você pode anotar que uso Windows?",
+      "Por favor, anota isso",
+      "Registra que o servidor é o X",
+      "Registre isso",
+      "Registre aí que prefiro testes mínimos.",
+      "Fica registrado que prefiro café.",
+      "Fica anotado que uso Windows.",
+      "Memoriza que meu voo é dia 3",
+      "Memorize isso",
+      "Não se esqueça que prefiro café.",
+      "Make a note that I prefer coffee",
+      "Please make a note of this.",
+      "Take a note that my flight is on the 3rd",
+      "Take note: the server is alpha",
+      "Note this down for later.",
+      "Note down that I use Windows",
+      "Jot that down",
+      "Apunta que prefiero café",
+      "Anota que mi vuelo es el día 3",
+      "Toma nota de que uso Windows.",
+      "Toma nota: el servidor es alpha",
+      "¿Puedes anotar esto?",
+      "Registra que el servidor es X",
+      "Queda anotado que prefiero café.",
+    ];
+    for (const prompt of positives) expect(isExplicitMemoryIntent(prompt), prompt).toBe(true);
+
+    const negatives = [
+      // Ordinary work: the object is a thing to act on, not a memory.
+      "Registra a venda no sistema",
+      "Anota o endereço no documento",
+      "Anota os itens na planilha",
+      "Registre o usuário no banco",
+      "Anota isso na planilha",
+      "Registre isso no sistema",
+      "Registrar ponto",
+      "Tome nota fiscal",
+      "Toma nota fiscal desse pedido",
+      "Anote todos os erros do log",
+      "Note this down in the README",
+      "Jot this down in a file",
+      "Take note of the following errors: ...",
+      "Apunta el error en el archivo",
+      "Registra al usuario en la base de datos",
+      "Toma nota fiscal",
+      // English "note that" is technical emphasis, not a memory request.
+      "Note that the code fails when the input is empty",
+      "Please note that the API changed",
+      "Take note that the build is slow",
+      "Make note of the errors in the log",
+      "Note: the server is X",
+      // Negations, quotations and mentions are not requests.
+      "Não anota isso",
+      "Não registre que prefiro café",
+      "Don't make a note that I prefer coffee",
+      "Ele disse: anota que prefiro café",
+      '"Anota que prefiro café", disse o autor.',
+      "O arquivo diz: fica registrado que prefiro café.",
+      "Explique a frase anota aí que meu voo é dia 3.",
+      "Qual a diferença entre anotar e registrar?",
+      "Ele anotou que o voo é dia 3",
+      "Memoriza o arquivo inteiro e resuma",
+    ];
+    for (const prompt of negatives) expect(isExplicitMemoryIntent(prompt), prompt).toBe(false);
   });
 
   it("keeps automatic memory confirmations behind every tool result across rounds", async () => {
@@ -991,7 +1070,8 @@ describe("memory context integration", () => {
     });
 
     const serialized = JSON.stringify(assembled.messages);
-    expect(memoryQueries).toContain("use this");
+    // The prompt searches by its meaningful words only ("this" is a function word).
+    expect(memoryQueries).toContain("use");
     expect(memoryQueries).toContain("needle-attachment-term");
     expect(historyQueries).toContain("needle-history-term");
     expect([...memoryQueries, ...historyQueries].every((query) => !query.includes("C:\\Users\\User\\Secrets"))).toBe(true);
@@ -1128,5 +1208,89 @@ describe("recent context assembly", () => {
     expect(formatted).not.toContain("sk-prod-abcdef1234567890");
     expect(formatted).toContain("C:\\Users\\Pessoa\\docs");
     expect(formatted.match(/\[\[OPENBOT_UNTRUSTED_ATTACHMENT_END\]\]/gu)).toHaveLength(1);
+  });
+});
+
+describe("lexical memory retrieval", () => {
+  function seededStore() {
+    const store = createTranscriptStore();
+    const conversationId = store.conversationStore.create("agent-a").id;
+    const add = (kind: "fact" | "decision", canonicalKey: string, text: string) => store.memoryStore.upsertMemory("agent-a", { kind, canonicalKey, text, trust: "user" }, { kind: "admin" });
+    add("fact", "pet.dog", "O cachorro do usuário se chama Thor.");
+    add("fact", "project.main", "A campanha principal de marketing é Aurora.");
+    add("decision", "db.choice", "Decidimos usar SQLite porque é local.");
+    return { store, conversationId };
+  }
+  const keys = (results: readonly { memory: { canonicalKey: string } }[]) => results.map((result) => result.memory.canonicalKey);
+
+  it("drops function words from queries and matches simple plurals by prefix", () => {
+    expect(significantSearchTerms("o que você sabe de mim?")).toEqual([]);
+    expect(significantSearchTerms("Meus cachorros estão bem?")).toEqual(["cachorros", "bem"]);
+    expect(significantSearchTerms("versão 2 do app em 2026")).toEqual(["versao", "app", "2026"]);
+    expect(ftsMatchExpression("cachorros")).toBe('"cachorro"*');
+    // Hyphenated or dotted identifiers stay exact phrases.
+    expect(significantSearchTerms("o FAROL-731 do grok-4.6 do user's")).toEqual(["farol-731", "grok-4-6", "users"]);
+    expect(ftsMatchExpression("obsolete-token")).toBe('"obsolete token"');
+    expect(ftsMatchExpression("pet 2026")).toBe('"pet" OR "2026"');
+    // A query of function words alone still searches them exactly (explicit search).
+    expect(ftsMatchExpression("de que")).toBe('"de" OR "que"');
+  });
+
+  it("finds memories by meaningful words only", () => {
+    const { store } = seededStore();
+    try {
+      const search = (query: string) => keys(store.memoryStore.searchMemories("agent-a", query, { limit: 6, automatic: true }));
+      expect(search("meus cachorros estão bem?")).toEqual(["pet.dog"]);
+      expect(search("como se chama meu cachorro?")).toEqual(["pet.dog"]);
+      expect(search("qual banco de dados escolhemos?")).not.toContain("project.main");
+      // An explicit search of function words alone still matches them exactly;
+      // automatic retrieval never issues one (see the assembler test below).
+      expect(search("de")).toContain("project.main");
+      expect(search("campanhas de marketing")).toEqual(["project.main"]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("injects no relevant memories for a prompt made of function words", () => {
+    const { store, conversationId } = seededStore();
+    try {
+      const assemble = (prompt: string) => JSON.stringify(new ContextAssembler().assemble({
+        agentId: "agent-a", conversationId, prompt, recentStore: store, memoryStore: store.memoryStore,
+        mode: "automatic", conversation: { temporary: false }, systemText: "", toolText: "",
+      }).messages);
+      const generic = assemble("o que você sabe de mim, me conta tudo?");
+      expect(generic).not.toContain("Relevant memories");
+      expect(generic).not.toContain("Aurora");
+      const specific = assemble("meus cachorros estão bem hoje?");
+      expect(specific).toContain("Relevant memories");
+      expect(specific).toContain("Thor");
+      expect(specific).not.toContain("Aurora");
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("memory usage from a turn", () => {
+  it("records the memories a completed turn put in context", async () => {
+    const store = createTranscriptStore();
+    const conversationId = store.conversationStore.create("agent-a").id;
+    store.conversationStore.activate("agent-a", conversationId);
+    store.memoryStore.setSettings("agent-a", "automatic");
+    const used = store.memoryStore.upsertMemory("agent-a", { kind: "fact", canonicalKey: "pet.dog", text: "O cachorro se chama Thor.", trust: "user" }, { kind: "admin" });
+    const unrelated = store.memoryStore.upsertMemory("agent-a", { kind: "fact", canonicalKey: "project.main", text: "A campanha principal é Aurora.", trust: "user" }, { kind: "admin" });
+    const registry = createProviderRegistry();
+    const adapter = createFakeAdapter("xai", { deltas: ["ok"] });
+    registry.register(adapter);
+    const runner = createTurnRunner({ registry, store });
+
+    runner.sendPrompt({ agentId: "agent-a", prompt: "como está o cachorro?", conversationId });
+    await runner.flush("agent-a");
+
+    expect(JSON.stringify(adapter.invocations[0]!.req.messages)).toContain("Thor");
+    expect(store.memoryStore.getMemoryUse(used.id)?.useCount).toBe(1);
+    expect(store.memoryStore.getMemoryUse(unrelated.id)).toBeNull();
+    store.close();
   });
 });

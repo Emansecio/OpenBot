@@ -12,6 +12,12 @@ export type MemoryKind =
 export type MemoryScope = "agent" | "user";
 export const USER_PROFILE_AGENT_ID = "__openbot_user_profile__";
 export const USER_PROFILE_KINDS: readonly MemoryKind[] = ["identity", "preference"];
+/**
+ * Kinds an automatic mutation may replace across conversations: a newer
+ * statement of the same fact about the person supersedes the older one
+ * instead of leaving both active. Everything else stays conversation-scoped.
+ */
+export const CROSS_CONVERSATION_REPLACEABLE_KINDS: readonly MemoryKind[] = ["identity", "preference", "constraint"];
 export type MemoryTrust = "user" | "verified_tool" | "external_observation";
 export type MemoryStatus = "active" | "superseded" | "forgotten" | "expired";
 export type MemoryJobStatus = "pending" | "running" | "retry" | "complete" | "dead";
@@ -19,7 +25,14 @@ export type MemoryDeletePolicy = "delete-derived" | "retain";
 
 export type MemoryMutationAuthority =
   | { kind: "user"; expectedRevision?: number }
-  | { kind: "automatic"; conversationId: string; evidenceIds: readonly string[]; expectedRevision?: number }
+  | {
+    kind: "automatic";
+    conversationId: string;
+    evidenceIds: readonly string[];
+    /** The evidence entries that are the person's own messages; only they can replace a memory from another conversation. */
+    userEvidenceIds?: readonly string[];
+    expectedRevision?: number;
+  }
   | { kind: "admin"; expectedRevision?: number };
 
 export type MemoryMutationRejectionCode =
@@ -295,6 +308,8 @@ export interface MemoryStore {
   listMemories(agentId: string, options?: MemoryListOptions): readonly Memory[];
   listMemoriesPage(agentId: string, options?: MemoryPageOptions): MemoryPage;
   searchMemories(agentId: string, query: string, options?: MemorySearchOptions): readonly MemorySearchResult[];
+  /** Records that these memories reached a model's context; recency ranking uses it. Optional so external stores keep working. */
+  recordMemoryUse?(memoryIds: readonly string[], nowMs?: number): number;
   getSummary(agentId: string, conversationId: string, automatic?: boolean): ConversationSummary | null;
   getForgottenSourceIds(agentId: string, conversationId: string): ReadonlySet<string>;
   hasForgottenContextSources(agentId: string, sources: readonly MemoryContextSource[]): boolean;

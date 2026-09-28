@@ -4,8 +4,9 @@ import { formatAttachmentContext } from "../rpc/attachments.js";
 import type { ProviderChatMessage, ProviderTool } from "../providers/router.js";
 import type { TranscriptEntry } from "../shared/contracts.js";
 import type { ConversationSummary, HistorySearchResult, Memory, MemoryContextSource, MemoryKind, MemoryMode, MemoryScope, MemorySearchResult, MemoryStore, MemoryTrust } from "./types.js";
-import { memoryContextSources as sourcesForMemory, USER_PROFILE_AGENT_ID, USER_PROFILE_KINDS } from "./types.js";
+import { CROSS_CONVERSATION_REPLACEABLE_KINDS, memoryContextSources as sourcesForMemory, USER_PROFILE_AGENT_ID, USER_PROFILE_KINDS } from "./types.js";
 import { MEMORY_POLICY_LIMITS } from "./policy.js";
+import { significantSearchTerms } from "./search-query.js";
 import {
   classifyProviderMessageTokens,
   computeModelContextBudget,
@@ -86,6 +87,8 @@ export interface ReflectionExistingMemory {
   pinned: boolean;
   trust: MemoryTrust;
   editable: boolean;
+  /** Not editable, but a supersede with the same kind and canonicalKey may replace it (a fact about the person from another conversation). */
+  replaceableWithSameKey: boolean;
 }
 
 export interface ReflectionRequestProjectionInput {
@@ -448,6 +451,8 @@ function memoryDerivesFromConversation(memory: Memory, conversationId: string): 
 }
 
 export function projectReflectionExistingMemory(memory: Memory, conversationId: string): ReflectionExistingMemory {
+  const unprotected = !memory.pinned && memory.trust !== "user";
+  const editable = unprotected && memoryDerivesFromConversation(memory, conversationId);
   return {
     id: memory.id,
     kind: memory.kind,
@@ -455,8 +460,36 @@ export function projectReflectionExistingMemory(memory: Memory, conversationId: 
     text: truncateText(memory.text, 240),
     pinned: memory.pinned,
     trust: memory.trust,
-    editable: !memory.pinned && memory.trust !== "user" && memoryDerivesFromConversation(memory, conversationId),
+    editable,
+    replaceableWithSameKey: unprotected && !editable && CROSS_CONVERSATION_REPLACEABLE_KINDS.includes(memory.kind),
   };
+}
+
+/** Memories a reflection job sees: the most important plus those that share words with the person's new messages. */
+export const REFLECTION_EXISTING_MEMORY_LIMIT = 24;
+const REFLECTION_TOP_MEMORY_LIMIT = 12;
+
+export function selectReflectionExistingMemories(memoryStore: MemoryStore, agentId: string, entries: readonly unknown[]): Memory[] {
+  const top = memoryStore.listMemories(agentId, { limit: REFLECTION_EXISTING_MEMORY_LIMIT, automatic: true });
+  // Newest messages first, so their words win the term limit.
+  const userText = entries.flatMap((entry) => (
+    typeof entry === "object" && entry !== null
+      && (entry as { kind?: unknown }).kind === "message"
+      && (entry as { role?: unknown }).role === "user"
+      && typeof (entry as { content?: unknown }).content === "string"
+      ? [(entry as { content: string }).content]
+      : []
+  )).reverse().join("\n");
+  const terms = significantSearchTerms(userText);
+  const related = terms.length === 0
+    ? []
+    : memoryStore.searchMemories(agentId, terms.join(" "), { limit: 20, automatic: true }).map((result) => result.memory);
+  const selected = new Map<string, Memory>();
+  for (const memory of [...top.slice(0, REFLECTION_TOP_MEMORY_LIMIT), ...related, ...top.slice(REFLECTION_TOP_MEMORY_LIMIT)]) {
+    if (selected.size >= REFLECTION_EXISTING_MEMORY_LIMIT) break;
+    if (!selected.has(memory.id)) selected.set(memory.id, memory);
+  }
+  return [...selected.values()];
 }
 
 export function createReflectionTranscriptFingerprint(
@@ -743,7 +776,10 @@ function buildContextSearchQueries(prompt: string, currentAttachmentContext: str
     seen.add(value);
     queries.push(value);
   };
-  push(boundedQuery(prompt));
+  // Only meaningful words search: a prompt of function words ("o que você
+  // sabe de mim?") would otherwise match, and inject, arbitrary rows.
+  const promptTerms = significantSearchTerms(prompt);
+  if (promptTerms.length > 0) push(boundedQuery(promptTerms.join(" ")));
   for (const token of extractContextSearchTokens(currentAttachmentContext)) {
     push(boundedQuery(token));
   }
@@ -838,14 +874,27 @@ function shouldSkipCrossChatRetrieval(text: string): boolean {
   return /^(ok|okay|okey|thanks|thank you|thx|obrigad[oa]|valeu|tmj|e ai|e agora|isso|same|same thing|what about that|aquele|aquilo)[!?.,]*$/u.test(normalized);
 }
 
+// Note-taking verbs ("anota", "registra", "make a note") are ambiguous with
+// ordinary work ("anota o endereço no documento", "registre o usuário"), so they
+// count only with a memory-shaped target: "que", a bare "isso/esto/this" that
+// ends the clause, "o seguinte:" or (note verbs only) ":" plus content.
+// English "note that ..." / "please note ..." / "take note that ..." are
+// deliberately excluded: they are common technical emphasis, not memory requests.
+const PT_THIS_END = String.raw`(?:disso|isso|isto|aquilo)(?=\s*(?:$|[.!?;:])|,?\s+(?:ai|agora|tambem|por favor|pra mim|para mim|pra depois|para depois|pra proxima vez|para a proxima vez)\b)`;
+const ES_THIS_END = String.raw`(?:esto|eso|aquello)(?=\s*(?:$|[.!?;:])|,?\s+(?:ahi|aqui|ahora|tambien|por favor|para mi|para mas tarde|para la proxima vez)\b)`;
+const EN_THIS_END = String.raw`(?=\s*(?:$|[.!?;:])|,?\s+(?:for later|for me|for next time|please)\b)`;
+const PORTUGUESE_NOTE = new RegExp(String.raw`^(?:por favor[\s,]+)?(?:voce (?:pode|poderia)\s+)?(?:(?:anot(?:a|e|ar)|tom(?:a|e|ar) nota(?: de)?)(?: ai)?(?:\s+que\b|\s+${PT_THIS_END}|\s+o seguinte\s*:\s*\S|\s*:\s*\S)|registr(?:a|e|ar)(?: ai)?(?:\s+que\b|\s+${PT_THIS_END}|\s+o seguinte\s*:\s*\S)|(?:fica|ficou) (?:anotado|registrado) que\b)`, "u");
+const SPANISH_NOTE = new RegExp(String.raw`^[¿¡]?\s*(?:por favor[\s,]+)?(?:(?:puedes|podrias)\s+)?(?:(?:anota(?:r)?|apunta(?:r)?|toma(?:r)? nota(?: de)?)(?: (?:ahi|aqui))?(?:\s+que\b|\s+${ES_THIS_END}|\s+lo siguiente\s*:\s*\S|\s*:\s*\S)|registra(?:r)?(?: (?:ahi|aqui))?(?:\s+que\b|\s+${ES_THIS_END}|\s+lo siguiente\s*:\s*\S)|queda (?:anotado|registrado) que\b)`, "u");
+const ENGLISH_NOTE = new RegExp(String.raw`^(?:(?:please|can you|could you|will you)\s+)?(?:(?:make|take) a note that\b|(?:make|take) (?:a )?note of (?:this|that|it)${EN_THIS_END}|(?:make|take) (?:a )?note\s*:\s*\S|note (?:this|that|it) down${EN_THIS_END}|note down (?:that\b|(?:this|that|it)${EN_THIS_END}|:\s*\S)|jot (?:this|that|it) down${EN_THIS_END})`, "u");
+
 export function isExplicitMemoryIntent(prompt: string): boolean {
   const normalized = normalizeForIntent(prompt);
   const englishLead = /^(?:(?:please|can you|could you|will you)\s+)?(?:remember|memorize|save|store|keep)\b[\s,:-]{0,12}(?:this|that|it|my|for later|for next time|preference|setting)/u;
-  const portugueseLead = /^(?:por favor[\s,]+)?(?:(?:(?:voce (?:pode|poderia)\s+)?(?:lembrar|guardar|salvar|gravar)(?:\s+de)?)|(?:lembre|guarde|salve|grave)(?:\s+de)?|(?:lembre-se|recorde-se)(?:\s+de)?)\b[\s,:-]{0,12}(?:disso|isso|isto|aquilo|(?:est|ess)[ae]s?\b|que\b|meu|minha|para depois|para a proxima vez|preferencia|configuracao)/u;
+  const portugueseLead = /^(?:por favor[\s,]+)?(?:(?:(?:voce (?:pode|poderia)\s+)?(?:lembrar|guardar|salvar|gravar|memorizar)(?:\s+de)?)|(?:lembre|guarde|salve|grave|memorize|memoriza)(?:\s+de)?|(?:lembre-se|recorde-se)(?:\s+de)?)\b[\s,:-]{0,12}(?:disso|isso|isto|aquilo|(?:est|ess)[ae]s?\b|que\b|meu|minha|para depois|para a proxima vez|preferencia|configuracao)/u;
   const spanishLead = /^[¿¡]?\s*(?:por favor[\s,]+)?(?:(?:(?:puedes|podrias)\s+)?(?:recordar|memorizar|guardar|salvar)|(?:recuerda|memoriza|guarda|salva))\b[\s,:-]{0,12}(?:esto|esta|eso|esa|que\b|mi|para mas tarde|para la proxima vez|preferencia|configuracion)/u;
   const forgetLead = /^[¿¡]?\s*(?:(?:please|por favor)[\s,]+)?(?:nao esqueca|nao se esqueca(?:\s+de)?|no olvides|no te olvides(?:\s+de)?)\b[\s,:-]{0,12}(?:disso|isso|isto|aquilo|esto|esta|eso|esa|que\b|meu|minha|mi|para depois|para mas tarde|para la proxima vez|amanha|manana)/u;
   const portugueseFacts = /^(?:por favor[\s,]+)?(?:voce (?:pode|poderia)\s+)?(?:guarde|guardar|salve|salvar|lembre|lembrar|memorize|memorizar)\b[\s,:-]+(?:(?:\d+|um|uma|dois|duas|tres|quatro|cinco|alguns|algumas)\s+|(?:o|a|os|as)\s+seguintes?\s+)?(?:informacoes|informacao|fatos?|preferencias?|decisoes|decisao)\b/u;
-  return matchesAnyPattern(normalized, [englishLead, portugueseLead, portugueseFacts, spanishLead, forgetLead]);
+  return matchesAnyPattern(normalized, [englishLead, portugueseLead, portugueseFacts, spanishLead, forgetLead, PORTUGUESE_NOTE, SPANISH_NOTE, ENGLISH_NOTE]);
 }
 
 /**

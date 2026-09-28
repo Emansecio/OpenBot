@@ -234,6 +234,14 @@ export function validateReflectionCandidates(
       reject("confidence", "confidence deve estar entre 0 e 1");
       return;
     }
+    const invalidTime = (["validFromMs", "validToMs", "expiresAtMs"] as const).find((field) => {
+      const value: unknown = candidate[field];
+      return value !== undefined && value !== null && (!Number.isSafeInteger(value) || (value as number) < 0);
+    });
+    if (invalidTime !== undefined) {
+      reject("validity", `${invalidTime} deve ser um instante em milissegundos`);
+      return;
+    }
     accepted.push(toSafeInput(candidate as ReflectionCandidate));
   });
   return { accepted, rejected };

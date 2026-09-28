@@ -11,7 +11,7 @@ import type {
   MemoryUpsertInput,
   MemoryScope,
 } from "./types.js";
-import { USER_PROFILE_AGENT_ID, USER_PROFILE_KINDS } from "./types.js";
+import { CROSS_CONVERSATION_REPLACEABLE_KINDS, USER_PROFILE_AGENT_ID, USER_PROFILE_KINDS } from "./types.js";
 
 export interface MemoryReflectionInput {
   agentId: string;
@@ -344,14 +344,37 @@ function jobScopedMemory(
   };
 }
 
+/** Examined entries written by the person themselves (not relayed by another agent). */
+function humanUserEntryIds(entries: readonly unknown[]): ReadonlySet<string> {
+  const ids = new Set<string>();
+  for (const entry of entries) {
+    if (
+      typeof entry !== "object"
+      || entry === null
+      || (entry as { kind?: unknown }).kind !== "message"
+      || (entry as { role?: unknown }).role !== "user"
+      || typeof (entry as { id?: unknown }).id !== "string"
+      || typeof (entry as { fromUser?: unknown }).fromUser !== "object"
+      || (entry as { fromUser?: unknown }).fromUser === null
+      || (entry as { fromAgent?: unknown }).fromAgent !== undefined
+    ) continue;
+    const id = (entry as { id: string }).id.trim();
+    if (id.length > 0) ids.add(id);
+  }
+  return ids;
+}
+
 function automaticAuthority(
   conversationId: string,
   sourceEntryIds: MemoryUpsertInput["sourceEntryIds"],
+  humanEntryIds: ReadonlySet<string>,
 ): MemoryMutationAuthority {
+  const evidenceIds = (sourceEntryIds ?? []).flatMap((source) => typeof source === "string" ? [source] : [source.entryId]);
   return {
     kind: "automatic",
     conversationId,
-    evidenceIds: (sourceEntryIds ?? []).flatMap((source) => typeof source === "string" ? [source] : [source.entryId]),
+    evidenceIds,
+    userEvidenceIds: evidenceIds.filter((entryId) => humanEntryIds.has(entryId)),
   };
 }
 
@@ -384,6 +407,7 @@ function validateReflectionTarget(
   conversationId: string,
   memoryId: string,
   operationIndex: number,
+  replacement?: MemoryUpsertInput,
 ): { memory?: Memory; rejection?: PolicyRejection } {
   const memory = store.getMemory(agentId, memoryId);
   if (memory === null) {
@@ -395,7 +419,15 @@ function validateReflectionTarget(
   if (memory.pinned || memory.trust === "user") {
     return { rejection: { index: operationIndex, code: "protected_target", message: "reflection automática não altera memórias pinned ou trust:user" } };
   }
-  if (!hasConversationProvenance(memory, conversationId)) {
+  // Another conversation's identity/preference/constraint may only be
+  // replaced by the same fact (kind and key); the store also requires the
+  // person's own message as evidence.
+  const sameFactReplacement = replacement !== undefined
+    && CROSS_CONVERSATION_REPLACEABLE_KINDS.includes(memory.kind)
+    && replacement.kind === memory.kind
+    && typeof replacement.canonicalKey === "string"
+    && normalizeCanonicalKey(replacement.canonicalKey) === memory.canonicalKey;
+  if (!hasConversationProvenance(memory, conversationId) && !sameFactReplacement) {
     return { rejection: { index: operationIndex, code: "foreign_target", message: "reflection automática só altera memórias derivadas da conversa atual" } };
   }
   return { memory };
@@ -560,7 +592,7 @@ export function applyReflectionResult(
     }
     return result;
   }, { accepted: [], rejected: [] });
-  const authority = automaticAuthority(input.conversationId, jobSourceEntryIds);
+  const authority = automaticAuthority(input.conversationId, jobSourceEntryIds, humanUserEntryIds(coveredEntries));
   const coveredThrough = input.coveredThroughSequenceId ?? input.throughSequenceId;
   if (requestedSummary !== undefined && requestedSummary.throughSequenceId !== coveredThrough) {
     throw new Error("reflection: summary solicitada deve alcançar o limite coberto do job");
@@ -607,7 +639,7 @@ export function applyReflectionResult(
           rejected.push(rejection);
         }
       } else {
-        const target = validateReflectionTarget(store, input.agentId, input.conversationId, operation.memoryId, operationIndex);
+        const target = validateReflectionTarget(store, input.agentId, input.conversationId, operation.memoryId, operationIndex, operation.op === "supersede" ? operation.replacement : undefined);
         if (target.rejection !== undefined) {
           rejected.push(target.rejection);
           continue;

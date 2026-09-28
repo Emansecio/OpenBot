@@ -48,7 +48,8 @@ import type {
   MemoryUpsertInput,
   SqliteMemoryStoreOptions,
 } from "./types.js";
-import { memoryContextSources, USER_PROFILE_AGENT_ID, USER_PROFILE_KINDS } from "./types.js";
+import { CROSS_CONVERSATION_REPLACEABLE_KINDS, memoryContextSources, USER_PROFILE_AGENT_ID, USER_PROFILE_KINDS } from "./types.js";
+import { ftsMatchExpression } from "./search-query.js";
 
 type MemoryRow = {
   id: string;
@@ -137,6 +138,21 @@ const JOB_STATUSES: readonly MemoryJobStatus[] = ["pending", "running", "retry",
 const MEMORY_KIND_SET: ReadonlySet<string> = new Set(MEMORY_KINDS);
 const MEMORY_STATUS_SET: ReadonlySet<string> = new Set(MEMORY_STATUSES);
 const JOB_STATUS_SET: ReadonlySet<string> = new Set(JOB_STATUSES);
+/**
+ * Search ranking weighs time-bound kinds by recency: a match loses half its
+ * weight every 30 days since the memory was last updated or put in context.
+ * Facts about the person and standing rules (identity, preference,
+ * constraint, procedure) never fade.
+ */
+export const MEMORY_RECENCY_HALF_LIFE_MS = 30 * 24 * 60 * 60_000;
+const RECENCY_DECAYING_KINDS: ReadonlySet<string> = new Set<MemoryKind>(["fact", "decision", "open_loop"]);
+const MEMORY_USE_BATCH_LIMIT = 256;
+
+export function memoryRecencyWeight(kind: string, ageMs: number): number {
+  if (!RECENCY_DECAYING_KINDS.has(kind) || !Number.isFinite(ageMs) || ageMs <= 0) return 1;
+  return 0.5 ** (ageMs / MEMORY_RECENCY_HALF_LIFE_MS);
+}
+
 const LEGACY_MEMORY_JOB_PROVIDER = "legacy-reflection-provider";
 const LEGACY_MEMORY_JOB_MODEL = "legacy-reflection-model";
 
@@ -366,12 +382,6 @@ function fromRevisionRow(row: RevisionRow): MemoryRevision {
   };
 }
 
-function ftsQuery(query: string): string {
-  const terms = query.normalize("NFKC").trim().split(/\s+/u).filter(Boolean).slice(0, 16);
-  if (terms.length === 0) return "";
-  return terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(" OR ");
-}
-
 function memoryPageFilter(options: MemoryPageOptions, kinds: readonly MemoryKind[], query: string): string {
   return JSON.stringify({
     includeInactive: options.includeInactive === true,
@@ -544,10 +554,43 @@ function ensureMutationAuthority(authority: MemoryMutationAuthority | undefined)
     if (!Array.isArray(authority.evidenceIds) || authority.evidenceIds.some((id) => typeof id !== "string" || id.trim().length === 0)) {
       throw mutationRejection("invalid_authority", "evidenceIds automáticos inválidos");
     }
+    if (authority.userEvidenceIds !== undefined && (
+      !Array.isArray(authority.userEvidenceIds)
+      || authority.userEvidenceIds.some((id) => typeof id !== "string" || !authority.evidenceIds.includes(id))
+    )) {
+      throw mutationRejection("invalid_authority", "userEvidenceIds automáticos devem ser parte de evidenceIds");
+    }
   }
 }
 
-function assertMutationAllowed(authority: MemoryMutationAuthority, target: Memory | undefined): void {
+/** The value an automatic mutation writes in place of its target, when it writes one. */
+interface MutationReplacement {
+  canonicalKey: string;
+  kind: MemoryKind;
+  sourceEntryIds: readonly MemorySourceEntry[];
+}
+
+/**
+ * An automatic mutation may replace a memory derived from another
+ * conversation only with the same fact about the person (same kind and
+ * canonical key, in a replaceable kind), backed by the person's own message
+ * in the authorized conversation. The old row is superseded, never forgotten.
+ */
+function crossConversationReplacementAllowed(
+  authority: Extract<MemoryMutationAuthority, { kind: "automatic" }>,
+  target: Memory,
+  replacement: MutationReplacement | undefined,
+): boolean {
+  if (replacement === undefined || target.status !== "active") return false;
+  if (!CROSS_CONVERSATION_REPLACEABLE_KINDS.includes(target.kind) || replacement.kind !== target.kind) return false;
+  if (replacement.canonicalKey !== target.canonicalKey) return false;
+  const userEvidence = new Set(authority.userEvidenceIds ?? []);
+  return replacement.sourceEntryIds.some((source) => (
+    typeof source !== "string" && source.conversationId === authority.conversationId && userEvidence.has(source.entryId)
+  ));
+}
+
+function assertMutationAllowed(authority: MemoryMutationAuthority, target: Memory | undefined, replacement?: MutationReplacement): void {
   const actualRevision = target?.revision ?? 0;
   if (authority.expectedRevision !== undefined && authority.expectedRevision !== actualRevision) {
     throw mutationRejection("revision_conflict", `revisão de memória stale: esperada ${authority.expectedRevision}, atual ${actualRevision}`);
@@ -562,7 +605,7 @@ function assertMutationAllowed(authority: MemoryMutationAuthority, target: Memor
           ? source.startsWith(`${authority.conversationId}:`)
           : source.conversationId === authority.conversationId
       ));
-    if (!hasConversationProvenance) {
+    if (!hasConversationProvenance && !crossConversationReplacementAllowed(authority, target, replacement)) {
       throw mutationRejection("invalid_authority", "automação só altera memória derivada da conversa autorizada");
     }
   }
@@ -651,6 +694,7 @@ export class SqliteMemoryStore implements MemoryStore {
         this.db.pragma("busy_timeout = 5000");
       }
       ensureOpenBotSchema(this.db);
+      this.db.function("openbot_memory_recency", { deterministic: true }, (kind, ageMs) => memoryRecencyWeight(String(kind), Number(ageMs)));
     } catch (error) {
       if (this.ownsDatabase) database?.close();
       throw error;
@@ -856,8 +900,12 @@ export class SqliteMemoryStore implements MemoryStore {
         assertMutationAllowed(authority, previous);
         throw Object.assign(new Error("canonicalKey já existe; use o gerenciador de memória para editar"), { code: "policy" });
       }
-      assertMutationAllowed(authority, old === undefined ? undefined : fromMemoryRow(old));
-      if (active !== undefined && active.id !== id) assertMutationAllowed(authority, fromMemoryRow(active));
+      // A replacement across conversations always gets its own row: the
+      // target is superseded with its history, never rewritten in place.
+      const inPlace = old !== undefined && old.status === "active" && old.id === id;
+      const replacement = inPlace ? undefined : { canonicalKey, kind: input.kind, sourceEntryIds };
+      assertMutationAllowed(authority, old === undefined ? undefined : fromMemoryRow(old), replacement);
+      if (active !== undefined && active.id !== id) assertMutationAllowed(authority, fromMemoryRow(active), replacement);
       if (old !== undefined && old.status === "active" && old.id === id) {
         const previous = fromMemoryRow(old);
         const candidate: Memory = {
@@ -943,7 +991,11 @@ export class SqliteMemoryStore implements MemoryStore {
     this.ensureOpen();
     const current = this.getMemory(agentId, memoryId);
     if (current === null) throw new Error("memória não encontrada");
-    assertMutationAllowed(authority, current);
+    assertMutationAllowed(authority, current, replacement === undefined ? undefined : {
+      canonicalKey: normalizeCanonicalKey(replacement.canonicalKey),
+      kind: replacement.kind,
+      sourceEntryIds: normalizeSources(replacement.sourceEntryIds),
+    });
     if (replacement !== undefined) {
       return this.runTransaction(() => {
         const next = this.upsertMemory(agentId, { ...replacement, id: replacement.id ?? randomUUID() }, authority);
@@ -1118,7 +1170,7 @@ export class SqliteMemoryStore implements MemoryStore {
     this.ensureOpen();
     const limit = Math.min(options.limit ?? 20, 20);
     if (!Number.isInteger(limit) || limit < 1) throw new Error("limit inválido");
-    const match = ftsQuery(query);
+    const match = ftsMatchExpression(query);
     if (match.length === 0) {
       return this.listMemories(agentId, { ...options, limit }).map((memory) => ({
         memory,
@@ -1132,21 +1184,50 @@ export class SqliteMemoryStore implements MemoryStore {
     const kinds = options.kind === undefined ? [] : (Array.isArray(options.kind) ? options.kind : [options.kind]);
     for (const kind of kinds) ensureKind(kind);
     const filter = memoryFilterClauses("m", agentId, options, kinds, searchNow);
+    // bm25 is negative (lower ranks first); the recency weight shrinks it toward 0.
     const statement = this.db.prepare<unknown[], MemoryRow & { fts_text: string; score: number }>(`
-      SELECT m.*, f.text AS fts_text, bm25(memory_fts) AS score
+      SELECT m.*, f.text AS fts_text,
+        bm25(memory_fts) * openbot_memory_recency(m.kind, ? - max(m.updated_at_ms, COALESCE(u.last_used_at_ms, 0))) AS score
       FROM memory_fts AS f JOIN agent_memories AS m ON m.id = f.memory_id AND m.agent_id = f.agent_id
+      LEFT JOIN memory_usage AS u ON u.memory_id = m.id
       WHERE f.agent_id = ? AND memory_fts MATCH ? AND ${filter.clauses.join(" AND ")}
       ORDER BY m.pinned DESC, score ASC, m.importance DESC, m.updated_at_ms DESC
       LIMIT ? OFFSET ?
     `);
     const rows = this.untaintedRows(agentId, options.automatic === true, limit,
-      (count, offset) => statement.all(agentId, match, ...filter.args, count, offset), fromMemoryRow);
+      (count, offset) => statement.all(searchNow, agentId, match, ...filter.args, count, offset), fromMemoryRow);
     return rows.map((row) => ({
       memory: fromMemoryRow(row),
       snippet: snippet(row.text, query),
       score: typeof row.score === "number" ? row.score : 0,
       provenance: { sourceConversationId: row.source_conversation_id, sourceEntryIds: parseSources(row.source_entry_ids_json) },
     }));
+  }
+
+  /**
+   * Records that these memories reached a model's context. Only active
+   * memories count; unknown ids are ignored. Returns how many were recorded.
+   */
+  recordMemoryUse(memoryIds: readonly string[], at = this.nowFn()): number {
+    this.ensureOpen();
+    assertSafeTimestamp(at, "usedAtMs");
+    const ids = [...new Set(memoryIds)].filter((id) => typeof id === "string" && id.trim().length > 0).slice(0, MEMORY_USE_BATCH_LIMIT);
+    if (ids.length === 0) return 0;
+    const record = this.db.prepare(`
+      INSERT INTO memory_usage(memory_id, use_count, last_used_at_ms)
+      SELECT id, 1, ? FROM agent_memories WHERE id = ? AND status = 'active'
+      ON CONFLICT(memory_id) DO UPDATE SET
+        use_count = use_count + 1,
+        last_used_at_ms = max(last_used_at_ms, excluded.last_used_at_ms)
+    `);
+    return this.runTransaction(() => ids.reduce((count, id) => count + record.run(at, id).changes, 0));
+  }
+
+  getMemoryUse(memoryId: string): { useCount: number; lastUsedAtMs: number } | null {
+    assertMemoryId(memoryId);
+    this.ensureOpen();
+    const row = this.db.prepare<unknown[], { use_count: number; last_used_at_ms: number }>("SELECT use_count, last_used_at_ms FROM memory_usage WHERE memory_id = ?").get(memoryId);
+    return row === undefined ? null : { useCount: row.use_count, lastUsedAtMs: row.last_used_at_ms };
   }
 
   /** Resolve tombstones and their revisions, including shared-profile origins. */
@@ -1426,7 +1507,7 @@ export class SqliteMemoryStore implements MemoryStore {
         });
       }
     }
-    const match = ftsQuery(query);
+    const match = ftsMatchExpression(query);
     if (match.length > 0) {
       const clauses = ["agent_id = ?", "history_fts MATCH ?"];
       const args: unknown[] = [agentId, match];
@@ -1510,7 +1591,7 @@ export class SqliteMemoryStore implements MemoryStore {
     const limit = Math.min(options.limit ?? 20, 50);
     if (!Number.isInteger(limit) || limit < 1) throw new Error("limit inválido");
     if (options.conversationId !== undefined) assertConversationId(options.conversationId);
-    const match = ftsQuery(query);
+    const match = ftsMatchExpression(query);
     if (match.length === 0) return { items: [] };
     const filter = transcriptPageFilter(options.conversationId, match);
     const clauses = ["f.agent_id = ?", "history_fts MATCH ?", "f.source_type = 'message'"];

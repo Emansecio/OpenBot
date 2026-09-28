@@ -582,6 +582,15 @@ function createMemorySchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory
       ON memory_revisions(memory_id, revision ASC);
 
+    -- When a memory last reached a model's context, and how often. Kept apart
+    -- from agent_memories so recording a use neither reindexes memory_fts nor
+    -- moves the provenance version.
+    CREATE TABLE IF NOT EXISTS memory_usage (
+      memory_id TEXT PRIMARY KEY REFERENCES agent_memories(id) ON DELETE CASCADE,
+      use_count INTEGER NOT NULL CHECK (use_count >= 1),
+      last_used_at_ms INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS memory_jobs (
       id TEXT PRIMARY KEY,
       agent_id TEXT NOT NULL,

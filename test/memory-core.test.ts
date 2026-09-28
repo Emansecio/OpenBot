@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { MemoryReflectionWorker, applyReflectionResult } from "../src/memory/reflection.js";
-import { SqliteMemoryStore } from "../src/memory/sqlite-store.js";
+import { MEMORY_RECENCY_HALF_LIFE_MS, memoryRecencyWeight, SqliteMemoryStore } from "../src/memory/sqlite-store.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
 import { OPENBOT_SCHEMA_VERSION } from "../src/store/schema.js";
 import { USER_PROFILE_AGENT_ID } from "../src/memory/types.js";
@@ -836,6 +836,65 @@ describe("memory lifecycle and privacy", () => {
       expect(transcript.memoryStore.getMemory(USER_PROFILE_AGENT_ID, unrelated.id)).toMatchObject({ status: "active", text: "idioma português" });
     } finally {
       transcript.close();
+    }
+  });
+});
+
+describe("memory usage and recency ranking", () => {
+  const DAY = 24 * 60 * 60_000;
+
+  it("records uses of active memories only and drops them with the memory", () => {
+    let clock = 1_000;
+    const memory = new SqliteMemoryStore({ path: ":memory:", now: () => clock });
+    try {
+      const add = (canonicalKey: string) => memory.upsertMemory("agent-a", { kind: "fact", canonicalKey, text: `Fato ${canonicalKey}.`, trust: "user" }, { kind: "admin" });
+      const kept = add("kept");
+      const forgotten = add("forgotten");
+      memory.forgetMemory("agent-a", forgotten.id, { kind: "user" });
+      expect(memory.recordMemoryUse([kept.id, kept.id, forgotten.id, "memory:missing"])).toBe(1);
+      clock = 5_000;
+      expect(memory.recordMemoryUse([kept.id], 3_000)).toBe(1);
+      expect(memory.getMemoryUse(kept.id)).toEqual({ useCount: 2, lastUsedAtMs: 3_000 });
+      expect(memory.recordMemoryUse([kept.id])).toBe(1);
+      expect(memory.getMemoryUse(kept.id)).toEqual({ useCount: 3, lastUsedAtMs: 5_000 });
+      expect(memory.getMemoryUse(forgotten.id)).toBeNull();
+      expect(memory.recordMemoryUse([])).toBe(0);
+      memory.clear("agent-a");
+      expect(memory.getMemoryUse(kept.id)).toBeNull();
+    } finally {
+      memory.close();
+    }
+  });
+
+  it("lets an old fact fall behind a fresh match until it is used again, while person facts never fade", () => {
+    let clock = 0;
+    const memory = new SqliteMemoryStore({ path: ":memory:", now: () => clock });
+    try {
+      // Same wording length, so bm25 ties and only importance and recency decide.
+      const add = (kind: "fact" | "preference", canonicalKey: string, text: string, importance: number) =>
+        memory.upsertMemory("agent-a", { kind, canonicalKey, text, trust: "user", importance }, { kind: "admin" });
+      const oldFact = add("fact", "fact.one", "Projeto Aurora usa SQLite.", 90);
+      const oldPreference = add("preference", "pref.one", "Resposta Borealis em tópicos.", 90);
+      clock = 90 * DAY;
+      const freshFact = add("fact", "fact.two", "Projeto Aurora usa Postgres.", 10);
+      add("preference", "pref.two", "Resposta Borealis em tabelas.", 10);
+      const order = (query: string) => memory.searchMemories("agent-a", query).map((result) => result.memory.id);
+
+      expect(order("aurora")).toEqual([freshFact.id, oldFact.id]);
+      expect(order("borealis")[0]).toBe(oldPreference.id);
+      memory.recordMemoryUse([oldFact.id]);
+      expect(order("aurora")).toEqual([oldFact.id, freshFact.id]);
+    } finally {
+      memory.close();
+    }
+  });
+
+  it("halves a fading kind's weight every half-life and keeps the others whole", () => {
+    expect(memoryRecencyWeight("fact", 0)).toBe(1);
+    expect(memoryRecencyWeight("decision", MEMORY_RECENCY_HALF_LIFE_MS)).toBeCloseTo(0.5);
+    expect(memoryRecencyWeight("open_loop", 2 * MEMORY_RECENCY_HALF_LIFE_MS)).toBeCloseTo(0.25);
+    for (const kind of ["identity", "preference", "constraint", "procedure"]) {
+      expect(memoryRecencyWeight(kind, 10 * MEMORY_RECENCY_HALF_LIFE_MS)).toBe(1);
     }
   });
 });

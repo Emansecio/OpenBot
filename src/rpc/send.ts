@@ -1528,6 +1528,20 @@ export class TurnRunner {
             conversation: { temporary: conversation?.temporary === true },
         };
     }
+    /** The memories a completed turn put in context; search ranking keeps them fresh. */
+    private recordTurnMemoryUse(turn: TurnMetadata): void {
+        const memoryIds = uniqueContextSources(turn).flatMap((source) => "memoryId" in source ? [source.memoryId] : []);
+        if (memoryIds.length === 0)
+            return;
+        try {
+            this.memoryStore()?.recordMemoryUse?.(memoryIds, this.nowFn());
+        }
+        catch {
+            // Usage only tunes recency ranking; the answer is already saved.
+            // Store errors can carry private paths, so log the fact only.
+            console.warn("[openbot] memory usage not recorded for this turn");
+        }
+    }
     private enqueueReflectionJob(
         agentId: string,
         provider: string,
@@ -3142,6 +3156,7 @@ export class TurnRunner {
                     this.appendAndPublish(agentId, [retryableTurnNotice(turn, "empty-provider-response", "O provedor concluiu sem retornar conteúdo.")], conversationId);
                 }
                 else {
+                    this.recordTurnMemoryUse(turn);
                     this.enqueueReflectionJob(agentId, provider, model, origin.kind === "user" ? prompt : "", conversationId, memoryContext, conversationCompactionNeeded, inference.reasoningEffort ?? "medium");
                 }
             }
@@ -3153,6 +3168,7 @@ export class TurnRunner {
                     this.appendAndPublish(agentId, [retryableTurnNotice(turn, "empty-provider-response", "O provedor concluiu sem retornar conteúdo.")], conversationId);
                 }
                 else if (!streamResult.aborted && !streamResult.error) {
+                    this.recordTurnMemoryUse(turn);
                     this.enqueueReflectionJob(agentId, provider, model, origin.kind === "user" ? prompt : "", conversationId, memoryContext, conversationCompactionNeeded, inference.reasoningEffort ?? "medium");
                 }
             }

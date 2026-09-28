@@ -451,7 +451,10 @@ export async function runBridgeRealVerify() {
         OPENBOT_USER_DATA: userData,
         OPENBOT_DATA_ROOT: dataRoot,
         OPENBOT_LOCAL_GATEWAY: "1",
-        OPENBOT_VISUAL_TEST: "1",
+        // No OPENBOT_VISUAL_TEST: its probe rewrites <body> 3 s after every
+        // dom-ready when #root is empty, and a probe left by one of this run's
+        // reloads can land while the next page is still mounting, destroying
+        // the live app mid-check. This gate reads no visual diagnostics.
         SAND_HOST_GATEWAY_URL: `http://127.0.0.1:${gatewayPort}`,
         SAND_HOST_GATEWAY_TOKEN: token,
       }),
@@ -639,6 +642,10 @@ async function verifyCatalogUi(evaluate, send, state, evidenceDir) {
   // panel and remote catalog responses are fixtures; the overlay is unmodified.
   state.catalogMode = {};
   state.providerConfigs = {};
+  // Earlier bridge checks save providers through the same gateway; these
+  // assertions look only at the calls this catalog run made.
+  const firstCatalogCall = state.calls.length;
+  const catalogSaves = () => state.calls.slice(firstCatalogCall).filter(call => call.method === "setProviderConfig");
   await evaluate(`(() => {
     const dialog = document.createElement('div');
     dialog.id = 'catalog-ui-fixture'; dialog.setAttribute('role', 'dialog');
@@ -658,6 +665,8 @@ async function verifyCatalogUi(evaluate, send, state, evidenceDir) {
       catalogState: document.getElementById('openbot-model-status')?.dataset.catalogState,
       saveStatus: document.getElementById('openbot-status')?.textContent,
       saveState: document.getElementById('openbot-provider-settings')?.dataset.saveState,
+      // A freshly mounted panel is a skeleton (rows sized from the last layout) until it loads.
+      loading: document.getElementById('openbot-provider-settings')?.dataset.loading === "1",
       busy: document.getElementById('openbot-model-refresh')?.disabled };
   })()`);
   const wait = async predicate => {
@@ -699,8 +708,8 @@ async function verifyCatalogUi(evaluate, send, state, evidenceDir) {
   await switchProvider("opencode-go");
   const go = await wait(v => !v.busy && v.provider === "opencode-go" && v.status?.includes("Lista pública"));
   // Autosave: switching the provider applied the (connected) OpenCode Go choice through real IPC.
-  const autosaved = await wait(v => v.saveState === "saved" && state.calls.some(call => call.method === "setProviderConfig" && call.body?.provider === "opencode-go"));
-  if (state.calls.some(call => call.method === "setProviderConfig" && call.body?.provider === "openai")) throw new Error("Autosave wrote the provider the user only passed through");
+  const autosaved = await wait(v => v.saveState === "saved" && catalogSaves().some(call => call.body?.provider === "opencode-go"));
+  if (catalogSaves().some(call => call.body?.provider === "openai")) throw new Error("Autosave wrote the provider the user only passed through");
   await sleep(600);
   await evaluate(`(() => { const field = document.getElementById("openbot-apikey"); field.value = "catalog-ui-fixture"; field.dispatchEvent(new Event("input", {bubbles:true})); document.getElementById("openbot-apikey-save").click(); })()`);
   await wait(v => !v.busy && v.saveStatus?.includes("Chave salva.") && v.provider === "opencode-go" && v.options.some(o => o.id === "opencode-go/pending" && o.disabled));
@@ -713,7 +722,7 @@ async function verifyCatalogUi(evaluate, send, state, evidenceDir) {
   await switchProvider("openai");
   const openai = await wait(v => !v.busy && v.provider === "openai" && v.catalogState === "fresh" && v.saveState === "blocked");
   // Blocked choices (removed model, unsupported reasoning) stay on screen but are never written.
-  if (state.calls.filter(call => call.method === "setProviderConfig").length !== 1) throw new Error("Autosave wrote a blocked selection: " + JSON.stringify(openai));
+  if (catalogSaves().length !== 1) throw new Error("Autosave wrote a blocked selection: " + JSON.stringify(openai));
   if (!openai.reasoning.some(o => o.id === "medium" && o.disabled) || !openai.reasoning.some(o => o.id === "high" && !o.disabled)) throw new Error("Reasoning efforts were not constrained");
   const screenshot = await send("Page.captureScreenshot", { format: "png" });
   writeFileSync(join(evidenceDir, "catalog-ui.png"), Buffer.from(screenshot.data, "base64"));
@@ -731,7 +740,12 @@ async function verifyCatalogUi(evaluate, send, state, evidenceDir) {
     window.__openbotLocalSettingsScan?.();
   })()`);
   await mountAgentSettings();
-  await wait(v => v.provider === 'xai' && !v.busy);
+  // The blocked OpenAI choice left in the global panel is this bot's pending
+  // selection: the bot panel shows it again, still blocked, instead of dropping it.
+  const restoredPending = await wait(v => !v.busy && !v.loading && v.catalogState === 'fresh');
+  if (restoredPending.provider !== 'openai' || restoredPending.saveState !== 'blocked') throw new Error('Pending blocked selection was not restored: ' + JSON.stringify(restoredPending));
+  await switchProvider('xai');
+  await wait(v => v.provider === 'xai' && !v.busy && !v.loading && v.catalogState === 'empty');
   if (!await evaluate(`document.getElementById('openbot-speed-row').hidden`)) throw new Error('Fast shown for unsupported provider');
   await switchProvider('openai');
   await wait(v => v.provider === 'openai' && !v.busy && v.catalogState === 'fresh');
@@ -747,7 +761,7 @@ async function verifyCatalogUi(evaluate, send, state, evidenceDir) {
   const fastSave = providerSaves().at(-1);
   if (fastSave?.body?.serviceTier !== 'priority' || fastSave.body.reasoningEffort !== 'high') throw new Error('Fast selection lost in real IPC');
   await mountAgentSettings();
-  await wait(v => v.provider === 'openai' && !v.busy);
+  await wait(v => v.provider === 'openai' && !v.busy && !v.loading);
   if (!await evaluate(`document.getElementById('openbot-speed').value === 'priority'`)) throw new Error('Fast did not reload');
   state.catalogMode.openai = 'no-fast';
   const savesBeforeNoFast = providerSaves().length;

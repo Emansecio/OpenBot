@@ -11,12 +11,14 @@ import type { ProviderAdmissionScheduler } from "../providers/admission.js";
 import { streamChat, type ProviderRegistry } from "../providers/router.js";
 import { resolveAgentInference } from "../rpc/identity.js";
 import type { Gateway } from "../server/gateway.js";
+import type { ReasoningEffort } from "../shared/contracts.js";
 import type { SqliteTranscriptStore } from "../store/index.js";
 import {
   buildReflectionRequestPayload,
   createReflectionTranscriptFingerprint,
   isContextOverflowError,
   projectReflectionExistingMemory,
+  selectReflectionExistingMemories,
   REFLECTION_REQUEST_MAX_BYTES,
   REFLECTION_REQUEST_RETRY_BYTES,
 } from "./context.js";
@@ -41,7 +43,17 @@ const REFLECTION_SYSTEM_PROMPT = [
   "Do not save transient task results, one-off data, things already captured in previousSummary, or anything derivable from the current transcript alone.",
   "Use scope:user on an upsert only for identity or preference facts about the person themselves that hold for every bot (name, language, tone, timezone, answer format, accessibility); never for this bot's tasks, projects or domain. userProfile lists what the shared profile already contains; do not duplicate it.",
   "existingMemories lists this agent's current memories with their ids; only entries with editable:true may be targeted by supersede or forget. When a new fact contradicts an existing memory, supersede or forget it instead of adding a duplicate; never upsert a canonicalKey that already exists with the same meaning.",
+  "An entry with replaceableWithSameKey:true is a fact about the person learned in another conversation: when the person's own message here states a newer value, supersede it with a replacement that keeps the same kind and canonicalKey and cites that user message; never forget it. To update a userProfile fact, upsert scope:user with its canonicalKey and kind, citing the user message.",
+  "For an open_loop, or a fact tied to a date or event, set expiresAtMs (epoch milliseconds, reckoned from the entries' timestampMs) to when it stops being relevant; omit expiresAtMs for durable facts.",
 ].join(" ");
+
+/**
+ * Reflection is background bookkeeping: it runs at "low" effort when the
+ * model declares that level, and keeps the turn's effort otherwise.
+ */
+export function reflectionReasoningEffort(resolution: ModelResolution | undefined, turnEffort: ReasoningEffort | undefined): ReasoningEffort | undefined {
+  return resolution?.supportedReasoningEfforts?.includes("low") === true ? "low" : turnEffort;
+}
 
 export interface ReflectionWiringDeps {
   store: SqliteTranscriptStore;
@@ -127,7 +139,7 @@ export function createReflectionWorker({ store, gateway, config, modelCatalog, r
         },
         expectedPreviousRevision: storedSummary?.revision ?? 0,
         ...(entrySequenceIds === undefined ? {} : { entrySequenceIds }),
-        existingMemories: store.memoryStore.listMemories(job.agentId, { limit: 24, automatic: true })
+        existingMemories: selectReflectionExistingMemories(store.memoryStore, job.agentId, entries)
           .map((memory) => projectReflectionExistingMemory(memory, job.conversationId)),
         userProfile: store.memoryStore.listMemories(USER_PROFILE_AGENT_ID, { kind: [...USER_PROFILE_KINDS], limit: 12, automatic: true })
           .map((memory) => ({ canonicalKey: memory.canonicalKey, kind: memory.kind, text: memory.text })),
@@ -159,7 +171,7 @@ export function createReflectionWorker({ store, gateway, config, modelCatalog, r
           purpose: "memory-reflection" as const,
           modelResolution: resolution,
           sessionId: createHash("sha256").update(JSON.stringify([input.agentId, input.conversationId])).digest("hex"),
-          reasoningEffort: input.reasoningEffort ?? resolveAgentInference(config.view(), input.agentId).reasoningEffort,
+          reasoningEffort: reflectionReasoningEffort(resolution, input.reasoningEffort ?? resolveAgentInference(config.view(), input.agentId).reasoningEffort),
           system: REFLECTION_SYSTEM_PROMPT,
           messages: [{
             role: "user" as const,

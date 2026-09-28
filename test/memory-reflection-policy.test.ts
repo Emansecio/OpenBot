@@ -1,7 +1,12 @@
 
+import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 
+import { projectReflectionExistingMemory, selectReflectionExistingMemories } from "../src/memory/context.js";
 import { applyReflectionResult } from "../src/memory/reflection.js";
+import { reflectionReasoningEffort } from "../src/memory/reflection-wiring.js";
+import { SqliteMemoryStore } from "../src/memory/sqlite-store.js";
+import type { ModelResolution } from "../src/providers/model-catalog.js";
 import { validateReflectionCandidates } from "../src/memory/policy.js";
 import { USER_PROFILE_AGENT_ID } from "../src/memory/types.js";
 import { SqliteTranscriptStore } from "../src/store/index.js";
@@ -726,5 +731,201 @@ describe("memory core", () => {
       sourceEntryIds: [{ conversationId: "missing-conversation", entryId: "entry-1" }],
     }, { kind: "admin" })).toThrow(/não encontrada/);
     transcript.close();
+  });
+});
+
+describe("cross-conversation replacement of facts about the person", () => {
+  function setup() {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    const older = chat(transcript, "agent-a");
+    const current = chat(transcript, "agent-a");
+    const oldEntry = { kind: "message" as const, id: "old-u1", role: "user" as const, content: "Prefiro respostas curtas.", timestampMs: 1, streaming: false, fromUser: HUMAN_FROM_USER };
+    transcript.append("agent-a", [oldEntry], older);
+    const previous = transcript.memoryStore.upsertMemory("agent-a", {
+      kind: "preference",
+      canonicalKey: "answer.length",
+      text: "Prefere respostas curtas.",
+      trust: "external_observation",
+      sourceConversationId: older,
+      sourceEntryIds: [{ conversationId: older, entryId: oldEntry.id }],
+    }, { kind: "automatic", conversationId: older, evidenceIds: [oldEntry.id] });
+    const human = { kind: "message", id: "u1", role: "user", content: "Agora prefiro respostas detalhadas.", fromUser: HUMAN_FROM_USER };
+    const assistant = { kind: "message", id: "a1", role: "assistant", content: "Anotado: respostas detalhadas." };
+    const input = (entries: unknown[]) => ({
+      agentId: "agent-a", conversationId: current, provider: "xai", model: "grok-4.6", fromSequenceId: 0, throughSequenceId: 2, entries,
+    });
+    const replacement = (overrides: Record<string, unknown> = {}) => ({
+      kind: "preference", canonicalKey: "answer.length", text: "Prefere respostas detalhadas.", trust: "external_observation", sourceEntryIds: ["u1"], ...overrides,
+    });
+    return { transcript, memory: transcript.memoryStore, older, current, previous, human, assistant, input, replacement };
+  }
+
+  it.each(["supersede", "upsert"] as const)("replaces an older preference restated by the person (%s), keeping its history", (op) => {
+    const { transcript, memory, current, previous, human, assistant, input, replacement } = setup();
+    try {
+      const operation = op === "supersede"
+        ? { op, memoryId: previous.id, replacement: replacement() }
+        : { op, memory: replacement() };
+      const applied = applyReflectionResult(memory, input([human, assistant]), { operations: [operation] });
+      expect(applied.rejected).toEqual([]);
+      const active = memory.listMemories("agent-a");
+      expect(active.map((item) => item.text)).toEqual(["Prefere respostas detalhadas."]);
+      expect(active[0]?.sourceConversationId).toBe(current);
+      expect(memory.getMemory("agent-a", previous.id)).toMatchObject({ status: "superseded", supersededBy: active[0]?.id, text: "Prefere respostas curtas." });
+      expect(memory.snapshotAgent("agent-a").revisions.filter((revision) => revision.memoryId === previous.id).length).toBeGreaterThanOrEqual(2);
+    } finally {
+      transcript.close();
+    }
+  });
+
+  it("keeps the older memory without the person's own message, the same key and kind, or a replacement", () => {
+    const { transcript, memory, previous, human, assistant, input, replacement } = setup();
+    try {
+      const applied = applyReflectionResult(memory, input([human, assistant]), {
+        operations: [
+          { op: "supersede", memoryId: previous.id, replacement: replacement({ sourceEntryIds: ["a1"] }) },
+          { op: "upsert", memory: replacement({ sourceEntryIds: ["a1"] }) },
+          { op: "supersede", memoryId: previous.id, replacement: replacement({ canonicalKey: "answer.detail" }) },
+          { op: "supersede", memoryId: previous.id, replacement: replacement({ kind: "fact" }) },
+          { op: "supersede", memoryId: previous.id },
+          { op: "forget", memoryId: previous.id },
+        ],
+      });
+      expect(applied.rejected.map((rejection) => rejection.code)).toEqual([
+        "invalid_authority",
+        "invalid_authority",
+        "foreign_target",
+        "foreign_target",
+        "foreign_target",
+        "foreign_target",
+      ]);
+      const relayed = { ...human, fromUser: undefined, fromAgent: { agentId: "agent-b", name: "B" } };
+      const fromAgent = applyReflectionResult(memory, input([relayed]), { operations: [{ op: "upsert", memory: replacement() }] });
+      expect(fromAgent.rejected.map((rejection) => rejection.code)).toEqual(["invalid_authority"]);
+      expect(memory.getMemory("agent-a", previous.id)?.status).toBe("active");
+      expect(memory.listMemories("agent-a")).toHaveLength(1);
+    } finally {
+      transcript.close();
+    }
+  });
+
+  it("never replaces another conversation's fact, pinned or trust:user memory automatically", () => {
+    const { transcript, memory, older, human, input } = setup();
+    try {
+      const base = { trust: "external_observation" as const, sourceConversationId: older };
+      const fact = memory.upsertMemory("agent-a", { ...base, kind: "fact", canonicalKey: "project.stack", text: "Usa Postgres." }, { kind: "admin" });
+      memory.upsertMemory("agent-a", { ...base, kind: "preference", canonicalKey: "tone", text: "Tom formal.", pinned: true }, { kind: "admin" });
+      memory.upsertMemory("agent-a", { ...base, kind: "preference", canonicalKey: "language", text: "Português.", trust: "user" }, { kind: "admin" });
+      const applied = applyReflectionResult(memory, input([human]), {
+        operations: [
+          { op: "supersede", memoryId: fact.id, replacement: { kind: "fact", canonicalKey: "project.stack", text: "Usa SQLite.", trust: "external_observation", sourceEntryIds: ["u1"] } },
+          { op: "upsert", memory: { kind: "fact", canonicalKey: "project.stack", text: "Usa SQLite.", trust: "external_observation", sourceEntryIds: ["u1"] } },
+          { op: "upsert", memory: { kind: "preference", canonicalKey: "tone", text: "Tom casual.", trust: "external_observation", sourceEntryIds: ["u1"] } },
+          { op: "upsert", memory: { kind: "preference", canonicalKey: "language", text: "Inglês.", trust: "external_observation", sourceEntryIds: ["u1"] } },
+        ],
+      });
+      expect(applied.rejected.map((rejection) => rejection.code)).toEqual([
+        "foreign_target",
+        "invalid_authority",
+        "protected_target",
+        "protected_target",
+      ]);
+      expect(memory.listMemories("agent-a").map((item) => item.text).sort()).toEqual(["Português.", "Prefere respostas curtas.", "Tom formal.", "Usa Postgres."]);
+    } finally {
+      transcript.close();
+    }
+  });
+
+  it("updates a shared-profile fact learned by another bot", () => {
+    const { transcript, memory, human, input } = setup();
+    try {
+      const otherBot = chat(transcript, "agent-b");
+      const otherEntry = { kind: "message" as const, id: "b-u1", role: "user" as const, content: "Me chame de Thiago.", timestampMs: 1, streaming: false, fromUser: HUMAN_FROM_USER };
+      transcript.append("agent-b", [otherEntry], otherBot);
+      const previous = memory.upsertMemory(USER_PROFILE_AGENT_ID, {
+        kind: "identity",
+        canonicalKey: "name",
+        text: "Chama-se Thiago.",
+        trust: "external_observation",
+        sourceConversationId: otherBot,
+        sourceEntryIds: [{ conversationId: otherBot, entryId: otherEntry.id }],
+      }, { kind: "automatic", conversationId: otherBot, evidenceIds: [otherEntry.id] });
+      const applied = applyReflectionResult(memory, input([human]), {
+        operations: [{ op: "upsert", scope: "user", memory: { kind: "identity", canonicalKey: "name", text: "Prefere ser chamado de Thi.", trust: "external_observation", sourceEntryIds: ["u1"] } }],
+      });
+      expect(applied.rejected).toEqual([]);
+      expect(memory.listMemories(USER_PROFILE_AGENT_ID).map((item) => item.text)).toEqual(["Prefere ser chamado de Thi."]);
+      expect(memory.getMemory(USER_PROFILE_AGENT_ID, previous.id)?.status).toBe("superseded");
+    } finally {
+      transcript.close();
+    }
+  });
+
+  it("marks another conversation's person facts as replaceable with the same key in the reflection payload", () => {
+    const { transcript, memory, current, previous } = setup();
+    try {
+      expect(projectReflectionExistingMemory(previous, current)).toMatchObject({ editable: false, replaceableWithSameKey: true });
+      const fact = memory.upsertMemory("agent-a", {
+        kind: "fact", canonicalKey: "stack", text: "Usa Postgres.", trust: "external_observation", sourceConversationId: previous.sourceConversationId,
+      }, { kind: "admin" });
+      expect(projectReflectionExistingMemory(fact, current)).toMatchObject({ editable: false, replaceableWithSameKey: false });
+    } finally {
+      transcript.close();
+    }
+  });
+});
+
+describe("reflection input and validity", () => {
+  it("expires an open loop at the expiresAtMs reflection set and rejects an invalid instant", () => {
+    const db = new Database(":memory:");
+    let clock = 1_000_000;
+    const memory = new SqliteMemoryStore({ path: ":memory:", database: db, now: () => clock });
+    const transcript = new SqliteTranscriptStore({ path: ":memory:", database: db, memoryStore: memory });
+    try {
+      const conversationId = chat(transcript, "agent-a");
+      const applied = applyReflectionResult(memory, {
+        agentId: "agent-a", conversationId, provider: "xai", model: "grok-4.6", fromSequenceId: 0, throughSequenceId: 1,
+        entries: [{ kind: "message", id: "e1", role: "user", content: "Preciso renovar o passaporte até sexta.", timestampMs: clock }],
+      }, {
+        operations: [
+          { op: "upsert", memory: { kind: "open_loop", canonicalKey: "passport.renewal", text: "Renovar o passaporte até sexta.", trust: "external_observation", sourceEntryIds: ["e1"], expiresAtMs: clock + 60_000 } },
+          { op: "upsert", memory: { kind: "open_loop", canonicalKey: "bad.expiry", text: "Prazo inválido.", trust: "external_observation", sourceEntryIds: ["e1"], expiresAtMs: "sexta" } },
+        ],
+      });
+      expect(applied.rejected.map((rejection) => rejection.code)).toEqual(["validity"]);
+      expect(memory.listMemories("agent-a").map((item) => item.canonicalKey)).toEqual(["passport.renewal"]);
+      clock += 60_000;
+      expect(memory.listMemories("agent-a")).toEqual([]);
+      expect(memory.getMemory("agent-a", applied.memories[0]!.id)?.status).toBe("expired");
+    } finally {
+      transcript.close();
+      db.close();
+    }
+  });
+
+  it("shows reflection the memories related to the new user messages, not only the most important", () => {
+    const transcript = new SqliteTranscriptStore({ path: ":memory:" });
+    try {
+      for (let index = 0; index < 30; index += 1) {
+        transcript.memoryStore.upsertMemory("agent-a", { kind: "fact", canonicalKey: `note.${index}`, text: `Nota número ${index}.`, trust: "user", importance: 90 - index }, { kind: "admin" });
+      }
+      transcript.memoryStore.upsertMemory("agent-a", { kind: "decision", canonicalKey: "db.engine", text: "O banco principal é Postgres.", trust: "user", importance: 1 }, { kind: "admin" });
+      const entries = [{ kind: "message", id: "u1", role: "user", content: "Vamos trocar os bancos para SQLite." }];
+      const selected = selectReflectionExistingMemories(transcript.memoryStore, "agent-a", entries).map((memory) => memory.canonicalKey);
+      expect(selected).toHaveLength(24);
+      expect(selected).toContain("db.engine");
+      expect(selected.slice(0, 12)).toEqual(Array.from({ length: 12 }, (_, index) => `note.${index}`));
+      expect(selectReflectionExistingMemories(transcript.memoryStore, "agent-a", [])).toHaveLength(24);
+      expect(selectReflectionExistingMemories(transcript.memoryStore, "agent-a", []).map((memory) => memory.canonicalKey)).not.toContain("db.engine");
+    } finally {
+      transcript.close();
+    }
+  });
+
+  it("runs reflection at low effort only when the model declares it", () => {
+    const declared = (efforts: string[]) => ({ supportedReasoningEfforts: efforts }) as unknown as ModelResolution;
+    expect(reflectionReasoningEffort(declared(["low", "medium", "high"]), "high")).toBe("low");
+    expect(reflectionReasoningEffort(declared(["medium", "high"]), "high")).toBe("high");
+    expect(reflectionReasoningEffort(undefined, "medium")).toBe("medium");
   });
 });
